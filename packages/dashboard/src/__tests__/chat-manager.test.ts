@@ -25,6 +25,26 @@ vi.mock("@fusion/core", () => ({
   summarizeTitle: mockSummarizeTitle,
 }));
 
+// SessionManager is constructed per-chat for CLI session continuity. We don't
+// want tests touching the real ~/.pi sessions directory, so stub the static
+// methods. The test `cliSessionFile-threading` asserts call shapes.
+const { mockSessionManagerCreate, mockSessionManagerOpen } = vi.hoisted(() => {
+  const fakeManager = {
+    getSessionFile: () => "/tmp/test/.pi-fake/session-abc.jsonl",
+  };
+  return {
+    mockSessionManagerCreate: vi.fn(() => fakeManager),
+    mockSessionManagerOpen: vi.fn(() => fakeManager),
+  };
+});
+
+vi.mock("@mariozechner/pi-coding-agent", () => ({
+  SessionManager: {
+    create: mockSessionManagerCreate,
+    open: mockSessionManagerOpen,
+  },
+}));
+
 // ── Mock Store ──────────────────────────────────────────────────────────────
 
 const mockChatStore = {
@@ -33,6 +53,7 @@ const mockChatStore = {
   addMessage: vi.fn(),
   getMessages: vi.fn(),
   updateSession: vi.fn(),
+  setCliSessionFile: vi.fn(),
 };
 
 const mockAgentStore = {
@@ -740,13 +761,15 @@ describe("ChatManager.sendMessage", () => {
     expect(createOptions.systemPrompt).not.toContain("## Soul");
   });
 
-  it("includes previous user and assistant messages in the prompt context", async () => {
+  it("sends only the new user message — prior turns come from the resumed CLI session, not the prompt", async () => {
     const promptSpy = vi.fn().mockResolvedValue(undefined);
 
+    // Even with a backlog in the store, the prompt must be the new message
+    // alone. Stuffing prior turns into the prompt is what bloated the on-disk
+    // CLI session every iteration before per-chat resume was wired up.
     mockChatStore.getMessages.mockReturnValue([
       { role: "user", content: "Earlier user question" },
       { role: "assistant", content: "Earlier assistant answer" },
-      { role: "system", content: "System note should be filtered" },
       { role: "user", content: "Current question" },
     ]);
 
@@ -755,9 +778,7 @@ describe("ChatManager.sendMessage", () => {
         session: {
           prompt: promptSpy,
           dispose: vi.fn(),
-          state: {
-            messages: [{ role: "assistant", content: "Done" }],
-          },
+          state: { messages: [{ role: "assistant", content: "Done" }] },
         },
       };
     });
@@ -767,12 +788,57 @@ describe("ChatManager.sendMessage", () => {
 
     expect(promptSpy).toHaveBeenCalledTimes(1);
     const promptArgument = promptSpy.mock.calls[0]?.[0];
-    expect(promptArgument).toContain("## Previous Conversation");
-    expect(promptArgument).toContain("[User]: Earlier user question");
-    expect(promptArgument).toContain("[Assistant]: Earlier assistant answer");
-    expect(promptArgument).not.toContain("System note should be filtered");
-    expect(promptArgument).toContain("## Current Message");
-    expect(promptArgument).toContain("Current question");
+    expect(promptArgument).toBe("Current question");
+    expect(promptArgument).not.toContain("Previous Conversation");
+    expect(promptArgument).not.toContain("Earlier user question");
+  });
+
+  it("creates a fresh CLI session on the first turn and persists its file path", async () => {
+    mockChatStore.getSession.mockReturnValue({
+      id: "chat-001",
+      agentId: "agent-001",
+      status: "active",
+      cliSessionFile: null,
+    });
+
+    const createSpy = vi.fn();
+    __setCreateFnAgent(async (options: any) => {
+      createSpy(options);
+      return {
+        session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+      };
+    });
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "First message");
+
+    expect(mockSessionManagerCreate).toHaveBeenCalledWith("/tmp/test");
+    expect(mockSessionManagerOpen).not.toHaveBeenCalled();
+    expect(mockChatStore.setCliSessionFile).toHaveBeenCalledWith(
+      "chat-001",
+      "/tmp/test/.pi-fake/session-abc.jsonl",
+    );
+    expect(createSpy.mock.calls[0]?.[0]?.sessionManager).toBeDefined();
+  });
+
+  it("reopens the same CLI session on subsequent turns instead of creating a new one", async () => {
+    mockChatStore.getSession.mockReturnValue({
+      id: "chat-001",
+      agentId: "agent-001",
+      status: "active",
+      cliSessionFile: __dirname + "/chat-manager.test.ts", // any existing file
+    });
+
+    __setCreateFnAgent(async () => ({
+      session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn(), state: { messages: [] } },
+    }));
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "Follow-up");
+
+    expect(mockSessionManagerOpen).toHaveBeenCalledTimes(1);
+    expect(mockSessionManagerCreate).not.toHaveBeenCalled();
+    expect(mockChatStore.setCliSessionFile).not.toHaveBeenCalled();
   });
 
   it("generates title when session has no title", async () => {
