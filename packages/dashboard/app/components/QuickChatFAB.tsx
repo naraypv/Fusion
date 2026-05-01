@@ -2035,6 +2035,11 @@ export function QuickChatFAB({
                   <button
                     type="button"
                     className="chat-input-stop quick-chat-send-btn"
+                    onTouchStart={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                      stopStreaming();
+                    }}
                     onClick={stopStreaming}
                     aria-label="Stop generation"
                     data-testid="quick-chat-stop"
@@ -2045,6 +2050,11 @@ export function QuickChatFAB({
                   <button
                     type="button"
                     className="quick-chat-send-btn"
+                    onTouchStart={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                      void handleSendMessage();
+                    }}
                     onClick={() => {
                       void handleSendMessage();
                     }}

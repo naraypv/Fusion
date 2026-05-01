@@ -2138,6 +2138,29 @@ describe("QuickChatFAB", () => {
       });
     });
 
+    it("sends on first touch tap on mobile without requiring a second tap", async () => {
+      mockMobileVisualViewport({
+        innerHeight: 800,
+        vvHeight: 800,
+      });
+
+      render(<QuickChatFAB addToast={addToast} open={true} onOpenChange={vi.fn()} projectId="proj-123" />);
+
+      const input = await screen.findByTestId("quick-chat-input");
+      await waitFor(() => {
+        expect(input).not.toBeDisabled();
+      });
+
+      fireEvent.change(input, { target: { value: "send from touch" } });
+
+      const sendButton = screen.getByTestId("quick-chat-send");
+      fireEvent.touchStart(sendButton);
+
+      await waitFor(() => {
+        expect(mockStreamChatResponse).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it("does not subscribe to keyboard tracking while panel is closed", async () => {
       const { mockVV } = mockMobileVisualViewport({
         innerHeight: 800,
