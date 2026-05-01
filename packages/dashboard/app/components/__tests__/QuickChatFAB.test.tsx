@@ -2156,6 +2156,7 @@ describe("QuickChatFAB", () => {
 
       const sendButton = screen.getByTestId("quick-chat-send");
       fireEvent.touchStart(sendButton);
+      fireEvent.click(sendButton);
 
       await waitFor(() => {
         expect(mockStreamChatResponse).toHaveBeenCalledTimes(1);

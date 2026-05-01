@@ -894,6 +894,8 @@ export function QuickChatFAB({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const shouldAutoFocusComposerRef = useRef(false);
+  const handledMobileActionRef = useRef(false);
+  const preserveComposerFocusRef = useRef(false);
   // Always-mounted offscreen input used to claim the iOS soft keyboard
   // synchronously inside the FAB click gesture, before the real composer
   // input has rendered (or while it is still `disabled` waiting for the
@@ -1351,6 +1353,12 @@ export function QuickChatFAB({
     input.focus({ preventScroll: true });
   }, []);
 
+  const markPreserveComposerFocus = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+    preserveComposerFocusRef.current = true;
+  }, []);
+
   const handleSendMessage = useCallback(async () => {
     const trimmed = messageInput.trim();
     const attachmentsToSend = pendingAttachmentsRef.current;
@@ -1374,6 +1382,7 @@ export function QuickChatFAB({
       // Keep pending attachments on failure so user can retry.
     } finally {
       focusComposerInput();
+      preserveComposerFocusRef.current = false;
     }
   }, [sendMessage, inputDisabled, messageInput, focusComposerInput]);
 
@@ -1468,6 +1477,13 @@ export function QuickChatFAB({
   );
 
   const handleInputBlur = useCallback(() => {
+    if (preserveComposerFocusRef.current) {
+      window.requestAnimationFrame(() => {
+        focusComposerInput();
+      });
+      return;
+    }
+
     // Pre-grow the panel ahead of iOS's keyboard dismiss animation so the
     // user sees the panel snap to full height immediately instead of
     // following the keyboard slide-down. The suppress flag prevents the
@@ -1498,7 +1514,7 @@ export function QuickChatFAB({
       fileMention.dismissMention();
       hideMentionPopupTimeoutRef.current = null;
     }, 120);
-  }, [fileMention]);
+  }, [fileMention, focusComposerInput]);
 
   const handleInputFocus = useCallback(() => {
     // Re-enable visualViewport tracking — the suppress flag set on blur
@@ -2045,12 +2061,31 @@ export function QuickChatFAB({
                   <button
                     type="button"
                     className="chat-input-stop quick-chat-send-btn"
+                    onPointerDown={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                      if (event.pointerType && event.pointerType !== "mouse") {
+                        handledMobileActionRef.current = true;
+                        stopStreaming();
+                      }
+                    }}
                     onTouchStart={(event) => {
                       if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
                       event.preventDefault();
+                      handledMobileActionRef.current = true;
                       stopStreaming();
                     }}
-                    onClick={stopStreaming}
+                    onMouseDown={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                    }}
+                    onClick={() => {
+                      if (handledMobileActionRef.current) {
+                        handledMobileActionRef.current = false;
+                        return;
+                      }
+                      stopStreaming();
+                    }}
                     aria-label="Stop generation"
                     data-testid="quick-chat-stop"
                   >
@@ -2060,13 +2095,33 @@ export function QuickChatFAB({
                   <button
                     type="button"
                     className="quick-chat-send-btn"
+                    onPointerDown={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                      if (event.pointerType && event.pointerType !== "mouse") {
+                        handledMobileActionRef.current = true;
+                        markPreserveComposerFocus();
+                        focusComposerInput();
+                        void handleSendMessage();
+                      }
+                    }}
                     onTouchStart={(event) => {
                       if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
                       event.preventDefault();
+                      handledMobileActionRef.current = true;
+                      markPreserveComposerFocus();
                       focusComposerInput();
                       void handleSendMessage();
                     }}
+                    onMouseDown={(event) => {
+                      if (typeof window === "undefined" || window.innerWidth > QUICK_CHAT_DESKTOP_BREAKPOINT) return;
+                      event.preventDefault();
+                    }}
                     onClick={() => {
+                      if (handledMobileActionRef.current) {
+                        handledMobileActionRef.current = false;
+                        return;
+                      }
                       void handleSendMessage();
                     }}
                     disabled={inputDisabled || (messageInput.trim().length === 0 && pendingAttachments.length === 0)}
