@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Database, createDatabase, toJson, toJsonNullable, fromJson, normalizeTaskComments } from "../db.js";
 import { DEFAULT_PROJECT_SETTINGS } from "../types.js";
-import { mkdtempSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, existsSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { rm } from "node:fs/promises";
 
 function makeTmpDir(): string {
@@ -131,7 +132,7 @@ describe("Database", () => {
     });
 
     it("seeds schema version", () => {
-      expect(db.getSchemaVersion()).toBe(56);
+      expect(db.getSchemaVersion()).toBe(57);
     });
 
     it("seeds lastModified", () => {
@@ -154,7 +155,7 @@ describe("Database", () => {
 
     it("is idempotent - calling init() twice does not fail", () => {
       expect(() => db.init()).not.toThrow();
-      expect(db.getSchemaVersion()).toBe(56);
+      expect(db.getSchemaVersion()).toBe(57);
     });
 
     it("does not overwrite existing config on re-init", () => {
@@ -761,7 +762,7 @@ describe("schema migrations", () => {
     db.init();
 
     // Verify version bumped to 29 (includes v1→v2 through v26→v29)
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     // Verify new columns exist and existing data is intact
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
@@ -786,11 +787,11 @@ describe("schema migrations", () => {
     const db = new Database(fusionDir);
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     // Re-init should not fail
     db.init();
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     db.close();
   });
@@ -825,7 +826,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     expect(cols.map((col) => col.name)).toContain("priority");
@@ -866,7 +867,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const colNames = cols.map((col) => col.name);
@@ -935,7 +936,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const colNames = cols.map((col) => col.name);
@@ -1038,7 +1039,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const cols = db.prepare("PRAGMA table_info(chat_messages)").all() as Array<{ name: string }>;
     expect(cols.map((col) => col.name)).toContain("attachments");
@@ -1112,7 +1113,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'agentRatings'").all() as Array<{ name: string }>;
     expect(tables).toEqual([{ name: "agentRatings" }]);
@@ -1136,7 +1137,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'mission_events'").all() as Array<{ name: string }>;
     expect(tables).toEqual([{ name: "mission_events" }]);
@@ -1240,7 +1241,7 @@ describe("schema migrations", () => {
     db.init();
 
     // Verify version bumped to 29
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
 
     // Verify new columns exist and existing data is intact
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
@@ -1421,6 +1422,24 @@ describe("schema migrations", () => {
     ]);
 
     db.close();
+  });
+
+  it("SCHEMA_VERSION matches the highest applyMigration target", () => {
+    tmpDir = makeTmpDir();
+    const dbSourcePath = join(dirname(fileURLToPath(import.meta.url)), "..", "db.ts");
+    const source = readFileSync(dbSourcePath, "utf8");
+
+    const versionMatch = source.match(/^const SCHEMA_VERSION = (\d+);/m);
+    expect(versionMatch, "SCHEMA_VERSION constant not found in db.ts").not.toBeNull();
+    const declaredVersion = Number(versionMatch![1]);
+
+    const migrationTargets = Array.from(source.matchAll(/this\.applyMigration\((\d+),/g)).map(
+      (m) => Number(m[1]),
+    );
+    expect(migrationTargets.length).toBeGreaterThan(0);
+    const maxMigration = Math.max(...migrationTargets);
+
+    expect(declaredVersion).toBe(maxMigration);
   });
 });
 
@@ -1624,12 +1643,12 @@ describe("FTS5 full-text search", () => {
 
   it("checkFts5Integrity returns false when integrity-check command fails", () => {
     const execSpy = vi.spyOn((db as any).db, "exec");
-    execSpy.mockImplementation((sql: string) => {
+    execSpy.mockImplementation(((sql: string) => {
       if (sql.includes("integrity-check")) {
         throw new Error("corruption found reading blob");
       }
-      return undefined as any;
-    });
+      return undefined;
+    }) as never);
 
     expect(db.checkFts5Integrity()).toBe(false);
   });
@@ -1691,7 +1710,7 @@ describe("createDatabase factory", () => {
     const db = createDatabase(fusionDir);
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(56);
+    expect(db.getSchemaVersion()).toBe(57);
     expect(db.getLastModified()).toBeGreaterThan(0);
 
     db.close();
