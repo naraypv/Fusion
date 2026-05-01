@@ -115,6 +115,11 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const modalRef = useRef<HTMLDivElement>(null);
   const streamConnectionRef = useRef<{ close: () => void; isConnected: () => boolean } | null>(null);
   const currentSessionIdRef = useRef<string | null>(null);
+  // Tracks resumeSessionId values the user has explicitly dismissed (via "New
+  // Session"). Without this, the resume effect re-fires on every callback
+  // identity change (e.g. typing into the textarea recreates loadSession) and
+  // yanks the user back into the previous session's question view.
+  const dismissedResumeRef = useRef<string | null>(null);
   const [lockSessionId, setLockSessionId] = useState<string | null>(resumeSessionId ?? null);
   const sessionTabId = useMemo(() => getSessionTabId(), []);
   const {
@@ -186,6 +191,53 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     }, 1000);
 
     return () => clearInterval(timer);
+  }, [view.type]);
+
+  // Fallback for missed SSE 'question'/'summary' events: when the loading
+  // state lingers, periodically refetch the session and transition the view
+  // if the server has already moved past generating. Without this, a dropped
+  // event leaves the panel stuck on "thinking" until the user closes and
+  // reopens the modal (which calls loadSession). Eight seconds is short
+  // enough to feel responsive but long enough to avoid hammering the API
+  // during normal generation.
+  useEffect(() => {
+    if (view.type !== "loading") return;
+    const sessionId = currentSessionIdRef.current;
+    if (!sessionId) return;
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const session = await fetchAiSession(sessionId);
+        if (cancelled || !session) return;
+        if (currentSessionIdRef.current !== sessionId) return;
+        if (session.status === "awaiting_input" && session.currentQuestion) {
+          const question = JSON.parse(session.currentQuestion) as PlanningQuestion;
+          setView({
+            type: "question",
+            session: { sessionId, currentQuestion: question, summary: null },
+          });
+          setStreamingOutput("");
+        } else if (session.status === "complete" && session.result) {
+          const summary = JSON.parse(session.result) as PlanningSummary;
+          setView({
+            type: "summary",
+            session: { sessionId, currentQuestion: null, summary },
+            summary,
+          });
+          setEditedSummary(summary);
+          setStreamingOutput("");
+        }
+      } catch {
+        // best-effort; keep polling
+      }
+    };
+
+    const interval = setInterval(tick, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [view.type]);
 
   const resetDetailState = useCallback(() => {
@@ -266,8 +318,16 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const connectToPlanningStream = useCallback(
     (sessionId: string) => {
       streamConnectionRef.current?.close();
+      // Guard handlers against late events from a connection the user has
+      // already navigated away from (e.g. clicked "New Session" while the
+      // previous SSE flushed a buffered question). currentSessionIdRef is
+      // cleared by resetDetailState and reassigned by handleStartPlanning /
+      // loadSession before each connectToPlanningStream call.
+      const isStaleEvent = () => currentSessionIdRef.current !== sessionId;
+
       const connection = connectPlanningStream(sessionId, projectId, {
         onThinking: (data) => {
+          if (isStaleEvent()) return;
           setStreamingOutput((prev) => prev + data);
           broadcastUpdate({
             sessionId,
@@ -280,6 +340,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           });
         },
         onQuestion: (question) => {
+          if (isStaleEvent()) return;
           setIsReconnecting(false);
           setIsRetrying(false);
           clearPlanningDescription(projectId);
@@ -300,6 +361,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           });
         },
         onSummary: (summary) => {
+          if (isStaleEvent()) return;
           setIsReconnecting(false);
           setIsRetrying(false);
           clearPlanningDescription(projectId);
@@ -536,13 +598,19 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
   // Resume the externally-requested session when the modal first opens.
   // (Selecting from the sidebar uses handleSelectSession instead.)
+  // Note: loadSession intentionally omitted from deps. It is recreated when
+  // connectToPlanningStream changes (which depends on initialPlan), so
+  // including it would re-fire this effect on every keystroke and re-resume
+  // a session the user already dismissed via "New Session".
   useEffect(() => {
     if (!isOpen || !resumeSessionId) return;
     if (currentSessionIdRef.current === resumeSessionId) return;
+    if (dismissedResumeRef.current === resumeSessionId) return;
     setSelectedSessionId(resumeSessionId);
     setMobileShowDetail(true);
     void loadSession(resumeSessionId);
-  }, [isOpen, resumeSessionId, loadSession]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, resumeSessionId]);
 
   // Re-sync the selected session whenever the modal is reopened. Without this,
   // a session that progressed (or completed) on the server while the modal was
@@ -645,10 +713,13 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const handleNewSession = useCallback(() => {
     streamConnectionRef.current?.close();
     streamConnectionRef.current = null;
+    if (resumeSessionId) {
+      dismissedResumeRef.current = resumeSessionId;
+    }
     resetDetailState();
     setSelectedSessionId(null);
     setMobileShowDetail(true);
-  }, [resetDetailState]);
+  }, [resetDetailState, resumeSessionId]);
 
   const handleBackToList = useCallback(() => {
     setMobileShowDetail(false);
