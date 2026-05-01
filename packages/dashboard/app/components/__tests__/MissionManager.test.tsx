@@ -944,15 +944,14 @@ describe("MissionManager", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Mission event 50")).toBeDefined();
-      expect(screen.queryByText("Mission event 51")).toBeNull();
+      expect(screen.getByText("50 of 65")).toBeDefined();
       expect(screen.getByTestId("mission-activity-load-more")).toBeDefined();
     });
 
     fireEvent.click(screen.getByTestId("mission-activity-load-more"));
 
-    await screen.findByText("Mission event 51", undefined, { timeout: 10_000 });
-
     await waitFor(() => {
+      expect(screen.getByText("65 of 65")).toBeDefined();
       expect(screen.queryByTestId("mission-activity-load-more")).toBeNull();
     });
   }, 15000);

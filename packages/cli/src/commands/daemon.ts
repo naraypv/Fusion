@@ -49,6 +49,11 @@ import {
   resolveClaudeCliExtensionPaths,
   setCachedClaudeCliResolution,
 } from "./claude-cli-extension.js";
+import {
+  getCachedDroidCliResolution,
+  resolveDroidCliExtensionPaths,
+  setCachedDroidCliResolution,
+} from "./droid-cli-extension.js";
 import { resolveSelfExtension } from "./self-extension.js";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
@@ -424,6 +429,24 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
     })();
 
+    const droidCliPaths = await (async () => {
+      try {
+        const globalSettings = await store.getGlobalSettingsStore().getSettings();
+        const result = resolveDroidCliExtensionPaths(globalSettings);
+        setCachedDroidCliResolution(result.resolution);
+        if (result.warning) {
+          console.warn(`[extensions] droid-cli: ${result.warning}`);
+        }
+        return result.paths;
+      } catch (err) {
+        console.warn(
+          `[extensions] Unable to evaluate useDroidCli setting: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        setCachedDroidCliResolution(null);
+        return [];
+      }
+    })();
+
     // Always prefer Fusion's vendored `@fusion/pi-claude-cli` over any
     // external `pi-claude-cli` install. Drops shadowing externals (e.g. a
     // global `npm install -g pi-claude-cli`) so the upstream's once-and-lock
@@ -443,7 +466,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     );
 
     const extensionsResult = await discoverAndLoadExtensions(
-      reconciledExtensionPaths,
+      [...reconciledExtensionPaths, ...droidCliPaths],
       cwd,
       join(cwd, ".fusion", "disabled-auto-extension-discovery"),
     );
@@ -526,6 +549,17 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
       return { status: r.status, reason: r.reason };
     },
+    getDroidCliExtensionStatus: () => {
+      const r = getCachedDroidCliResolution();
+      if (!r) return null;
+      if (r.status === "ok") {
+        return { status: "ok", path: r.path, packageVersion: r.packageVersion };
+      }
+      if (r.status === "not-installed") {
+        return { status: "not-installed" };
+      }
+      return { status: r.status, reason: r.reason };
+    },
     onUseClaudeCliToggled: (_prev, next) => {
       if (!next) return;
       void (async () => {
@@ -541,6 +575,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
           );
         }
       })();
+    },
+    onUseDroidCliToggled: (_prev, next) => {
+      if (next) {
+        console.log("[extensions] Droid CLI enabled — restart required for full effect");
+      }
     },
     headless: true,
     daemon: { token: daemonToken },
