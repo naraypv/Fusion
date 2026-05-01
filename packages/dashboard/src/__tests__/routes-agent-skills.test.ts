@@ -11,6 +11,7 @@ type AgentRecord = {
   updatedAt: string;
   metadata: Record<string, unknown>;
   reportsTo?: string;
+  heartbeatProcedurePath?: string;
 };
 
 const mockInit = vi.fn().mockResolvedValue(undefined);
@@ -51,8 +52,11 @@ vi.mock("@fusion/core", () => {
     prepareAgentCompaniesImport: (...args: unknown[]) => mockPrepareAgentCompaniesImport(...args),
     AgentCompaniesParseError: MockAgentCompaniesParseError,
     DEFAULT_HEARTBEAT_PROCEDURE_PATH: ".fusion/HEARTBEAT.md",
-    getDefaultHeartbeatProcedurePath: (agentId: string) =>
-      `.fusion/agents/${agentId}/HEARTBEAT.md`,
+    getDefaultHeartbeatProcedurePath: (agentId: string, agentName?: string) =>
+      agentName
+        ? `.fusion/agents/${agentName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")}-${agentId}/HEARTBEAT.md`
+        : `.fusion/agents/${agentId}/HEARTBEAT.md`,
+    getSafeAgentAssetIdSegment: (agentId: string) => agentId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent",
   };
 });
 
@@ -99,6 +103,7 @@ describe("Agent skills routes", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
         metadata: input.metadata ?? {},
+        heartbeatProcedurePath: input.heartbeatProcedurePath,
       };
       agents.set(id, agent);
       return agent;
@@ -181,6 +186,35 @@ describe("Agent skills routes", () => {
       const body = response.body as AgentRecord;
       expect(body.metadata).toEqual({});
       expect(body.metadata.skills).toBeUndefined();
+    });
+  });
+
+  describe("POST /api/agents/:id/upgrade-heartbeat-procedure", () => {
+    it("preserves existing legacy default heartbeat path", async () => {
+      agents.set("agent-001", {
+        id: "agent-001",
+        name: "Legacy Agent",
+        role: "executor",
+        state: "idle",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        metadata: {},
+        heartbeatProcedurePath: ".fusion/agents/agent-001/HEARTBEAT.md",
+      });
+
+      const response = await request(
+        app,
+        "POST",
+        "/api/agents/agent-001/upgrade-heartbeat-procedure",
+        undefined,
+        {},
+      );
+
+      expect(response.status).toBe(200);
+      expect(mockUpdateAgent).toHaveBeenCalledWith(
+        "agent-001",
+        expect.objectContaining({ heartbeatProcedurePath: ".fusion/agents/agent-001/HEARTBEAT.md" }),
+      );
     });
   });
 

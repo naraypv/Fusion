@@ -3263,20 +3263,71 @@ export interface AgentConfigRevision {
  */
 export const DEFAULT_HEARTBEAT_PROCEDURE_PATH = ".fusion/HEARTBEAT.md";
 
+function slugifyAgentAssetSegment(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function getSafeAgentAssetIdSegment(agentId: string): string {
+  const slug = slugifyAgentAssetSegment(agentId);
+  return slug || "agent";
+}
+
+/**
+ * Compute the canonical per-agent asset directory segment.
+ *
+ * Canonical format: `<slugged-display-name>-<safe-agent-id>`.
+ * Example: `CEO` + `agent2736` => `ceo-agent2736`.
+ *
+ * If the display-name slug is empty (for example name has only symbols), the
+ * id-derived segment is used as the directory prefix so the result is always
+ * filesystem-safe and non-empty.
+ */
+export function getCanonicalAgentAssetDirectoryName(agentName: string, agentId: string): string {
+  if (!agentId || typeof agentId !== "string") {
+    throw new Error("getCanonicalAgentAssetDirectoryName requires a non-empty agentId");
+  }
+  const safeId = getSafeAgentAssetIdSegment(agentId);
+  const nameSlug = slugifyAgentAssetSegment(agentName ?? "");
+  const prefix = nameSlug || safeId;
+  return `${prefix}-${safeId}`;
+}
+
+/** Legacy per-agent asset directory segment used by older builds. */
+export function getLegacyAgentAssetDirectoryName(agentId: string): string {
+  if (!agentId || typeof agentId !== "string") {
+    throw new Error("getLegacyAgentAssetDirectoryName requires a non-empty agentId");
+  }
+  return agentId;
+}
+
+/** Canonical managed instruction bundle directory name for an agent. */
+export function getCanonicalAgentInstructionsBundleDirName(agentName: string, agentId: string): string {
+  return `${getCanonicalAgentAssetDirectoryName(agentName, agentId)}-instructions`;
+}
+
+/** Legacy managed instruction bundle directory name used by older builds. */
+export function getLegacyAgentInstructionsBundleDirName(agentId: string): string {
+  return `${getLegacyAgentAssetDirectoryName(agentId)}-instructions`;
+}
+
 /**
  * Compute the project-relative default heartbeat procedure file path for a
  * given agent. Each agent gets their own editable HEARTBEAT.md so operators
  * can tune the per-tick procedure without changes leaking across the team.
  *
- * The path is laid out under `.fusion/agents/<agentId>/HEARTBEAT.md` so it
- * lives alongside any other future per-agent assets and survives agent
- * renames (which do not change the immutable agent id).
+ * The path is laid out under `.fusion/agents/<canonical-agent-dir>/HEARTBEAT.md`.
  */
-export function getDefaultHeartbeatProcedurePath(agentId: string): string {
+export function getDefaultHeartbeatProcedurePath(agentId: string, agentName?: string): string {
   if (!agentId || typeof agentId !== "string") {
     throw new Error("getDefaultHeartbeatProcedurePath requires a non-empty agentId");
   }
-  return `.fusion/agents/${agentId}/HEARTBEAT.md`;
+  const directory = agentName
+    ? getCanonicalAgentAssetDirectoryName(agentName, agentId)
+    : getLegacyAgentAssetDirectoryName(agentId);
+  return `.fusion/agents/${directory}/HEARTBEAT.md`;
 }
 
 /** Extract trackable config fields from an Agent into a snapshot */

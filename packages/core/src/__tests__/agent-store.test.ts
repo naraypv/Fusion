@@ -18,7 +18,12 @@ import { join } from "node:path";
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { CheckoutConflictError, type AgentCapability, type AgentState } from "../types.js";
+import {
+  CheckoutConflictError,
+  getCanonicalAgentAssetDirectoryName,
+  type AgentCapability,
+  type AgentState,
+} from "../types.js";
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), "fn-agent-store-test-"));
@@ -148,6 +153,27 @@ describe("AgentStore", () => {
       });
       expect(new Date(agent.createdAt).getTime()).not.toBeNaN();
       expect(new Date(agent.updatedAt).getTime()).not.toBeNaN();
+    });
+
+    it("defaults heartbeat procedure path to canonical display-name directory", async () => {
+      const agent = await store.createAgent({
+        name: "CEO",
+        role: "executor",
+      });
+
+      const expectedDir = getCanonicalAgentAssetDirectoryName(agent.name, agent.id);
+      expect(agent.heartbeatProcedurePath).toBe(`.fusion/agents/${expectedDir}/HEARTBEAT.md`);
+    });
+
+    it("falls back to id-based segment when display-name slug is empty", async () => {
+      const agent = await store.createAgent({
+        name: "!!!",
+        role: "executor",
+      });
+
+      const expectedDir = getCanonicalAgentAssetDirectoryName(agent.name, agent.id);
+      expect(expectedDir).toContain("agent-");
+      expect(agent.heartbeatProcedurePath).toBe(`.fusion/agents/${expectedDir}/HEARTBEAT.md`);
     });
 
     it("preserves custom metadata", async () => {

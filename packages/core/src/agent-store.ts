@@ -38,7 +38,19 @@ import type {
   Task,
   AgentLogEntry,
 } from "./types.js";
-import { AGENT_VALID_TRANSITIONS, agentToConfigSnapshot, diffConfigSnapshots, isEphemeralAgent, CheckoutConflictError, DEFAULT_HEARTBEAT_PROCEDURE_PATH, getDefaultHeartbeatProcedurePath } from "./types.js";
+import {
+  AGENT_VALID_TRANSITIONS,
+  agentToConfigSnapshot,
+  diffConfigSnapshots,
+  isEphemeralAgent,
+  CheckoutConflictError,
+  DEFAULT_HEARTBEAT_PROCEDURE_PATH,
+  getDefaultHeartbeatProcedurePath,
+  getCanonicalAgentInstructionsBundleDirName,
+  getLegacyAgentAssetDirectoryName,
+  getLegacyAgentInstructionsBundleDirName,
+  getSafeAgentAssetIdSegment,
+} from "./types.js";
 import type { RunMutationContext } from "./types.js";
 import type { TaskStore } from "./store.js";
 import { computeAccessState } from "./agent-permissions.js";
@@ -262,7 +274,7 @@ export class AgentStore extends EventEmitter {
         continue;
       }
 
-      const newRelPath = getDefaultHeartbeatProcedurePath(agent.id);
+      const newRelPath = await this.resolveCompatibleHeartbeatProcedurePath(agent);
       const newAbsPath = join(this.rootDir, "..", newRelPath);
 
       // Best-effort copy of operator edits to the new per-agent location.
@@ -468,7 +480,7 @@ export class AgentStore extends EventEmitter {
     // don't need persistent procedure files.
     const ephemeral = isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo });
     const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
-      ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId));
+      ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
 
     const agent: Agent = {
       id: agentId,
@@ -742,7 +754,9 @@ export class AgentStore extends EventEmitter {
    * Does not create the directory.
    */
   getInstructionsDir(agentId: string): string {
-    return this.getBundleDir(agentId);
+    const agent = this.readAgent(agentId);
+    const agentName = agent?.name ?? "";
+    return join(this.agentsDir, getCanonicalAgentInstructionsBundleDirName(agentName, agentId));
   }
 
   /**
@@ -750,7 +764,7 @@ export class AgentStore extends EventEmitter {
    * Returns [] when the bundle directory does not exist.
    */
   async listBundleFiles(agentId: string): Promise<string[]> {
-    const bundleDir = this.getBundleDir(agentId);
+    const bundleDir = await this.resolveCompatibleBundleDir(agentId, false);
 
     try {
       const entries = await readdir(bundleDir, { withFileTypes: true });
@@ -771,7 +785,8 @@ export class AgentStore extends EventEmitter {
    */
   async readBundleFile(agentId: string, filePath: string): Promise<string> {
     this.validateBundleFilePath(filePath);
-    const resolvedPath = join(this.getBundleDir(agentId), filePath);
+    const bundleDir = await this.resolveCompatibleBundleDir(agentId, false);
+    const resolvedPath = join(bundleDir, filePath);
     return readFile(resolvedPath, "utf-8");
   }
 
@@ -782,7 +797,7 @@ export class AgentStore extends EventEmitter {
     return this.withLock(agentId, async () => {
       this.validateBundleFilePath(filePath);
 
-      const bundleDir = this.getBundleDir(agentId);
+      const bundleDir = await this.resolveCompatibleBundleDir(agentId, true);
       await mkdir(bundleDir, { recursive: true });
 
       const existingFiles = await this.listBundleFiles(agentId);
@@ -804,7 +819,8 @@ export class AgentStore extends EventEmitter {
   async deleteBundleFile(agentId: string, filePath: string): Promise<void> {
     return this.withLock(agentId, async () => {
       this.validateBundleFilePath(filePath);
-      await unlink(join(this.getBundleDir(agentId), filePath));
+      const bundleDir = await this.resolveCompatibleBundleDir(agentId, false);
+      await unlink(join(bundleDir, filePath));
     });
   }
 
@@ -831,7 +847,7 @@ export class AgentStore extends EventEmitter {
     const updated = await this.updateAgent(agentId, { bundleConfig: normalizedConfig });
 
     if (normalizedConfig.mode === "managed") {
-      await mkdir(this.getBundleDir(agentId), { recursive: true });
+      await mkdir(await this.resolveCompatibleBundleDir(agentId, true), { recursive: true });
     }
 
     return updated;
@@ -860,7 +876,7 @@ export class AgentStore extends EventEmitter {
       });
     }
 
-    await mkdir(this.getBundleDir(agentId), { recursive: true });
+    await mkdir(await this.resolveCompatibleBundleDir(agentId, true), { recursive: true });
 
     const files: string[] = [];
 
@@ -2057,8 +2073,108 @@ export class AgentStore extends EventEmitter {
     return null;
   }
 
-  private getBundleDir(agentId: string): string {
-    return join(this.agentsDir, `${agentId}-instructions`);
+  private getCanonicalBundleDir(agent: Agent): string {
+    return join(this.agentsDir, getCanonicalAgentInstructionsBundleDirName(agent.name, agent.id));
+  }
+
+  private getLegacyBundleDir(agentId: string): string {
+    return join(this.agentsDir, getLegacyAgentInstructionsBundleDirName(agentId));
+  }
+
+  private async resolveCompatibleBundleDir(agentId: string, createIfMissing: boolean): Promise<string> {
+    const agent = this.readAgent(agentId);
+    if (!agent) {
+      throw new Error(`Agent ${agentId} not found`);
+    }
+
+    const canonicalDir = this.getCanonicalBundleDir(agent);
+    if (await this.pathExists(canonicalDir)) {
+      return canonicalDir;
+    }
+
+    const compatibleDir = await this.findExistingDisplayNameBundleDir(agent);
+    if (compatibleDir) {
+      return compatibleDir;
+    }
+
+    const legacyDir = this.getLegacyBundleDir(agent.id);
+    if (await this.pathExists(legacyDir)) {
+      return legacyDir;
+    }
+
+    return createIfMissing ? canonicalDir : canonicalDir;
+  }
+
+  private async findExistingDisplayNameBundleDir(agent: Agent): Promise<string | null> {
+    const safeId = getSafeAgentAssetIdSegment(agent.id);
+    try {
+      const entries = await readdir(this.agentsDir, { withFileTypes: true });
+      const candidates = entries
+        .filter((entry) => entry.isDirectory() && entry.name.endsWith("-instructions"))
+        .map((entry) => entry.name)
+        .filter((name) => {
+          const base = name.slice(0, -"-instructions".length);
+          return base.endsWith(`-${safeId}`);
+        })
+        .sort((a, b) => a.localeCompare(b));
+
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      const canonicalName = getCanonicalAgentInstructionsBundleDirName(agent.name, agent.id);
+      const selected = candidates.find((candidate) => candidate === canonicalName) ?? candidates[0];
+      return join(this.agentsDir, selected);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  private async resolveCompatibleHeartbeatProcedurePath(agent: Agent): Promise<string> {
+    const canonicalPath = getDefaultHeartbeatProcedurePath(agent.id, agent.name);
+    const canonicalAbs = join(this.rootDir, "..", canonicalPath);
+    if (await this.pathExists(canonicalAbs)) {
+      return canonicalPath;
+    }
+
+    const safeId = getSafeAgentAssetIdSegment(agent.id);
+    try {
+      const entries = await readdir(this.agentsDir, { withFileTypes: true });
+      const compatibleDir = entries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .find((name) => name.endsWith(`-${safeId}`));
+      if (compatibleDir) {
+        const candidatePath = `.fusion/agents/${compatibleDir}/HEARTBEAT.md`;
+        if (await this.pathExists(join(this.rootDir, "..", candidatePath))) {
+          return candidatePath;
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw err;
+      }
+    }
+
+    const legacyPath = `.fusion/agents/${getLegacyAgentAssetDirectoryName(agent.id)}/HEARTBEAT.md`;
+    const legacyAbs = join(this.rootDir, "..", legacyPath);
+    if (await this.pathExists(legacyAbs)) {
+      return legacyPath;
+    }
+
+    return canonicalPath;
+  }
+
+  private async pathExists(path: string): Promise<boolean> {
+    try {
+      await access(path, fsConstants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private validateBundleFilePath(filePath: string): void {

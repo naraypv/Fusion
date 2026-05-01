@@ -2500,8 +2500,21 @@ function HeartbeatProcedureSection({
   const [fileLoadError, setFileLoadError] = useState<string | null>(null);
   const [justSavedFile, setJustSavedFile] = useState(false);
   const currentPath = agent.heartbeatProcedurePath?.trim();
-  const expectedDefaultPath = `.fusion/agents/${agent.id}/HEARTBEAT.md`;
-  const onDefault = currentPath === expectedDefaultPath;
+  const canonicalDefaultPath = `.fusion/agents/${agent.name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || agent.id.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "agent"}-${agent.id
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "agent"}/HEARTBEAT.md`;
+  const legacyDefaultPath = `.fusion/agents/${agent.id}/HEARTBEAT.md`;
+  const safeId = agent.id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+  const onDefault = Boolean(
+    currentPath
+      && (currentPath === canonicalDefaultPath
+        || currentPath === legacyDefaultPath
+        || new RegExp(`^\\.fusion/agents/[^/]+-${safeId}/HEARTBEAT\\.md$`).test(currentPath)),
+  );
   const hasFilePath = Boolean(currentPath);
 
   const loadHeartbeatFile = useCallback(async (path: string) => {
@@ -2575,9 +2588,10 @@ function HeartbeatProcedureSection({
     <div className="config-section">
       <h3>Heartbeat Procedure</h3>
       <p className="config-description">
-        The per-tick procedure this agent runs every wake. Defaults to a project-level
-        markdown file you can edit. Resets on every tick — no need to restart the agent
-        after editing.
+        The per-tick procedure this agent runs every wake. Defaults to a per-agent
+        markdown file (for example <code>.fusion/agents/ceo-agent2736/HEARTBEAT.md</code>)
+        that you can edit. Legacy id-only default paths remain valid. Resets on every tick —
+        no need to restart the agent after editing.
       </p>
       <div className="config-fields">
         <div className="config-field">
@@ -2629,7 +2643,7 @@ function HeartbeatProcedureSection({
           </button>
           <span className="config-hint">
             Sets <code>heartbeatProcedurePath</code> to{" "}
-            <code>{expectedDefaultPath}</code>
+            <code>{canonicalDefaultPath}</code>
             {" "}and seeds the file from the built-in template if it doesn't exist.
             Each agent gets its own per-agent file, so edits stay scoped to this agent.
             Operator edits to the file are preserved.

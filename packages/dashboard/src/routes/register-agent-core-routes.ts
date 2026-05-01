@@ -10,6 +10,21 @@ interface AgentCoreRouteDeps {
   validateAgentInstructionsPayload: (instructionsPath: unknown, instructionsText: unknown) => boolean;
 }
 
+function isCompatibleDefaultHeartbeatPath(path: string | undefined, agent: Agent): boolean {
+  const trimmed = path?.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed === getDefaultHeartbeatProcedurePath(agent.id, agent.name)) {
+    return true;
+  }
+  if (trimmed === getDefaultHeartbeatProcedurePath(agent.id)) {
+    return true;
+  }
+  const safeId = (agent.id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent");
+  return new RegExp(`^\\.fusion/agents/[^/]+-${safeId}/HEARTBEAT\\.md$`).test(trimmed);
+}
+
 export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: AgentCoreRouteDeps): void {
   const { router, getProjectContext, rethrowAsApiError } = ctx;
   const { sanitizeAgentTaskLinks, validateAgentInstructionsPayload } = deps;
@@ -160,7 +175,7 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
       // the per-agent default path (which createAgent fills in for
       // non-ephemeral agents when no override is provided). Idempotent —
       // operator edits are kept.
-      const expectedDefaultPath = getDefaultHeartbeatProcedurePath(agent.id);
+      const expectedDefaultPath = getDefaultHeartbeatProcedurePath(agent.id, agent.name);
       if (agent.heartbeatProcedurePath === expectedDefaultPath) {
         try {
           await ensureDefaultHeartbeatProcedureFile(scopedStore.getRootDir(), expectedDefaultPath, HEARTBEAT_PROCEDURE);
@@ -490,7 +505,9 @@ export function registerAgentCoreRoutes(ctx: ApiRoutesContext, deps: AgentCoreRo
         throw notFound(`agent ${req.params.id} not found`);
       }
 
-      const targetPath = getDefaultHeartbeatProcedurePath(req.params.id);
+      const targetPath = isCompatibleDefaultHeartbeatPath(existing.heartbeatProcedurePath, existing)
+        ? existing.heartbeatProcedurePath!
+        : getDefaultHeartbeatProcedurePath(existing.id, existing.name);
       const filePath = await ensureDefaultHeartbeatProcedureFile(
         scopedStore.getRootDir(),
         targetPath,

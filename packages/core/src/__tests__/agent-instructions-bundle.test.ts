@@ -3,6 +3,11 @@ import { mkdtemp, rm, mkdir, writeFile, readFile, access } from "node:fs/promise
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AgentStore } from "../agent-store.js";
+import {
+  getCanonicalAgentInstructionsBundleDirName,
+  getLegacyAgentInstructionsBundleDirName,
+  getSafeAgentAssetIdSegment,
+} from "../types.js";
 
 describe("AgentStore — instructions bundle", () => {
   let testDir: string;
@@ -62,7 +67,9 @@ describe("AgentStore — instructions bundle", () => {
   it("getInstructionsDir returns the managed bundle directory path", async () => {
     const agent = await store.createAgent({ name: "dir-agent", role: "executor" });
     createdAgentIds.push(agent.id);
-    expect(store.getInstructionsDir(agent.id)).toBe(join(testDir, "agents", `${agent.id}-instructions`));
+    expect(store.getInstructionsDir(agent.id)).toBe(
+      join(testDir, "agents", getCanonicalAgentInstructionsBundleDirName(agent.name, agent.id)),
+    );
   });
 
   it("listBundleFiles returns empty for missing directory and sorted .md files only", async () => {
@@ -272,5 +279,28 @@ describe("AgentStore — instructions bundle", () => {
     });
     expect(migrated.instructionsText).toBeUndefined();
     expect(migrated.instructionsPath).toBeUndefined();
+  });
+
+  it("uses existing legacy id-only instructions directory when present", async () => {
+    const agent = await store.createAgent({ name: "Legacy Bundle", role: "executor" });
+    createdAgentIds.push(agent.id);
+
+    const legacyDir = join(testDir, "agents", getLegacyAgentInstructionsBundleDirName(agent.id));
+    await mkdir(legacyDir, { recursive: true });
+    await writeFile(join(legacyDir, "AGENTS.md"), "legacy content", "utf-8");
+
+    await expect(store.readBundleFile(agent.id, "AGENTS.md")).resolves.toBe("legacy content");
+  });
+
+  it("uses previously-created display-name instructions directory for same id", async () => {
+    const agent = await store.createAgent({ name: "Current Name", role: "executor" });
+    createdAgentIds.push(agent.id);
+
+    const priorDirName = `previous-name-${getSafeAgentAssetIdSegment(agent.id)}-instructions`;
+    const priorDir = join(testDir, "agents", priorDirName);
+    await mkdir(priorDir, { recursive: true });
+    await writeFile(join(priorDir, "AGENTS.md"), "existing display path", "utf-8");
+
+    await expect(store.readBundleFile(agent.id, "AGENTS.md")).resolves.toBe("existing display path");
   });
 });

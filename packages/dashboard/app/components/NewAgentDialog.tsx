@@ -599,12 +599,12 @@ export function NewAgentDialog({ isOpen, onClose, onCreated, projectId, prefillD
                         id="agent-heartbeat-procedure-path"
                         type="text"
                         className="input"
-                        placeholder="e.g. .fusion/agents/my-agent/HEARTBEAT.md"
+                        placeholder="e.g. .fusion/agents/ceo-agent2736/HEARTBEAT.md"
                         value={heartbeatProcedurePath}
                         onChange={e => setHeartbeatProcedurePath(e.target.value)}
                       />
                       <p className="agent-dialog-optional agent-dialog-field-hint">
-                        Path to the agent&apos;s heartbeat markdown file, typically .fusion/agents/&lt;agent-id&gt;/HEARTBEAT.md.
+                        Path to the agent&apos;s heartbeat procedure path, typically .fusion/agents/ceo-agent2736/HEARTBEAT.md. Legacy id-only default paths still work.
                       </p>
                     </div>
                     <div className="agent-dialog-field">
@@ -742,7 +742,7 @@ export function NewAgentDialog({ isOpen, onClose, onCreated, projectId, prefillD
                     id="agent-review-heartbeat-procedure-path"
                     type="text"
                     className="input"
-                    placeholder="e.g. .fusion/agents/my-agent/HEARTBEAT.md"
+                    placeholder="e.g. .fusion/agents/ceo-agent2736/HEARTBEAT.md"
                     value={heartbeatProcedurePath}
                     onChange={e => setHeartbeatProcedurePath(e.target.value)}
                   />

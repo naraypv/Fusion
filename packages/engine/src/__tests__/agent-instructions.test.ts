@@ -8,6 +8,8 @@ import {
   resolveAgentInstructionsWithRatings,
   buildAgentChatPrompt,
   buildSystemPromptWithInstructions,
+  ensureDefaultHeartbeatProcedureFile,
+  resolveAgentHeartbeatProcedure,
 } from "../agent-instructions.js";
 
 function makeAgent(overrides: Partial<Agent> = {}): Agent {
@@ -698,5 +700,63 @@ describe("diagnostics logging", () => {
     expect(warnSpy.mock.calls[0]?.[0]).toContain("agent-instructions");
     expect(warnSpy.mock.calls[0]?.[0]).toContain("Failed to read project memory");
     expect(prompt).toContain("## Identity");
+  });
+});
+
+describe("heartbeat procedure path compatibility", () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), "agent-heartbeat-proc-"));
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it("loads canonical display-name heartbeat procedure paths", async () => {
+    const relPath = ".fusion/agents/ceo-agent2736/HEARTBEAT.md";
+    await mkdir(join(testDir, ".fusion", "agents", "ceo-agent2736"), { recursive: true });
+    await writeFile(join(testDir, relPath), "Canonical heartbeat", "utf-8");
+
+    const content = await resolveAgentHeartbeatProcedure(
+      makeAgent({ id: "agent2736", heartbeatProcedurePath: relPath }),
+      testDir,
+    );
+
+    expect(content).toBe("Canonical heartbeat");
+  });
+
+  it("loads legacy id-only heartbeat procedure paths", async () => {
+    const relPath = ".fusion/agents/agent-legacy/HEARTBEAT.md";
+    await mkdir(join(testDir, ".fusion", "agents", "agent-legacy"), { recursive: true });
+    await writeFile(join(testDir, relPath), "Legacy heartbeat", "utf-8");
+
+    const content = await resolveAgentHeartbeatProcedure(
+      makeAgent({ id: "agent-legacy", heartbeatProcedurePath: relPath }),
+      testDir,
+    );
+
+    expect(content).toBe("Legacy heartbeat");
+  });
+
+  it("rejects traversal heartbeat procedure paths", async () => {
+    const content = await resolveAgentHeartbeatProcedure(
+      makeAgent({ heartbeatProcedurePath: "../outside.md" }),
+      testDir,
+    );
+    expect(content).toBeNull();
+  });
+
+  it("seeds default heartbeat procedure only for valid project-relative markdown paths", async () => {
+    const seeded = await ensureDefaultHeartbeatProcedureFile(
+      testDir,
+      ".fusion/agents/ceo-agent2736/HEARTBEAT.md",
+      "Default",
+    );
+    expect(seeded).toBeTruthy();
+
+    const invalid = await ensureDefaultHeartbeatProcedureFile(testDir, "../outside.md", "Default");
+    expect(invalid).toBeNull();
   });
 });

@@ -227,9 +227,12 @@ The **Settings** tab in the Agent Detail modal includes a **Heartbeat Procedure*
 
 ### Relation to upgrade flow
 
-- **Upgrade to Default Heartbeat Procedure** still sets `heartbeatProcedurePath` to:
-  - `.fusion/agents/{agent.id}/HEARTBEAT.md`
-- If the default file does not exist yet, the backend seeds it from the built-in template.
+- Canonical per-agent asset directories now use **display name + immutable id suffix** (example: `ceo-agent2736`).
+  - Canonical heartbeat path example: `.fusion/agents/ceo-agent2736/HEARTBEAT.md`
+  - Canonical managed bundle directory example: `.fusion/agents/ceo-agent2736-instructions/`
+- Legacy id-only paths (for example `.fusion/agents/{agent.id}/HEARTBEAT.md`) and previously created display-name-based paths remain supported.
+- Upgrade/create flows preserve existing compatible files and directories in place; Fusion does **not** auto-rename or delete old paths.
+- If the selected default file does not exist yet, the backend seeds it from the built-in template.
 - After upgrade completes and the agent refreshes, operators can immediately open the seeded per-agent `HEARTBEAT.md` from the same modal section.
 
 ## New Agent Presets (Dashboard UI)
@@ -245,7 +248,7 @@ The custom tab exposes separate fields for:
 
 - **Title** (`title`) — optional role title/description
 - **Soul** (`soul`) — optional personality and communication style guidance
-- **Heartbeat Procedure Path** (`heartbeatProcedurePath`) — optional path to the agent heartbeat markdown file, typically `.fusion/agents/<agent-id>/HEARTBEAT.md`
+- **Heartbeat Procedure Path** (`heartbeatProcedurePath`) — optional path to the agent heartbeat markdown file, typically `.fusion/agents/<display-name>-<agent-id>/HEARTBEAT.md` (legacy id-only paths remain valid)
 - **Instructions Path** (`instructionsPath`) — optional file-backed instructions path
 - **Inline Instructions** (`instructionsText`) — optional inline behavior instructions
 
