@@ -12,6 +12,8 @@ export const PROJECT_STORAGE_KEYS: string[] = [
   "kb-dashboard-hide-done",
   "kb-dashboard-list-collapsed",
   "kb-dashboard-selected-tasks",
+  "kb-dashboard-list-selected-task",
+  "kb-dashboard-list-sidebar-width",
   "kb-quick-entry-text",
   "kb-inline-create-text",
   "fn-agent-view",

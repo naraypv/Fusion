@@ -79,6 +79,8 @@ describe("projectStorage", () => {
         "kb-dashboard-hide-done",
         "kb-dashboard-list-collapsed",
         "kb-dashboard-selected-tasks",
+        "kb-dashboard-list-selected-task",
+        "kb-dashboard-list-sidebar-width",
         "kb-quick-entry-text",
         "kb-inline-create-text",
         "fn-agent-view",
@@ -93,7 +95,7 @@ describe("projectStorage", () => {
         "kb-chat-active-session",
       ]),
     );
-    expect(PROJECT_STORAGE_KEYS).toHaveLength(17);
+    expect(PROJECT_STORAGE_KEYS).toHaveLength(19);
   });
 
   it("has no overlap between global and project-scoped keys", () => {

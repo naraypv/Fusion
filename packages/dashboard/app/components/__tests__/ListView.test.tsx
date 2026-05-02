@@ -101,6 +101,18 @@ function mockDesktopViewport() {
 describe("ListView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    ensureMatchMedia();
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
   });
 
   it("renders without crashing", () => {
@@ -211,7 +223,8 @@ describe("ListView", () => {
     expect(screen.getByText("FN-002")).toBeDefined();
   });
 
-  it("calls onOpenDetail synchronously with Task when row is clicked", async () => {
+  it("updates selectedTaskId on desktop row click without opening detail", () => {
+    const viewportSpy = mockDesktopViewport();
     const tasks = [createMockTask({ id: "FN-001", title: "Test Task" })];
     const mockOnOpenDetail = vi.fn();
 
@@ -220,21 +233,135 @@ describe("ListView", () => {
     const row = screen.getByText("FN-001").closest("tr");
     fireEvent.click(row!);
 
-    // Should call onOpenDetail synchronously with the Task object (no fetch)
-    expect(mockOnOpenDetail).toHaveBeenCalledWith(tasks[0]);
-    expect(mockOnOpenDetail).toHaveBeenCalledTimes(1);
+    expect(mockOnOpenDetail).not.toHaveBeenCalled();
+    expect(localStorage.getItem(scopedStorageKey("kb-dashboard-list-selected-task"))).toBe("FN-001");
+    expect(fetchTaskDetail).not.toHaveBeenCalled();
+    expect(row?.className).toContain("list-row--selected");
+    expect(screen.getByText("Task selected. Detail view coming soon.")).toBeInTheDocument();
+    viewportSpy.mockRestore();
   });
 
-  it("does not call fetchTaskDetail on row click", () => {
+  it("calls onOpenDetail on mobile row click", () => {
+    const viewportSpy = mockMobileViewport();
     const tasks = [createMockTask({ id: "FN-001", title: "Test Task" })];
     const mockOnOpenDetail = vi.fn();
 
     renderListView({ tasks, onOpenDetail: mockOnOpenDetail });
 
-    const row = screen.getByText("FN-001").closest("tr");
-    fireEvent.click(row!);
+    const card = document.querySelector('.list-card[data-id="FN-001"]');
+    fireEvent.click(card!);
 
+    expect(mockOnOpenDetail).toHaveBeenCalledWith(tasks[0]);
+    expect(mockOnOpenDetail).toHaveBeenCalledTimes(1);
     expect(fetchTaskDetail).not.toHaveBeenCalled();
+    viewportSpy.mockRestore();
+  });
+
+  it("keeps selectedTaskIds and selectedTaskId as separate persisted state", async () => {
+    const viewportSpy = mockDesktopViewport();
+    const tasks = [createMockTask({ id: "FN-001", title: "Test Task" })];
+
+    renderListView({ tasks });
+
+    const row = screen.getByText("FN-001").closest("tr")!;
+    const checkbox = within(row).getByRole("checkbox", { name: "Select FN-001" });
+
+    fireEvent.click(checkbox);
+    fireEvent.click(row);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(scopedStorageKey("kb-dashboard-selected-tasks"))).toContain("FN-001");
+      expect(localStorage.getItem(scopedStorageKey("kb-dashboard-list-selected-task"))).toBe("FN-001");
+    });
+    viewportSpy.mockRestore();
+  });
+
+  it("initializes selectedTaskId from persisted project storage", () => {
+    const viewportSpy = mockDesktopViewport();
+    localStorage.setItem(scopedStorageKey("kb-dashboard-list-selected-task"), "FN-001");
+    const tasks = [createMockTask({ id: "FN-001", title: "Persisted task" })];
+
+    renderListView({ tasks });
+
+    expect(localStorage.getItem(scopedStorageKey("kb-dashboard-list-selected-task"))).toBe("FN-001");
+    viewportSpy.mockRestore();
+  });
+
+  it("renders desktop split-pane shell with resize handle and empty detail state", () => {
+    const viewportSpy = mockDesktopViewport();
+    const tasks = [createMockTask({ id: "FN-001", title: "Task" })];
+
+    renderListView({ tasks });
+
+    expect(screen.getByTestId("list-split-layout")).toBeInTheDocument();
+    expect(screen.getByTestId("list-split-sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("list-split-resize-handle")).toBeInTheDocument();
+    expect(screen.getByTestId("list-split-detail")).toBeInTheDocument();
+    expect(screen.getByText("Select a task to view details")).toBeInTheDocument();
+    viewportSpy.mockRestore();
+  });
+
+  it("reloads persisted sidebar width when projectId changes", () => {
+    const viewportSpy = mockDesktopViewport();
+    localStorage.setItem(scopedKey("kb-dashboard-list-sidebar-width", "project-a"), "300");
+    localStorage.setItem(scopedKey("kb-dashboard-list-sidebar-width", "project-b"), "460");
+    const tasks = [createMockTask({ id: "FN-001", title: "Task" })];
+
+    const { rerender } = render(
+      <ListView
+        tasks={tasks}
+        onMoveTask={vi.fn()}
+        onOpenDetail={vi.fn()}
+        addToast={mockAddToast}
+        projectId="project-a"
+      />
+    );
+
+    expect(screen.getByTestId("list-split-sidebar")).toHaveStyle({ width: "300px" });
+
+    rerender(
+      <ListView
+        tasks={tasks}
+        onMoveTask={vi.fn()}
+        onOpenDetail={vi.fn()}
+        addToast={mockAddToast}
+        projectId="project-b"
+      />
+    );
+
+    expect(screen.getByTestId("list-split-sidebar")).toHaveStyle({ width: "460px" });
+    viewportSpy.mockRestore();
+  });
+
+  it("supports keyboard resizing on the desktop split-pane handle", () => {
+    const viewportSpy = mockDesktopViewport();
+    const tasks = [createMockTask({ id: "FN-001", title: "Task" })];
+
+    renderListView({ tasks });
+
+    const handle = screen.getByTestId("list-split-resize-handle");
+    const startWidth = Number(handle.getAttribute("aria-valuenow"));
+
+    expect(handle).toHaveAttribute("tabindex", "0");
+    expect(handle).toHaveAttribute("aria-valuemin", "280");
+    expect(Number(handle.getAttribute("aria-valuemax"))).toBeGreaterThanOrEqual(280);
+
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+
+    expect(Number(handle.getAttribute("aria-valuenow"))).toBeGreaterThan(startWidth);
+    viewportSpy.mockRestore();
+  });
+
+  it("does not render split-pane structure on mobile", () => {
+    const viewportSpy = mockMobileViewport();
+    const tasks = [createMockTask({ id: "FN-001", title: "Task" })];
+
+    renderListView({ tasks });
+
+    expect(screen.queryByTestId("list-split-layout")).toBeNull();
+    expect(screen.queryByTestId("list-split-resize-handle")).toBeNull();
+    expect(screen.queryByTestId("list-split-detail")).toBeNull();
+    viewportSpy.mockRestore();
   });
 
   it("sorts tasks by ID when ID header is clicked", () => {

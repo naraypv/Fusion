@@ -38,6 +38,10 @@
   font-style: italic;
 }
 
+.list-clear-column-filter-btn {
+  margin-left: var(--space-sm);
+}
+
 /* Selection stats */
 .list-selection-stats {
   display: flex;
@@ -262,14 +266,14 @@
 
 .list-drop-zone.active {
   border-color: var(--todo);
-  background: rgba(88, 166, 255, 0.15);
+  background: color-mix(in srgb, var(--todo) 15%, transparent);
   box-shadow: 0 0 0 1px var(--todo);
 }
 
 .list-drop-zone.drag-over {
   border-color: var(--todo);
   box-shadow: 0 0 0 1px var(--todo);
-  background: rgba(88, 166, 255, 0.1);
+  background: color-mix(in srgb, var(--todo) 10%, transparent);
 }
 
 .drop-zone-dot {
@@ -302,6 +306,52 @@
   padding: 0;
 }
 
+.list-split-layout {
+  display: grid;
+  grid-template-columns: auto var(--space-xs) minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.list-split-sidebar {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.list-split-resize-handle {
+  cursor: col-resize;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+  transition: background var(--transition-fast);
+}
+
+.list-split-resize-handle:hover,
+.list-split-resize-handle:focus-visible {
+  background: color-mix(in srgb, var(--todo) 35%, transparent);
+}
+
+.list-split-resize-handle:focus-visible {
+  box-shadow: var(--focus-ring-strong);
+  outline: none;
+}
+
+.list-split-detail {
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  padding: var(--space-xl);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.list-split-detail p {
+  margin-block: 0;
+  margin-inline: 0;
+}
+
 .list-table {
   width: 100%;
   border-collapse: collapse;
@@ -332,7 +382,7 @@
 
 /* Reduce padding on ID column header to match data cells */
 .list-table th:first-child.list-header-cell {
-  padding-right: 8px;
+  padding-right: var(--space-sm);
 }
 
 .list-header-cell:hover {
@@ -359,6 +409,11 @@
 
 .list-row:hover {
   background: var(--card-hover);
+}
+
+.list-row--selected {
+  background: color-mix(in srgb, var(--todo) 12%, transparent);
+  box-shadow: inset 0 0 0 1px var(--todo);
 }
 
 .list-row.dragging {
@@ -653,7 +708,7 @@
 @keyframes section-expand {
   from {
     opacity: 0;
-    transform: translateY(-4px);
+    transform: translateY(calc(var(--space-xs) * -1));
   }
   to {
     opacity: 1;
@@ -662,7 +717,7 @@
 }
 
 .list-section-header ~ tr {
-  animation: section-expand 0.2s ease-out;
+  animation: section-expand var(--transition-normal) ease-out;
 }
 
 /* Empty section row */
@@ -714,6 +769,22 @@
 
   .list-table-container {
     overflow-x: auto;
+  }
+
+  .list-split-layout {
+    display: block;
+  }
+
+  .list-split-sidebar,
+  .list-split-detail {
+    overflow: visible;
+    border: none;
+    padding: 0;
+  }
+
+  .list-split-resize-handle,
+  .list-split-detail {
+    display: none;
   }
 
   .list-table {

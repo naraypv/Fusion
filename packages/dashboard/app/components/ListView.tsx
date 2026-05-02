@@ -11,7 +11,7 @@ import { NodeHealthDot } from "./NodeHealthDot";
 import { isTaskStuck } from "../utils/taskStuck";
 import type { ToastType } from "../hooks/useToast";
 import { useViewportMode } from "../hooks/useViewportMode";
-import { getScopedItem, setScopedItem } from "../utils/projectStorage";
+import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { getUnifiedTaskProgress } from "../utils/taskProgress";
 
 const COLUMN_COLOR_MAP: Record<Column, string> = {
@@ -109,6 +109,48 @@ function readSelectedTaskIds(projectId?: string): Set<string> {
   }
 
   return new Set<string>();
+}
+
+function readSelectedTaskId(projectId?: string): string | null {
+  try {
+    const saved = getScopedItem("kb-dashboard-list-selected-task", projectId);
+    if (typeof saved === "string" && saved.trim().length > 0) {
+      return saved;
+    }
+  } catch {
+    // Invalid localStorage data - fall through to default
+  }
+
+  return null;
+}
+
+function readSidebarWidth(projectId?: string): number {
+  const fallbackWidth = 400;
+  try {
+    const saved = getScopedItem("kb-dashboard-list-sidebar-width", projectId);
+    if (!saved) return fallbackWidth;
+    const parsed = Number(saved);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  } catch {
+    // Invalid localStorage data - fall through to default
+  }
+
+  return fallbackWidth;
+}
+
+const LIST_SIDEBAR_MIN_WIDTH = 280;
+const LIST_SIDEBAR_MAX_RATIO = 0.65;
+const LIST_SIDEBAR_KEYBOARD_STEP = 16;
+
+function getSidebarMaxWidth(containerWidth: number): number {
+  return Math.max(LIST_SIDEBAR_MIN_WIDTH, containerWidth * LIST_SIDEBAR_MAX_RATIO);
+}
+
+function clampSidebarWidth(width: number, containerWidth: number): number {
+  const maxWidth = getSidebarMaxWidth(containerWidth);
+  return Math.min(Math.max(width, LIST_SIDEBAR_MIN_WIDTH), maxWidth);
 }
 
 interface ListViewProps {
@@ -235,12 +277,18 @@ export function ListView({
 
   // Selection state - initialize from localStorage
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(() => readSelectedTaskIds(projectId));
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => readSelectedTaskId(projectId));
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => readSidebarWidth(projectId));
+  const splitLayoutRef = useRef<HTMLDivElement>(null);
+  const splitSidebarRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setVisibleColumns(readVisibleColumns(projectId));
     setHideDoneTasks(readHideDoneTasks(projectId));
     setCollapsedSections(readCollapsedSections(projectId));
     setSelectedTaskIds(readSelectedTaskIds(projectId));
+    setSelectedTaskId(readSelectedTaskId(projectId));
+    setSidebarWidth(readSidebarWidth(projectId));
   }, [projectId]);
 
   // Persist selection to localStorage
@@ -249,6 +297,72 @@ export function ListView({
       setScopedItem("kb-dashboard-selected-tasks", JSON.stringify([...selectedTaskIds]), projectId);
     }
   }, [projectId, selectedTaskIds]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (selectedTaskId) {
+      setScopedItem("kb-dashboard-list-selected-task", selectedTaskId, projectId);
+      return;
+    }
+
+    removeScopedItem("kb-dashboard-list-selected-task", projectId);
+  }, [projectId, selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId) return;
+    if (!tasks.some((task) => task.id === selectedTaskId)) {
+      setSelectedTaskId(null);
+    }
+  }, [selectedTaskId, tasks]);
+
+  useEffect(() => {
+    if (isMobile || typeof ResizeObserver === "undefined") return;
+    const container = splitLayoutRef.current;
+    if (!container) return;
+
+    const applyClamp = () => {
+      // Keep width valid when viewport/container size changes.
+      const clamped = clampSidebarWidth(sidebarWidth, container.clientWidth);
+      if (clamped !== sidebarWidth) {
+        setSidebarWidth(clamped);
+      }
+    };
+
+    applyClamp();
+    const observer = new ResizeObserver(applyClamp);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [isMobile, sidebarWidth]);
+
+  useEffect(() => {
+    if (isMobile || typeof ResizeObserver === "undefined") return;
+    const sidebar = splitSidebarRef.current;
+    const container = splitLayoutRef.current;
+    if (!sidebar || !container) return;
+
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastSavedWidth = sidebar.offsetWidth;
+
+    const observer = new ResizeObserver(() => {
+      const nextWidth = clampSidebarWidth(sidebar.offsetWidth, container.clientWidth);
+      if (nextWidth === lastSavedWidth) return;
+      lastSavedWidth = nextWidth;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        try {
+          setScopedItem("kb-dashboard-list-sidebar-width", String(nextWidth), projectId);
+        } catch {
+          // localStorage persistence is best-effort.
+        }
+      }, 200);
+    });
+
+    observer.observe(sidebar);
+    return () => {
+      observer.disconnect();
+      if (saveTimer) clearTimeout(saveTimer);
+    };
+  }, [isMobile, projectId]);
 
   // Toggle task selection
   const toggleTaskSelection = useCallback((taskId: string) => {
@@ -601,9 +715,14 @@ export function ListView({
 
   const handleRowClick = useCallback(
     (task: Task) => {
-      onOpenDetail(task);
+      if (isMobile) {
+        onOpenDetail(task);
+        return;
+      }
+
+      setSelectedTaskId(task.id);
     },
-    [onOpenDetail]
+    [isMobile, onOpenDetail]
   );
 
   const handleDragStart = useCallback(
@@ -623,6 +742,54 @@ export function ListView({
     setDraggingTaskId(null);
     setDragOverColumn(null);
   }, []);
+
+  const handleSplitResizeStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (isMobile) return;
+    event.preventDefault();
+    const container = splitLayoutRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const proposedWidth = moveEvent.clientX - rect.left;
+      setSidebarWidth(clampSidebarWidth(proposedWidth, rect.width));
+    };
+
+    const onMouseUp = () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  }, [isMobile]);
+
+  const handleSplitResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (isMobile) return;
+    const measuredWidth = splitLayoutRef.current?.clientWidth ?? 0;
+    const fallbackWidth = sidebarWidth / LIST_SIDEBAR_MAX_RATIO + LIST_SIDEBAR_KEYBOARD_STEP;
+    const containerWidth = Math.max(measuredWidth, fallbackWidth);
+
+    const maxWidth = getSidebarMaxWidth(containerWidth);
+
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const delta = event.key === "ArrowLeft" ? -LIST_SIDEBAR_KEYBOARD_STEP : LIST_SIDEBAR_KEYBOARD_STEP;
+      setSidebarWidth((current) => clampSidebarWidth(current + delta, containerWidth));
+      return;
+    }
+
+    if (event.key === "Home") {
+      event.preventDefault();
+      setSidebarWidth(LIST_SIDEBAR_MIN_WIDTH);
+      return;
+    }
+
+    if (event.key === "End") {
+      event.preventDefault();
+      setSidebarWidth(maxWidth);
+    }
+  }, [isMobile, sidebarWidth]);
 
   const handleColumnDragOver = useCallback(
     (e: React.DragEvent, column: Column) => {
@@ -724,10 +891,9 @@ export function ListView({
           )}
           {selectedColumn && (
             <button
-              className="btn btn-sm"
+              className="btn btn-sm list-clear-column-filter-btn"
               onClick={clearColumnFilter}
               aria-label="Clear column filter"
-              style={{ marginLeft: "8px" }}
             >
               Clear
             </button>
@@ -835,22 +1001,29 @@ export function ListView({
       </div>
 
       <div className="list-table-container">
-        <div className="list-quick-entry-above-table">
-          <QuickEntryBox 
-            onCreate={onQuickCreate ?? (async () => addToast("Task creation not available", "error"))} 
-            addToast={addToast}
-            tasks={tasks}
-            availableModels={availableModels}
-            onPlanningMode={onPlanningMode}
-            onSubtaskBreakdown={onSubtaskBreakdown}
-            projectId={projectId}
-            autoExpand={false}
-            favoriteProviders={favoriteProviders}
-            favoriteModels={favoriteModels}
-            onToggleFavorite={onToggleFavorite}
-            onToggleModelFavorite={onToggleModelFavorite}
-          />
-        </div>
+        <div className={isMobile ? "" : "list-split-layout"} data-testid={isMobile ? undefined : "list-split-layout"} ref={splitLayoutRef}>
+          <div
+            className={isMobile ? "" : "list-split-sidebar"}
+            data-testid={isMobile ? undefined : "list-split-sidebar"}
+            ref={splitSidebarRef}
+            style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
+          >
+            <div className="list-quick-entry-above-table">
+              <QuickEntryBox 
+                onCreate={onQuickCreate ?? (async () => addToast("Task creation not available", "error"))} 
+                addToast={addToast}
+                tasks={tasks}
+                availableModels={availableModels}
+                onPlanningMode={onPlanningMode}
+                onSubtaskBreakdown={onSubtaskBreakdown}
+                projectId={projectId}
+                autoExpand={false}
+                favoriteProviders={favoriteProviders}
+                favoriteModels={favoriteModels}
+                onToggleFavorite={onToggleFavorite}
+                onToggleModelFavorite={onToggleModelFavorite}
+              />
+            </div>
         {filteredCount === 0 ? (
           <div className="list-empty">
             {searchQuery ? "No tasks match your filter" : "No tasks yet"}
@@ -1101,7 +1274,7 @@ export function ListView({
                                   isStuckState ? " stuck" : ""
                                 }${isAgentActive ? " agent-active" : ""}${
                                   isDragging ? " dragging" : ""
-                                }`}
+                                }${selectedTaskId === task.id ? " list-row--selected" : ""}`}
                                 onClick={() => handleRowClick(task)}
                                 draggable={!isPaused}
                                 onDragStart={(e) => handleDragStart(e, task)}
@@ -1218,6 +1391,37 @@ export function ListView({
             </tbody>
           </table>
         )}
+          </div>
+          {!isMobile && (
+            <>
+              <div
+                className="list-split-resize-handle"
+                data-testid="list-split-resize-handle"
+                onMouseDown={handleSplitResizeStart}
+                onKeyDown={handleSplitResizeKeyDown}
+                role="separator"
+                tabIndex={0}
+                aria-orientation="vertical"
+                aria-label="Resize task list sidebar"
+                aria-valuemin={LIST_SIDEBAR_MIN_WIDTH}
+                aria-valuemax={Math.round(
+                  getSidebarMaxWidth(
+                    splitLayoutRef.current?.clientWidth ??
+                      (sidebarWidth / LIST_SIDEBAR_MAX_RATIO + LIST_SIDEBAR_KEYBOARD_STEP)
+                  )
+                )}
+                aria-valuenow={Math.round(sidebarWidth)}
+              />
+              <div className="list-split-detail" data-testid="list-split-detail">
+                {!selectedTaskId ? (
+                  <p>Select a task to view details</p>
+                ) : (
+                  <p>Task selected. Detail view coming soon.</p>
+                )}
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
