@@ -922,7 +922,7 @@ function DashboardTab({
                 <div key={run.id} className="run-item">
                   <StatusIcon size={14} style={{ color: statusSpec.color }} />
                   <span>{relativeTime(run.startedAt)}</span>
-                  <span className="text-muted">{Math.max(0, Math.round((new Date(run.completedAt || run.startedAt).getTime() - new Date(run.startedAt).getTime()) / 1000))}s</span>
+                  <span className="text-muted">{Math.max(0, Math.round((new Date(run.endedAt || run.startedAt).getTime() - new Date(run.startedAt).getTime()) / 1000))}s</span>
                 </div>
               );
             })}

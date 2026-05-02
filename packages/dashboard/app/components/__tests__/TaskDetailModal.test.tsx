@@ -1345,6 +1345,33 @@ describe("TaskDetailModal", () => {
     });
   });
 
+  it("wraps in-review PR content in a spaced detail section after dependencies", () => {
+    const { container } = render(
+      <TaskDetailModal
+        task={makeTask({ column: "in-review", status: "creating-pr", dependencies: ["FN-001"] })}
+        onClose={noop}
+        onMoveTask={noopMove}
+        onDeleteTask={noopDelete}
+        onMergeTask={noopMerge}
+        onOpenDetail={noopOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    const depsSection = container.querySelector(".detail-deps");
+    const prSection = container.querySelector(".detail-pr-section");
+
+    expect(depsSection).toBeTruthy();
+    expect(prSection).toBeTruthy();
+    expect(depsSection?.nextElementSibling).toBe(prSection);
+    expect(prSection?.querySelector(".pr-section")).toBeTruthy();
+  });
+
+  it("defines tokenized margin on detail-pr-section spacing contract", () => {
+    const css = loadAllAppCss();
+    expectBaseRule(css, ".detail-pr-section", "margin-top: var(--space-lg);");
+  });
+
   it("activity list does not have nested scroll constraints", () => {
     const { container } = render(
       <TaskDetailModal

@@ -2294,23 +2294,25 @@ export function TaskDetailModal({
           </div>
           {/* PR Section - only for in-review tasks */}
           {task.column === "in-review" && (
-            <PrSection
-              taskId={task.id}
-              projectId={projectId}
-              prInfo={task.prInfo}
-              automationStatus={task.status ?? null}
-              autoMerge={settings?.autoMerge ?? false}
-              prAuthAvailable={prAuthAvailable ?? false}
-              onPrCreated={(prInfo) => {
-                // Update task locally to show new PR
-                (task as TaskDetail).prInfo = prInfo;
-                addToast(`PR #${prInfo.number} created`, "success");
-              }}
-              onPrUpdated={(prInfo) => {
-                (task as TaskDetail).prInfo = prInfo;
-              }}
-              addToast={addToast}
-            />
+            <div className="detail-section detail-pr-section">
+              <PrSection
+                taskId={task.id}
+                projectId={projectId}
+                prInfo={task.prInfo}
+                automationStatus={task.status ?? null}
+                autoMerge={settings?.autoMerge ?? false}
+                prAuthAvailable={prAuthAvailable ?? false}
+                onPrCreated={(prInfo) => {
+                  // Update task locally to show new PR
+                  (task as TaskDetail).prInfo = prInfo;
+                  addToast(`PR #${prInfo.number} created`, "success");
+                }}
+                onPrUpdated={(prInfo) => {
+                  (task as TaskDetail).prInfo = prInfo;
+                }}
+                addToast={addToast}
+              />
+            </div>
           )}
           </>
           )}

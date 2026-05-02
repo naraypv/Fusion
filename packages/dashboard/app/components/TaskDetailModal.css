@@ -237,6 +237,10 @@
   margin-top: var(--space-lg);
 }
 
+.detail-pr-section {
+  margin-top: var(--space-lg);
+}
+
 .detail-provider-icons {
   display: inline-flex;
   align-items: center;
