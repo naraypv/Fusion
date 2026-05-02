@@ -2,6 +2,48 @@
 
 User-facing release notes aggregated across all packages. This file is auto-synced from each `packages/*/CHANGELOG.md` by `scripts/release.mjs` — do not edit by hand.
 
+## 0.14.2
+
+### @fusion/dashboard
+
+#### Patch Changes
+
+- @fusion/core@0.14.2
+- @fusion/engine@0.14.2
+- @fusion-plugin-examples/hermes-runtime@0.2.18
+- @fusion-plugin-examples/openclaw-runtime@0.2.18
+- @fusion-plugin-examples/paperclip-runtime@0.2.18
+
+### @fusion/engine
+
+#### Patch Changes
+
+- @fusion/core@0.14.2
+- @fusion/pi-claude-cli@0.14.2
+
+### @fusion/plugin-sdk
+
+#### Patch Changes
+
+- @fusion/core@0.14.2
+
+### @runfusion/fusion
+
+#### Patch Changes
+
+- 7ec394a: Keep chat and quick chat visibly in a connecting or thinking state during long Claude CLI responses, and repair missing spaces in some streamed sentence boundaries.
+- b3e2b61: Hide deprecated Google Gemini CLI/Antigravity auth providers from dashboard onboarding and Settings while keeping supported Google/Gemini API-key, Google Generative AI, Vertex, and Cloud Code paths intact. Also documents the internal pi-coding-agent v0.71.x upgrade plan for follow-up dependency bump work.
+- b3e2b61: Remove redundant `fn_identity` heartbeat tool and trim the inline Identity Snapshot to presence flags + content hashes. Full soul/instructions/memory content is already loaded in the system prompt's Custom Instructions section, so per-tick previews were duplicating multi-KB of context for no verification benefit. Saves prompt tokens on every heartbeat run.
+
+### runfusion.ai
+
+#### Patch Changes
+
+- Updated dependencies [7ec394a]
+- Updated dependencies [b3e2b61]
+- Updated dependencies [b3e2b61]
+  - @runfusion/fusion@0.14.2
+
 ## 0.14.1
 
 ### @fusion/dashboard
