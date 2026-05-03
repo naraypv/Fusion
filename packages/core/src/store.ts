@@ -4704,7 +4704,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       this.flushAgentLogBuffer();
     } else if (!this.agentLogFlushTimer) {
       this.agentLogFlushTimer = setTimeout(
-        () => this.flushAgentLogBuffer(),
+        () => {
+          try {
+            this.flushAgentLogBuffer();
+          } catch (err) {
+            // Timer-triggered flush failed — log but don't crash the process.
+            console.error("[fusion] Timer-triggered agent log flush failed:", err);
+          }
+        },
         TaskStore.AGENT_LOG_FLUSH_MS,
       );
       this.agentLogFlushTimer.unref();
@@ -4722,8 +4729,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
     if (this.agentLogBuffer.length === 0) return;
 
-    const batch = this.agentLogBuffer;
-    this.agentLogBuffer = [];
+    // Snapshot the entries to flush. New entries appended during the
+    // synchronous transaction will appear past batch.length in
+    // this.agentLogBuffer, so we splice only the flushed count.
+    const batch = this.agentLogBuffer.slice();
+    const flushCount = batch.length;
 
     this.db.transaction(() => {
       const stmt = this.db.prepare(`
@@ -4734,6 +4744,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         stmt.run(entry.taskId, entry.timestamp, entry.text, entry.type, entry.detail, entry.agent);
       }
     });
+
+    // Remove only the flushed entries. If appendAgentLog added entries
+    // during the transaction (can't happen in single-threaded Node, but
+    // defensive), they remain in the buffer.
+    this.agentLogBuffer.splice(0, flushCount);
     this.db.bumpLastModified();
   }
 
@@ -6107,8 +6122,10 @@ ${stepsSection}`;
     if (this.agentLogBuffer.length > 0) {
       try {
         this.flushAgentLogBuffer();
-      } catch {
+      } catch (err) {
         // Best-effort flush — entries for deleted tasks will fail FK check.
+        // Log the error instead of silently swallowing it.
+        console.warn("[fusion] Could not flush remaining agent log entries on close:", err);
       }
     }
     if (this._db) {
