@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Router } from "express";
 import { registerModelRoutes } from "../routes/register-model-routes.js";
 
-function setup(useDroidCli?: boolean) {
+function setup(useDroidCli?: boolean, mergedSettings: Record<string, unknown> = {}) {
   const getHandlers = new Map<string, (req: unknown, res: { json: (body: unknown) => void }) => Promise<void>>();
   const router = {
     get: vi.fn((path: string, handler: (req: unknown, res: { json: (body: unknown) => void }) => Promise<void>) => {
@@ -14,6 +14,7 @@ function setup(useDroidCli?: boolean) {
     getGlobalSettingsStore: () => ({
       getSettings: vi.fn().mockResolvedValue({ useDroidCli }),
     }),
+    getSettingsFast: vi.fn().mockResolvedValue(mergedSettings),
   };
 
   const runtimeLogger = {
@@ -57,5 +58,22 @@ describe("registerModelRoutes droid-cli filter", () => {
 
     const response = json.mock.calls[0][0] as { models: Array<{ provider: string }> };
     expect(response.models.some((model) => model.provider === "droid-cli")).toBe(true);
+  });
+
+  it("includes resolved planning model when settings hierarchy resolves one", async () => {
+    const { handler } = setup(false, {
+      planningProvider: "openai",
+      planningModelId: "gpt-4o",
+    });
+    const json = vi.fn();
+
+    await handler({}, { json });
+
+    const response = json.mock.calls[0][0] as {
+      resolvedPlanningProvider?: string;
+      resolvedPlanningModelId?: string;
+    };
+    expect(response.resolvedPlanningProvider).toBe("openai");
+    expect(response.resolvedPlanningModelId).toBe("gpt-4o");
   });
 });

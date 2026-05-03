@@ -223,6 +223,8 @@ describe("PlanningModeModal", () => {
       models: mockModels,
       favoriteProviders: [],
       favoriteModels: [],
+      resolvedPlanningProvider: "openai",
+      resolvedPlanningModelId: "gpt-4o",
     });
     mockAcquireSessionLock.mockResolvedValue({ acquired: true, currentHolder: null });
     mockReleaseSessionLock.mockResolvedValue(undefined);
@@ -338,14 +340,14 @@ describe("PlanningModeModal", () => {
 
       const modelTrigger = screen.getByRole("button", { name: "Planning Model" });
       expect(modelTrigger).toBeDefined();
-      expect(screen.getByText("Using default")).toBeDefined();
 
       await waitFor(() => {
         expect(mockFetchModels).toHaveBeenCalledTimes(1);
+        expect(screen.getByText("openai/gpt-4o")).toBeDefined();
       });
     });
 
-    it("updates planning model selection and badge", async () => {
+    it("shows resolved default model badge and switches to override badge when selected", async () => {
       render(
         <PlanningModeModal
           isOpen={true}
@@ -359,6 +361,8 @@ describe("PlanningModeModal", () => {
       await waitFor(() => {
         expect(mockFetchModels).toHaveBeenCalledTimes(1);
       });
+
+      expect(screen.getByText("openai/gpt-4o")).toBeDefined();
 
       fireEvent.click(screen.getByRole("button", { name: "Planning Model" }));
       fireEvent.click(screen.getByRole("option", { name: /Claude Sonnet 4.5/ }));
@@ -399,7 +403,7 @@ describe("PlanningModeModal", () => {
       });
     });
 
-    it("renders advanced disclosure controls in the initial view", () => {
+    it("renders advanced disclosure controls in the initial view", async () => {
       render(
         <PlanningModeModal
           isOpen={true}
@@ -418,7 +422,9 @@ describe("PlanningModeModal", () => {
       const disclosureScope = within(disclosure as HTMLElement);
 
       expect(disclosureScope.getByRole("button", { name: "Planning Model" })).toBeDefined();
-      expect(disclosureScope.getByText("Using default")).toBeDefined();
+      await waitFor(() => {
+        expect(disclosureScope.getByText("openai/gpt-4o")).toBeDefined();
+      });
       expect(disclosureScope.getByText(/Selects which model runs the planning interview/)).toBeDefined();
       expect(disclosureScope.getByText(/Plan size sets default interview depth/)).toBeDefined();
       expect(disclosureScope.getByRole("button", { name: "Small" })).toBeDefined();

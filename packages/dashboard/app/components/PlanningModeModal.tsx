@@ -150,6 +150,10 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const [modelsError, setModelsError] = useState<string | null>(null);
   const [favoriteProviders, setFavoriteProviders] = useState<string[]>([]);
   const [favoriteModels, setFavoriteModels] = useState<string[]>([]);
+  const [resolvedPlanningModel, setResolvedPlanningModel] = useState<{
+    provider?: string;
+    modelId?: string;
+  }>({});
   const trackedLockSessionRef = useRef<string | null>(null);
 
   // Sidebar list state
@@ -277,11 +281,15 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
   const getModelBadgeLabel = useCallback(
     (provider?: string, modelId?: string) => {
-      if (!provider || !modelId) return "Using default";
+      if (!provider || !modelId) {
+        return resolvedPlanningModel.provider && resolvedPlanningModel.modelId
+          ? `${resolvedPlanningModel.provider}/${resolvedPlanningModel.modelId}`
+          : "Using default";
+      }
       const matched = loadedModels.find((model) => model.provider === provider && model.id === modelId);
       return matched ? `${matched.provider}/${matched.id}` : `${provider}/${modelId}`;
     },
-    [loadedModels],
+    [loadedModels, resolvedPlanningModel.modelId, resolvedPlanningModel.provider],
   );
 
   const loadModels = useCallback(async () => {
@@ -293,6 +301,10 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       setLoadedModels(response.models);
       setFavoriteProviders(response.favoriteProviders);
       setFavoriteModels(response.favoriteModels);
+      setResolvedPlanningModel({
+        provider: response.resolvedPlanningProvider,
+        modelId: response.resolvedPlanningModelId,
+      });
     } catch (err) {
       setModelsError(getErrorMessage(err) || "Failed to load models");
     } finally {

@@ -1,3 +1,4 @@
+import { resolvePlanningSettingsModel } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 
@@ -12,6 +13,8 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     let defaultModelId: string | undefined;
     let useClaudeCli = false;
     let useDroidCli = false;
+    let resolvedPlanningProvider: string | undefined;
+    let resolvedPlanningModelId: string | undefined;
     if (store) {
       try {
         const globalStore = store.getGlobalSettingsStore();
@@ -22,6 +25,11 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         defaultModelId = globalSettings.defaultModelId;
         useClaudeCli = globalSettings.useClaudeCli === true;
         useDroidCli = globalSettings.useDroidCli === true;
+
+        const mergedSettings = await store.getSettingsFast();
+        const resolvedPlanningModel = resolvePlanningSettingsModel(mergedSettings);
+        resolvedPlanningProvider = resolvedPlanningModel.provider;
+        resolvedPlanningModelId = resolvedPlanningModel.modelId;
       } catch {
         // Silently ignore settings errors - just return empty favorites/default model
       }
@@ -30,6 +38,13 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     const defaultModelResponse =
       defaultProvider && defaultModelId
         ? { defaultProvider, defaultModelId }
+        : {};
+    const resolvedPlanningModelResponse =
+      resolvedPlanningProvider && resolvedPlanningModelId
+        ? {
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+          }
         : {};
 
     // Always return 200 with empty array instead of 404 when no models available.
@@ -40,6 +55,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         favoriteProviders,
         favoriteModels,
         ...defaultModelResponse,
+        ...resolvedPlanningModelResponse,
       });
       return;
     }
@@ -72,6 +88,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         favoriteProviders,
         favoriteModels,
         ...defaultModelResponse,
+        ...resolvedPlanningModelResponse,
       });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -84,6 +101,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         favoriteProviders,
         favoriteModels,
         ...defaultModelResponse,
+        ...resolvedPlanningModelResponse,
       });
     }
   });
