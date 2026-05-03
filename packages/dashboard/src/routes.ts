@@ -98,6 +98,7 @@ import { registerFilesTerminalWorkspaceRoutes } from "./routes/register-files-te
 import { registerAgentsProjectsNodesRoutes } from "./routes/register-agents-projects-nodes.js";
 import { registerProjectRoutes } from "./routes/register-project-routes.js";
 import { registerNodeRoutes } from "./routes/register-node-routes.js";
+import { registerDockerNodeRoutes } from "./routes/register-docker-node-routes.js";
 import { registerSettingsSyncRoutes } from "./routes/register-settings-sync-routes.js";
 import { registerMeshRoutes } from "./routes/register-mesh-routes.js";
 import { registerDiscoveryRoutes } from "./routes/register-discovery-routes.js";
@@ -3851,6 +3852,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // ── Node Management Routes (Multi-Node Support) ───────────────────────────
 
   registerNodeRoutes(routeContext);
+  registerDockerNodeRoutes(routeContext);
 
   // ── Remote Node Settings Sync Routes ──────────────────────────────────────
 

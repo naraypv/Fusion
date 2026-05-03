@@ -70,6 +70,12 @@ import type {
   ResearchRunStatus,
   TaskPriority,
   TaskSourceIssue,
+  ManagedDockerNodeInput,
+  DockerHostConfig,
+  DockerResourceSizing,
+  DockerVolumeMount,
+  DockerExtraCli,
+  DockerNodeStatus,
 } from "@fusion/core";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
 import type { ScheduledTask, ScheduledTaskCreateInput, ScheduledTaskUpdateInput, AutomationRunResult, Routine, RoutineCreateInput, RoutineUpdateInput, RoutineExecutionResult } from "@fusion/core";
@@ -5259,6 +5265,29 @@ export interface NodeInfo {
   updatedAt: NodeConfig["updatedAt"];
 }
 
+/** Managed Docker node information returned by docker node endpoints */
+export interface DockerNodeInfo {
+  id: string;
+  nodeId: string | null;
+  name: string;
+  nodeType: "docker-managed";
+  imageName: string;
+  imageTag: string;
+  containerId: string | null;
+  status: DockerNodeStatus;
+  hostConfig: DockerHostConfig;
+  envVars: Record<string, string>;
+  volumeMounts: DockerVolumeMount[];
+  resourceSizing: DockerResourceSizing;
+  extraClis: DockerExtraCli[];
+  persistentStorage: boolean;
+  reachableUrl: string | null;
+  apiKey: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** Node discovered over local network mDNS/DNS-SD */
 export interface DiscoveredNodeInfo {
   name: string;
@@ -5398,6 +5427,19 @@ export function fetchNodes(): Promise<NodeInfo[]> {
 /** Fetch discovery runtime status and active config. */
 export function fetchDiscoveryStatus(): Promise<{ active: boolean; config: DiscoveryConfig | null }> {
   return api<{ active: boolean; config: DiscoveryConfig | null }>("/discovery/status");
+}
+
+/** Fetch all managed Docker nodes */
+export function listManagedDockerNodes(): Promise<DockerNodeInfo[]> {
+  return api<DockerNodeInfo[]>("/docker-nodes");
+}
+
+/** Create a managed Docker node */
+export function createManagedDockerNode(input: ManagedDockerNodeInput): Promise<DockerNodeInfo> {
+  return api<DockerNodeInfo>("/docker-nodes", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 /** Start local-network discovery service. */

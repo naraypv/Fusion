@@ -127,6 +127,8 @@ export function NodeDetailModal({
     return getProjectsForNode(projects, node);
   }, [node, projects]);
 
+  const isManagedDockerNode = useMemo(() => node?.capabilities?.includes("docker-managed") ?? false, [node]);
+
   const handleHealthCheck = useCallback(async () => {
     if (!node) return;
 
@@ -407,35 +409,37 @@ export function NodeDetailModal({
             </div>
           </section>
 
-          <section className="node-detail-modal__section">
-            <h4>Docker Management</h4>
-            <div className="node-detail-modal__health-row">
-              <span>Container: <strong>{dockerStatus}</strong></span>
-              <span>Image: <strong>runfusion/fusion:latest</strong></span>
-            </div>
-            <div className="node-detail-modal__sync-actions">
-              <button className="btn btn-sm" onClick={() => handleDockerLifecycle("start")}>Start</button>
-              <button className="btn btn-sm" onClick={() => handleDockerLifecycle("stop")}>Stop</button>
-              <button className="btn btn-sm" onClick={() => handleDockerLifecycle("restart")}>Restart</button>
-              <button className="btn btn-sm" onClick={() => handleDockerLifecycle("recreate")}>Recreate</button>
-              <button className="btn btn-sm" onClick={() => handleDockerLifecycle("upgrade")}>Upgrade Image</button>
-            </div>
-            <div className="node-detail-modal__docker-grid">
-              <label className="node-detail-modal__field">
-                <span>Environment Variables</span>
-                <textarea className="input node-detail-modal__textarea" value={dockerEnv} onChange={(event) => setDockerEnv(event.target.value)} />
-              </label>
-              <label className="node-detail-modal__field">
-                <span>Volume Mounts</span>
-                <textarea className="input node-detail-modal__textarea" value={dockerMounts} onChange={(event) => setDockerMounts(event.target.value)} />
-              </label>
-            </div>
-            <div className="node-detail-modal__sync-actions">
-              <button className="btn btn-sm" onClick={() => addToast("Container logs opened", "success")}>View Logs</button>
-              <button className="btn btn-sm" onClick={() => addToast("Config changes saved", "success")}>Save Config</button>
-              <button className="btn btn-danger btn-sm" onClick={() => addToast("Delete flow opened (retain/remove volumes)", "warning")}>Delete Node…</button>
-            </div>
-          </section>
+          {isManagedDockerNode && (
+            <section className="node-detail-modal__section">
+              <h4>Docker Management</h4>
+              <div className="node-detail-modal__health-row">
+                <span>Container: <strong>{dockerStatus}</strong></span>
+                <span>Image: <strong>runfusion/fusion:latest</strong></span>
+              </div>
+              <div className="node-detail-modal__sync-actions">
+                <button className="btn btn-sm" onClick={() => handleDockerLifecycle("start")}>Start</button>
+                <button className="btn btn-sm" onClick={() => handleDockerLifecycle("stop")}>Stop</button>
+                <button className="btn btn-sm" onClick={() => handleDockerLifecycle("restart")}>Restart</button>
+                <button className="btn btn-sm" onClick={() => handleDockerLifecycle("recreate")}>Recreate</button>
+                <button className="btn btn-sm" onClick={() => handleDockerLifecycle("upgrade")}>Upgrade Image</button>
+              </div>
+              <div className="node-detail-modal__docker-grid">
+                <label className="node-detail-modal__field">
+                  <span>Environment Variables</span>
+                  <textarea className="input node-detail-modal__textarea" value={dockerEnv} onChange={(event) => setDockerEnv(event.target.value)} />
+                </label>
+                <label className="node-detail-modal__field">
+                  <span>Volume Mounts</span>
+                  <textarea className="input node-detail-modal__textarea" value={dockerMounts} onChange={(event) => setDockerMounts(event.target.value)} />
+                </label>
+              </div>
+              <div className="node-detail-modal__sync-actions">
+                <button className="btn btn-sm" onClick={() => addToast("Container logs opened", "success")}>View Logs</button>
+                <button className="btn btn-sm" onClick={() => addToast("Config changes saved", "success")}>Save Config</button>
+                <button className="btn btn-danger btn-sm" onClick={() => addToast("Delete flow opened (retain/remove volumes)", "warning")}>Delete Node…</button>
+              </div>
+            </section>
+          )}
 
           {/* Settings Sync section — only for remote nodes */}
           {node.type === "remote" && (

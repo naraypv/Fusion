@@ -8,7 +8,10 @@ import type { NodeInfo, NodeUpdateInput } from "../api";
 import { NodeCard } from "./NodeCard";
 import { MeshTopology } from "./MeshTopology";
 import { AddNodeModal, type AddNodeInput } from "./AddNodeModal";
+import { DockerNodeOnboardingModal } from "./DockerNodeOnboardingModal";
 import { NodeDetailModal } from "./NodeDetailModal";
+import { useManagedDockerNodes } from "../hooks/useManagedDockerNodes";
+import type { ManagedDockerNodeInput } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
 
 interface NodesViewProps {
@@ -20,7 +23,9 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
   const { nodes, loading, error, refresh, register, update, unregister, healthCheck } = useNodes();
   const { projects } = useProjects();
   const { syncStatusMap, pushSettings, pullSettings, syncAuth, trackNode, getAuthSyncState, getAuthProviders } = useNodeSettingsSync();
+  const { dockerNodes, create: createDockerNode } = useManagedDockerNodes();
   const [addModalOpen, setAddModalOpen] = useState(false);
+  const [dockerOnboardingOpen, setDockerOnboardingOpen] = useState(false);
   const [selectedNode, setSelectedNode] = useState<NodeInfo | null>(null);
 
   // Track remote nodes for sync status polling
@@ -51,6 +56,18 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
   const handleRegister = useCallback(async (input: AddNodeInput) => {
     await register(input);
   }, [register]);
+
+  const handleCreateDockerNode = useCallback(async (input: ManagedDockerNodeInput) => {
+    try {
+      await createDockerNode(input);
+      addToast(`Docker node "${input.name}" created`, "success");
+      setDockerOnboardingOpen(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to create Docker node";
+      addToast(message, "error");
+      throw err;
+    }
+  }, [addToast, createDockerNode]);
 
   const handleRefresh = useCallback(async () => {
     try {
@@ -110,9 +127,13 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
             <RefreshCw size={14} className={loading ? "spin" : ""} />
             Refresh
           </button>
-          <button className="btn btn-primary btn-sm" onClick={() => setAddModalOpen(true)}>
+          <button className="btn btn-sm" onClick={() => setAddModalOpen(true)}>
             <Plus size={14} />
             Add Node
+          </button>
+          <button className="btn btn-primary btn-sm" onClick={() => setDockerOnboardingOpen(true)}>
+            <Plus size={14} />
+            Provision Docker Node
           </button>
         </div>
       </div>
@@ -141,6 +162,17 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
       </div>
 
       {error && <div className="nodes-view-error">{error}</div>}
+
+      <section className="nodes-view-topology" aria-label="Docker Nodes Summary">
+        <h3 className="nodes-view-section-title">Docker Nodes</h3>
+        <div className="nodes-view-stat">
+          <span>Managed Docker Nodes</span>
+          <strong>{dockerNodes.length}</strong>
+          <button className="btn btn-sm" onClick={() => setDockerOnboardingOpen(true)}>
+            Provision
+          </button>
+        </div>
+      </section>
 
       {/* Mesh Topology Visualization */}
       {!loading && nodes.length > 0 && (
@@ -192,6 +224,13 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
         isOpen={addModalOpen}
         onClose={() => setAddModalOpen(false)}
         onSubmit={handleRegister}
+        addToast={addToast}
+      />
+
+      <DockerNodeOnboardingModal
+        isOpen={dockerOnboardingOpen}
+        onClose={() => setDockerOnboardingOpen(false)}
+        onSubmit={handleCreateDockerNode}
         addToast={addToast}
       />
 

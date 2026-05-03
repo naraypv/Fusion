@@ -103,13 +103,19 @@ describe("NodeDetailModal", () => {
       expect(screen.getByRole("dialog", { name: "Node details for Custom Node Name" })).toBeInTheDocument();
     });
 
-    it("renders Overview, Projects, Health, Docker Management, and Settings Sync sections for remote nodes", () => {
+    it("renders Overview, Projects, Health, and Settings Sync sections for remote nodes", () => {
       render(<NodeDetailModal {...defaultProps} />);
       expect(screen.getByText("Overview")).toBeInTheDocument();
       expect(screen.getByText(/^Assigned Projects \(\d+\)$/)).toBeInTheDocument();
       expect(screen.getByText("Health")).toBeInTheDocument();
-      expect(screen.getByText("Docker Management")).toBeInTheDocument();
+      expect(screen.queryByText("Docker Management")).not.toBeInTheDocument();
       expect(screen.getByText("Settings Sync")).toBeInTheDocument();
+    });
+
+    it("renders Docker Management section for managed docker nodes", () => {
+      const dockerManagedNode = makeNode({ capabilities: ["docker-managed"] });
+      render(<NodeDetailModal {...defaultProps} node={dockerManagedNode} />);
+      expect(screen.getByText("Docker Management")).toBeInTheDocument();
     });
 
     it("does not render Settings Sync section for local nodes", () => {

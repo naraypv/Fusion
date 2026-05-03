@@ -214,7 +214,7 @@ describe("AddNodeModal", () => {
     render(<AddNodeModal {...defaultProps} />);
 
     expect(
-      screen.getByText("Provision a managed Docker node with guided defaults, then expand Advanced for host/TLS/env/mount overrides.")
+      screen.getByText("Register an existing Fusion node by providing its connection details and concurrency settings.")
     ).toBeInTheDocument();
   });
 

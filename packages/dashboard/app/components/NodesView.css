@@ -657,4 +657,5 @@
   .nodes-view-section-title {
     font-size: calc(var(--space-md) + var(--space-xs) / 4);
   }
+
 }

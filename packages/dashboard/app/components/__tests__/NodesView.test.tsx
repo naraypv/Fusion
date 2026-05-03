@@ -5,6 +5,7 @@ import type { NodeInfo, ProjectInfo } from "../../api";
 import { useNodes } from "../../hooks/useNodes";
 import { useProjects } from "../../hooks/useProjects";
 import { useNodeSettingsSync } from "../../hooks/useNodeSettingsSync";
+import { useManagedDockerNodes } from "../../hooks/useManagedDockerNodes";
 import type { NodeSettingsSyncStatus } from "../../api-node";
 
 vi.mock("../../hooks/useNodes", () => ({
@@ -39,9 +40,14 @@ vi.mock("../../hooks/useNodeSettingsSync", () => ({
   }),
 }));
 
+vi.mock("../../hooks/useManagedDockerNodes", () => ({
+  useManagedDockerNodes: vi.fn(),
+}));
+
 const mockUseNodes = vi.mocked(useNodes);
 const mockUseProjects = vi.mocked(useProjects);
 const mockUseNodeSettingsSync = vi.mocked(useNodeSettingsSync);
+const mockUseManagedDockerNodes = vi.mocked(useManagedDockerNodes);
 
 function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
   return {
@@ -107,6 +113,14 @@ beforeEach(() => {
     syncAuth: vi.fn().mockResolvedValue({ success: true, syncedProviders: [] }),
     getAuthSyncState: vi.fn().mockReturnValue(undefined),
     getAuthProviders: vi.fn().mockReturnValue(undefined),
+  });
+
+  mockUseManagedDockerNodes.mockReturnValue({
+    dockerNodes: [],
+    loading: false,
+    error: null,
+    refresh: vi.fn().mockResolvedValue(undefined),
+    create: vi.fn().mockResolvedValue(undefined),
   });
 });
 
