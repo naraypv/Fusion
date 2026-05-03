@@ -170,7 +170,7 @@ export interface AuthStorageLike {
   /** Get the configured API key for usage providers. */
   getApiKey?(providerId: string): string | null | undefined | Promise<string | null | undefined>;
   /** Get raw stored credentials for usage providers. */
-  get?(providerId: string): { type?: string; key?: string } | null | undefined;
+  get?(providerId: string): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
 }
 
 /**

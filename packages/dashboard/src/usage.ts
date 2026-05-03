@@ -67,8 +67,25 @@ export interface ProviderUsage {
 export interface AuthStorageLike {
   reload(): void;
   hasAuth(provider: string): boolean;
-  get?(provider: string): { type?: string; key?: string } | null | undefined;
+  get?(provider: string): AuthCredentialEntry | null | undefined;
   getApiKey?(provider: string): string | null | undefined | Promise<string | null | undefined>;
+}
+
+/**
+ * Credential entry returned by AuthStorage.get().
+ * Covers both API-key entries (`{ type: "api_key", key }`) and OAuth entries
+ * (`{ type: "oauth", access, refresh, expires }`) stored by Fusion's auth
+ * subsystem. The `[key: string]: unknown` index signature allows additional
+ * provider-specific fields (e.g. `scopes`, `subscriptionType`) without
+ * widening the entire interface.
+ */
+export interface AuthCredentialEntry {
+  type?: string;
+  key?: string;
+  access?: string;
+  refresh?: string;
+  expires?: number;
+  [key: string]: unknown;
 }
 
 // Cache for usage data with TTL
@@ -835,12 +852,18 @@ async function fetchClaudeUsageViaCli(): Promise<ProviderUsage> {
 /**
  * Fetch Claude usage data via the Anthropic OAuth usage API.
  *
- * Reads credentials from the Claude CLI's credential store (files or macOS
- * keychain) and calls api.anthropic.com/api/oauth/usage directly.
+ * Reads credentials from (in order of precedence):
+ *  1. Fusion auth storage (`authStorage.get("anthropic")`) — OAuth credentials
+ *     stored by the `fn auth login anthropic` flow.
+ *  2. Claude CLI credential files (`~/.claude/.credentials.json`,
+ *     `~/.config/claude/.credentials.json`).
+ *  3. macOS keychain (`Claude Code-credentials`).
+ *
+ * Then calls api.anthropic.com/api/oauth/usage directly.
  * Includes retry logic with exponential backoff for transient 429 responses.
  * Falls back to parsing `claude /usage` CLI output when rate limited.
  */
-async function fetchClaudeUsage(): Promise<ProviderUsage> {
+async function fetchClaudeUsage(authStorage?: AuthStorageLike): Promise<ProviderUsage> {
   const usage: ProviderUsage = {
     name: "Claude",
     icon: "🟠",
@@ -849,30 +872,59 @@ async function fetchClaudeUsage(): Promise<ProviderUsage> {
   };
 
   // ── Credential reading for plan detection & auth check ──────────────
-  const credPaths = [
-    path.join(getHomeDir(), ".claude", ".credentials.json"),
-    path.join(getHomeDir(), ".config", "claude", ".credentials.json"),
-  ];
 
+  // Try Fusion auth storage first (OAuth credentials from `fn auth login anthropic`).
+  // Normalize to the same shape as Claude CLI credentials so the rest of the
+  // fetcher works unchanged.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped credentials JSON
   let creds: any = null;
-  for (const p of credPaths) {
-    try {
-      creds = JSON.parse(await readFile(p, "utf-8"));
-      break;
-    } catch {
-      // File doesn't exist or invalid JSON - continue to next path
+
+  try {
+    authStorage?.reload();
+  } catch {
+    // Reload may fail if no storage - ignore
+  }
+  try {
+    const fusionCreds = authStorage?.get?.("anthropic");
+    if (fusionCreds?.type === "oauth" && fusionCreds.access) {
+      creds = {
+        accessToken: fusionCreds.access,
+        refreshToken: fusionCreds.refresh || undefined,
+        expiresAt: typeof fusionCreds.expires === "number" ? fusionCreds.expires : undefined,
+        scopes: Array.isArray(fusionCreds.scopes) ? fusionCreds.scopes : ["user:profile"],
+        ...(fusionCreds.subscriptionType ? { subscriptionType: fusionCreds.subscriptionType } : {}),
+        ...(fusionCreds.rateLimitTier ? { rateLimitTier: fusionCreds.rateLimitTier } : {}),
+      };
     }
+  } catch {
+    // get() may not be implemented or throw - ignore
   }
 
-  // Fallback to macOS keychain if file credentials not found
+  // Legacy: Claude CLI credential files
   if (!creds) {
-    creds = await readClaudeKeychainCredentials();
+    const credPaths = [
+      path.join(getHomeDir(), ".claude", ".credentials.json"),
+      path.join(getHomeDir(), ".config", "claude", ".credentials.json"),
+    ];
+
+    for (const p of credPaths) {
+      try {
+        creds = JSON.parse(await readFile(p, "utf-8"));
+        break;
+      } catch {
+        // File doesn't exist or invalid JSON - continue to next path
+      }
+    }
+
+    // Fallback to macOS keychain if file credentials not found
+    if (!creds) {
+      creds = await readClaudeKeychainCredentials();
+    }
   }
 
   const oauthCreds = creds?.claudeAiOauth || creds;
   if (!oauthCreds?.accessToken) {
-    usage.error = "No Claude CLI credentials — run 'claude' to login";
+    usage.error = "No Claude credentials — run 'claude' to login or 'fn auth login anthropic'";
     return usage;
   }
 
@@ -1686,7 +1738,7 @@ export async function fetchAllProviderUsage(authStorage?: AuthStorageLike): Prom
   // Fetch all providers in parallel with per-provider timeout
   // Currently includes: Claude, Codex, Gemini, Minimax, Zai, GitHub Copilot
   const results = await Promise.allSettled([
-    withTimeout(fetchClaudeUsage(), "Claude", CLAUDE_FETCH_TIMEOUT_MS),
+    withTimeout(fetchClaudeUsage(authStorage), "Claude", CLAUDE_FETCH_TIMEOUT_MS),
     withTimeout(fetchCodexUsage(), "Codex"),
     withTimeout(fetchGeminiUsage(), "Gemini"),
     withTimeout(fetchMinimaxUsage(authStorage), "Minimax"),

@@ -255,6 +255,172 @@ describe("usage", () => {
       expect(claude).toBeUndefined();
     });
 
+    it("reads Claude credentials from Fusion auth-storage anthropic oauth when no CLI files exist", async () => {
+      mockReadFile.mockImplementation(async () => {
+        return Promise.reject(new Error("File not found"));
+      });
+      mockExecFileSync.mockImplementation(() => {
+        throw new Error("Keychain item not found");
+      });
+
+      const authStorage = {
+        reload: vi.fn(),
+        hasAuth: vi.fn((provider: string) => provider === "anthropic"),
+        get: vi.fn((provider: string) => {
+          if (provider !== "anthropic") return null;
+          return {
+            type: "oauth",
+            access: "fusion-access-token",
+            refresh: "fusion-refresh-token",
+            expires: Date.now() + 60 * 60 * 1000,
+            scopes: ["user:profile"],
+            subscriptionType: "pro",
+          };
+        }),
+      };
+
+      // Mock the usage API response
+      const mockReq = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockRequest.mockImplementation((_options: any, callback: any) => {
+        const mockRes = {
+          statusCode: 200,
+          headers: {},
+          on: vi.fn((event: string, handler: any) => {
+            if (event === "data") {
+              handler(Buffer.from(JSON.stringify({
+                five_hour: {
+                  utilization: 40.0,
+                  resets_at: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString(),
+                },
+                seven_day: {
+                  utilization: 15.0,
+                  resets_at: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(),
+                },
+              })));
+            }
+            if (event === "end") handler();
+          }),
+        };
+        callback(mockRes);
+        return mockReq;
+      });
+
+      const providers = await fetchAllProviderUsage(authStorage);
+      const claude = providers.find((p) => p.name === "Claude")!;
+
+      // Claude should now be authenticated via Fusion auth-storage anthropic credentials
+      expect(claude).toBeDefined();
+      expect(claude.status).toBe("ok");
+      expect(claude.plan).toBe("Pro");
+      expect(claude.windows).toHaveLength(2);
+
+      const sessionWindow = claude.windows.find((w) => w.label.includes("Session"));
+      expect(sessionWindow).toBeDefined();
+      expect(sessionWindow!.percentUsed).toBe(40);
+
+      // Verify authStorage.get was called for "anthropic"
+      expect(authStorage.get).toHaveBeenCalledWith("anthropic");
+    });
+
+    it("falls back to CLI when Fusion auth-storage anthropic token is expired and refresh fails", async () => {
+      mockReadFile.mockImplementation(async () => {
+        return Promise.reject(new Error("File not found"));
+      });
+      mockExecFileSync.mockImplementation(() => {
+        throw new Error("Keychain item not found");
+      });
+
+      const authStorage = {
+        reload: vi.fn(),
+        hasAuth: vi.fn(() => true),
+        get: vi.fn((provider: string) => {
+          if (provider !== "anthropic") return null;
+          return {
+            type: "oauth",
+            access: "expired-fusion-token",
+            refresh: "bad-refresh-token",
+            expires: Date.now() - 60_000, // expired 1 minute ago
+            scopes: ["user:profile"],
+          };
+        }),
+      };
+
+      // Token refresh fails, CLI fallback fails (node-pty mocked to throw)
+      const mockReq = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockRequest.mockImplementation((_options: any, callback: any) => {
+        const mockRes = {
+          statusCode: 400,
+          headers: {},
+          on: vi.fn((event: string, handler: any) => {
+            if (event === "data") handler(Buffer.from('{"error":"invalid_grant"}'));
+            if (event === "end") handler();
+          }),
+        };
+        callback(mockRes);
+        return mockReq;
+      });
+
+      const providers = await fetchAllProviderUsage(authStorage);
+      const claude = providers.find((p) => p.name === "Claude")!;
+
+      // Falls back to CLI (which fails in test env) — should get error, not no-auth
+      expect(claude.status).toBe("error");
+    });
+
+    it("prefers Fusion auth-storage over legacy Claude CLI files", async () => {
+      // Both sources available — Fusion should win
+      mockReadFile.mockImplementation((filePath: string) => {
+        if (filePath.includes("claude")) {
+          return JSON.stringify({
+            accessToken: "legacy-cli-token",
+            scopes: ["user:profile"],
+            subscriptionType: "free",
+          });
+        }
+        return Promise.reject(new Error("File not found"));
+      });
+      mockExecFileSync.mockImplementation(() => {
+        throw new Error("Keychain item not found");
+      });
+
+      const authStorage = {
+        reload: vi.fn(),
+        hasAuth: vi.fn(() => true),
+        get: vi.fn((provider: string) => {
+          if (provider !== "anthropic") return null;
+          return {
+            type: "oauth",
+            access: "fusion-access-token",
+            refresh: "fusion-refresh-token",
+            expires: Date.now() + 60 * 60 * 1000,
+            scopes: ["user:profile"],
+            subscriptionType: "max",
+          };
+        }),
+      };
+
+      const mockReq = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockRequest.mockImplementation((_options: any, callback: any) => {
+        const mockRes = {
+          statusCode: 200,
+          headers: {},
+          on: vi.fn((event: string, handler: any) => {
+            if (event === "data") handler(Buffer.from(JSON.stringify({ five_hour: { utilization: 10.0 } })));
+            if (event === "end") handler();
+          }),
+        };
+        callback(mockRes);
+        return mockReq;
+      });
+
+      const providers = await fetchAllProviderUsage(authStorage);
+      const claude = providers.find((p) => p.name === "Claude")!;
+
+      expect(claude.status).toBe("ok");
+      // Fusion plan (max) should take precedence over CLI plan (free)
+      expect(claude.plan).toBe("Max");
+    });
+
     it("reads credentials from macOS keychain when file paths fail", async () => {
       setupClaudeMocks({
         keychainContent: {
