@@ -57,7 +57,7 @@ describe("Database", () => {
       const journalSizeLimit = db.prepare("PRAGMA journal_size_limit").get() as { journal_size_limit: number };
 
       expect(synchronous.synchronous).toBe(1); // NORMAL
-      expect(autoCheckpoint.wal_autocheckpoint).toBe(1000);
+      expect(autoCheckpoint.wal_autocheckpoint).toBe(100);
       expect(journalSizeLimit.journal_size_limit).toBe(4_194_304);
     });
 
@@ -184,13 +184,62 @@ describe("Database", () => {
     it("does not overwrite existing config on re-init", () => {
       // Update the config
       db.prepare("UPDATE config SET nextId = 42 WHERE id = 1").run();
-      
+
       // Re-init
       db.init();
-      
+
       // Should keep updated value
       const row = db.prepare("SELECT nextId FROM config WHERE id = 1").get() as any;
       expect(row.nextId).toBe(42);
+    });
+
+    it("sets wal_autocheckpoint to 100", () => {
+      const row = db.prepare("PRAGMA wal_autocheckpoint").get() as { wal_autocheckpoint: number };
+      expect(row.wal_autocheckpoint).toBe(100);
+    });
+
+    it("sets journal_size_limit to 4 MB", () => {
+      const row = db.prepare("PRAGMA journal_size_limit").get() as { journal_size_limit: number };
+      expect(row.journal_size_limit).toBe(4194304);
+    });
+
+    it("sets synchronous to NORMAL (1)", () => {
+      const row = db.prepare("PRAGMA synchronous").get() as { synchronous: number };
+      expect(row.synchronous).toBe(1); // NORMAL = 1
+    });
+
+    it("sets busy_timeout to 5000ms", () => {
+      const row = db.prepare("PRAGMA busy_timeout").get() as Record<string, number>;
+      // node:sqlite returns PRAGMA results as objects; the key name varies
+      const value = Object.values(row)[0];
+      expect(value).toBe(5000);
+    });
+
+    it("skips WAL PRAGMAs for in-memory databases", () => {
+      const memDb = new Database(":memory:", { inMemory: true });
+      memDb.init();
+      // journal_mode for :memory: is "memory", not "wal"
+      const row = memDb.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+      expect(row.journal_mode).toBe("memory");
+      memDb.close();
+    });
+  });
+
+  describe("startup integrity check", () => {
+    it("passes silently on a healthy database", () => {
+      // db was already init'd in beforeEach — no warning means pass
+      const result = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
+      expect(result.integrity_check).toBe("ok");
+    });
+
+    it("init completes without throwing even on a fresh database", () => {
+      const freshDir = makeTmpDir();
+      const freshFusionDir = join(freshDir, ".fusion");
+      const freshDb = new Database(freshFusionDir);
+
+      // init includes the integrity check — should not throw
+      expect(() => freshDb.init()).not.toThrow();
+      freshDb.close();
     });
   });
 

@@ -510,6 +510,22 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   /** Cached TodoStore instance */
   private todoStore: TodoStore | null = null;
 
+  /** Buffer for batching agent log writes to reduce WAL pressure. */
+  private agentLogBuffer: Array<{
+    taskId: string;
+    timestamp: string;
+    text: string;
+    type: string;
+    detail: string | null;
+    agent: string | null;
+  }> = [];
+  /** Timer for flushing the agent log buffer. */
+  private agentLogFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Maximum buffer size before forced flush. */
+  private static readonly AGENT_LOG_BUFFER_SIZE = 50;
+  /** Flush interval in milliseconds. */
+  private static readonly AGENT_LOG_FLUSH_MS = 2000;
+
   // Test-only: when true, both fusion.db and archive.db open as `:memory:`
   // SQLite connections instead of disk-backed files. Production code never
   // sets this; it's gated through an opt-in TaskStoreOptions field below.
@@ -3736,6 +3752,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
 
   async deleteTask(id: string, options?: { removeDependencyReferences?: boolean }): Promise<Task> {
+    // Flush buffered agent logs so FK cascade deletes can find them.
+    this.flushAgentLogBuffer();
     return this.withTaskLock(id, async () => {
       const task = this.readTaskFromDb(id);
       if (!task) {
@@ -4671,13 +4689,52 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       ...(agent !== undefined && { agent }),
     };
 
-    this.db.prepare(`
-      INSERT INTO agentLogEntries (taskId, timestamp, text, type, detail, agent)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(taskId, timestamp, text, type, normalizedDetail ?? null, agent ?? null);
-
-    this.db.bumpLastModified();
+    // Buffer the entry for batched insertion to reduce WAL pressure.
+    this.agentLogBuffer.push({
+      taskId,
+      timestamp,
+      text,
+      type,
+      detail: normalizedDetail ?? null,
+      agent: agent ?? null,
+    });
     this.emit("agent:log", entry);
+
+    if (this.agentLogBuffer.length >= TaskStore.AGENT_LOG_BUFFER_SIZE) {
+      this.flushAgentLogBuffer();
+    } else if (!this.agentLogFlushTimer) {
+      this.agentLogFlushTimer = setTimeout(
+        () => this.flushAgentLogBuffer(),
+        TaskStore.AGENT_LOG_FLUSH_MS,
+      );
+      this.agentLogFlushTimer.unref();
+    }
+  }
+
+  /**
+   * Flush all buffered agent log entries in a single transaction.
+   * Called when the buffer is full or on a timer.
+   */
+  flushAgentLogBuffer(): void {
+    if (this.agentLogFlushTimer) {
+      clearTimeout(this.agentLogFlushTimer);
+      this.agentLogFlushTimer = null;
+    }
+    if (this.agentLogBuffer.length === 0) return;
+
+    const batch = this.agentLogBuffer;
+    this.agentLogBuffer = [];
+
+    this.db.transaction(() => {
+      const stmt = this.db.prepare(`
+        INSERT INTO agentLogEntries (taskId, timestamp, text, type, detail, agent)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const entry of batch) {
+        stmt.run(entry.taskId, entry.timestamp, entry.text, entry.type, entry.detail, entry.agent);
+      }
+    });
+    this.db.bumpLastModified();
   }
 
   async appendAgentLogBatch(
@@ -5374,6 +5431,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     taskId: string,
     options?: { limit?: number; offset?: number },
   ): Promise<AgentLogEntry[]> {
+    // Ensure buffered entries are visible before reading.
+    this.flushAgentLogBuffer();
     const limit = options?.limit !== undefined
       ? (Number.isFinite(options.limit) ? Math.max(0, Math.floor(options.limit)) : 0)
       : undefined;
@@ -5419,6 +5478,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * @returns Total number of log entries
    */
   async getAgentLogCount(taskId: string): Promise<number> {
+    this.flushAgentLogBuffer();
     const row = this.db.prepare(
       "SELECT COUNT(*) as count FROM agentLogEntries WHERE taskId = ?",
     ).get(taskId) as { count: number } | undefined;
@@ -6042,6 +6102,15 @@ ${stepsSection}`;
    */
   close(): void {
     this.stopWatching();
+    // Flush any remaining buffered agent log entries before closing.
+    // Wrap in try-catch because entries for already-deleted tasks will fail FK check.
+    if (this.agentLogBuffer.length > 0) {
+      try {
+        this.flushAgentLogBuffer();
+      } catch {
+        // Best-effort flush — entries for deleted tasks will fail FK check.
+      }
+    }
     if (this._db) {
       this._db.close();
       this._db = null;

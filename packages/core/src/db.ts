@@ -703,6 +703,7 @@ export class Database {
   private transactionDepth = 0;
   private readonly _fts5Available: boolean;
 
+
   constructor(fusionDir: string, options?: { inMemory?: boolean }) {
     // In-memory mode is a test-only fast path that swaps the on-disk
     // SQLite file for SQLite's `:memory:` connection. Schema + data live
@@ -755,9 +756,10 @@ export class Database {
       this.db.exec("PRAGMA busy_timeout = 5000");
       // In WAL mode NORMAL is nearly as durable as FULL with much lower fsync cost.
       this.db.exec("PRAGMA synchronous = NORMAL");
-      // Let WAL grow to roughly the journal size limit before auto-checkpointing.
-      // This avoids frequent synchronous checkpoints on log-heavy workloads.
-      this.db.exec("PRAGMA wal_autocheckpoint = 1000");
+      // Checkpoint every 100 pages (~400 KB) to keep WAL small and reduce
+      // corruption risk. More aggressive than the default 1000, but paired
+      // with journal_size_limit to prevent WAL bloat.
+      this.db.exec("PRAGMA wal_autocheckpoint = 100");
       // Bound WAL growth between checkpoints/maintenance cycles.
       this.db.exec("PRAGMA journal_size_limit = 4194304");
     } else {
@@ -916,6 +918,35 @@ export class Database {
       `INSERT OR IGNORE INTO __meta (key, value) VALUES ('lastModified', '${Date.now()}')`,
     );
 
+    // Startup integrity check — run BEFORE migrations and seeds to avoid
+    // writing to a corrupted database and making it worse. Uses the
+    // structured integrityCheck() method and attempts WAL checkpoint
+    // recovery on failure.
+    const integrity = this.integrityCheck();
+    if (!integrity.ok) {
+      this.corruptionDetected = true;
+      console.warn("[fusion:db] Database integrity check FAILED — corruption detected");
+      // Attempt WAL checkpoint recovery
+      try {
+        this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const recheck = this.integrityCheck();
+        if (recheck.ok) {
+          this.corruptionDetected = false;
+          console.warn("[fusion:db] Database recovered via WAL checkpoint.");
+        } else {
+          console.error(
+            `[fusion:db] Database is corrupted and could not be auto-recovered. ` +
+            `Run: sqlite3 ${this.dbPath} ".recover" | sqlite3 ${this.dbPath}.recovered`,
+          );
+        }
+      } catch {
+        console.error(
+          "[fusion:db] Database corruption detected and checkpoint recovery failed. " +
+          "Manual recovery required.",
+        );
+      }
+    }
+
     // Run schema migrations
     this.migrate();
 
@@ -927,12 +958,6 @@ export class Database {
     this.db.exec(
       `INSERT OR IGNORE INTO config (id, nextId, nextWorkflowStepId, settings, workflowSteps, updatedAt) VALUES (1, 1, 1, '${JSON.stringify(DEFAULT_PROJECT_SETTINGS)}', '[]', '${configNow}')`,
     );
-
-    const integrity = this.integrityCheck();
-    if (!integrity.ok) {
-      this.corruptionDetected = true;
-      console.warn("[fusion:db] Database integrity check FAILED — corruption detected");
-    }
   }
 
   /**
