@@ -101,10 +101,22 @@ export function normalizeAgentSkills(
       }
     }
 
-    // Skip invalid/empty entries and deduplicate
-    if (name && name.length > 0 && !seen.has(name)) {
-      seen.add(name);
-      result.push(name);
+    // Skip invalid/empty entries and deduplicate.
+    // If the entry is a full skill ID ("source::path"), extract just the
+    // skill name (last two path segments) so it matches the discovered
+    // skill.name produced by extractSkillName().
+    if (name && name.length > 0) {
+      if (name.includes("::")) {
+        const idPath = name.split("::").pop()!;
+        const parts = idPath.replace(/\\/g, "/").split("/").filter(Boolean);
+        if (parts.length >= 2) {
+          name = parts.slice(-2).join("/");
+        }
+      }
+      if (!seen.has(name)) {
+        seen.add(name);
+        result.push(name);
+      }
     }
   }
 

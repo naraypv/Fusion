@@ -327,20 +327,40 @@ export function createSkillsOverrideFromSelection(
     // Skills must match the inclusion criteria AND not be in the exclusion list
     const hasExcluded = excludedSkillPaths.size > 0;
     let filteredSkills: Skill[];
+    // Build a name-based lookup for pattern/exclusion matching.
+    // Settings patterns are relative (e.g. "web-research/SKILL.md") but
+    // skill.filePath is absolute. Match against skill.name instead so
+    // that patterns written by toggleExecutionSkill() actually resolve.
+    const skillNameMatches = (skill: Skill, pattern: string): boolean =>
+      skill.name.toLowerCase() === pattern.toLowerCase()
+      || skill.filePath === pattern;
+    const isExcluded = (skill: Skill): boolean => {
+      for (const ep of excludedSkillPaths) {
+        if (skillNameMatches(skill, ep)) return true;
+      }
+      return false;
+    };
+    const isAllowed = (skill: Skill): boolean => {
+      for (const ap of allowedSkillPaths) {
+        if (skillNameMatches(skill, ap)) return true;
+      }
+      return false;
+    };
+
     if (hasRequestedNames) {
       // Filter by requested names (case-insensitive match)
       const requestedNamesLower = new Set(requestedSkillNames!.map((n) => n.toLowerCase()));
       filteredSkills = base.skills.filter(
-        (skill) => requestedNamesLower.has(skill.name.toLowerCase()) && !excludedSkillPaths.has(skill.filePath)
+        (skill) => requestedNamesLower.has(skill.name.toLowerCase()) && !isExcluded(skill)
       );
     } else if (hasPatterns) {
-      // Filter by file path (in allowed set AND not in excluded set)
+      // Filter by pattern (allowed AND not excluded)
       filteredSkills = base.skills.filter(
-        (skill) => allowedSkillPaths.has(skill.filePath) && !excludedSkillPaths.has(skill.filePath)
+        (skill) => isAllowed(skill) && !isExcluded(skill)
       );
     } else if (hasExcluded) {
       // Only exclusions set - filter out excluded skills
-      filteredSkills = base.skills.filter((skill) => !excludedSkillPaths.has(skill.filePath));
+      filteredSkills = base.skills.filter((skill) => !isExcluded(skill));
     } else {
       // No filter criteria - this shouldn't happen if filterActive is true
       filteredSkills = base.skills;
@@ -350,28 +370,22 @@ export function createSkillsOverrideFromSelection(
     const newDiagnostics: ResourceDiagnostic[] = [];
 
     // Check for excluded paths that DO match a discovered skill (disabled)
-    // These are skills that exist but were explicitly excluded by project patterns
     const purpose = sessionPurpose ? ` [${sessionPurpose}]` : "";
-    const discoveredPaths = new Set(base.skills.map((s) => s.filePath));
+    const discoveredNames = new Set(base.skills.map((s) => s.name.toLowerCase()));
 
     for (const excludedPath of excludedSkillPaths) {
-      if (discoveredPaths.has(excludedPath)) {
-        // Skill exists but was disabled by project patterns
-        // Use "warning" type since ResourceDiagnostic only supports warning|error|collision
+      if (discoveredNames.has(excludedPath.toLowerCase())) {
         newDiagnostics.push({
           type: "warning",
           message: `Skill at '${excludedPath}' exists but is disabled by project execution settings${purpose}`,
           path: excludedPath,
         });
       }
-      // If the path doesn't match any discovered skill, it's not a disabled skill - it's just not relevant
     }
 
     // Check for configured patterns (allowed paths) that don't match any discovered skill
-    // Note: At this point, we have access to base.skills for validation
     for (const allowedPath of allowedSkillPaths) {
-      if (!discoveredPaths.has(allowedPath)) {
-        // Allowed path doesn't match any discovered skill - this is a missing/invalid pattern
+      if (!discoveredNames.has(allowedPath.toLowerCase())) {
         newDiagnostics.push({
           type: "warning",
           message: `Configured skill pattern '${allowedPath}' not found in discovered skills${purpose}`,
