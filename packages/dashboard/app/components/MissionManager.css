@@ -125,6 +125,12 @@
   outline: none;
 }
 
+/* Hide back button on desktop — sidebar is always visible so navigation is unnecessary.
+   Keep control mounted in DOM for jsdom test compatibility; mobile override restores visibility. */
+.mission-manager--desktop .mission-manager__back-btn {
+  display: none;
+}
+
 /* ── Body ── */
 .mission-manager__body {
   flex: 1;
@@ -2195,6 +2201,11 @@
 
   .mission-manager__header--inline {
     padding: var(--space-md);
+  }
+
+  /* Back button visible on mobile — stacked list→detail navigation needs it. */
+  .mission-manager--desktop .mission-manager__back-btn {
+    display: inline-flex;
   }
 
   /* Restore dynamic header title text on mobile. */

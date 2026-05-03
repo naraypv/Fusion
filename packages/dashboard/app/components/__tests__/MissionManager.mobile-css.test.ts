@@ -58,6 +58,16 @@ describe("MissionManager mobile styles", () => {
     expect(section).toContain("display: block;");
   });
 
+  it("hides back button on desktop and restores it on mobile", () => {
+    const css = loadAllAppCss();
+    const desktopRule = css.match(/\.mission-manager--desktop \.mission-manager__back-btn\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule).toContain("display: none;");
+
+    const section = getMissionMobileSection(css);
+    const mobileRule = section.match(/\.mission-manager--desktop \.mission-manager__back-btn\s*\{[^}]*\}/)?.[0];
+    expect(mobileRule).toContain("display: inline-flex;");
+  });
+
   it("keeps desktop defaults and mobile overrides for header title spans", () => {
     const css = loadAllAppCss();
     const desktopMobileSpanBlock = css.match(/\.mission-manager__title-text--mobile\s*\{[^}]*\}/)?.[0];

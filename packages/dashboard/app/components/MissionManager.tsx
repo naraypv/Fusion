@@ -3727,7 +3727,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const manager = (
     <div
       ref={modalRef}
-      className={`mission-manager mission-manager--desktop-split${isInline ? " mission-manager--inline" : ""}`}
+      className={`mission-manager mission-manager--desktop${isInline ? " mission-manager--inline" : ""}`}
       role={isInline ? undefined : "dialog"}
       aria-modal={isInline ? undefined : true}
       aria-label={isInline ? undefined : "Mission Manager"}
@@ -3735,7 +3735,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     >
       <div className={`mission-manager__header${isInline ? " mission-manager__header--inline" : ""}`}>
         <div className="mission-manager__header-title">
-          {isMobile && selectedMission && (
+          {selectedMission && (
             <button
               className="mission-manager__back-btn"
               onClick={handleBackToList}
