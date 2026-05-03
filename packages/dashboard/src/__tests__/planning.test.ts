@@ -2893,3 +2893,270 @@ describe("planning routes lock enforcement", () => {
     expect(String(streamResponse.body)).toContain("event: complete");
   });
 });
+
+// ── Thinking-Block Response Extraction Tests (FN-3300) ─────────────────────
+
+describe("FN-3300: thinking-block response extraction", () => {
+  /**
+   * Creates a mock agent that returns array content blocks (thinking + text).
+   * This simulates Claude-style extended thinking responses.
+   */
+  function createMockAgentWithBlocks(
+    responses: Array<
+      | string
+      | Array<{ type: string; text?: string; thinking?: string }>
+    >,
+  ) {
+    const messages: Array<{
+      role: string;
+      content:
+        | string
+        | Array<{ type: string; text?: string; thinking?: string }>;
+    }> = [];
+    let callIndex = 0;
+
+    return {
+      session: {
+        state: { messages },
+        prompt: vi.fn(async (msg: string) => {
+          messages.push({ role: "user", content: msg });
+          const response = responses[callIndex++] ?? responses[responses.length - 1];
+          messages.push({ role: "assistant", content: response });
+        }),
+        dispose: vi.fn(),
+      },
+    };
+  }
+
+  /**
+   * Creates a mock streaming agent with array content blocks and callbacks.
+   */
+  function setupMockStreamingAgentWithBlocks(options: {
+    contentBlocks: Array<
+      | string
+      | Array<{ type: string; text?: string; thinking?: string }>
+    >;
+    thinkingOutputPerPrompt?: string[];
+  }) {
+    const contentBlocks = options.contentBlocks;
+    const thinkingOutputPerPrompt = options.thinkingOutputPerPrompt ?? [];
+    let promptIndex = 0;
+
+    const createFnAgentSpy = vi.fn(
+      async (agentOptions?: {
+        onThinking?: (delta: string) => void;
+        onText?: (delta: string) => void;
+      }) => {
+        const messages: Array<{
+          role: string;
+          content:
+            | string
+            | Array<{ type: string; text?: string; thinking?: string }>;
+        }> = [];
+
+        return {
+          session: {
+            state: { messages },
+            prompt: vi.fn(async (message: string) => {
+              messages.push({ role: "user", content: message });
+              const thinking = thinkingOutputPerPrompt[promptIndex];
+              if (thinking) {
+                agentOptions?.onText?.(thinking);
+              }
+              const response = contentBlocks[promptIndex] ?? contentBlocks[contentBlocks.length - 1];
+              messages.push({ role: "assistant", content: response });
+              promptIndex += 1;
+            }),
+            dispose: vi.fn(),
+          },
+        };
+      },
+    );
+
+    __setCreateFnAgent(createFnAgentSpy as any);
+    return { createFnAgentSpy };
+  }
+
+  const questionJson = JSON.stringify({
+    type: "question",
+    data: {
+      id: "q-scope",
+      type: "single_select",
+      question: "What is the scope?",
+      description: "Describe the scope.",
+      options: [
+        { id: "small", label: "Small", description: "Quick" },
+        { id: "medium", label: "Medium", description: "Standard" },
+        { id: "large", label: "Large", description: "Complex" },
+      ],
+    },
+  });
+
+  beforeEach(() => {
+    __resetPlanningState();
+  });
+
+  describe("continueAgentConversation (streaming path)", () => {
+    it("falls back to thinkingOutput when message content has only thinking blocks", async () => {
+      // The streaming agent accumulates text via onText callback into thinkingOutput.
+      // When the message content array has only thinking-type blocks, the
+      // text blocks filter yields empty string. The fix ensures we fall back
+      // to the accumulated thinkingOutput instead of overwriting with "".
+      setupMockStreamingAgentWithBlocks({
+        contentBlocks: [
+          // First prompt: only thinking blocks in message content
+          [{ type: "thinking", thinking: "Let me think about this..." }],
+          // Retry prompt: valid text response
+          questionJson,
+        ],
+        // The actual JSON was accumulated via onText callback during streaming
+        thinkingOutputPerPrompt: [questionJson, questionJson],
+      });
+
+      const { sessionId } = await createSessionWithAgent(
+        getUniqueIp(),
+        "Test plan",
+        TEST_ROOT_DIR,
+      );
+
+      // Submit response to trigger continueAgentConversation
+      const result = await submitResponse(sessionId, { scope: "medium" });
+      expect(result.type).toBe("question");
+      if (result.type === "question") {
+        expect(result.data.id).toBe("q-scope");
+      }
+    });
+
+    it("prefers text blocks over thinkingOutput when both are present", async () => {
+      const differentJson = JSON.stringify({
+        type: "question",
+        data: {
+          id: "q-from-text-block",
+          type: "text",
+          question: "What do you need?",
+          description: "Describe.",
+        },
+      });
+
+      setupMockStreamingAgentWithBlocks({
+        contentBlocks: [
+          // Message has both thinking AND text blocks
+          [
+            { type: "thinking", thinking: "Thinking about the response..." },
+            { type: "text", text: differentJson },
+          ],
+        ],
+        // thinkingOutput has something different — should NOT be used
+        thinkingOutputPerPrompt: ["old-thinking-output"],
+      });
+
+      const { sessionId } = await createSessionWithAgent(
+        getUniqueIp(),
+        "Test plan",
+        TEST_ROOT_DIR,
+      );
+
+      const result = await submitResponse(sessionId, { scope: "medium" });
+      expect(result.type).toBe("question");
+      if (result.type === "question") {
+        expect(result.data.id).toBe("q-from-text-block");
+      }
+    });
+  });
+
+  describe("getFirstQuestionFromAgent (non-streaming path)", () => {
+    it("extracts thinking block content when no text blocks are present", async () => {
+      // Non-streaming path: createSession uses createMockAgent which returns
+      // array content blocks. When only thinking blocks exist, extract their text.
+      const agent = createMockAgentWithBlocks([
+        // Only thinking blocks — the JSON is inside the thinking text
+        [{ type: "thinking", thinking: questionJson }],
+      ]);
+      __setCreateFnAgent(async () => agent);
+
+      const result = await createSession(
+        getUniqueIp(),
+        "Test plan",
+        undefined,
+        TEST_ROOT_DIR,
+      );
+
+      expect(result.firstQuestion).toBeDefined();
+      expect(result.firstQuestion.id).toBe("q-scope");
+    });
+
+    it("prefers text blocks over thinking blocks when both present", async () => {
+      const textBlockJson = JSON.stringify({
+        type: "question",
+        data: {
+          id: "q-from-text",
+          type: "text",
+          question: "Text block question?",
+          description: "From text block.",
+        },
+      });
+
+      const agent = createMockAgentWithBlocks([
+        [
+          { type: "thinking", thinking: questionJson },
+          { type: "text", text: textBlockJson },
+        ],
+      ]);
+      __setCreateFnAgent(async () => agent);
+
+      const result = await createSession(
+        getUniqueIp(),
+        "Test plan",
+        undefined,
+        TEST_ROOT_DIR,
+      );
+
+      expect(result.firstQuestion).toBeDefined();
+      expect(result.firstQuestion.id).toBe("q-from-text");
+    });
+  });
+
+  describe("diagnostics logging for empty response text", () => {
+    it("logs warning when response text is empty after extraction", async () => {
+      const { setDiagnosticsSink, resetDiagnosticsSink: resetSink } = await import(
+        "../ai-session-diagnostics.js"
+      );
+
+      const warnings: Array<{
+        level: string;
+        scope: string;
+        message: string;
+        context: Record<string, unknown>;
+      }> = [];
+      setDiagnosticsSink((level, scope, message, context) => {
+        warnings.push({ level, scope, message, context });
+      });
+
+      try {
+        // Agent returns content array with only thinking blocks, and no
+        // thinking text in them either — truly empty thinking blocks
+        const agent = createMockAgentWithBlocks([
+          [{ type: "thinking", thinking: "" }],
+        ]);
+        __setCreateFnAgent(async () => agent);
+
+        await expect(
+          createSession(getUniqueIp(), "Test plan", undefined, TEST_ROOT_DIR),
+        ).rejects.toThrow("Failed to get first question from AI");
+
+        // Should have logged a warning about empty response text
+        const extractionWarning = warnings.find(
+          (w) =>
+            w.message === "Response text is empty or very short before parse" &&
+            w.context.operation === "response-extraction",
+        );
+        expect(extractionWarning).toBeDefined();
+        expect(extractionWarning!.context.contentBlockTypes).toEqual([
+          "thinking",
+        ]);
+      } finally {
+        resetSink();
+      }
+    });
+  });
+});

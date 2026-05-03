@@ -825,7 +825,7 @@ async function getFirstQuestionFromAgent(
   // Extract response text
   interface AgentMessage {
     role: string;
-    content?: string | Array<{ type: string; text: string }>;
+    content?: string | Array<{ type: string; text?: string; thinking?: string }>;
   }
   const lastMessage = (session.agent.session.state.messages as AgentMessage[])
     .filter((m: AgentMessage) => m.role === "assistant")
@@ -836,11 +836,39 @@ async function getFirstQuestionFromAgent(
     if (typeof lastMessage.content === "string") {
       responseText = lastMessage.content;
     } else if (Array.isArray(lastMessage.content)) {
-      responseText = lastMessage.content
-        .filter((c: { type: string; text: string }): c is { type: "text"; text: string } => c.type === "text")
-        .map((c: { type: string; text: string }) => c.text)
+      // Try text blocks first
+      const textContent = lastMessage.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+        .map((c) => c.text)
         .join("");
+      if (textContent) {
+        responseText = textContent;
+      } else {
+        // Fallback: extract thinking blocks when no text blocks are present
+        const thinkingContent = lastMessage.content
+          .filter((c): c is { type: "thinking"; thinking: string } => c.type === "thinking" && typeof c.thinking === "string")
+          .map((c) => c.thinking)
+          .join("");
+        responseText = thinkingContent;
+      }
     }
+  }
+
+  // Diagnostic: warn when response text is empty or very short
+  if (!responseText || responseText.length < 10) {
+    const contentBlockTypes = Array.isArray(lastMessage?.content)
+      ? lastMessage.content.map((c: { type: string }) => c.type)
+      : typeof lastMessage?.content === "string" ? ["string"] : [];
+    diagnostics.warn(
+      "Response text is empty or very short before parse",
+      {
+        sessionId: session.id,
+        responseTextLength: responseText.length,
+        contentBlockTypes,
+        usedThinkingBlocksFallback: !Array.isArray(lastMessage?.content) ? false : !lastMessage.content.some((c: { type: string }) => c.type === "text"),
+        operation: "response-extraction",
+      }
+    );
   }
 
   // Parse response with retry
@@ -870,10 +898,19 @@ async function getFirstQuestionFromAgent(
             if (typeof retryMessage.content === "string") {
               responseText = retryMessage.content;
             } else if (Array.isArray(retryMessage.content)) {
-              responseText = retryMessage.content
-                .filter((c: { type: string; text: string }): c is { type: "text"; text: string } => c.type === "text")
-                .map((c: { type: string; text: string }) => c.text)
+              const textContent = retryMessage.content
+                .filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+                .map((c) => c.text)
                 .join("");
+              if (textContent) {
+                responseText = textContent;
+              } else {
+                const thinkingContent = retryMessage.content
+                  .filter((c): c is { type: "thinking"; thinking: string } => c.type === "thinking" && typeof c.thinking === "string")
+                  .map((c) => c.thinking)
+                  .join("");
+                responseText = thinkingContent;
+              }
             }
           }
         } catch {
@@ -1469,12 +1506,32 @@ async function continueAgentConversation(session: Session, message: string): Pro
       if (typeof lastMessage.content === "string") {
         responseText = lastMessage.content;
       } else if (Array.isArray(lastMessage.content)) {
-        // Extract text from content blocks
-        responseText = lastMessage.content
+        // Extract text from content blocks; only overwrite fallback if non-empty
+        const extracted = lastMessage.content
           .filter((c: { type: string; text: string }): c is { type: "text"; text: string } => c.type === "text")
           .map((c: { type: string; text: string }) => c.text)
           .join("");
+        if (extracted) {
+          responseText = extracted;
+        }
       }
+    }
+
+    // Diagnostic: warn when response text is empty or very short
+    if (!responseText || responseText.length < 10) {
+      const contentBlockTypes = Array.isArray(lastMessage?.content)
+        ? lastMessage.content.map((c: { type: string }) => c.type)
+        : typeof lastMessage?.content === "string" ? ["string"] : [];
+      diagnostics.warn(
+        "Response text is empty or very short before parse",
+        {
+          sessionId: session.id,
+          responseTextLength: responseText.length,
+          contentBlockTypes,
+          usedThinkingOutputFallback: responseText === session.thinkingOutput,
+          operation: "response-extraction",
+        }
+      );
     }
 
     // Parse the JSON response with retry
@@ -1512,10 +1569,13 @@ async function continueAgentConversation(session: Session, message: string): Pro
               if (typeof retryMessage.content === "string") {
                 retryText = retryMessage.content;
               } else if (Array.isArray(retryMessage.content)) {
-                retryText = retryMessage.content
+                const extracted = retryMessage.content
                   .filter((c: { type: string; text: string }): c is { type: "text"; text: string } => c.type === "text")
                   .map((c: { type: string; text: string }) => c.text)
                   .join("");
+                if (extracted) {
+                  retryText = extracted;
+                }
               }
             }
             responseText = retryText;
