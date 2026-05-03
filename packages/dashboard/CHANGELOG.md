@@ -1,5 +1,17 @@
 # @fusion/dashboard
 
+## 0.16.0
+
+### Patch Changes
+
+- c769444: Fix `git diff --no-index` calls treating exit code 1 as an error in the dashboard git-routes. `--no-index` exits 1 when files differ — that's the success case for synthetic untracked-file diffs. Switched to `spawn` so we accept exit 0 and 1 with stdout, independent of how callers wrap `execFile`/`promisify`.
+  - @fusion/core@0.16.0
+  - @fusion/engine@0.16.0
+  - @fusion-plugin-examples/dependency-graph@0.1.2
+  - @fusion-plugin-examples/hermes-runtime@0.2.21
+  - @fusion-plugin-examples/openclaw-runtime@0.2.21
+  - @fusion-plugin-examples/paperclip-runtime@0.2.21
+
 ## 0.15.0
 
 ### Patch Changes
