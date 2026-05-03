@@ -821,6 +821,42 @@ describe("ChatManager.sendMessage", () => {
     expect(createSpy.mock.calls[0]?.[0]?.sessionManager).toBeDefined();
   });
 
+  it("reopens the same CLI session on second turn and persists both assistant replies", async () => {
+    const promptSpy = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+
+    mockChatStore.getSession
+      .mockReturnValueOnce({
+        id: "chat-001",
+        agentId: "agent-001",
+        status: "active",
+        cliSessionFile: null,
+      })
+      .mockReturnValueOnce({
+        id: "chat-001",
+        agentId: "agent-001",
+        status: "active",
+        cliSessionFile: __dirname + "/chat-manager.test.ts",
+      });
+
+    __setCreateFnAgent(async () => ({
+      session: { prompt: promptSpy, dispose: vi.fn(), state: { messages: [{ role: "assistant", content: "Done" }] } },
+    }));
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "Turn one");
+    await chatManager.sendMessage("chat-001", "Turn two");
+
+    expect(mockSessionManagerCreate).toHaveBeenCalledTimes(1);
+    expect(mockSessionManagerOpen).toHaveBeenCalledTimes(1);
+    expect(promptSpy).toHaveBeenCalledTimes(2);
+
+    const assistantCalls = mockChatStore.addMessage.mock.calls.filter((call) => call[1].role === "assistant");
+    expect(assistantCalls).toHaveLength(2);
+  });
+
   it("reopens the same CLI session on subsequent turns instead of creating a new one", async () => {
     mockChatStore.getSession.mockReturnValue({
       id: "chat-001",

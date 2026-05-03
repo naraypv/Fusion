@@ -928,6 +928,35 @@ describe("Chat API Routes", () => {
   // ── SSE Streaming Tests ────────────────────────────────────────────────────
 
   describe("POST /api/chat/sessions/:id/messages (SSE)", () => {
+    it("creates a fresh backend send for second turn on same session", async () => {
+      mockGetSession.mockReturnValue(sampleSession);
+      mockSendMessage.mockImplementation(async (sessionId: string) => {
+        mockChatStreamManager.broadcast(sessionId, {
+          type: "done",
+          data: { messageId: `msg-${Date.now()}` },
+        });
+      });
+
+      const first = await request(
+        app,
+        "POST",
+        "/api/chat/sessions/chat-abc123/messages",
+        JSON.stringify({ content: "Turn 1" }),
+        { "content-type": "application/json" },
+      );
+
+      const second = await request(
+        app,
+        "POST",
+        "/api/chat/sessions/chat-abc123/messages",
+        JSON.stringify({ content: "Turn 2" }),
+        { "content-type": "application/json" },
+      );
+
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+    });
+
     it("returns 404 when session not found", async () => {
       mockGetSession.mockReturnValue(undefined);
 

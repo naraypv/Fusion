@@ -462,6 +462,55 @@ describe("useQuickChat", () => {
     expect(mockStreamChatResponse).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a fresh stream and shows active state on second turn after first turn completes", async () => {
+    const existingSession = makeSession({ id: "session-existing", agentId: "agent-001" });
+    const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
+
+    mockFetchResumeChatSession.mockResolvedValueOnce({ session: existingSession });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
+      handlers.push(nextHandlers);
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    const { result } = renderHook(() => useQuickChat("proj-123"));
+
+    await act(async () => {
+      await result.current.switchSession("agent-001");
+    });
+
+    act(() => {
+      void result.current.sendMessage("Turn 1");
+    });
+
+    expect(mockStreamChatResponse).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      handlers[0]?.onDone?.({ messageId: "msg-001" });
+    });
+
+    await waitFor(() => {
+      expect(result.current.isStreaming).toBe(false);
+    });
+
+    act(() => {
+      void result.current.sendMessage("Turn 2");
+    });
+
+    await waitFor(() => {
+      expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
+      expect(result.current.isStreaming).toBe(true);
+    });
+
+    act(() => {
+      handlers[1]?.onError?.("second turn failed");
+    });
+
+    await waitFor(() => {
+      expect(result.current.isStreaming).toBe(false);
+    });
+  });
+
   it("queued message is auto-sent after streaming onDone", async () => {
     const existingSession = makeSession({ id: "session-existing", agentId: "agent-001" });
     const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];

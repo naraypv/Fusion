@@ -317,6 +317,38 @@ describe("QuickChatFAB session-first UX", () => {
     expect(mockCreateChatSession).not.toHaveBeenCalled();
   });
 
+  it("shows streaming feedback on second turn after first turn completes", async () => {
+    const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
+      handlers.push(nextHandlers);
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    render(<QuickChatFAB addToast={vi.fn()} projectId="proj-1" />);
+    fireEvent.click(screen.getByTestId("quick-chat-fab"));
+
+    const input = await screen.findByTestId("quick-chat-input");
+    await waitFor(() => expect(input).not.toBeDisabled());
+
+    fireEvent.change(input, { target: { value: "Turn one" } });
+    fireEvent.click(screen.getByTestId("quick-chat-send"));
+
+    expect(await screen.findByTestId("quick-chat-streaming-message")).toBeInTheDocument();
+
+    handlers[0]?.onDone?.({ messageId: "msg-1" });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("quick-chat-streaming-message")).toBeNull();
+    });
+
+    fireEvent.change(input, { target: { value: "Turn two" } });
+    fireEvent.click(screen.getByTestId("quick-chat-send"));
+
+    expect(await screen.findByTestId("quick-chat-streaming-message")).toBeInTheDocument();
+    expect(screen.getByTestId("quick-chat-waiting")).toHaveTextContent("Connecting…");
+    expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
+  });
+
   it("shows the streaming indicator instead of the loading placeholder while waiting for a long reply", async () => {
     const deferredMessages = createDeferredPromise<{ messages: never[] }>();
     mockFetchChatMessages.mockImplementation(() => deferredMessages.promise);

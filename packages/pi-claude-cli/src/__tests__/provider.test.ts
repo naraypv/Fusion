@@ -1512,6 +1512,31 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
     });
   });
 
+  describe("resume behavior", () => {
+    it("uses --resume for follow-up quick-chat turns when sessionId is present", async () => {
+      const model = mockModels[0] as any;
+      const context = {
+        messages: [
+          { role: "user", content: "Turn 1" },
+          { role: "assistant", content: "Reply 1" },
+          { role: "user", content: "Follow-up" },
+        ],
+      };
+
+      streamViaCli(model, context, { sessionId: "session-follow-up" } as any);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const args = (spawn as any).mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
+      expect(args).toContain("session-follow-up");
+      expect(args).not.toContain("--session-id");
+
+      const proc = (spawn as any).mock.results[0].value;
+      proc.stdout.end();
+      await vi.advanceTimersByTimeAsync(100);
+    });
+  });
+
   describe("MCP config with custom tool results", () => {
     it("keeps MCP config even when conversation ends with custom tool result", async () => {
       const model = mockModels[0] as any;

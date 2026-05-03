@@ -713,6 +713,17 @@ describe("resume session flag", () => {
     expect(args).not.toContain("--resume");
   });
 
+  it("does not include --session-id when --resume is provided", () => {
+    spawnClaude("claude-sonnet-4-5-20250929", undefined, {
+      resumeSessionId: "session-abc",
+      newSessionId: "session-new",
+    });
+    const args = (spawn as any).mock.calls[0][1] as string[];
+
+    expect(args).toContain("--resume");
+    expect(args).not.toContain("--session-id");
+  });
+
   it("includes both --resume and --effort when both are provided", () => {
     spawnClaude("claude-sonnet-4-5-20250929", undefined, {
       resumeSessionId: "session-abc",
