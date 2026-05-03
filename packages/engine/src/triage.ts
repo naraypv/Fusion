@@ -24,6 +24,7 @@ import { buildSessionSkillContext } from "./session-skill-context.js";
 import { PRIORITY_SPECIFY, type AgentSemaphore } from "./concurrency.js";
 import { AgentLogger } from "./agent-logger.js";
 import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import { notifyFallbackUsed } from "./notifier.js";
 import { planLog, reviewerLog, formatError } from "./logger.js";
 import {
   isUsageLimitError,
@@ -1029,6 +1030,9 @@ export class TriageProcessor {
           defaultThinkingLevel: settings.defaultThinkingLevel,
           // Skill selection: use assigned agent skills if available, otherwise role fallback
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+          taskId: task.id,
+          taskTitle: task.title,
+          onFallbackModelUsed: notifyFallbackUsed,
         });
 
         const modelDesc = describeModel(session);
@@ -1226,6 +1230,9 @@ export class TriageProcessor {
               defaultModelId: planningFallbackModelId,
               defaultThinkingLevel: settings.defaultThinkingLevel,
               ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+              taskId: task.id,
+              taskTitle: task.title,
+              onFallbackModelUsed: notifyFallbackUsed,
             });
 
             session = fallbackResult.session;

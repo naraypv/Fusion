@@ -23,6 +23,7 @@ export const DEFAULT_NTFY_EVENTS: readonly NtfyNotificationEvent[] = [
   "awaiting-user-review",
   "planning-awaiting-input",
   "gridlock",
+  "fallback-used",
 ] as const;
 
 export interface NtfyNotificationConfigInput {
@@ -53,7 +54,7 @@ interface NtfyConfig {
 
 /** Event types for task notification deduplication */
 type TaskNotificationEvent = "in-review" | "merged" | "failed" | "awaiting-approval" | "awaiting-user-review";
-type AnyNotificationEvent = TaskNotificationEvent | "gridlock";
+type AnyNotificationEvent = TaskNotificationEvent | "gridlock" | "fallback-used";
 
 /**
  * Format a task identifier for notifications.
@@ -166,6 +167,35 @@ export async function sendNtfyNotification({
  * It keeps legacy APIs (getConfig, notifyGridlock) while delegating task event
  * notifications to the pluggable provider-based notification module.
  */
+let activeNotificationService: NotificationService | undefined;
+
+export interface FallbackNotificationInput {
+  primaryModel: string;
+  fallbackModel: string;
+  triggerPoint: "session-creation" | "prompt-time";
+  taskId?: string;
+  taskTitle?: string;
+  timestamp?: string;
+}
+
+export async function notifyFallbackUsed(input: FallbackNotificationInput): Promise<void> {
+  if (!activeNotificationService) {
+    return;
+  }
+
+  await activeNotificationService.dispatch("fallback-used", {
+    taskId: input.taskId,
+    taskTitle: input.taskTitle,
+    event: "fallback-used",
+    timestamp: input.timestamp,
+    metadata: {
+      primaryModel: input.primaryModel,
+      fallbackModel: input.fallbackModel,
+      triggerPoint: input.triggerPoint,
+    },
+  });
+}
+
 export class NtfyNotifier {
   private config: NtfyConfig = {
     enabled: false,
@@ -192,6 +222,7 @@ export class NtfyNotifier {
       projectId: this.projectId,
       ntfyBaseUrl: options.ntfyBaseUrl,
     });
+    activeNotificationService = this.notificationService;
   }
 
   async start(): Promise<void> {

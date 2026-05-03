@@ -133,6 +133,8 @@ export class WebhookNotificationProvider implements NotificationProvider {
         return `Task "${identifier}" is awaiting your input during planning`;
       case "gridlock":
         return "Pipeline gridlocked";
+      case "fallback-used":
+        return `Fusion recovered by switching from ${String(payload.metadata?.primaryModel ?? "primary model")} to ${String(payload.metadata?.fallbackModel ?? "fallback model")} (${String(payload.metadata?.triggerPoint ?? "unknown trigger")})`;
       default:
         return `Event "${event}" for task ${identifier}`;
     }
@@ -145,7 +147,7 @@ export class WebhookNotificationProvider implements NotificationProvider {
 
     const description = payload.taskDescription ?? "";
     const snippet = description.length > 200 ? `${description.slice(0, 200)}...` : description;
-    return `${payload.taskId}: ${snippet}`;
+    return `${payload.taskId ?? "unknown-task"}: ${snippet}`;
   }
 
   private formatPayload(payload: NotificationPayload, message: string): Record<string, unknown> {

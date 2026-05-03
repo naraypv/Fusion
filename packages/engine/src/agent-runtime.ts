@@ -16,6 +16,7 @@
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { SkillSelectionContext } from "./skill-resolver.js";
+import type { FallbackModelUsedPayload } from "./pi.js";
 
 /**
  * Options for creating an agent session.
@@ -69,6 +70,11 @@ export interface AgentRuntimeOptions {
    * the runtime's internal setup latency rather than unbounded.
    */
   beforeSpawnSession?: () => Promise<void> | void;
+  /** Callback fired when runtime falls back from primary model to fallback model. */
+  onFallbackModelUsed?: (payload: FallbackModelUsedPayload) => Promise<void> | void;
+  /** Optional task context for fallback notifications. */
+  taskId?: string;
+  taskTitle?: string;
 }
 
 /**

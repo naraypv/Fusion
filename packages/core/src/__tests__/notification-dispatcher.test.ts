@@ -153,6 +153,7 @@ describe("NotificationDispatcher", () => {
       "awaiting-user-review",
       "planning-awaiting-input",
       "gridlock",
+      "fallback-used",
     ]);
     expect(DEFAULT_GLOBAL_SETTINGS.notificationProviders).toEqual([]);
   });

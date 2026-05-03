@@ -17,6 +17,7 @@ import { AgentLogger } from "./agent-logger.js";
 import { reviewerLog } from "./logger.js";
 import { checkSessionError } from "./usage-limit-detector.js";
 import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import { notifyFallbackUsed } from "./notifier.js";
 import { createMemoryGetTool, createMemorySearchTool } from "./agent-tools.js";
 
 export const REVIEWER_SYSTEM_PROMPT = `You are an independent code and plan reviewer.
@@ -254,6 +255,8 @@ export interface ReviewOptions {
   store?: TaskStore;
   /** Task ID for agent log persistence. Required alongside `store`. */
   taskId?: string;
+  /** Optional task title for fallback-used notification context. */
+  taskTitle?: string;
   /** Task with optional assignedAgentId for skill selection. */
   task?: { assignedAgentId?: string | null };
   /** User comments on the task (author === "user"). For spec reviews, the reviewer explicitly checks that every comment is addressed. */
@@ -488,6 +491,9 @@ export async function reviewStep(
       defaultThinkingLevel: options.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+      taskId: options.taskId,
+      taskTitle: options.taskTitle,
+      onFallbackModelUsed: notifyFallbackUsed,
       beforeSpawnSession: async () => {
         if (!options.store) return;
         let finalSettings: Settings | undefined;

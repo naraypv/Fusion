@@ -393,6 +393,15 @@ export async function compactSessionContext(
   }
 }
 
+export interface FallbackModelUsedPayload {
+  primaryModel: string;
+  fallbackModel: string;
+  triggerPoint: "session-creation" | "prompt-time";
+  taskId?: string;
+  taskTitle?: string;
+  timestamp?: string;
+}
+
 export interface AgentOptions {
   cwd: string;
   systemPrompt: string;
@@ -429,6 +438,11 @@ export interface AgentOptions {
   /** Last-chance abort hook fired immediately before `createAgentSession`.
    *  See `AgentRuntimeOptions.beforeSpawnSession`. */
   beforeSpawnSession?: () => Promise<void> | void;
+  /** Callback fired when runtime falls back from primary model to fallback model. */
+  onFallbackModelUsed?: (payload: FallbackModelUsedPayload) => Promise<void> | void;
+  /** Optional task context for fallback notifications. */
+  taskId?: string;
+  taskTitle?: string;
 }
 
 function resolveConfiguredModel(
@@ -1204,6 +1218,20 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     });
   };
 
+  const emitFallbackUsed = async (triggerPoint: "session-creation" | "prompt-time"): Promise<void> => {
+    if (!options.onFallbackModelUsed || !selectedModel || !fallbackModel) {
+      return;
+    }
+    await options.onFallbackModelUsed({
+      primaryModel: `${selectedModel.provider}/${selectedModel.id}`,
+      fallbackModel: `${fallbackModel.provider}/${fallbackModel.id}`,
+      triggerPoint,
+      taskId: options.taskId,
+      taskTitle: options.taskTitle,
+      timestamp: new Date().toISOString(),
+    });
+  };
+
   let sessionResult;
   let usingFallback = false;
   try {
@@ -1217,6 +1245,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     piLog.warn(`Primary model failed (${err.message}), trying fallback`);
     usingFallback = true;
     sessionResult = await createSessionWithModel(fallbackModel);
+    await emitFallbackUsed("session-creation");
     piLog.log("Fallback session created successfully");
   }
 
@@ -1278,6 +1307,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       }
 
       const fallbackSessionResult = await createSessionWithModel(fallbackModel);
+      await emitFallbackUsed("prompt-time");
       const fallbackSession = fallbackSessionResult.session as PromptableSession;
       installToolResultContentGuard(fallbackSession as unknown as AgentToolHookSession);
       installMessageContentGuard(

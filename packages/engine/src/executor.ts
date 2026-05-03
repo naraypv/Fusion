@@ -55,6 +55,7 @@ import {
 import { getTaskCompletionBlockerForStore } from "./task-completion.js";
 import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
 import { createRunVerificationTool } from "./run-verification-tool.js";
+import { notifyFallbackUsed } from "./notifier.js";
 
 // Re-export for backward compatibility (tests import from executor.ts)
 export { summarizeToolArgs } from "./agent-logger.js";
@@ -2746,6 +2747,9 @@ export class TaskExecutor {
           sessionManager,
           // Skill selection: use assigned agent skills if available, otherwise role fallback
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+          taskId: task.id,
+          taskTitle: detail.title,
+          onFallbackModelUsed: notifyFallbackUsed,
         });
 
         if (isResuming) {

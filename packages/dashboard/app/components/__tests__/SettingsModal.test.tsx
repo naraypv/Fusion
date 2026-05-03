@@ -2416,6 +2416,18 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("button", { name: /Test notification/ })).toBeInTheDocument();
     });
 
+    it("shows fallback-used event option for both providers", async () => {
+      mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
+      renderModal();
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+
+      expect(screen.getByLabelText("Fallback model used (recovered)")).toBeInTheDocument();
+
+      await userEvent.click(screen.getByLabelText("Webhook notifications"));
+      expect(screen.getAllByLabelText("Fallback model used (recovered)").length).toBeGreaterThan(0);
+    });
+
     it("shows webhook fields when webhook provider is enabled", async () => {
       renderModal();
       await waitForSettingsModalReady();
@@ -2493,9 +2505,11 @@ describe("SettingsModal", () => {
       const inReview = screen.getByLabelText("Task completed (in-review)") as HTMLInputElement;
       const failed = screen.getByLabelText("Task failed") as HTMLInputElement;
       const merged = screen.getByLabelText("Task merged") as HTMLInputElement;
+      const fallbackUsed = screen.getByLabelText("Fallback model used (recovered)") as HTMLInputElement;
       expect(inReview.checked).toBe(true);
       expect(failed.checked).toBe(true);
       expect(merged.checked).toBe(false);
+      expect(fallbackUsed.checked).toBe(false);
     });
   });
 

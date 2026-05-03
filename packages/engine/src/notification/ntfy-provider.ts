@@ -33,7 +33,8 @@ type SupportedNtfyEvent =
   | "failed"
   | "awaiting-approval"
   | "awaiting-user-review"
-  | "planning-awaiting-input";
+  | "planning-awaiting-input"
+  | "fallback-used";
 
 const SUPPORTED_EVENTS = new Set<SupportedNtfyEvent>([
   "in-review",
@@ -42,6 +43,7 @@ const SUPPORTED_EVENTS = new Set<SupportedNtfyEvent>([
   "awaiting-approval",
   "awaiting-user-review",
   "planning-awaiting-input",
+  "fallback-used",
 ]);
 
 export class NtfyNotificationProvider implements NotificationProvider {
@@ -92,8 +94,9 @@ export class NtfyNotificationProvider implements NotificationProvider {
       };
     }
 
+    const taskId = payload.taskId ?? "unknown-task";
     const taskLike = {
-      id: payload.taskId,
+      id: taskId,
       title: payload.taskTitle,
       description: payload.taskDescription ?? "",
     } as Pick<Task, "id" | "title" | "description"> as Task;
@@ -107,33 +110,38 @@ export class NtfyNotificationProvider implements NotificationProvider {
 
     const contentByEvent: Record<SupportedNtfyEvent, { title: string; message: string; priority: "default" | "high" }> = {
       "in-review": {
-        title: `Task ${payload.taskId} completed`,
+        title: `Task ${taskId} completed`,
         message: `Task "${identifier}" is ready for review`,
         priority: "default",
       },
       merged: {
-        title: `Task ${payload.taskId} merged`,
+        title: `Task ${taskId} merged`,
         message: `Task "${identifier}" has been merged to main`,
         priority: "default",
       },
       failed: {
-        title: `Task ${payload.taskId} failed`,
+        title: `Task ${taskId} failed`,
         message: `Task "${identifier}" has failed and needs attention`,
         priority: "high",
       },
       "awaiting-approval": {
-        title: `Plan needs approval for ${payload.taskId}`,
+        title: `Plan needs approval for ${taskId}`,
         message: `Task "${identifier}" needs your approval before it can proceed`,
         priority: "high",
       },
       "awaiting-user-review": {
-        title: `User review needed for ${payload.taskId}`,
+        title: `User review needed for ${taskId}`,
         message: `Task "${identifier}" needs human review before it can proceed`,
         priority: "high",
       },
       "planning-awaiting-input": {
-        title: `Planning input needed for ${payload.taskId}`,
+        title: `Planning input needed for ${taskId}`,
         message: `Task "${identifier}" is awaiting your input during planning`,
+        priority: "high",
+      },
+      "fallback-used": {
+        title: `Fallback model used${payload.taskId ? ` for ${payload.taskId}` : ""}`,
+        message: `Fusion switched from ${String(payload.metadata?.primaryModel ?? "primary model")} to ${String(payload.metadata?.fallbackModel ?? "fallback model")} after a retryable failure (${String(payload.metadata?.triggerPoint ?? "unknown trigger")}).`,
         priority: "high",
       },
     };

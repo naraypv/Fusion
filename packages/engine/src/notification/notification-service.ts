@@ -228,6 +228,15 @@ export class NotificationService {
     );
   }
 
+  async dispatch(eventType: NotificationEvent, payload: NotificationPayload): Promise<void> {
+    if (!this.notificationsEnabled) {
+      return;
+    }
+
+    const dedupTaskId = payload.taskId ?? "global";
+    this.maybeNotify(dedupTaskId, eventType, payload);
+  }
+
   private createTaskPayload(task: Task, event: NotificationEvent): NotificationPayload {
     return {
       taskId: task.id,

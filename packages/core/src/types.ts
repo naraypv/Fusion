@@ -208,7 +208,15 @@ export interface WorkflowStep {
 
 /** Input for creating a new workflow step. */
 /** Event types that can trigger ntfy notifications */
-export type NtfyNotificationEvent = "in-review" | "merged" | "failed" | "awaiting-approval" | "awaiting-user-review" | "planning-awaiting-input" | "gridlock";
+export type NtfyNotificationEvent =
+  | "in-review"
+  | "merged"
+  | "failed"
+  | "awaiting-approval"
+  | "awaiting-user-review"
+  | "planning-awaiting-input"
+  | "gridlock"
+  | "fallback-used";
 
 /** Known notification event types. Providers may support additional custom events. */
 export const NOTIFICATION_EVENTS = [
@@ -219,6 +227,7 @@ export const NOTIFICATION_EVENTS = [
   "awaiting-user-review",
   "planning-awaiting-input",
   "gridlock",
+  "fallback-used",
 ] as const;
 
 /** Notification event type. Known events plus provider-specific custom events. */
@@ -226,7 +235,7 @@ export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number] | (string &
 
 /** Standard payload shape shared across notification providers. */
 export interface NotificationPayload {
-  taskId: string;
+  taskId?: string;
   taskTitle?: string;
   taskDescription?: string;
   event: NotificationEvent;

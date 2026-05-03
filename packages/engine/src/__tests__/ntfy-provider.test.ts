@@ -42,6 +42,7 @@ describe("NtfyNotificationProvider", () => {
     ["awaiting-approval", "Plan needs approval for FN-1", "needs your approval", "high"],
     ["awaiting-user-review", "User review needed for FN-1", "needs human review", "high"],
     ["planning-awaiting-input", "Planning input needed for FN-1", "awaiting your input", "high"],
+    ["fallback-used", "Fallback model used for FN-1", "switched from", "high"],
   ])("maps %s event correctly", async (event, expectedTitle, messagePart, priority) => {
     await provider.sendNotification(event as any, { taskId: "FN-1", taskTitle: "T", event: event as any });
 
@@ -62,6 +63,7 @@ describe("NtfyNotificationProvider", () => {
     expect(provider.isEventSupported("awaiting-approval" as any)).toBe(true);
     expect(provider.isEventSupported("awaiting-user-review" as any)).toBe(true);
     expect(provider.isEventSupported("planning-awaiting-input" as any)).toBe(true);
+    expect(provider.isEventSupported("fallback-used" as any)).toBe(true);
     expect(provider.isEventSupported("custom-event" as any)).toBe(false);
   });
 

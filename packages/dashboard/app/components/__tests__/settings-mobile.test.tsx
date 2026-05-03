@@ -28,7 +28,7 @@ const defaultSettings = {
   defaultPresetBySize: {},
   ntfyEnabled: false,
   ntfyTopic: undefined,
-  ntfyEvents: ["in-review", "merged", "failed", "awaiting-approval", "awaiting-user-review"],
+  ntfyEvents: ["in-review", "merged", "failed", "awaiting-approval", "awaiting-user-review", "fallback-used"],
   webhookEnabled: false,
   webhookUrl: undefined,
   webhookFormat: undefined,

@@ -7,6 +7,7 @@ import {
   buildNtfyClickUrl,
   isNtfyEventEnabled,
   resolveNtfyEvents,
+  notifyFallbackUsed,
 } from "../notifier.js";
 import { NotificationService } from "../notification/notification-service.js";
 
@@ -68,6 +69,7 @@ describe("Ntfy notifier helpers", () => {
     expect(DEFAULT_NTFY_EVENTS).toContain("planning-awaiting-input");
     expect(resolveNtfyEvents(undefined)).toContain("planning-awaiting-input");
     expect(DEFAULT_NTFY_EVENTS).toContain("gridlock");
+    expect(DEFAULT_NTFY_EVENTS).toContain("fallback-used");
   });
 
   it("checks planning-awaiting-input event enablement", () => {
@@ -1121,6 +1123,35 @@ describe("NtfyNotifier", () => {
       );
 
       await sharedService.stop();
+    });
+
+    it("dispatches and deduplicates fallback-used notifications", async () => {
+      notifier = new NtfyNotifier(store);
+      await notifier.start();
+
+      await notifyFallbackUsed({
+        primaryModel: "anthropic/claude-sonnet-4-5",
+        fallbackModel: "openai/gpt-4o",
+        triggerPoint: "session-creation",
+        taskId: "FN-900",
+        taskTitle: "Fallback task",
+      });
+      await notifyFallbackUsed({
+        primaryModel: "anthropic/claude-sonnet-4-5",
+        fallbackModel: "openai/gpt-4o",
+        triggerPoint: "session-creation",
+        taskId: "FN-900",
+        taskTitle: "Fallback task",
+      });
+      await flushAsyncWork();
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://ntfy.sh/test-topic",
+        expect.objectContaining({
+          body: expect.stringContaining("switched from anthropic/claude-sonnet-4-5 to openai/gpt-4o"),
+        }),
+      );
     });
 
     it("allows notifications for different tasks independently", async () => {

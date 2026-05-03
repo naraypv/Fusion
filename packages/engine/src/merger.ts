@@ -155,6 +155,7 @@ import {
 import { describeModel, promptWithFallback } from "./pi.js";
 import { accumulateSessionTokenUsage } from "./session-token-usage.js";
 import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
+import { notifyFallbackUsed } from "./notifier.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import type { WorktreePool } from "./worktree-pool.js";
 import { AgentLogger } from "./agent-logger.js";
@@ -2336,6 +2337,8 @@ You are assisting with a paused \`git pull --rebase\`.
       ? settings.defaultModelIdOverride
       : settings.defaultModelId,
     defaultThinkingLevel: settings.defaultThinkingLevel,
+    taskId,
+    onFallbackModelUsed: notifyFallbackUsed,
   });
 
   const prompt = [

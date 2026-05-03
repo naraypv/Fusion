@@ -137,6 +137,7 @@ describe("WebhookNotificationProvider", () => {
     ["awaiting-user-review", "needs human review before it can proceed"],
     ["planning-awaiting-input", "is awaiting your input during planning"],
     ["gridlock", "Pipeline gridlocked"],
+    ["fallback-used", "Fusion recovered by switching from"],
     ["unknown-event", 'Event "unknown-event" for task My Task'],
   ])("message formatting for %s", async (event, expectedPart) => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, statusText: "OK" });

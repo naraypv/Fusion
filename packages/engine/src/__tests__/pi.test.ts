@@ -681,6 +681,93 @@ describe("piLog structured diagnostics", () => {
     expect(hasModelLog).toBe(true);
   });
 
+  it("fires fallback hook on session-creation fallback", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const onFallbackModelUsed = vi.fn();
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockRejectedValueOnce(new Error("429 Too Many Requests"))
+      .mockResolvedValueOnce({
+        session: {
+          model: { provider: "test", id: "fallback-model" },
+          prompt: vi.fn(),
+          subscribe: vi.fn(),
+          dispose: vi.fn(),
+          setThinkingLevel: vi.fn(),
+          sessionFile: undefined,
+        },
+      } as any);
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      taskId: "FN-1",
+      taskTitle: "My Task",
+      onFallbackModelUsed,
+    });
+
+    expect(onFallbackModelUsed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        triggerPoint: "session-creation",
+        primaryModel: "test/test-model",
+        fallbackModel: "test/test-model",
+        taskId: "FN-1",
+      }),
+    );
+  });
+
+  it("fires fallback hook on prompt-time fallback", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const onFallbackModelUsed = vi.fn();
+
+    const primarySession = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn().mockRejectedValue(new Error("429 Too Many Requests")),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    const fallbackSession = {
+      model: { provider: "test", id: "fallback-model" },
+      prompt: vi.fn().mockResolvedValue(undefined),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock
+      .mockResolvedValueOnce({ session: primarySession } as any)
+      .mockResolvedValueOnce({ session: fallbackSession } as any);
+
+    const { session } = await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test",
+      defaultProvider: "test",
+      defaultModelId: "primary-model",
+      fallbackProvider: "test",
+      fallbackModelId: "fallback-model",
+      taskId: "FN-2",
+      onFallbackModelUsed,
+    });
+
+    await (session as any).promptWithFallback("prompt text");
+
+    expect(onFallbackModelUsed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        triggerPoint: "prompt-time",
+        taskId: "FN-2",
+      }),
+    );
+  });
+
   it("logs warning on primary model failure and fallback attempt", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
     createAgentSessionMock.mockReset();
