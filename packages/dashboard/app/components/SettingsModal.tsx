@@ -1970,6 +1970,25 @@ export function SettingsModal({
                 immediate check at any time.
               </small>
             </div>
+            <div className="form-group">
+              <label htmlFor="autoReloadOnVersionChange" className="checkbox-label">
+                <input
+                  id="autoReloadOnVersionChange"
+                  type="checkbox"
+                  checked={form.autoReloadOnVersionChange !== false}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, autoReloadOnVersionChange: e.target.checked }))
+                  }
+                />
+                Auto-reload dashboard on version change
+              </label>
+              <small>
+                When enabled (default), the dashboard automatically reloads when it
+                detects a new build version — either from server rebuilds or service
+                worker updates. Disable this to stay on the current version until you
+                manually refresh.
+              </small>
+            </div>
           </>
         );
       case "global-models": {

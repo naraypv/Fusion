@@ -48,6 +48,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   updateCheckEnabled: true,
   fnBinaryCheckEnabled: true,
   updateCheckFrequency: "daily",
+  autoReloadOnVersionChange: true,
   showGitHubStarButton: true,
   modelOnboardingComplete: undefined,
   useClaudeCli: undefined,

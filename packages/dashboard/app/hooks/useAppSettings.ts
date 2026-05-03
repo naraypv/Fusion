@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchConfig, fetchSettings, updateSettings } from "../api";
+import { fetchConfig, fetchSettings, updateSettings, updateGlobalSettings } from "../api";
+import { setAutoReloadEnabled } from "../versionCheck";
 
 /**
  * Settings state and actions consumed by the dashboard App shell.
@@ -20,10 +21,12 @@ export interface UseAppSettingsResult {
   memoryEnabled: boolean;
   devServerEnabled: boolean;
   todosEnabled: boolean;
+  autoReloadOnVersionChange: boolean;
   toggleAutoMerge: () => Promise<void>;
   toggleGlobalPause: () => Promise<void>;
   toggleEnginePause: () => Promise<void>;
   toggleShowQuickChatFAB: () => Promise<void>;
+  toggleAutoReloadOnVersionChange: () => Promise<void>;
   /** Re-fetches settings from the backend to pick up changes made externally (e.g., by SettingsModal). */
   refresh: () => Promise<void>;
 }
@@ -47,6 +50,7 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
   const [memoryEnabled, setMemoryEnabled] = useState(false);
   const [devServerEnabled, setDevServerEnabled] = useState(false);
   const [todosEnabled, setTodosEnabled] = useState(false);
+  const [autoReloadOnVersionChange, setAutoReloadOnVersionChangeState] = useState(true);
 
   /**
    * Fetches config and settings from the backend and updates local state.
@@ -78,6 +82,10 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
       setMemoryEnabled(features.memoryView === true);
       setDevServerEnabled(features.devServerView === true || features.devServer === true);
       setTodosEnabled(features.todoView === true);
+      // Sync the module-level auto-reload guard with the persisted setting
+      const autoReload = settings.autoReloadOnVersionChange !== false;
+      setAutoReloadOnVersionChangeState(autoReload);
+      setAutoReloadEnabled(autoReload);
     }
 
     setSettingsLoaded(true);
@@ -144,6 +152,19 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
     }
   }, [showQuickChatFAB, projectId]);
 
+  const toggleAutoReloadOnVersionChange = useCallback(async () => {
+    const next = !autoReloadOnVersionChange;
+    setAutoReloadOnVersionChangeState(next);
+    setAutoReloadEnabled(next);
+
+    try {
+      await updateGlobalSettings({ autoReloadOnVersionChange: next });
+    } catch {
+      setAutoReloadOnVersionChangeState(!next);
+      setAutoReloadEnabled(!next);
+    }
+  }, [autoReloadOnVersionChange]);
+
   return {
     maxConcurrent,
     rootDir,
@@ -160,10 +181,12 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
     memoryEnabled,
     devServerEnabled,
     todosEnabled,
+    autoReloadOnVersionChange,
     toggleAutoMerge,
     toggleGlobalPause,
     toggleEnginePause,
     toggleShowQuickChatFAB,
+    toggleAutoReloadOnVersionChange,
     refresh,
   };
 }
