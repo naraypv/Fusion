@@ -1,3 +1,8 @@
+// @vitest-environment jsdom
+// Uses DOMException("Aborted", "AbortError") whose constructor.name behaves
+// differently in node (resolves to "DOMException") vs jsdom ("AbortError"),
+// which the proxy error classifier asserts on.
+
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { request, get } from "../test-request.js";

@@ -16,7 +16,14 @@ export default defineConfig({
     },
   },
   test: {
-    environment: "jsdom",
+    // `app/**` is React UI — needs jsdom + CSS. `src/**` is the Express
+    // backend, mostly Node-only logic; running it in node env trims jsdom
+    // env+CSS-include cost. The handful of src tests that genuinely need DOM
+    // opt-in via `// @vitest-environment jsdom`.
+    environment: "node",
+    environmentMatchGlobs: [
+      ["app/**", "jsdom"],
+    ],
     // Process CSS imports so jsdom-based tests that assert on getComputedStyle
     // see the actual rules from co-located component CSS files.
     css: { include: [/.+/] },
