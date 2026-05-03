@@ -225,6 +225,23 @@ describe("agents-view mobile CSS", () => {
     expect(block).toContain("flex-wrap: wrap");
   });
 
+  it("keeps mobile split layout constrained so inner panes own vertical scrolling", () => {
+    expect(mobileMediaBlock).toContain(".agents-split-layout");
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-layout")).toContain("min-height: 0");
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-layout")).toContain("height: 100%");
+
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-sidebar")).toContain("min-height: 0");
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-sidebar")).toContain("overflow: hidden");
+
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-detail")).toContain("min-height: 0");
+    expect(extractRuleBlock(mobileMediaBlock, ".agents-split-detail")).toContain("overflow: hidden");
+
+    const contentBlock = extractRuleBlock(mobileMediaBlock, ".agents-view-content");
+    expect(contentBlock).toContain("overflow-y: auto");
+    expect(contentBlock).toContain("-webkit-overflow-scrolling: touch");
+    expect(contentBlock).toContain("overscroll-behavior: contain");
+  });
+
   it("stacks grouped filter controls on mobile", () => {
     expect(mobileMediaBlock).toContain(".agent-controls-filters");
     const block = extractRuleBlock(mobileMediaBlock, ".agent-controls-filters");

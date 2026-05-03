@@ -272,6 +272,8 @@ describe("AgentsView", () => {
       mockViewportMode.mockReturnValue("mobile");
       const { container } = render(<AgentsView addToast={mockAddToast} />);
 
+      expect(container.querySelector(".agents-split-layout")).toBeTruthy();
+      expect(container.querySelector(".agents-view-content")).toBeTruthy();
       expect(container.querySelector(".agents-split-sidebar")).toBeTruthy();
       expect(container.querySelector(".agents-split-detail--hidden-mobile")).toBeTruthy();
 
@@ -279,14 +281,18 @@ describe("AgentsView", () => {
 
       await waitFor(() => {
         expect(screen.getByRole("button", { name: "Agents" })).toBeTruthy();
+        expect(screen.getByTestId("agent-detail-view")).toHaveAttribute("data-inline", "true");
       });
 
       expect(container.querySelector(".agents-split-sidebar--hidden-mobile")).toBeTruthy();
+      expect(container.querySelector(".agents-split-detail--hidden-mobile")).toBeNull();
+
       fireEvent.click(screen.getByRole("button", { name: "Agents" }));
 
       await waitFor(() => {
         expect(screen.getByText("Select an agent")).toBeInTheDocument();
       });
+      expect(container.querySelector(".agents-split-detail--hidden-mobile")).toBeTruthy();
     });
 
     it("shows a loading indicator while the initial agents fetch is pending", async () => {
