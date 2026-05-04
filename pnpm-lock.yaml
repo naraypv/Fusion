@@ -38,6 +38,9 @@ importers:
       '@mariozechner/pi-coding-agent':
         specifier: ^0.72.1
         version: 0.72.1(@modelcontextprotocol/sdk@1.28.0(zod@4.3.6))(ws@8.20.0)(zod@4.3.6)
+      dockerode:
+        specifier: ^4.0.12
+        version: 4.0.12
       express:
         specifier: ^5.1.0
         version: 5.2.1

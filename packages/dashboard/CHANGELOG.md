@@ -1,5 +1,17 @@
 # @fusion/dashboard
 
+## 0.18.0
+
+### Patch Changes
+
+- @fusion/core@0.18.0
+- @fusion/engine@0.18.0
+- @fusion-plugin-examples/dependency-graph@0.1.6
+- @fusion-plugin-examples/droid-runtime@0.1.1
+- @fusion-plugin-examples/hermes-runtime@0.2.25
+- @fusion-plugin-examples/openclaw-runtime@0.2.25
+- @fusion-plugin-examples/paperclip-runtime@0.2.25
+
 ## 0.17.2
 
 ### Patch Changes
