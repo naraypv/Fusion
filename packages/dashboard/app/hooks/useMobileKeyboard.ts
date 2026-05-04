@@ -64,17 +64,24 @@ function getKeyboardMetrics(): KeyboardMetrics {
     updateBaselineViewportHeight(vv.height);
   }
 
-  // Android/Chrome style overlap.
+  // Android/Chrome style overlap. Only treat as open while an input is
+  // actually focused — without this, the (often slow) visualViewport
+  // dismissal animation keeps reporting overlap > 0 for hundreds of ms
+  // after the user has tapped Done, which leaves App-level layout (mobile
+  // nav bar visibility, project-content padding) stuck in keyboard-up
+  // mode and makes downstream components (ChatView) jump on settle.
   const chromeOverlap = Math.max(0, window.innerHeight - vv.offsetTop - vv.height);
-  if (chromeOverlap > 0) {
+  if (chromeOverlap > 0 && focused) {
     return { overlap: chromeOverlap, open: true, vvHeight: vv.height, vvOffsetTop: offsetTop };
   }
 
-  // iOS fallback (window.innerHeight shrinks with keyboard).
+  // iOS fallback (window.innerHeight shrinks with keyboard). Same focused
+  // requirement as above — the dismissal animation otherwise leaves the
+  // gap > the open-threshold for the duration of the slide.
   const baselineHeight = getBaselineViewportHeight();
   const gap = Math.max(0, baselineHeight - vv.offsetTop - vv.height);
 
-  if (gap >= IOS_FALLBACK_MIN_GAP_PX) {
+  if (gap >= IOS_FALLBACK_MIN_GAP_PX && focused) {
     return { overlap: gap, open: true, vvHeight: vv.height, vvOffsetTop: offsetTop };
   }
 

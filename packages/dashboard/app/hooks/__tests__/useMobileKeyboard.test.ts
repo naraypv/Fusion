@@ -122,6 +122,10 @@ describe("useMobileKeyboard", () => {
       vvHeight: 600,
     });
 
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
+
     const { result } = renderHook(() => useMobileKeyboard());
 
     await waitFor(() => {
@@ -148,6 +152,8 @@ describe("useMobileKeyboard", () => {
       expect(result.current.keyboardOverlap).toBe(100);
       expect(result.current.viewportHeight).toBe(700);
     });
+
+    input.remove();
   });
 
   it("unsubscribes listeners and resets state when disabled", async () => {
@@ -155,6 +161,10 @@ describe("useMobileKeyboard", () => {
       innerHeight: 760,
       vvHeight: 600,
     });
+
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
 
     const { result, rerender } = renderHook(
       ({ enabled }) => useMobileKeyboard({ enabled }),
@@ -178,6 +188,8 @@ describe("useMobileKeyboard", () => {
 
     expect(mockVV.removeEventListener).toHaveBeenCalledWith("resize", resizeListener);
     expect(mockVV.removeEventListener).toHaveBeenCalledWith("scroll", scrollListener);
+
+    input.remove();
   });
 
   it("uses iOS Safari fallback when innerHeight shrinks with visualViewport", async () => {
@@ -185,6 +197,10 @@ describe("useMobileKeyboard", () => {
       innerHeight: 844,
       vvHeight: 844,
     });
+
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
 
     const { result } = renderHook(() => useMobileKeyboard());
 
@@ -212,6 +228,8 @@ describe("useMobileKeyboard", () => {
       expect(result.current.keyboardOverlap).toBe(324);
       expect(result.current.viewportHeight).toBe(520);
     });
+
+    input.remove();
   });
 
   it("reports moderate iOS fallback overlap below 80px", async () => {
@@ -219,6 +237,10 @@ describe("useMobileKeyboard", () => {
       innerHeight: 844,
       vvHeight: 844,
     });
+
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+    input.focus();
 
     const { result } = renderHook(() => useMobileKeyboard());
 
@@ -245,6 +267,8 @@ describe("useMobileKeyboard", () => {
       expect(result.current.keyboardOverlap).toBe(40);
       expect(result.current.viewportHeight).toBe(804);
     });
+
+    input.remove();
   });
 
   it("uses focused-input fallback for small viewport gaps", async () => {
@@ -331,6 +355,50 @@ describe("useMobileKeyboard", () => {
       expect(result.current.keyboardOverlap).toBe(0);
       expect(result.current.viewportHeight).toBe(824);
       expect(result.current.keyboardOpen).toBe(true);
+    });
+
+    input.remove();
+  });
+
+  it("reports keyboardOpen=false the instant focus leaves an input even while visualViewport still reports keyboard-up size", async () => {
+    // Regression for the ChatView "composer crawls down with the keyboard"
+    // bug: on iOS the visualViewport keeps reporting the small mid-dismiss
+    // size for hundreds of ms after the user blurs an input. App-level
+    // layout (mobile nav bar, project-content padding) must flip back to
+    // no-keyboard mode immediately on blur, not when vv finally settles.
+    const { listeners, mockVV } = setupMobileVisualViewport({
+      innerHeight: 844,
+      vvHeight: 844,
+    });
+
+    const input = document.createElement("textarea");
+    document.body.appendChild(input);
+
+    const { result } = renderHook(() => useMobileKeyboard());
+
+    // Bring up the keyboard: focus the input, then shrink the viewport.
+    input.focus();
+    Object.defineProperty(window, "innerHeight", { value: 520, writable: true, configurable: true });
+    Object.defineProperty(mockVV, "height", { value: 520, writable: true, configurable: true });
+
+    act(() => {
+      for (const cb of listeners.resize) cb();
+    });
+
+    await waitFor(() => {
+      expect(result.current.keyboardOpen).toBe(true);
+    });
+
+    // Blur, but leave visualViewport still reporting the small mid-dismiss
+    // size — the dismissal animation takes hundreds of ms on iOS.
+    input.blur();
+
+    act(() => {
+      for (const cb of listeners.resize) cb();
+    });
+
+    await waitFor(() => {
+      expect(result.current.keyboardOpen).toBe(false);
     });
 
     input.remove();
