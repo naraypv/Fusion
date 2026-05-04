@@ -2553,10 +2553,10 @@ describe("TaskDetailModal", () => {
       );
 
       const segments = container.querySelectorAll(".step-progress-segment");
-      expect((segments[0] as HTMLElement).style.backgroundColor).toBe("var(--color-success, #3fb950)");
-      expect((segments[1] as HTMLElement).style.backgroundColor).toBe("var(--todo, #58a6ff)");
-      expect((segments[2] as HTMLElement).style.backgroundColor).toBe("var(--border, #30363d)");
-      expect((segments[3] as HTMLElement).style.backgroundColor).toBe("var(--text-dim, #484f58)");
+      expect((segments[0] as HTMLElement).style.backgroundColor).toBe("var(--color-success)");
+      expect((segments[1] as HTMLElement).style.backgroundColor).toBe("var(--todo)");
+      expect((segments[2] as HTMLElement).style.backgroundColor).toBe("var(--border)");
+      expect((segments[3] as HTMLElement).style.backgroundColor).toBe("var(--text-dim)");
     });
 
     it("displays singular completion label for one-step tasks", () => {

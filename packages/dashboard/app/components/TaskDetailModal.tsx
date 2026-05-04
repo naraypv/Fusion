@@ -117,14 +117,14 @@ function resolveEffectivePlanning(
 function getStepStatusColor(status: string): string {
   switch (status) {
     case "done":
-      return "var(--color-success, #3fb950)";
+      return "var(--color-success)";
     case "in-progress":
-      return "var(--todo, #58a6ff)";
+      return "var(--todo)";
     case "skipped":
-      return "var(--text-dim, #484f58)";
+      return "var(--text-dim)";
     case "pending":
     default:
-      return "var(--border, #30363d)";
+      return "var(--border)";
   }
 }
 
