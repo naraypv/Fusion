@@ -33,3 +33,120 @@ All Items 1-4 should be able to be set up via CLI commands and OAuth login flow 
 5. Fusion does not have native DSPy support. That should be implemented using the DSPy repo in the system that has multi OAuth account based LM call support which is different from the classic DSPy implementation. This Fusion DSPy must be well engineered that the entire Fusion request and ticketing system must be contacting large language models using the DSPy based calls and template functions. This is a large implementation in which all the native Fusion functioning modules will have a parallel DSPy based function/tool/chat call system so that all agent behavior is turned into DSPy based declaritive calls that the system is upgraded to production readiness that will be able to serve a large client population working in the serves or be dependable for scientific workflows by removing the stochastic noise or hallucination risk by the ability of DSPy to do declaratively program the Large language models. This will force all fusion calls to LLMs via DSPy infrastructure so that it will always give high quality production ready responses that can be depended on long tailed scientific and software tasks. This should not replace the old fusion callstack. Instead, a DSPy menu item should be added to the general and project level tasks that will have several toggle controls that we will be adding systematically overtime as this evolves. Currently each of these must have a single toggle showing "Route all LLM calls via DSPy". If this is toggled on, then it will make all traffic routing of the LLM calls via DSPy based declarative programming based routing which will automatically replace all the LLM functional call function by function to DSPy format as a parallel DSPy only routing infrastructure to replicate all the functionalities of the Fusion infrastructure that has LLM calls. For the user, this does not change any behavior. But underneath everything changes to DSPy routines. 
 
 Once this is completed and tests pass, install this new fusion locally. Initial the install using the old fusion system key (fn_65238150c60b558aa413a3ec471dedab) and test it locally. Once its production ready accoriding to you, terminate the session and update the produciton branch and push to production branch inthe github. Then merge the main branch to production branch locally and in github. The test this again, debug any errors or update related breakages and put in safe guards to prevent future update related breakages both ways. THen once is ensured to be functional even after source update and merge of main, push to github to the production branch once again. THen stop and record all required memory, state and documentation files for agents and humans to pick this up from this state. Then let me know of the completion status. 
+
+
+---
+
+# Goals Set - 2: Atomistic planning and slop-janitor as core Fusion capability
+
+This section extends the fork’s intent: treat **durable, ordered goal plans** and **plan–improve–implement–review loops** (as implemented by `slop-janitor` and the Codex exec-plan pattern) as a **first-class Fusion capability**, not only as an external tool run manually against `.agent/user-intent.md`.
+
+**Reference repo:** `/media/naray/backup_np_2/github/slop-janitor` (Rust CLI + Codex app-server integration, `.agent/goals/`, `.agent/work/`, skills under `.agents/skills/`).
+
+**Non-goals for this goal set:** Replacing Fusion’s engine with Codex; requiring every user to install Codex. Integration must respect upstream Fusion constraints (AGENTS.md: static `@fusion/*` imports, no blocking `execSync` for user commands, tests required for behavior changes).
+
+---
+
+## Recursive step-by-step plan (integration decomposition)
+
+Each level expands the previous into smaller units until each leaf is a single deliverable or a single verification command.
+
+### Level 0 — Outcome
+
+Fusion can **produce, persist, and execute** atomistic plans (goals or exec-plan-shaped work) tied to tasks or missions, with optional **external runner** compatibility so the same artifacts work with `slop-janitor goals run` when Codex is available.
+
+### Level 1 — Major phases
+
+1. **Inventory:** Map where Fusion already stores prompts, task specs, workflow steps, and agent instructions (`packages/core`, `packages/engine`, `packages/cli`, `packages/dashboard`).
+2. **Contract:** Define the canonical on-disk artifact shape Fusion owns (minimum: ordered goals with `objective`, `acceptance_criteria`, `validation`, `status`, `depends_on`; optional: ledger events). Align field names with slop-janitor’s `goals.json` where practical to avoid duplicate mental models.
+3. **Integration mode decision:** Choose one primary path (document the other as optional):
+   - **A. Subprocess adapter:** Fusion invokes `slop-janitor` (or a thin wrapper) when configured, same as any CLI integration; artifacts live under `.fusion/` or `.agent/` per project policy.
+   - **B. In-process library:** Port or reimplement only the **state machine** (goal ordering, checkpoints, validation hooks) inside `@fusion/engine` or `@fusion/core`, without binding the whole repo to Codex.
+4. **UI / CLI:** Expose “create goal plan from brief”, “approve plan”, “run next goal”, “import/export plan” in dashboard and/or `fn` CLI.
+5. **Safety:** Sandboxing, checkout leases, and “never auto-merge” rules must apply to plan-driven runs like any executor session.
+6. **Verification:** Unit tests for plan parsing and transitions; integration test with mocked runner; documentation for fork operators.
+
+### Level 2 — Per-phase atomic units (examples)
+
+- **Inventory:** List every code path that builds the “task prompt” or system prompt for triage/executor; note JSON vs markdown boundaries.
+- **Contract:** Write a JSON Schema (or TypeScript type + zod) for `goals.json` consumed and emitted by Fusion; version field `plan_format_version`.
+- **Subprocess adapter:** Resolve binary path from env + settings; capture stdout/stderr to Fusion run audit; enforce timeout and non-4040 ports for any spawned local services.
+- **In-process:** Implement `PlanRunner` interface with `loadPlan`, `completeGoal`, `appendLedger`; engine calls LLM for “execute current goal” using existing model resolution.
+- **UI:** Read-only plan viewer first; then approve/run controls behind feature flag.
+
+### Level 3 — Leaf stop conditions (each must be observable)
+
+- Schema validates sample plans from slop-janitor and from hand-written fixtures.
+- One E2E test: “create plan → mark goal complete → ledger line appended.”
+- Docs: `docs/planning-integration.md` (or fork-only doc path) describes artifact layout and how to run slop-janitor against the same folder.
+
+---
+
+## Prompt A — Optimal prompt for Fusion-side design and implementation (use in Cursor on the Fusion repo)
+
+Use this **after** slop-janitor (or `create-goals`) has produced a concrete plan under `.agent/goals/<id>/` or an ExecPlan under `.agent/work/`, and you have read `.agent/user-intent.md` Goals Set 1 and 2.
+
+```text
+You are working in the Fusion fork repository. Read AGENTS.md and obey it (imports, execAsync for user commands, tests, port 4040).
+
+Goal: Design and implement “atomistic planning” as core Fusion functionality, aligned with slop-janitor’s durable plan model (.agent/goals: brief.md, goals.json, ledger.jsonl) and PLANS.md-style exec plans under .agent/work/ when relevant.
+
+Constraints:
+- Do not break upstream mergeability: keep changes modular (new module or adapter boundary).
+- Preserve existing LLM call paths unless Goals Set 1 “DSPy routing” is already implemented; this task may add parallel plan artifacts only.
+- Every new behavior needs tests under __tests__/ per repo convention.
+
+Deliverables:
+1. A short design note in-repo (path you choose under docs/ or .agent/) listing: artifact paths, JSON schema/version, how tasks link to a plan ID, and whether Fusion invokes slop-janitor as subprocess or reimplements a minimal runner.
+2. Typed plan load/save in @fusion/core (or appropriate package).
+3. Engine hook: when a task enters a “planned execution” mode, load active goal, inject objective + acceptance criteria into the agent prompt, and record completion back to goals.json + ledger.
+4. CLI or dashboard stub (feature-flagged) to list goals and mark status — smallest vertical slice that proves the loop.
+
+Start by grepping for task prompt assembly and AgentStore/session creation; propose the smallest diff that closes the loop end-to-end, then iterate.
+```
+
+---
+
+## Prompt B — Optimal prompt for slop-janitor to integrate Fusion properly (use from Fusion repo root with linked repo)
+
+Use this with **slop-janitor** when Fusion is the primary cwd and you need the janitor/builder/goals runner to **see both repos** and emit plans that reference real Fusion paths.
+
+Prerequisites: clean git state in Fusion (and slop-janitor if linked); `CODEX_WORKSPACE` set per slop-janitor README.
+
+```text
+Primary repository: this Fusion fork. Linked repository: /media/naray/backup_np_2/github/slop-janitor (read-only is fine unless you are editing slop-janitor itself).
+
+Read Fusion/.agent/user-intent.md Goals Set 1 and Goals Set 2 in full. Read Fusion/AGENTS.md.
+
+Task: Produce an implementation-biased goal plan or Meta Exec Plan that integrates slop-janitor-style atomistic planning as a core Fusion feature. Plans must reference concrete Fusion file paths (packages/core, packages/engine, packages/cli, packages/dashboard) and cite existing patterns (task store, run audit, settings).
+
+Requirements for each goal in goals.json:
+- objective, acceptance_criteria, validation (exact pnpm test or grep-based checks), depends_on, stop_condition.
+- Explicit non-goals so Codex does not refactor unrelated DSPy or OAuth work unless this plan’s dependency graph orders it.
+
+If using builder: set slices so early slices land the contract + types + tests; later slices add UI/CLI. If using create-goals only: keep goals ordered with no parallel ambiguity.
+
+After the plan file exists, stop for human approval before running slop-janitor goals run.
+```
+
+Example command line (operator runs from Fusion root):
+
+```bash
+export CODEX_WORKSPACE=/path/to/codex/codex-rs
+/path/to/slop-janitor/slop-janitor --linked-repo /media/naray/backup_np_2/github/slop-janitor --prompt "$(cat Fusion/.agent/snippet-use-prompt-B.txt)"
+```
+
+(Replace the `cat` path with a small file containing Prompt B if the shell struggles with length.)
+
+---
+
+## Ordering relative to Goals Set 1
+
+- **Parallel-safe:** Plan artifact types and read-only viewers can proceed in parallel with OAuth/DSPy work if they touch different packages or live behind feature flags.
+- **Serialize when:** Any change to the **same** prompt assembly pipeline or model routing as DSPy (Goals Set 1 item 5) must be sequenced: either land DSPy toggle contract first, or land plan-injection **behind** the same routing abstraction so you do not double-patch the same functions.
+
+---
+
+## Completion signal for Goals Set 2
+
+Stop when: (1) Fusion can create/update/read a versioned goal plan bound to a task or project ID, (2) at least one automated test proves plan state transitions, (3) documentation tells a human how to optionally run `slop-janitor goals run` on the same artifact directory, and (4) production-branch merge rules from Goals Set 1 still hold.
