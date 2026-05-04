@@ -167,6 +167,16 @@ async function promptSessionAndCheck(session: AgentSession, prompt: string, opti
         piLog.warn(`pi state error — failed to inspect transcript: ${inspectErr instanceof Error ? inspectErr.message : String(inspectErr)}`);
       }
     }
+    // Some OpenAI-compatible providers (notably Moonshot/Kimi) end generation
+    // with a non-standard `finish_reason: repeat` when their server-side
+    // repetition detector trips. pi-ai surfaces this as a fatal state error,
+    // but for our purposes the assistant turn is already complete — treat it
+    // as a soft stop so the heartbeat keeps running.
+    if (/Provider finish_reason:\s*repeat\b/i.test(stateError)) {
+      piLog.warn(`pi state error — treating provider finish_reason=repeat as soft stop: ${stateError}`);
+      clearSessionStateError(session);
+      return;
+    }
     throw new Error(stateError);
   }
 }
