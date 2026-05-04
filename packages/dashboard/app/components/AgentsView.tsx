@@ -1,6 +1,6 @@
 import "./AgentsView.css";
 import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense } from "react";
-import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, ChevronDown, ChevronUp, Filter, Upload, Network, SlidersHorizontal, Copy, Check } from "lucide-react";
+import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, ChevronDown, ChevronUp, Filter, Upload, Network, SlidersHorizontal, Copy, Check, ZoomIn, ZoomOut, Minimize2 } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
 import { updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings } from "../api";
 
@@ -47,6 +47,7 @@ const AGENT_ROLES: { value: AgentCapability; label: string; icon: string }[] = [
 const HEARTBEAT_MULTIPLIER_PRESETS = [0.1, 0.25, 0.5, 1, 2, 3, 5, 10] as const;
 
 const SKILL_PATH_LABEL_PATTERN = /(?:^|\/)skills\/([^/]+)\/SKILL\.md$/i;
+const ORG_CHART_ZOOM_LEVELS = [0.75, 1, 1.25, 1.5] as const;
 
 export function formatAgentSkillBadgeLabel(skillId: string): string {
   const trimmedSkillId = skillId.trim();
@@ -267,6 +268,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const [isOrgTreeLoading, setIsOrgTreeLoading] = useState(false);
   const [isControlsPanelOpen, setIsControlsPanelOpen] = useState(false);
   const [isOverviewOpen, setIsOverviewOpen] = useState(false);
+  const [orgChartZoomIndex, setOrgChartZoomIndex] = useState(1);
   const controlsPanelRef = useRef<HTMLDivElement>(null);
   const { confirm } = useConfirm();
   const controlsTriggerRef = useRef<HTMLButtonElement>(null);
@@ -706,6 +708,9 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
   const handleAgentViewChange = useCallback((nextView: "list" | "board" | "org") => {
     setAgentView(nextView);
+    if (nextView !== "org") {
+      setOrgChartZoomIndex(1);
+    }
     if (isMobileViewport && selectedAgentId) {
       handleCloseDetail();
     }
@@ -714,6 +719,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const getRoleLabel = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.label ?? role;
   const getRoleIcon = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.icon ?? "◆";
   const selectedAgent = selectedAgentId ? displayAgents.find((agent) => agent.id === selectedAgentId) ?? null : null;
+  const orgChartZoom = ORG_CHART_ZOOM_LEVELS[orgChartZoomIndex];
 
   /** Get skill badges from agent metadata */
   const getSkillBadges = (agent: Agent): string[] => {
@@ -966,27 +972,68 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             <span>Loading agents...</span>
           </div>
         ) : agentView === "org" ? (
-          <div className="agent-org-chart" data-testid="agent-org-chart">
-            {isOrgTreeLoading ? (
-              <div className="agent-org-chart__loading" role="status" aria-live="polite">
-                <RefreshCw size={18} className="spin" />
-                <span>Loading org chart...</span>
+          <div className="agent-org-chart-shell" data-testid="agent-org-chart-shell">
+            {isMobileViewport ? (
+              <div className="agent-org-chart-controls" data-testid="agent-org-chart-controls">
+                <button
+                  type="button"
+                  className="btn-icon touch-target"
+                  onClick={() => setOrgChartZoomIndex((value) => Math.max(0, value - 1))}
+                  disabled={orgChartZoomIndex === 0}
+                  aria-label="Zoom out org chart"
+                  title="Zoom out"
+                >
+                  <ZoomOut size={16} />
+                </button>
+                <span className="agent-org-chart-controls__zoom-label" aria-live="polite">{Math.round(orgChartZoom * 100)}%</span>
+                <button
+                  type="button"
+                  className="btn-icon touch-target"
+                  onClick={() => setOrgChartZoomIndex((value) => Math.min(ORG_CHART_ZOOM_LEVELS.length - 1, value + 1))}
+                  disabled={orgChartZoomIndex === ORG_CHART_ZOOM_LEVELS.length - 1}
+                  aria-label="Zoom in org chart"
+                  title="Zoom in"
+                >
+                  <ZoomIn size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="btn touch-target btn-sm agent-org-chart-controls__fit-btn"
+                  onClick={() => setOrgChartZoomIndex(1)}
+                  aria-label="Fit org chart"
+                  title="Fit org chart"
+                >
+                  <Minimize2 size={16} />
+                  Fit
+                </button>
               </div>
-            ) : displayOrgTree.length === 0 ? (
-              <AgentEmptyState onCtaClick={handleOpenNewAgent} />
-            ) : (
-              displayOrgTree.map((node) => (
-                <OrgChartNode
-                  key={node.agent.id}
-                  node={node}
-                  onSelect={openAgentDetail}
-                  getHealthStatus={getHealthStatus}
-                  getRoleIcon={getRoleIcon}
-                  getSkillBadges={getSkillBadges}
-                  selectedAgentId={selectedAgentId}
-                />
-              ))
-            )}
+            ) : null}
+            <div className="agent-org-chart-viewport" data-testid="agent-org-chart-viewport">
+              <div className={`agent-org-chart-canvas agent-org-chart-canvas--zoom-${Math.round(orgChartZoom * 100)}`}>
+                <div className="agent-org-chart" data-testid="agent-org-chart">
+                  {isOrgTreeLoading ? (
+                    <div className="agent-org-chart__loading" role="status" aria-live="polite">
+                      <RefreshCw size={18} className="spin" />
+                      <span>Loading org chart...</span>
+                    </div>
+                  ) : displayOrgTree.length === 0 ? (
+                    <AgentEmptyState onCtaClick={handleOpenNewAgent} />
+                  ) : (
+                    displayOrgTree.map((node) => (
+                      <OrgChartNode
+                        key={node.agent.id}
+                        node={node}
+                        onSelect={openAgentDetail}
+                        getHealthStatus={getHealthStatus}
+                        getRoleIcon={getRoleIcon}
+                        getSkillBadges={getSkillBadges}
+                        selectedAgentId={selectedAgentId}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
         ) : agentView === "board" ? (
           <div className="agent-board">
