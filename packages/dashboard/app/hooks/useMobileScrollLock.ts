@@ -85,10 +85,18 @@ function releaseLock(): void {
   body.style.width = bodyWidth;
   body.style.overflow = bodyOverflow;
   savedStyles = null;
-  // Snap back to where the user was before the lock started. With the body
-  // un-fixed, this scroll actually applies (vs. being a no-op while the
-  // body was overflow:hidden).
-  window.scrollTo(0, scrollY);
+  // Always snap back to the top, not to the captured `scrollY`. The
+  // captured value is only meaningful if the lock was applied before iOS
+  // had a chance to forcibly scroll the document (e.g. modal open with
+  // no focused input). For App-level activation triggered by an input
+  // gaining focus, iOS may have already scrolled the document by the
+  // time the lock effect runs — capturing that already-shifted scrollY
+  // and restoring to it would leave the dashboard pushed up after the
+  // keyboard dismisses (the original bug). The dashboard's base layout
+  // has `body { overflow: hidden }` so user-initiated scroll position
+  // is always 0 anyway.
+  window.scrollTo(0, 0);
+  void scrollY;
 }
 
 /** Test-only: reset the module-level lock state. */

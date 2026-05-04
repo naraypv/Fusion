@@ -73,7 +73,8 @@ describe("useMobileScrollLock", () => {
     expect(document.body.style.top).toBe("5px");
     expect(document.body.style.overflow).toBe("");
     expect(document.documentElement.style.overflow).toBe("");
-    expect(scrollSpy).toHaveBeenCalledWith(0, 240);
+    // Always snap to 0 on release — see hook source for rationale.
+    expect(scrollSpy).toHaveBeenCalledWith(0, 0);
   });
 
   it("does not lock when disabled", () => {
@@ -97,6 +98,6 @@ describe("useMobileScrollLock", () => {
 
     outer.unmount();
     expect(document.body.style.position).toBe("");
-    expect(scrollSpy).toHaveBeenCalledWith(0, 80);
+    expect(scrollSpy).toHaveBeenCalledWith(0, 0);
   });
 });
