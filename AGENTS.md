@@ -762,3 +762,13 @@ Cards have `--focus-ring-strong` focus style and `--card-hover` background on ho
 - **CSS regex tests in test files** — When changing mobile CSS values (e.g., `min-height`), update both the CSS and the corresponding test assertions. Use non-greedy `[^}]*` patterns for block-scoped regex, not `[\s\S]*` which can bleed across block boundaries.
 - **BEM specificity conflicts** — When a container state class (`.quick-entry-box--expanded`) and an element modifier (`.quick-entry-input--expanded`) both target the same element, the container may win due to higher specificity. Use `:not(.modifier)` to scope container rules: `.quick-entry-box--expanded .quick-entry-input:not(.quick-entry-input--expanded)`.
 - **CSS in `@media` blocks** — Don't search backwards for the nearest `@media` to check if a rule is mobile-scoped. Track brace depth to confirm the line is inside the block. Many components are defined globally even if they only visually appear on mobile.
+
+## Learned User Preferences
+
+- Treat `.agent/` planning trees (goals, work items, `user-intent.md`, active pointers) as local-only: keep them out of git commits and pushes unless the team explicitly chooses to version them (add or maintain `.gitignore` rules accordingly).
+- When using slop-janitor with Fusion as the target repo, separate plan creation (`create-goals` / builder meta-plan) from execution (`goals run`); default janitor cycles do not emit the `.agent/goals/<id>/` layout (`brief.md`, `goals.json`, `ledger.jsonl`) that `goals run` expects.
+
+## Learned Workspace Facts
+
+- Atomistic planning and slop-janitor integration intent for this fork lives in `.agent/user-intent.md` (Goals Set 2); executed goal queues may live under `.agent/goals/<id>/` when using `slop-janitor goals run`.
+- Related orchestrator checkout for planning work: `/media/naray/backup_np_2/github/slop-janitor` (used alongside Fusion as cwd or `--linked-repo` target per that tool’s README).
