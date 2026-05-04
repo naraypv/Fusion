@@ -16,13 +16,19 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 
-const args = globalThis.process.argv.slice(2);
-const invokedAs = basename(globalThis.process.argv[1] || "").replace(/\.(js|cjs|mjs|exe)$/i, "");
+const processRef = globalThis.process;
+const fetchRef = globalThis.fetch;
+const abortControllerRef = globalThis.AbortController;
+const setTimeoutRef = globalThis.setTimeout;
+const clearTimeoutRef = globalThis.clearTimeout;
+
+const args = processRef.argv.slice(2);
+const invokedAs = basename(processRef.argv[1] || "").replace(/\.(js|cjs|mjs|exe)$/i, "");
 const isAliasInvocation = invokedAs === "runfusion.ai" || invokedAs === "runfusion";
 
 if (isAliasInvocation && args.length === 0) {
   // No subcommand → default to dashboard.
-  globalThis.process.argv = [globalThis.process.argv[0], globalThis.process.argv[1], "dashboard"];
+  processRef.argv = [processRef.argv[0], processRef.argv[1], "dashboard"];
 }
 
 maybeAnnounceUpdateAndRefresh();
