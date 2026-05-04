@@ -1,8 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { execSync, exec } from "node:child_process";
+import { execSync, exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 import {
   runVerificationCommand as runVerificationCommandShared,
   summarizeVerificationOutput,
@@ -355,11 +356,85 @@ export function throwIfAborted(signal: AbortSignal | undefined, taskId: string):
   throw new MergeAbortedError(`Merge aborted for ${taskId}: engine shutdown requested`);
 }
 
+/**
+ * Return the union of all dirty paths in `rootDir`:
+ * - tracked files modified vs the index (`git diff --name-only`)
+ * - staged but not yet committed (`git diff --cached --name-only`)
+ * - untracked files (`git status --porcelain` lines starting with `??`)
+ *
+ * Errors are swallowed and an empty set is returned so callers are never
+ * blocked by a failing porcelain query.
+ *
+ * All three git queries use NUL-delimited output (`-z`) so paths with
+ * embedded spaces or special characters are parsed correctly without quoting.
+ */
+export async function snapshotDirtyFiles(rootDir: string): Promise<Set<string>> {
+  const paths = new Set<string>();
+  try {
+    const [unstagedOut, stagedOut, porcelainOut] = await Promise.all([
+      execFileAsync("git", ["diff", "-z", "--name-only"], { cwd: rootDir, encoding: "utf-8" }).then(
+        (r) => r.stdout,
+        () => "",
+      ),
+      execFileAsync("git", ["diff", "-z", "--cached", "--name-only"], { cwd: rootDir, encoding: "utf-8" }).then(
+        (r) => r.stdout,
+        () => "",
+      ),
+      execFileAsync("git", ["status", "-z", "--porcelain"], { cwd: rootDir, encoding: "utf-8" }).then(
+        (r) => r.stdout,
+        () => "",
+      ),
+    ]);
+
+    for (const entry of unstagedOut.split("\0")) {
+      const p = entry.trim();
+      if (p) paths.add(p);
+    }
+    for (const entry of stagedOut.split("\0")) {
+      const p = entry.trim();
+      if (p) paths.add(p);
+    }
+    // Untracked files: entries beginning with `?? ` (3-char prefix, no quoting in -z mode)
+    for (const entry of porcelainOut.split("\0")) {
+      if (!entry.startsWith("?? ")) continue;
+      const p = entry.slice(3);
+      if (p) paths.add(p);
+    }
+  } catch {
+    // Best-effort — an empty snapshot is safe: the allowlist logic will simply
+    // not add any fix-agent files, which is conservative.
+  }
+  return paths;
+}
+
 function rethrowIfMergeAborted(error: unknown): void {
   if (error instanceof Error && error.name === "MergeAbortedError") {
     throw error;
   }
 }
+
+/**
+ * Run execSync and always return a trimmed UTF-8 string.
+ * execSync may return a Buffer, string, or null depending on the encoding option;
+ * this helper normalises all three cases.
+ */
+function execSyncText(command: string, options: Parameters<typeof execSync>[1]): string {
+  const output = execSync(command, options);
+  if (output == null) return "";
+  if (typeof output === "string") return output.trim();
+  return (output as Buffer).toString("utf-8").trim();
+}
+
+/** Extra environment variables injected into verification child processes to boost concurrency. */
+const VERIFICATION_EXTRA_ENV: NodeJS.ProcessEnv = Object.fromEntries(
+  (
+    [
+      ["FUSION_TEST_TOTAL_WORKERS", "8"],
+      ["FUSION_TEST_CONCURRENCY", "4"],
+      ["FUSION_TEST_WORKSPACE_CONCURRENCY", "4"],
+    ] as [string, string][]
+  ).filter(([key]) => !(key in process.env)),
+);
 
 async function runDeterministicVerification(
   store: TaskStore,
@@ -383,6 +458,41 @@ async function runDeterministicVerification(
   const normalizedBuildCommand = buildCommand?.trim();
   const hasTestCommand = !!normalizedTestCommand;
   const hasBuildCommand = !!normalizedBuildCommand;
+
+  // ── Tree-hash verification cache (Layer 1) ─────────────────────────────
+  const effectiveTestCommand = normalizedTestCommand ?? "";
+  const effectiveBuildCommand = normalizedBuildCommand ?? "";
+  let treeSha: string | null = null;
+  try {
+    treeSha = execSync("git rev-parse HEAD^{tree}", { cwd: rootDir, stdio: "pipe" })
+      .toString()
+      .trim();
+  } catch (err) {
+    mergerLog.warn(`${taskId}: could not resolve tree sha — skipping verification cache: ${String(err)}`);
+  }
+
+  if (treeSha) {
+    const cacheHit = store.getVerificationCacheHit(treeSha, effectiveTestCommand, effectiveBuildCommand);
+    if (cacheHit) {
+      const sha7 = treeSha.slice(0, 7);
+      const msg = `Skipping deterministic verification — cached pass for tree ${sha7} (recorded at ${cacheHit.recordedAt}, by ${cacheHit.taskId ?? "unknown"})`;
+      mergerLog.log(`${taskId}: ${msg}`);
+      await store.logEntry(taskId, msg);
+      await store.appendAgentLog(taskId, msg, "text", undefined, "merger");
+      const syntheticResult: VerificationCommandResult = {
+        command: "",
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        success: true,
+        cached: true,
+      };
+      if (hasTestCommand) result.testResult = { ...syntheticResult, command: effectiveTestCommand };
+      if (hasBuildCommand) result.buildResult = { ...syntheticResult, command: effectiveBuildCommand };
+      return result;
+    }
+  }
+  // ── End cache lookup ───────────────────────────────────────────────────
 
   // Build source indicator for logging
   const testSourceLabel = testSource === "inferred" ? " [inferred]" : "";
@@ -461,6 +571,18 @@ async function runDeterministicVerification(
   mergerLog.log(`${taskId}: deterministic verification passed`);
   await store.logEntry(taskId, "Deterministic merge verification passed");
   await store.appendAgentLog(taskId, "Deterministic merge verification passed", "text", undefined, "merger");
+
+  // ── Record cache pass ──────────────────────────────────────────────────
+  if (treeSha) {
+    try {
+      store.recordVerificationCachePass(treeSha, effectiveTestCommand, effectiveBuildCommand, taskId);
+      mergerLog.log(`${taskId}: Recorded verification pass for tree ${treeSha.slice(0, 7)}`);
+      await store.logEntry(taskId, `Recorded verification pass for tree ${treeSha.slice(0, 7)}`);
+    } catch (err) {
+      mergerLog.warn(`${taskId}: could not record verification cache pass: ${String(err)}`);
+    }
+  }
+
   return result;
 }
 
@@ -473,13 +595,19 @@ async function runVerificationCommand(
   signal?: AbortSignal,
 ): Promise<VerificationCommandResult> {
   throwIfAborted(signal, taskId);
-  return runVerificationCommandShared(store, rootDir, taskId, command, type, signal, mergerLog, "merger");
+  return runVerificationCommandShared(store, rootDir, taskId, command, type, signal, mergerLog, "merger", VERIFICATION_EXTRA_ENV);
 }
 
 /**
  * Attempt an in-merge verification fix by spawning an AI agent on the main branch.
  * Returns true if verification passes after the fix, false otherwise.
  * Never throws — errors are caught and logged, and the function returns false.
+ *
+ * @param fixModifiedFiles - Mutable set that this function populates with every
+ *   path that changed during the fix agent's run (post-snapshot minus
+ *   pre-snapshot). The caller passes this set across all fix attempts so that
+ *   `commitOrAmendMergeWithFixes` can build an allowlist that covers every file
+ *   the fix agent touched, regardless of how many retries were needed.
  */
 async function attemptInMergeVerificationFix(
   store: TaskStore,
@@ -497,7 +625,11 @@ async function attemptInMergeVerificationFix(
   fixAttemptNumber?: number,
   _testCommand?: string,
   _buildCommand?: string,
+  fixModifiedFiles?: Set<string>,
 ): Promise<boolean> {
+  // Snapshot the working tree before doing anything so the diff reflects only
+  // what the fix agent touched, not pre-existing dirty state.
+  const preFixSnapshot = await snapshotDirtyFiles(rootDir);
   try {
     mergerLog.log(`${taskId}: spawning in-merge verification fix agent`);
 
@@ -631,6 +763,17 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
       });
       await accumulateSessionTokenUsage(store, taskId, session);
 
+      // Compute which paths the fix agent introduced or modified, then
+      // accumulate them into the caller's mutable set.
+      const postFixSnapshot = await snapshotDirtyFiles(rootDir);
+      if (fixModifiedFiles) {
+        for (const p of postFixSnapshot) {
+          if (!preFixSnapshot.has(p)) {
+            fixModifiedFiles.add(p);
+          }
+        }
+      }
+
       // Re-run deterministic verification command after the fix attempt.
       await store.logEntry(
         taskId,
@@ -660,6 +803,19 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
     }
   } catch (err: unknown) {
     rethrowIfMergeAborted(err);
+    // Even on failure, try to surface any paths the agent partially touched.
+    if (fixModifiedFiles) {
+      try {
+        const postFixSnapshot = await snapshotDirtyFiles(rootDir);
+        for (const p of postFixSnapshot) {
+          if (!preFixSnapshot.has(p)) {
+            fixModifiedFiles.add(p);
+          }
+        }
+      } catch {
+        // Best-effort only
+      }
+    }
     const errorMessage = err instanceof Error ? err.message : String(err);
     mergerLog.warn(`${taskId}: in-merge fix agent error: ${errorMessage}`);
     await store.logEntry(taskId, "In-merge verification fix agent encountered an error", errorMessage);
@@ -821,10 +977,16 @@ async function buildDeterministicMergeMessage(params: {
  * branch's actual step commits, so consumers of mergeDetails never see a
  * hallucinated body that talks about files that aren't in the diff.
  *
+ * Only files that are part of the squash or that the fix agent explicitly
+ * modified are staged. Any other dirty files in the working tree are left
+ * untouched and a warning is emitted for each one.
+ *
  * Returns true on a successful commit/amend. Never throws — errors are logged
  * and the function returns false (callers decide whether to abort the merge).
+ *
+ * @internal Exported for integration tests only — not part of the public API.
  */
-async function commitOrAmendMergeWithFixes(
+export async function commitOrAmendMergeWithFixes(
   rootDir: string,
   taskId: string,
   branch: string,
@@ -837,18 +999,79 @@ async function commitOrAmendMergeWithFixes(
   signal?: AbortSignal,
   aiSummary?: string | null,
   aiSubject?: string | null,
+  fixModifiedFiles: ReadonlySet<string> = new Set(),
 ): Promise<boolean> {
   try {
-    // Stage everything (squash state + verification fixes the agent left
-    // unstaged). FN-2152 still applies: filter out any submodule gitlinks
-    // before committing.
-    const { stdout: unstagedFiles } = await execAsync("git diff --name-only", {
+    // Build an allowlist of paths we are permitted to stage.
+    // Allowlist = (already staged by squash) ∪ (unstaged ∩ fixModifiedFiles)
+    // We also handle untracked files created by the fix agent.
+    //
+    // FN-2152 still applies: the submodule-gitlink filter below removes any
+    // gitlinks that slip through (nested worktrees, etc.).
+
+    // 1. Read currently-staged files (squash produced these) for diagnostic logging.
+    const { stdout: squashStagedOut } = await execAsync("git diff --cached --name-only", {
       cwd: rootDir,
       encoding: "utf-8",
     });
-    if (unstagedFiles.trim().length > 0) {
-      await execAsync("git add -A", { cwd: rootDir });
+    const squashStaged = new Set(squashStagedOut.split("\n").map((l) => l.trim()).filter(Boolean));
+
+    // 2. What is currently unstaged (tracked, modified-but-not-staged).
+    const { stdout: unstagedOut } = await execAsync("git diff --name-only", {
+      cwd: rootDir,
+      encoding: "utf-8",
+    });
+    const unstaged = new Set(unstagedOut.split("\n").map((l) => l.trim()).filter(Boolean));
+
+    // 3. Untracked files created by the fix agent (NUL-delimited, no quoting needed).
+    const { stdout: porcelainOut } = await execFileAsync("git", ["status", "-z", "--porcelain"], {
+      cwd: rootDir,
+      encoding: "utf-8",
+    });
+    const untracked = new Set<string>();
+    for (const entry of porcelainOut.split("\0")) {
+      if (!entry.startsWith("?? ")) continue;
+      const p = entry.slice(3);
+      if (p) untracked.add(p);
     }
+
+    // 4. Stage each unstaged path that the fix agent touched (batched, no shell).
+    const unstagedToStage: string[] = [];
+    for (const p of unstaged) {
+      if (fixModifiedFiles.has(p)) {
+        unstagedToStage.push(p);
+      } else {
+        mergerLog.warn(
+          `${taskId}: refusing to stage unrelated working-tree change: ${p} (not part of squash or in-merge fix)`,
+        );
+      }
+    }
+    if (unstagedToStage.length > 0) {
+      await execFileAsync("git", ["add", "--", ...unstagedToStage], { cwd: rootDir });
+    }
+
+    // 5. Stage untracked files created by the fix agent (batched, no shell).
+    const untrackedToStage: string[] = [];
+    for (const p of untracked) {
+      if (fixModifiedFiles.has(p)) {
+        untrackedToStage.push(p);
+      } else {
+        mergerLog.warn(
+          `${taskId}: refusing to stage unrelated working-tree change: ${p} (not part of squash or in-merge fix)`,
+        );
+      }
+    }
+    if (untrackedToStage.length > 0) {
+      await execFileAsync("git", ["add", "--", ...untrackedToStage], { cwd: rootDir });
+    }
+
+    // Fix 3: cap long path lists to avoid unreadable single-line logs.
+    const cap = (arr: string[], n = 20) =>
+      arr.length <= n ? arr.join(", ") : `${arr.slice(0, n).join(", ")} ... (+${arr.length - n} more)`;
+
+    mergerLog.log(
+      `${taskId}: staging allowlist — squash: [${cap([...squashStaged])}], fixModified: [${cap([...fixModifiedFiles])}]`,
+    );
 
     const { stdout: staged } = await execAsync("git diff --cached --raw", {
       cwd: rootDir,
@@ -1286,8 +1509,8 @@ export async function classifyConflict(filePath: string, cwd: string): Promise<C
  */
 export async function resolveWithOurs(filePath: string, cwd: string): Promise<void> {
   try {
-    await execAsync(`git checkout --ours "${filePath}"`, { cwd });
-    await execAsync(`git add "${filePath}"`, { cwd });
+    await execFileAsync("git", ["checkout", "--ours", "--", filePath], { cwd });
+    await execFileAsync("git", ["add", "--", filePath], { cwd });
     mergerLog.log(`Auto-resolved ${filePath} using --ours`);
   } catch (error) {
     throw new Error(`Failed to auto-resolve ${filePath} with ours: ${error}`);
@@ -1300,8 +1523,8 @@ export async function resolveWithOurs(filePath: string, cwd: string): Promise<vo
  */
 export async function resolveWithTheirs(filePath: string, cwd: string): Promise<void> {
   try {
-    await execAsync(`git checkout --theirs "${filePath}"`, { cwd });
-    await execAsync(`git add "${filePath}"`, { cwd });
+    await execFileAsync("git", ["checkout", "--theirs", "--", filePath], { cwd });
+    await execFileAsync("git", ["add", "--", filePath], { cwd });
     mergerLog.log(`Auto-resolved ${filePath} using --theirs`);
   } catch (error) {
     throw new Error(`Failed to auto-resolve ${filePath} with theirs: ${error}`);
@@ -1314,7 +1537,7 @@ export async function resolveWithTheirs(filePath: string, cwd: string): Promise<
  */
 export async function resolveTrivialWhitespace(filePath: string, cwd: string): Promise<void> {
   try {
-    await execAsync(`git add "${filePath}"`, { cwd });
+    await execFileAsync("git", ["add", "--", filePath], { cwd });
     mergerLog.log(`Auto-resolved ${filePath} (trivial whitespace)`);
   } catch (error) {
     throw new Error(`Failed to auto-resolve ${filePath} trivial conflict: ${error}`);
@@ -1887,7 +2110,7 @@ function parsePushRemoteTarget(rootDir: string, pushRemote?: string): { remote: 
 
   let branch = branchTokens.join(" ").trim();
   if (!branch) {
-    branch = execSync("git symbolic-ref --short HEAD", {
+    branch = execSyncText("git symbolic-ref --short HEAD", {
       cwd: rootDir,
       encoding: "utf-8",
       stdio: "pipe",
@@ -2331,7 +2554,7 @@ export async function aiMergeTask(
     result.error = `Branch '${branch}' not found — moving to done without merge`;
     // Best-effort: try to capture current HEAD commitSha even though branch is missing
     try {
-      const commitSha = execSync("git rev-parse HEAD", {
+      const commitSha = execSyncText("git rev-parse HEAD", {
         cwd: rootDir,
         stdio: "pipe",
         encoding: "utf-8",
@@ -2360,12 +2583,12 @@ export async function aiMergeTask(
   // causing feature code to be committed to the wrong lineage.
   try {
     throwIfAborted(options.signal, taskId);
-    const currentBranch = execSync("git symbolic-ref --short HEAD", {
+    const currentBranch = execSyncText("git symbolic-ref --short HEAD", {
       cwd: rootDir,
       encoding: "utf-8",
       stdio: "pipe",
     }).trim();
-    const mainBranch = execSync("git rev-parse --abbrev-ref origin/HEAD", {
+    const mainBranch = execSyncText("git rev-parse --abbrev-ref origin/HEAD", {
       cwd: rootDir,
       encoding: "utf-8",
       stdio: "pipe",
@@ -3063,6 +3286,9 @@ export async function aiMergeTask(
 
           if (failedResult) {
             let fixSuccess = false;
+            // Accumulate all paths the fix agent touches across retries so
+            // commitOrAmendMergeWithFixes can build a precise allowlist.
+            const verificationFixModifiedFiles = new Set<string>();
             for (let fixAttempt = 1; fixAttempt <= maxFixRetries; fixAttempt++) {
               const fixAttemptStartedAt = Date.now();
               mergerLog.log(`${taskId}: in-merge verification fix attempt ${fixAttempt}/${maxFixRetries}`);
@@ -3090,6 +3316,7 @@ export async function aiMergeTask(
                 fixAttempt,
                 effectiveTestCommand,
                 effectiveBuildCommand,
+                verificationFixModifiedFiles,
               );
 
               const fixAttemptDurationMs = Date.now() - fixAttemptStartedAt;
@@ -3135,6 +3362,7 @@ export async function aiMergeTask(
                 options.signal,
                 aiMergeSummary,
                 aiMergeSubject,
+                verificationFixModifiedFiles,
               );
               if (!finalized) {
                 // Phantom-merge guard: refused to fabricate a commit. Reset
@@ -3175,6 +3403,9 @@ export async function aiMergeTask(
           const fixType = effectiveBuildCommand ? "build" as const : "test" as const;
 
           let fixSuccess = false;
+          // Accumulate all paths the fix agent touches across retries so
+          // commitOrAmendMergeWithFixes can build a precise allowlist.
+          const buildFixModifiedFiles = new Set<string>();
           for (let fixAttempt = 1; fixAttempt <= maxFixRetries; fixAttempt++) {
             const fixAttemptStartedAt = Date.now();
             mergerLog.log(`${taskId}: in-merge verification fix attempt ${fixAttempt}/${maxFixRetries}`);
@@ -3202,6 +3433,7 @@ export async function aiMergeTask(
               fixAttempt,
               effectiveTestCommand,
               effectiveBuildCommand,
+              buildFixModifiedFiles,
             );
 
             const fixAttemptDurationMs = Date.now() - fixAttemptStartedAt;
@@ -3242,6 +3474,7 @@ export async function aiMergeTask(
               options.signal,
               aiMergeSummary,
               aiMergeSubject,
+              buildFixModifiedFiles,
             );
             if (!finalized) {
               // Phantom-merge guard: the verification fix passed but no
@@ -3371,7 +3604,7 @@ export async function aiMergeTask(
 
   // 5b. Collect merge details and store on task
   try {
-    const commitSha = execSync("git rev-parse HEAD", {
+    const commitSha = execSyncText("git rev-parse HEAD", {
       cwd: rootDir,
       stdio: "pipe",
       encoding: "utf-8",
@@ -3644,7 +3877,7 @@ export async function aiMergeTask(
 async function tryFastForwardFromOrigin(rootDir: string, taskId: string): Promise<void> {
   let currentBranch: string;
   try {
-    currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
+    currentBranch = execSyncText("git rev-parse --abbrev-ref HEAD", {
       cwd: rootDir,
       encoding: "utf-8",
       stdio: "pipe",
@@ -3665,7 +3898,7 @@ async function tryFastForwardFromOrigin(rootDir: string, taskId: string): Promis
   let behind = 0;
   let ahead = 0;
   try {
-    const counts = execSync(`git rev-list --left-right --count "origin/${currentBranch}...HEAD"`, {
+    const counts = execSyncText(`git rev-list --left-right --count "origin/${currentBranch}...HEAD"`, {
       cwd: rootDir,
       encoding: "utf-8",
       stdio: "pipe",
@@ -3903,7 +4136,7 @@ async function executeMergeAttempt(
         // If only auto-resolvable conflicts (or all were resolved), commit directly
         if (complex.length === 0) {
           // All conflicts auto-resolved, commit with fallback message
-          const staged = execSync("git diff --cached --quiet 2>&1; echo $?", {
+          const staged = execSyncText("git diff --cached --quiet 2>&1; echo $?", {
             cwd: rootDir,
             encoding: "utf-8",
           }).trim();
@@ -4025,7 +4258,7 @@ async function executeMergeAttempt(
       }
 
       // Check for conflicts
-      const conflictedOutput = execSync("git diff --name-only --diff-filter=U", {
+      const conflictedOutput = execSyncText("git diff --name-only --diff-filter=U", {
         cwd: rootDir,
         encoding: "utf-8",
       }).trim();
@@ -4206,7 +4439,7 @@ async function attemptWithSideStrategy(
     });
 
     // Check if there are still conflicts (some types can't be auto-resolved)
-    const conflictedOutput = execSync("git diff --name-only --diff-filter=U", {
+    const conflictedOutput = execSyncText("git diff --name-only --diff-filter=U", {
       cwd: rootDir,
       encoding: "utf-8",
     }).trim();
@@ -4217,7 +4450,7 @@ async function attemptWithSideStrategy(
     }
 
     // Check if there's anything staged
-    const staged = execSync("git diff --cached --quiet 2>&1; echo $?", {
+    const staged = execSyncText("git diff --cached --quiet 2>&1; echo $?", {
       cwd: rootDir,
       encoding: "utf-8",
     }).trim();
@@ -4584,7 +4817,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     }
 
     // Verify commit happened
-    const staged = execSync("git diff --cached --quiet 2>&1; echo $?", {
+    const staged = execSyncText("git diff --cached --quiet 2>&1; echo $?", {
       cwd: rootDir,
       encoding: "utf-8",
     }).trim();

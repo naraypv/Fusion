@@ -790,6 +790,57 @@
 }
 
 /* === FN-1167: Agent Org Chart + Chain of Command === */
+.agent-org-chart-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.agent-org-chart-controls {
+  display: none;
+}
+
+.agent-org-chart-controls__zoom-label {
+  min-width: calc(var(--space-2xl) * 2);
+  font-family: var(--font-mono);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.agent-org-chart-controls__fit-btn {
+  margin-left: auto;
+}
+
+.agent-org-chart-viewport {
+  overflow: auto;
+  max-width: 100%;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
+}
+
+.agent-org-chart-canvas {
+  width: max-content;
+  transform-origin: top left;
+  transition: transform var(--transition-fast);
+}
+
+.agent-org-chart-canvas--zoom-75 {
+  transform: scale(0.75);
+}
+
+.agent-org-chart-canvas--zoom-100 {
+  transform: scale(1);
+}
+
+.agent-org-chart-canvas--zoom-125 {
+  transform: scale(1.25);
+}
+
+.agent-org-chart-canvas--zoom-150 {
+  transform: scale(1.5);
+}
+
 .agent-org-chart {
   --org-chart-node-width: calc(var(--space-xl) * 9 + var(--space-xs));
   --org-chart-connector-gap: var(--space-xs);
@@ -798,8 +849,6 @@
   justify-content: flex-start;
   gap: var(--space-xl);
   padding: var(--space-lg);
-  overflow-x: auto;
-  overflow-y: visible;
   min-height: var(--org-chart-node-width);
 }
 
@@ -1005,6 +1054,25 @@
 
   .agent-metric-label {
     font-size: calc(var(--space-sm) + var(--space-xs) * 0.5);
+  }
+
+  .agent-org-chart-shell {
+    min-height: 0;
+  }
+
+  .agent-org-chart-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+  }
+
+  .agent-org-chart-controls .btn-icon,
+  .agent-org-chart-controls .agent-org-chart-controls__fit-btn {
+    min-height: calc(var(--space-lg) * 2 + var(--space-xs));
+  }
+
+  .agent-org-chart-viewport {
+    min-height: calc(var(--space-2xl) * 4);
   }
 
   .agent-org-chart {

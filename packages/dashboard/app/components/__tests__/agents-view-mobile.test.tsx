@@ -259,7 +259,10 @@ describe("agents-view mobile CSS", () => {
     expect(block).toContain("flex-wrap: wrap");
   });
 
-  it("defines mobile org chart sizing rules", () => {
+  it("defines mobile org chart sizing and pan/zoom controls rules", () => {
+    expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-controls")).toContain("display: flex");
+    expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-controls")).toContain("gap: var(--space-sm)");
+    expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-viewport")).toContain("min-height: calc(var(--space-2xl) * 4)");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("gap: var(--space-sm)");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("--org-chart-node-width: calc(var(--space-2xl) * 5)");
     expect(extractRuleBlock(mobileMediaBlock, ".org-chart-node-card")).toContain("padding: var(--space-sm)");

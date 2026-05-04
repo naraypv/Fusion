@@ -44,9 +44,9 @@ await import("@runfusion/fusion/dist/bin.js");
 // stderr isn't a TTY, or when FUSION_NO_UPDATE_CHECK=1 is set.
 function maybeAnnounceUpdateAndRefresh() {
   try {
-    if (process.env.FUSION_NO_UPDATE_CHECK === "1") return;
-    if (process.env.CI) return;
-    if (!process.stderr.isTTY) return;
+    if (globalThis.process.env.FUSION_NO_UPDATE_CHECK === "1") return;
+    if (globalThis.process.env.CI) return;
+    if (!globalThis.process.stderr.isTTY) return;
 
     const fusionDir = resolveFusionDir();
     const cachePath = join(fusionDir, "update-check.json");
@@ -65,7 +65,7 @@ function maybeAnnounceUpdateAndRefresh() {
     ) {
       const yellow = (s) => `\x1b[33m${s}\x1b[0m`;
       const dim = (s) => `\x1b[2m${s}\x1b[0m`;
-      process.stderr.write(
+      globalThis.process.stderr.write(
         yellow(
           `\nFusion ${cache.latestVersion} is available (you have ${currentVersion}).\n`,
         ) +
@@ -88,7 +88,7 @@ function maybeAnnounceUpdateAndRefresh() {
 }
 
 function resolveFusionDir() {
-  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+  const home = globalThis.process.env.HOME || globalThis.process.env.USERPROFILE || homedir();
   const preferred = join(home, ".fusion");
   if (existsSync(preferred)) return preferred;
   const legacy = join(home, ".pi", "fusion");
@@ -108,10 +108,10 @@ function readBundledFusionVersion() {
 }
 
 async function backgroundRefresh(fusionDir, cachePath, currentVersion) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1500);
+  const controller = new globalThis.AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), 1500);
   try {
-    const response = await fetch("https://registry.npmjs.org/@runfusion%2Ffusion", {
+    const response = await globalThis.fetch("https://registry.npmjs.org/@runfusion%2Ffusion", {
       signal: controller.signal,
     });
     if (!response.ok) return;
@@ -131,7 +131,7 @@ async function backgroundRefresh(fusionDir, cachePath, currentVersion) {
       writeFileSync(cachePath, JSON.stringify(result, null, 2), "utf-8");
     } catch { /* best-effort */ }
   } finally {
-    clearTimeout(timeout);
+    globalThis.clearTimeout(timeout);
   }
 }
 

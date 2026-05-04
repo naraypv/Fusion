@@ -1291,6 +1291,40 @@ describe("AgentsView", () => {
       });
     });
 
+    it("shows mobile zoom controls for org chart and keeps node selection working", async () => {
+      mockViewportMode.mockReturnValue("mobile");
+      mockFetchOrgTree.mockResolvedValue(orgTree);
+      const { container } = render(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      const controls = await screen.findByTestId("agent-org-chart-controls");
+      expect(controls).toBeTruthy();
+      expect(screen.getByText("100%")).toBeTruthy();
+
+      const viewport = screen.getByTestId("agent-org-chart-viewport");
+      expect(viewport).toBeTruthy();
+      const canvas = container.querySelector(".agent-org-chart-canvas");
+      expect(canvas?.className).toContain("agent-org-chart-canvas--zoom-100");
+
+      fireEvent.click(within(controls).getByTitle("Zoom in"));
+      await waitFor(() => {
+        expect(screen.getByText("125%")).toBeTruthy();
+        expect(container.querySelector(".agent-org-chart-canvas")?.className).toContain("agent-org-chart-canvas--zoom-125");
+      });
+
+      fireEvent.click(within(controls).getByTitle("Fit org chart"));
+      await waitFor(() => {
+        expect(screen.getByText("100%")).toBeTruthy();
+        expect(container.querySelector(".agent-org-chart-canvas")?.className).toContain("agent-org-chart-canvas--zoom-100");
+      });
+
+      fireEvent.click(screen.getByText("Director One"));
+      await waitFor(() => {
+        expect(screen.getByTestId("agent-detail-view")).toHaveTextContent("agent-child-1");
+      });
+    });
+
     it("shows org chart empty state when API returns no nodes", async () => {
       mockFetchOrgTree.mockResolvedValue([]);
       render(<AgentsView addToast={mockAddToast} />);
