@@ -924,16 +924,29 @@ export class Database {
           this.corruptionDetected = false;
           console.warn(`[fusion:db] Database recovered via WAL checkpoint: ${this.dbPath}`);
         } else {
+          const recheckMsg = ("errors" in recheck && Array.isArray(recheck.errors))
+            ? recheck.errors.slice(0, 3).join(" | ")
+            : "unknown";
           console.error(
             `[fusion:db] Database is corrupted and could not be auto-recovered. ` +
             `Run: sqlite3 ${this.dbPath} ".recover" | sqlite3 ${this.dbPath}.recovered`,
           );
+          throw new Error(
+            `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Integrity errors: ${recheckMsg}`,
+          );
         }
       } catch (err) {
+        // Re-throw our own abort error; wrap others
+        if (err instanceof Error && err.message.startsWith("[fusion:db] Refusing")) {
+          throw err;
+        }
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error(
           `[fusion:db] Database corruption detected for ${this.dbPath} and checkpoint recovery failed: ${errMsg}. ` +
           "Manual recovery required.",
+        );
+        throw new Error(
+          `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Recovery error: ${errMsg}`,
         );
       }
     }

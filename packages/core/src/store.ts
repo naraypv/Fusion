@@ -4741,13 +4741,15 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const batch = this.agentLogBuffer.slice();
     const flushCount = batch.length;
 
+    let validEntries = batch;
+    let flushSucceeded = false;
     try {
       // Filter out entries for deleted tasks to prevent FK violations
       // from poisoning the entire buffer.
       const liveTaskIds = new Set(
         (this.db.prepare("SELECT id FROM tasks").all() as Array<{ id: string }>).map((r) => r.id),
       );
-      const validEntries = batch.filter((e) => liveTaskIds.has(e.taskId));
+      validEntries = batch.filter((e) => liveTaskIds.has(e.taskId));
       const dropped = batch.length - validEntries.length;
       if (dropped > 0) {
         console.warn(
@@ -4767,10 +4769,15 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
           this.db.bumpLastModified();
         });
       }
+      flushSucceeded = true;
     } finally {
-      // Always drain the flushed slice so a failed transaction doesn't
-      // cause the same entries to block every future flush.
+      // Always drain the original slice from the buffer.
       this.agentLogBuffer.splice(0, flushCount);
+      // On transient failures (busy/IO), requeue valid entries for retry.
+      // Stale rows were already filtered out above.
+      if (!flushSucceeded && validEntries.length > 0) {
+        this.agentLogBuffer.unshift(...validEntries);
+      }
     }
   }
 

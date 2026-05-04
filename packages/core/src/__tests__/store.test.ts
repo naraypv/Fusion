@@ -4917,8 +4917,11 @@ Task with acceptance criteria
         const task = await createTestTask();
 
         await store.appendAgentLog(task.id, "to be cascaded", "text");
-        // deleteTask should flush first, then cascade-delete the entry
+        // Prove flush happens before delete
+        const flushSpy = vi.spyOn(store as any, "flushAgentLogBuffer");
         await store.deleteTask(task.id);
+        expect(flushSpy).toHaveBeenCalled();
+        flushSpy.mockRestore();
 
         const after = (store as any).db.prepare(
           "SELECT COUNT(*) as count FROM agentLogEntries WHERE taskId = ?",
