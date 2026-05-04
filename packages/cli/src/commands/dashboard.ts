@@ -31,6 +31,7 @@ import { aiMergeTask, MissionAutopilot, MissionExecutionLoop, HeartbeatMonitor, 
 import { AuthStorage, DefaultPackageManager, ModelRegistry, SettingsManager, discoverAndLoadExtensions, createExtensionRuntime } from "@mariozechner/pi-coding-agent";
 import {
   getMergeStrategy,
+  getTaskBranchName,
   processPullRequestMergeTask,
 } from "./task-lifecycle.js";
 import { promptForPort } from "./port-prompt.js";
@@ -1148,6 +1149,21 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // (semaphore-gated via the engine's InProcessRuntime).
   //
   const onMergeImpl = async (taskId: string) => {
+    const settings = await store.getSettings();
+    if (getMergeStrategy(settings) === "pull-request") {
+      const githubClient = new GitHubClient();
+      const outcome = await processPullRequestMergeTask(store, cwd, taskId, githubClient, getTaskMergeBlocker);
+      const task = await store.getTask(taskId);
+      return {
+        task,
+        branch: getTaskBranchName(taskId),
+        merged: outcome === "merged",
+        worktreeRemoved: false,
+        branchDeleted: false,
+        error: outcome === "waiting" ? "pull request not ready" : undefined,
+      };
+    }
+
     const streamedMergeLog = new StreamedLogBuffer(
       (line) => logSink.log(line, "merge"),
       STREAM_LOG_FLUSH_IDLE_MS,
