@@ -23,6 +23,9 @@ const existsSyncMock = vi.fn((_path: PathLike) => false);
 const readFileSyncMock = vi.fn((_path?: any) => "{}");
 const readCustomProvidersMock = vi.fn(() => []);
 const packageManagerCwdCapture = vi.fn();
+const { setFusionClaudeCliAccountEnvMock } = vi.hoisted(() => ({
+  setFusionClaudeCliAccountEnvMock: vi.fn(),
+}));
 
 // Route async `exec` through the `execSync` mock so the promisify bridge works.
 // Use Symbol.for("nodejs.util.promisify.custom") directly to avoid async imports
@@ -72,6 +75,10 @@ vi.mock("node:fs", async () => {
 
 vi.mock("../custom-providers.js", () => ({
   readCustomProviders: readCustomProvidersMock,
+}));
+
+vi.mock("@fusion/pi-claude-cli/src/process-manager.js", () => ({
+  setFusionClaudeCliAccountEnv: setFusionClaudeCliAccountEnvMock,
 }));
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
@@ -395,6 +402,7 @@ describe("createFnAgent", () => {
     findMock.mockImplementation((provider: string, modelId: string) => ({ provider, id: modelId }));
     createAgentSessionMock.mockResolvedValue({
       session: {
+        sessionId: "session-test",
         prompt: vi.fn(),
         subscribe: vi.fn(),
         dispose: vi.fn(),
@@ -596,6 +604,45 @@ describe("createFnAgent", () => {
       apiKey: "CUSTOM_API_KEY",
       models: [expect.objectContaining({ id: "custom-model", name: "Custom Model" })],
     }));
+  });
+
+  it("uses claude-cli account homes for pi-claude-cli model sessions", async () => {
+    existsSyncMock.mockImplementation((path) => String(path).endsWith("/.fusion/agent/accounts.json"));
+    readFileSyncMock.mockImplementation((path?: any) => {
+      if (String(path).endsWith("/.fusion/agent/accounts.json")) {
+        return JSON.stringify({
+          version: 1,
+          accounts: [{
+            id: "claude-cli-account-1",
+            providerId: "claude-cli",
+            label: "Claude account 1",
+            credentialKind: "cli_oauth_home",
+            accountFingerprint: "sha256:test",
+            priority: 100,
+            status: "active",
+            createdAt: "2026-05-05T00:00:00.000Z",
+            updatedAt: "2026-05-05T00:00:00.000Z",
+            home: "/tmp/fusion-claude-account",
+          }],
+        });
+      }
+      return "{}";
+    });
+
+    const { createFnAgent } = await import("../pi.js");
+
+    await createFnAgent({
+      cwd: "/project",
+      systemPrompt: "test",
+      tools: "readonly",
+      defaultProvider: "pi-claude-cli",
+      defaultModelId: "claude-sonnet-4-5",
+    });
+
+    expect(setFusionClaudeCliAccountEnvMock).toHaveBeenCalledWith("session-test", {
+      HOME: "/tmp/fusion-claude-account",
+      CLAUDE_CONFIG_DIR: "/tmp/fusion-claude-account/.claude",
+    });
   });
 
   it("avoids lock-based SettingsManager.create when loading extension providers", async () => {

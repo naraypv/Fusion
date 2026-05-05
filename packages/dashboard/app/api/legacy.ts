@@ -1195,6 +1195,10 @@ export interface ModelInfo {
   name: string;
   reasoning: boolean;
   contextWindow: number;
+  accountId?: string;
+  accountProvider?: string;
+  accountLabel?: string;
+  accountDisplayHint?: string;
 }
 
 /** Response from the models endpoint */
@@ -1678,9 +1682,18 @@ export function setClaudeCliEnabled(
   });
 }
 
+export interface CliAccountLoginResponse {
+  success: boolean;
+  provider: string;
+  url?: string;
+  instructions?: string;
+  manualCode?: ManualOAuthCodeInfo;
+  result?: AuthAddAccountResult;
+}
+
 /** Start a CLI-backed account login from the dashboard server process. */
-export function addCliAccountProvider(provider: string): Promise<{ success: boolean; result: AuthAddAccountResult }> {
-  return api<{ success: boolean; result: AuthAddAccountResult }>("/auth/cli-account", {
+export function addCliAccountProvider(provider: string): Promise<CliAccountLoginResponse> {
+  return api<CliAccountLoginResponse>("/auth/cli-account", {
     method: "POST",
     body: JSON.stringify({ provider }),
   });

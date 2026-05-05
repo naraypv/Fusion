@@ -1,7 +1,6 @@
 const HIDDEN_ONBOARDING_AND_SETTINGS_PROVIDER_IDS = new Set([
   "google-antigravity",
   "antigravity",
-  "google-gemini-cli",
 ]);
 
 export function isProviderVisibleInOnboardingAndSettings(providerId: string): boolean {

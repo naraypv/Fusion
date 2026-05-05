@@ -27,6 +27,7 @@ export interface FusionAuthStorageOptions {
 
 export interface FusionAuthStorageExtras {
   listAccounts(providerId?: string): AccountCredentialSummary[];
+  getSelectedAccount(providerId: string): AccountCredentialRecord | undefined;
   selectAccount(providerId: string): AccountCredentialRecord | undefined;
   markAccountFailure(accountId: string, failure: AccountFailureState, cooldownMs?: number): AccountCredentialRecord | undefined;
   markAccountSuccess(accountId: string): AccountCredentialRecord | undefined;
@@ -272,6 +273,11 @@ export function createFusionAuthStorage(options: FusionAuthStorageOptions = {}):
 
       if (prop === "listAccounts") {
         return (provider?: string) => accountStore.listSummaries(provider);
+      }
+
+      if (prop === "getSelectedAccount") {
+        return (provider: string) =>
+          accountStore.selectAccount({ providerId: provider, accountId: selectedAccountIds[provider] });
       }
 
       if (prop === "selectAccount") {

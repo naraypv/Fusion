@@ -39,6 +39,7 @@ import {
   registerProcess,
   cleanupSystemPromptFile,
   buildClaudeSpawnArgs,
+  getFusionClaudeCliAccountEnv,
 } from "./process-manager.js";
 import { parseLine } from "./stream-parser.js";
 import { createEventBridge } from "./event-bridge.js";
@@ -74,6 +75,7 @@ function debugLog(message: string): void {
 type StreamViaCLiOptions = SimpleStreamOptions & {
   cwd?: string;
   mcpConfigPath?: string;
+  env?: NodeJS.ProcessEnv;
 };
 
 /**
@@ -140,6 +142,7 @@ export function streamViaCli(
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+        env: options?.env ?? getFusionClaudeCliAccountEnv(options?.sessionId),
       };
 
       // Spawn subprocess

@@ -16,6 +16,30 @@ function debugLog(message: string): void {
   console.error(`[pi-claude-cli] ${message}`);
 }
 
+type FusionClaudeAccountEnvGlobal = typeof globalThis & {
+  __fusionClaudeCliAccountEnvBySession?: Map<string, NodeJS.ProcessEnv>;
+};
+
+function fusionAccountEnvMap(): Map<string, NodeJS.ProcessEnv> {
+  const target = globalThis as FusionClaudeAccountEnvGlobal;
+  target.__fusionClaudeCliAccountEnvBySession ??= new Map();
+  return target.__fusionClaudeCliAccountEnvBySession;
+}
+
+export function setFusionClaudeCliAccountEnv(sessionId: string, env: NodeJS.ProcessEnv): void {
+  fusionAccountEnvMap().set(sessionId, env);
+}
+
+export function getFusionClaudeCliAccountEnv(sessionId: string | undefined): NodeJS.ProcessEnv | undefined {
+  if (!sessionId) return undefined;
+  return fusionAccountEnvMap().get(sessionId);
+}
+
+export function clearFusionClaudeCliAccountEnv(sessionId: string | undefined): void {
+  if (!sessionId) return;
+  fusionAccountEnvMap().delete(sessionId);
+}
+
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
  *
@@ -86,6 +110,7 @@ export function spawnClaude(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    env?: NodeJS.ProcessEnv;
   },
 ): ChildProcess {
   const args = buildClaudeSpawnArgs(modelId, systemPrompt, {
@@ -96,6 +121,7 @@ export function spawnClaude(
   });
 
   const proc = spawn("claude", args, {
+    env: { ...process.env, ...(options?.env ?? {}) },
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
   });

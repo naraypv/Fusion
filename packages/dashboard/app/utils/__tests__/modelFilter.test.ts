@@ -82,6 +82,23 @@ describe("filterModels", () => {
     expect(result[0].id).toBe("claude-opus-4");
   });
 
+  it("filters account-specific rows by account label and display hint", () => {
+    const accountModel: ModelInfo = {
+      provider: "pi-claude-cli",
+      id: "claude-sonnet-4-5",
+      name: "Claude Sonnet 4.5 - Claude account 1",
+      reasoning: true,
+      contextWindow: 200000,
+      accountId: "claude-cli-account-1",
+      accountProvider: "claude-cli",
+      accountLabel: "Claude account 1",
+      accountDisplayHint: "user@example.com",
+    };
+
+    expect(filterModels([accountModel], "account 1")).toEqual([accountModel]);
+    expect(filterModels([accountModel], "user@example.com")).toEqual([accountModel]);
+  });
+
   it("handles multi-word filters with AND logic", () => {
     // "anthropic" AND "sonnet" should match only Claude Sonnet
     const result = filterModels(models, "anthropic sonnet");

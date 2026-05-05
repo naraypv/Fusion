@@ -2,7 +2,7 @@ import { isGhAvailable, isGhAuthenticated, MultiAccountAuthStore, type AccountCr
 import { probeClaudeCli } from "../claude-cli-probe.js";
 import { probeDroidCli } from "../droid-cli-probe.js";
 import { probeLlamaCpp } from "../llama-cpp-probe.js";
-import { captureCliAccount, probeCliAccountProvider, type CliAccountProviderId } from "../cli-account-auth.js";
+import { probeCliAccountProvider, startCliAccountLogin, type CliAccountProviderId, type StartedCliAccountLogin } from "../cli-account-auth.js";
 import { ApiError, badRequest, conflict } from "../api-error.js";
 import { clearUsageCache } from "../usage.js";
 import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js";
@@ -63,11 +63,12 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
    * Maps provider ID → pending interactive login state.
    */
   const loginInProgress = new Map<string, PendingLogin>();
-  const cliAccountLoginInProgress = new Set<CliAccountProviderId>();
+  const cliAccountLoginInProgress = new Map<CliAccountProviderId, StartedCliAccountLogin>();
+  const cliAccountLoginStarting = new Set<CliAccountProviderId>();
 
   const OAUTH_SESSION_TTL_MS = 5 * 60 * 1000;
   const oauthSessions = new Map<string, { port: number; path: string; originalRedirectUri: string; expiresAt: number }>();
-  const multiAccountProviderIds = new Set(["openai-codex", "anthropic", "claude-cli", "cursor", "minimax"]);
+  const multiAccountProviderIds = new Set(["openai-codex", "anthropic", "claude-cli", "cursor", "minimax", "google-gemini-cli"]);
   type SafeAddAccountResult = {
     status: AddAccountResult["status"];
     message: string;
@@ -77,6 +78,14 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
 
   function isMultiAccountProvider(providerId: string): boolean {
     return multiAccountProviderIds.has(providerId);
+  }
+
+  function isCliAccountProvider(provider: unknown): provider is CliAccountProviderId {
+    return provider === "claude-cli" || provider === "cursor" || provider === "google-gemini-cli";
+  }
+
+  function isCliLoginActive(provider: CliAccountProviderId): boolean {
+    return cliAccountLoginStarting.has(provider) || cliAccountLoginInProgress.has(provider);
   }
 
   function toSafeAddAccountResult(result: AddAccountResult): SafeAddAccountResult {
@@ -103,6 +112,38 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
 
   function getProviderAccounts(storage: AuthStorageLike, providerId: string): AccountCredentialSummary[] {
     return storage.listAccounts?.(providerId) ?? [];
+  }
+
+  async function enableClaudeCliAfterAccountLogin(provider: CliAccountProviderId): Promise<void> {
+    if (provider !== "claude-cli" || !store) {
+      return;
+    }
+
+    let prev = false;
+    try {
+      const priorGlobal = await store.getGlobalSettingsStore().getSettings();
+      prev = priorGlobal.useClaudeCli === true;
+    } catch {
+      // Unreadable prior — enabling below still makes the new account usable.
+    }
+    const settings = await store.updateGlobalSettings({ useClaudeCli: true });
+    invalidateAllGlobalSettingsCaches();
+    const engineManager = options?.engineManager;
+    if (engineManager) {
+      for (const engine of engineManager.getAllEngines().values()) {
+        engine.getTaskStore().getGlobalSettingsStore().invalidateCache();
+      }
+    }
+    const next = settings.useClaudeCli === true;
+    if (options?.onUseClaudeCliToggled && prev !== next) {
+      try {
+        options.onUseClaudeCliToggled(prev, next);
+      } catch (hookErr) {
+        console.warn(
+          `[auth/cli-account] onUseClaudeCliToggled callback threw: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
+        );
+      }
+    }
   }
 
   function withAccountStatus<T extends { id: string }>(
@@ -327,6 +368,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
           name: "Anthropic — via Claude CLI",
           authenticated: (enabled || accounts.length > 0) && binary.available && extensionOk,
           type: "cli" as const,
+          loginInProgress: isCliLoginActive("claude-cli"),
         }));
       }
 
@@ -341,6 +383,22 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
           name: "Cursor — via Cursor Agent",
           authenticated: accounts.length > 0 && cursorProbe.available,
           type: "cli" as const,
+          loginInProgress: isCliLoginActive("cursor"),
+        }));
+      }
+
+      // Inject the synthetic "Google Gemini CLI" provider. Fusion drives the
+      // CLI's OAuth-user-code flow from the dashboard so the browser tab opens
+      // from the already-running dashboard browser instead of the server.
+      {
+        const geminiProbe = await probeCliAccountProvider("google-gemini-cli");
+        const accounts = getProviderAccounts(storage, "google-gemini-cli");
+        providers.push(withAccountStatus(storage, {
+          id: "google-gemini-cli",
+          name: "Google Gemini CLI",
+          authenticated: accounts.length > 0 && geminiProbe.available,
+          type: "cli" as const,
+          loginInProgress: isCliLoginActive("google-gemini-cli"),
         }));
       }
 
@@ -613,57 +671,49 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
   router.post("/auth/cli-account", async (req, res) => {
     const provider = req.body?.provider as unknown;
     try {
-      if (provider !== "claude-cli" && provider !== "cursor") {
-        throw badRequest("provider must be claude-cli or cursor");
+      if (!isCliAccountProvider(provider)) {
+        throw badRequest("provider must be claude-cli, cursor, or google-gemini-cli");
       }
-      if (cliAccountLoginInProgress.has(provider)) {
+      if (isCliLoginActive(provider)) {
         throw conflict(`CLI login already in progress for ${provider}`);
       }
 
-      cliAccountLoginInProgress.add(provider);
-      const result = await captureCliAccount(provider, new MultiAccountAuthStore());
-      const safeResult = toSafeAddAccountResult(result);
-      lastLoginResults.set(provider, safeResult);
+      cliAccountLoginStarting.add(provider);
+      const session = await startCliAccountLogin(provider, new MultiAccountAuthStore());
+      cliAccountLoginInProgress.set(provider, session);
+      cliAccountLoginStarting.delete(provider);
+      session.completion
+        .then(async (result) => {
+          const safeResult = toSafeAddAccountResult(result);
+          lastLoginResults.set(provider, safeResult);
+          await enableClaudeCliAfterAccountLogin(provider);
+          getAuthStorage().reload();
+          clearUsageCache();
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[auth/cli-account] ${provider} login failed: ${message}`);
+        })
+        .finally(() => {
+          cliAccountLoginInProgress.delete(provider);
+          cliAccountLoginStarting.delete(provider);
+        });
 
-      if (provider === "claude-cli" && store) {
-        let prev = false;
-        try {
-          const priorGlobal = await store.getGlobalSettingsStore().getSettings();
-          prev = priorGlobal.useClaudeCli === true;
-        } catch {
-          // Unreadable prior — enabling below still makes the new account usable.
-        }
-        const settings = await store.updateGlobalSettings({ useClaudeCli: true });
-        invalidateAllGlobalSettingsCaches();
-        const engineManager = options?.engineManager;
-        if (engineManager) {
-          for (const engine of engineManager.getAllEngines().values()) {
-            engine.getTaskStore().getGlobalSettingsStore().invalidateCache();
-          }
-        }
-        const next = settings.useClaudeCli === true;
-        if (options?.onUseClaudeCliToggled && prev !== next) {
-          try {
-            options.onUseClaudeCliToggled(prev, next);
-          } catch (hookErr) {
-            console.warn(
-              `[auth/cli-account] onUseClaudeCliToggled callback threw: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
-            );
-          }
-        }
-      }
-
-      clearUsageCache();
-      res.json({ success: true, provider, result: safeResult });
+      res.json({
+        success: true,
+        provider,
+        url: session.url,
+        instructions: session.instructions,
+        manualCode: session.manualCode,
+      });
     } catch (err: unknown) {
+      if (isCliAccountProvider(provider)) {
+        cliAccountLoginStarting.delete(provider);
+      }
       if (err instanceof ApiError) {
         throw err;
       }
       rethrowAsApiError(err);
-    } finally {
-      if (provider === "claude-cli" || provider === "cursor") {
-        cliAccountLoginInProgress.delete(provider);
-      }
     }
   });
 
@@ -936,6 +986,16 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
 
       const activeLogin = loginInProgress.get(provider);
       if (!activeLogin) {
+        if (isCliAccountProvider(provider)) {
+          const cliLogin = cliAccountLoginInProgress.get(provider);
+          if (cliLogin) {
+            cliLogin.cancel();
+            cliAccountLoginInProgress.delete(provider);
+            cliAccountLoginStarting.delete(provider);
+            res.json({ success: true, cancelled: true });
+            return;
+          }
+        }
         res.json({ success: true, cancelled: false });
         return;
       }
@@ -971,6 +1031,14 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
 
       const activeLogin = loginInProgress.get(provider);
       if (!activeLogin) {
+        if (isCliAccountProvider(provider)) {
+          const cliLogin = cliAccountLoginInProgress.get(provider);
+          if (cliLogin) {
+            const submitted = cliLogin.submitManualCode(code.trim());
+            res.json({ success: true, submitted });
+            return;
+          }
+        }
         throw conflict(`No login in progress for ${provider}`);
       }
 

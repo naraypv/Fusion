@@ -19,7 +19,7 @@ export const DSPY_ACCOUNT_REGISTRY_VERSION = 1;
 
 interface DspyAccountRef {
   name: string;
-  provider: "claude" | "codex" | "cursor" | "minimax";
+  provider: "claude" | "codex" | "cursor" | "gemini" | "minimax";
   model?: string;
   env_key?: string;
   command?: string;
@@ -49,6 +49,7 @@ function mapDspyProvider(providerId: string): DspyAccountRef["provider"] | undef
   if (providerId === "openai-codex" || providerId === "codex") return "codex";
   if (providerId === "claude-cli" || providerId === "anthropic" || providerId === "claude") return "claude";
   if (providerId === "cursor") return "cursor";
+  if (providerId === "google-gemini-cli" || providerId === "gemini") return "gemini";
   if (providerId === "minimax") return "minimax";
   return undefined;
 }
@@ -57,6 +58,7 @@ function commandForProvider(provider: DspyAccountRef["provider"]): string | unde
   if (provider === "codex") return "codex";
   if (provider === "claude") return "claude";
   if (provider === "cursor") return "cursor-agent";
+  if (provider === "gemini") return "gemini";
   return undefined;
 }
 
@@ -84,7 +86,7 @@ function toDspyAccountRef(account: AccountCredentialRecord, defaultModelId?: str
   if (provider === "minimax" && !envKey) {
     return undefined;
   }
-  if ((provider === "claude" || provider === "cursor" || provider === "codex") && !home && !account.credential) {
+  if ((provider === "claude" || provider === "cursor" || provider === "codex" || provider === "gemini") && !home && !account.credential) {
     return undefined;
   }
 
@@ -172,7 +174,7 @@ export function buildDspyRoutedSystemPrompt(systemPrompt: string, metadata: Dspy
     `module: ${metadata.moduleName}`,
     `signature: ${metadata.signatureName}(system_prompt, user_request, tool_context, account_pool_state) -> agent_response`,
     "predictor: dspy.ChainOfThought",
-    "lm: dspy.SubscriptionLM.from_registry(providers=['codex', 'claude', 'cursor', 'minimax'])",
+    "lm: dspy.SubscriptionLM.from_registry(providers=['codex', 'claude', 'cursor', 'gemini', 'minimax'])",
     "routing: all LLM completions for this Fusion session are declared as DSPy program calls before provider execution",
     "quality_contract: preserve the existing Fusion behavior while treating instructions, inputs, outputs, and tool observations as typed DSPy fields",
     "</fusion-dspy-routing>",

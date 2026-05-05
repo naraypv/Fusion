@@ -118,6 +118,39 @@ describe("CustomModelDropdown", () => {
     expect(onChange).toHaveBeenCalledWith("");
   });
 
+  it("emits account-qualified values for account-specific model rows", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    const models = [
+      ...MOCK_MODELS,
+      {
+        provider: "pi-claude-cli",
+        id: "claude-sonnet-4-5",
+        name: "Claude Sonnet 4.5 - Claude account 1",
+        reasoning: true,
+        contextWindow: 200000,
+        accountId: "claude-cli-account-1",
+        accountProvider: "claude-cli",
+        accountLabel: "Claude account 1",
+      },
+    ];
+
+    render(
+      <CustomModelDropdown
+        label="Executor Model"
+        value=""
+        onChange={onChange}
+        models={models}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Executor Model" }));
+    const portal = await screen.findByTestId("model-combobox-portal");
+    await user.click(within(portal).getByText("Claude Sonnet 4.5 - Claude account 1"));
+
+    expect(onChange).toHaveBeenCalledWith("pi-claude-cli/claude-sonnet-4-5?account=claude-cli-account-1");
+  });
+
   it("closes the portaled dropdown when clicking outside the trigger and menu", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();

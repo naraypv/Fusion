@@ -215,6 +215,7 @@ const REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS = new Set([
   "claude-cli",
   "cursor",
   "minimax",
+  "google-gemini-cli",
 ]);
 
 function canAddAnotherAuthAccount(provider: AuthProvider): boolean {
@@ -1158,18 +1159,80 @@ export function SettingsModal({
 
   const handleAddCliAccount = useCallback(async (providerId: string) => {
     setAuthActionInProgress(providerId);
+    clearAuthLoginUiState(providerId);
+    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
     try {
       const result = await addCliAccountProvider(providerId);
+      if (result.instructions?.trim()) {
+        setLoginInstructions((prev) => ({ ...prev, [providerId]: result.instructions! }));
+      }
+      if (result.manualCode) {
+        setManualCodeConfigs((prev) => ({ ...prev, [providerId]: result.manualCode! }));
+      }
+      if (result.url) {
+        setAuthProviders((prev) => prev.map((provider) =>
+          provider.id === providerId ? { ...provider, loginInProgress: true } : provider,
+        ));
+        window.open(appendTokenQuery(result.url), "_blank");
+
+        pollIntervalRef.current = setInterval(async () => {
+          try {
+            const { providers } = await fetchAuthStatus();
+            const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
+            setAuthProviders(visibleProviders);
+            const provider = visibleProviders.find((p) => p.id === providerId);
+            const loginResult = provider?.lastLoginResult;
+            const loginCompleted =
+              Boolean(loginResult) ||
+              ((provider?.accountCount ?? 0) > startingAccountCount) ||
+              (startingAccountCount === 0 && provider?.authenticated === true);
+
+            if (loginCompleted) {
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              setAuthActionInProgress(null);
+              clearAuthLoginUiState(providerId);
+              const toast = accountResultToast(loginResult);
+              addToast(toast.message, toast.type);
+              scrollSettingsToTop();
+              return;
+            }
+
+            if (!provider?.loginInProgress) {
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              setAuthActionInProgress(null);
+              clearAuthLoginUiState(providerId);
+              addToast("CLI login did not complete. Please try again.", "error");
+            }
+          } catch {
+            // Continue polling on transient errors.
+          }
+        }, 2000);
+        return;
+      }
+
       await loadAuthStatus();
       const toast = accountResultToast(result.result);
       addToast(toast.message, toast.type);
       scrollSettingsToTop();
     } catch (err) {
-      addToast(getErrorMessage(err) || "CLI login failed", "error");
-    } finally {
       setAuthActionInProgress(null);
+      clearAuthLoginUiState(providerId);
+      const message = getErrorMessage(err) || "CLI login failed";
+      const isConflict = message.includes("already in progress") || (typeof err === "object" && err !== null && "status" in err && (err as { status?: number }).status === 409);
+      if (isConflict) {
+        addToast("Login already in progress. You can cancel it and retry.", "warning");
+        await loadAuthStatus();
+      } else {
+        addToast(message, "error");
+      }
     }
-  }, [addToast, loadAuthStatus, scrollSettingsToTop]);
+  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleClearApiKey = useCallback(async (providerId: string) => {
     setAuthActionInProgress(providerId);
@@ -1530,10 +1593,23 @@ export function SettingsModal({
       if (!value) {
         next[index] = {};
       } else {
-        const slashIdx = value.indexOf("/");
+        const accountMarker = "?account=";
+        const accountIdx = value.indexOf(accountMarker);
+        const modelValue = accountIdx === -1 ? value : value.slice(0, accountIdx);
+        const accountId = accountIdx === -1 ? undefined : decodeURIComponent(value.slice(accountIdx + accountMarker.length));
+        const slashIdx = modelValue.indexOf("/");
+        const provider = modelValue.slice(0, slashIdx);
+        const modelId = modelValue.slice(slashIdx + 1);
+        const selectedModel = availableModels.find((model) =>
+          model.provider === provider &&
+          model.id === modelId &&
+          model.accountId === accountId,
+        );
         next[index] = {
-          provider: value.slice(0, slashIdx),
-          modelId: value.slice(slashIdx + 1),
+          provider,
+          modelId,
+          ...(accountId ? { accountId } : {}),
+          ...(selectedModel?.accountProvider ? { accountProvider: selectedModel.accountProvider } : {}),
           enabled: true,
         };
       }
@@ -1547,7 +1623,9 @@ export function SettingsModal({
     return (
       <div className="settings-fallback-chain">
         {slots.map((entry, index) => {
-          const value = entry.provider && entry.modelId ? `${entry.provider}/${entry.modelId}` : "";
+          const value = entry.provider && entry.modelId
+            ? `${entry.provider}/${entry.modelId}${entry.accountId ? `?account=${encodeURIComponent(entry.accountId)}` : ""}`
+            : "";
           return (
             <div className="settings-fallback-chain-row" key={`${scope}-fallback-${index}`}>
               <label htmlFor={`${scope}-fallback-chain-${index}`}>Priority {index + 1}</label>
@@ -5222,6 +5300,7 @@ export function SettingsModal({
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
         const cursorProvider = cliAuthProviders.find((p) => p.id === "cursor");
+        const geminiCliProvider = cliAuthProviders.find((p) => p.id === "google-gemini-cli");
         const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
         const claudeCliCard = claudeCliProvider ? (
           <ClaudeCliProviderCard
@@ -5229,6 +5308,14 @@ export function SettingsModal({
             authenticated={claudeCliProvider.authenticated}
             accounts={claudeCliProvider.accounts}
             addAccountBusy={authActionInProgress === "claude-cli"}
+            loginInProgress={claudeCliProvider.loginInProgress || authActionInProgress === "claude-cli"}
+            instructions={loginInstructions["claude-cli"]}
+            manualCode={manualCodeConfigs["claude-cli"]}
+            manualCodeValue={manualCodeInputs["claude-cli"] ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "claude-cli"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "claude-cli": value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("claude-cli")}
+            onCancelLogin={() => void handleCancelLogin("claude-cli")}
             onAddAccount={() => {
               void handleAddCliAccount("claude-cli");
             }}
@@ -5244,8 +5331,36 @@ export function SettingsModal({
             authenticated={cursorProvider.authenticated}
             accounts={cursorProvider.accounts}
             busy={authActionInProgress === "cursor"}
+            loginInProgress={cursorProvider.loginInProgress || authActionInProgress === "cursor"}
+            instructions={loginInstructions.cursor}
+            manualCode={manualCodeConfigs.cursor}
+            manualCodeValue={manualCodeInputs.cursor ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "cursor"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, cursor: value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("cursor")}
+            onCancelLogin={() => void handleCancelLogin("cursor")}
             onAddAccount={() => {
               void handleAddCliAccount("cursor");
+            }}
+          />
+        ) : null;
+        const geminiCliCard = geminiCliProvider ? (
+          <CliAccountProviderCard
+            providerId="google-gemini-cli"
+            name={geminiCliProvider.name}
+            authenticated={geminiCliProvider.authenticated}
+            accounts={geminiCliProvider.accounts}
+            busy={authActionInProgress === "google-gemini-cli"}
+            loginInProgress={geminiCliProvider.loginInProgress || authActionInProgress === "google-gemini-cli"}
+            instructions={loginInstructions["google-gemini-cli"]}
+            manualCode={manualCodeConfigs["google-gemini-cli"]}
+            manualCodeValue={manualCodeInputs["google-gemini-cli"] ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "google-gemini-cli"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "google-gemini-cli": value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("google-gemini-cli")}
+            onCancelLogin={() => void handleCancelLogin("google-gemini-cli")}
+            onAddAccount={() => {
+              void handleAddCliAccount("google-gemini-cli");
             }}
           />
         ) : null;
@@ -5262,11 +5377,13 @@ export function SettingsModal({
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
           || (cursorProvider?.authenticated ?? false)
+          || (geminiCliProvider?.authenticated ?? false)
           || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
           || (cursorProvider && !cursorProvider.authenticated)
+          || (geminiCliProvider && !geminiCliProvider.authenticated)
           || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
           <>
@@ -5301,6 +5418,7 @@ export function SettingsModal({
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
                   {cursorProvider?.authenticated && cursorCard}
+                  {geminiCliProvider?.authenticated && geminiCliCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
                   {authenticatedProviders.map((provider) => {
                     const canAddAnotherAccount = canAddAnotherAuthAccount(provider);
@@ -5445,6 +5563,7 @@ export function SettingsModal({
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
                   {cursorProvider && !cursorProvider.authenticated && cursorCard}
+                  {geminiCliProvider && !geminiCliProvider.authenticated && geminiCliCard}
                   {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card">

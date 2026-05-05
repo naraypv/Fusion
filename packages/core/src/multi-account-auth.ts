@@ -138,6 +138,7 @@ function titleCaseProvider(providerId: string): string {
   if (providerId === "minimax") return "MiniMax";
   if (providerId === "claude" || providerId === "claude-cli" || providerId === "anthropic") return "Claude";
   if (providerId === "cursor") return "Cursor";
+  if (providerId === "google-gemini-cli") return "Google Gemini CLI";
   return providerId
     .split(/[-_]+/)
     .filter(Boolean)

@@ -36,6 +36,7 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { getEnabledPiExtensionPaths, getFusionAgentDir, getLegacyPiAgentDir, reconcileClaudeCliPaths, reconcileDroidCliPaths, resolveModelFallbackChain, resolvePiExtensionProjectRoot, resolveRouteAllLlmCallsViaDspy, type Settings } from "@fusion/core";
+import { setFusionClaudeCliAccountEnv } from "@fusion/pi-claude-cli/src/process-manager.js";
 import {
   resolveSessionSkills,
   createSkillsOverrideFromSelection,
@@ -465,7 +466,7 @@ export interface AgentOptions {
   /** Optional fallback model ID used with `fallbackProvider`. */
   fallbackModelId?: string;
   /** Ordered fallback models. When present, this supersedes the legacy single fallback pair. */
-  modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
+  modelFallbackChain?: Array<{ provider?: string; modelId?: string; accountId?: string; accountProvider?: string }>;
   /** Route this session through Fusion's DSPy declarative bridge. */
   routeViaDspy?: boolean;
   /** Default thinking effort level (e.g. "medium", "high"). When provided, sets the session's thinking level after creation. */
@@ -568,6 +569,22 @@ function classifyAccountFailure(message: string) {
     return "transient" as const;
   }
   return "unknown" as const;
+}
+
+function accountProviderForModelProvider(provider: string | undefined): string | undefined {
+  if (!provider) return undefined;
+  if (provider === "pi-claude-cli") return "claude-cli";
+  return provider;
+}
+
+function cliAccountEnvFor(provider: string, home: string): NodeJS.ProcessEnv {
+  if (provider === "claude-cli") {
+    return {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: join(home, ".claude"),
+    };
+  }
+  return { HOME: home };
 }
 
 function accountFailureCooldownMs(message: string): number {
@@ -1226,13 +1243,27 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     options.defaultProvider,
     options.defaultModelId,
   );
-  const fallbackModels = effectiveModelFallbackChain.map((entry) => resolveConfiguredModel(
-    modelRegistry,
-    "fallback",
-    entry.provider,
-    entry.modelId,
-  )).filter((model): model is NonNullable<typeof selectedModel> => Boolean(model));
-  const fallbackModel = fallbackModels[0];
+  const fallbackCandidates = effectiveModelFallbackChain
+    .map((entry) => {
+      const model = resolveConfiguredModel(
+        modelRegistry,
+        "fallback",
+        entry.provider,
+        entry.modelId,
+      );
+      return model ? {
+        model,
+        ...(entry.accountId ? { accountId: entry.accountId } : {}),
+        ...(entry.accountProvider ? { accountProvider: entry.accountProvider } : {}),
+      } : undefined;
+    })
+    .filter((candidate): candidate is {
+      model: NonNullable<typeof selectedModel>;
+      accountId?: string;
+      accountProvider?: string;
+    } => Boolean(candidate));
+  const fallbackModels = fallbackCandidates.map((candidate) => candidate.model);
+  const fallbackModel = fallbackCandidates[0]?.model;
 
   // Resolve skill selection: explicit skillSelection wins over convenience `skills`
   let effectiveSkillSelection: SkillSelectionContext | undefined = options.skillSelection;
@@ -1316,7 +1347,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     return true;
   };
 
-  const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
+  const createSessionWithModel = async (
+    modelOverride?: typeof selectedModel,
+    accountSelection?: { accountId?: string; accountProvider?: string },
+  ) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
     // suppress the defaults with `noTools: "builtin"` and register our wrapped
@@ -1335,13 +1369,20 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       await options.beforeSpawnSession();
     }
     const provider = modelOverride?.provider;
-    if (provider && authStorage.listAccounts(provider).length > 0 && !selectedAccountIds[provider]) {
-      const account = authStorage.selectAccount(provider);
+    const accountProvider = accountSelection?.accountProvider ?? accountProviderForModelProvider(provider);
+    if (accountProvider && accountSelection?.accountId) {
+      selectedAccountIds[accountProvider] = accountSelection.accountId;
+      const account = authStorage.listAccounts(accountProvider).find((candidate) => candidate.id === accountSelection.accountId);
       if (account) {
-        piLog.log(`Selected ${provider} auth account ${account.label}`);
+        piLog.log(`Selected ${accountProvider} auth account ${account.label}`);
+      }
+    } else if (accountProvider && authStorage.listAccounts(accountProvider).length > 0 && !selectedAccountIds[accountProvider]) {
+      const account = authStorage.selectAccount(accountProvider);
+      if (account) {
+        piLog.log(`Selected ${accountProvider} auth account ${account.label}`);
       }
     }
-    return createAgentSession({
+    const result = await createAgentSession({
       cwd: options.cwd,
       authStorage,
       modelRegistry,
@@ -1352,27 +1393,40 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       settingsManager,
       ...(modelOverride ? { model: modelOverride } : {}),
     });
+    if (provider === "pi-claude-cli") {
+      const account = authStorage.getSelectedAccount("claude-cli");
+      if (account?.home) {
+        setFusionClaudeCliAccountEnv(result.session.sessionId, cliAccountEnvFor("claude-cli", account.home));
+      }
+    }
+    return result;
   };
 
-  const createSessionWithAccountFallback = async (modelOverride?: typeof selectedModel) => {
+  const createSessionWithAccountFallback = async (
+    modelOverride?: typeof selectedModel,
+    accountSelection?: { accountId?: string; accountProvider?: string },
+  ) => {
     const provider = modelOverride?.provider;
-    const maxAttempts = provider ? Math.max(1, authStorage.listAccounts(provider).length) : 1;
+    const accountProvider = accountSelection?.accountProvider ?? accountProviderForModelProvider(provider);
+    const maxAttempts = accountSelection?.accountId
+      ? 1
+      : accountProvider ? Math.max(1, authStorage.listAccounts(accountProvider).length) : 1;
     let lastError: unknown;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
-        return await createSessionWithModel(modelOverride);
+        return await createSessionWithModel(modelOverride, accountSelection);
       } catch (err: any) {
         lastError = err;
         const message = err?.message || String(err);
-        if (!provider || !isRetryableModelSelectionError(message) || !markCurrentAccountFailure(provider, message)) {
+        if (!accountProvider || !isRetryableModelSelectionError(message) || !markCurrentAccountFailure(accountProvider, message)) {
           throw err;
         }
-        const next = authStorage.selectAccount(provider);
-        if (!next || selectedAccountIds[provider] === undefined) {
+        const next = authStorage.selectAccount(accountProvider);
+        if (!next || selectedAccountIds[accountProvider] === undefined) {
           throw err;
         }
-        piLog.warn(`Auth account for ${provider} failed during session creation (${message}); retrying with ${next.label}`);
+        piLog.warn(`Auth account for ${accountProvider} failed during session creation (${message}); retrying with ${next.label}`);
       }
     }
 
@@ -1398,6 +1452,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
   let sessionResult;
   let usingFallback = false;
+  let activeFallbackCandidate: (typeof fallbackCandidates)[number] | undefined;
   try {
     sessionResult = await createSessionWithAccountFallback(selectedModel);
     piLog.log(`Session created successfully (model=${selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : "default"})`);
@@ -1408,19 +1463,20 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     }
     piLog.warn(`Primary model failed (${err.message}), trying fallback chain`);
     let lastFallbackError: unknown = err;
-    for (const candidate of fallbackModels) {
+    for (const candidate of fallbackCandidates) {
       try {
         usingFallback = true;
-        sessionResult = await createSessionWithAccountFallback(candidate);
-        await emitFallbackUsed("session-creation", candidate);
-        piLog.log(`Fallback session created successfully (${candidate.provider}/${candidate.id})`);
+        activeFallbackCandidate = candidate;
+        sessionResult = await createSessionWithAccountFallback(candidate.model, candidate);
+        await emitFallbackUsed("session-creation", candidate.model);
+        piLog.log(`Fallback session created successfully (${candidate.model.provider}/${candidate.model.id})`);
         break;
       } catch (fallbackErr: any) {
         lastFallbackError = fallbackErr;
         if (!isRetryableModelSelectionError(fallbackErr?.message || "")) {
           throw fallbackErr;
         }
-        piLog.warn(`Fallback model ${candidate.provider}/${candidate.id} failed (${fallbackErr.message}); trying next fallback`);
+        piLog.warn(`Fallback model ${candidate.model.provider}/${candidate.model.id} failed (${fallbackErr.message}); trying next fallback`);
       }
     }
     if (!sessionResult) {
@@ -1492,12 +1548,16 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         }
       }
 
-      const activeModel = usingFallback ? fallbackModel : selectedModel;
+      const activeModel = usingFallback ? activeFallbackCandidate?.model ?? fallbackModel : selectedModel;
       const activeProvider = activeModel?.provider;
-      if (activeModel && activeProvider && isRetryableModelSelectionError(errorMessage) && markCurrentAccountFailure(activeProvider, errorMessage)) {
-        const nextAccount = authStorage.selectAccount(activeProvider);
+      const activeAccountProvider = usingFallback
+        ? activeFallbackCandidate?.accountProvider ?? accountProviderForModelProvider(activeProvider)
+        : accountProviderForModelProvider(activeProvider);
+      const explicitActiveAccount = usingFallback && Boolean(activeFallbackCandidate?.accountId);
+      if (activeModel && activeAccountProvider && !explicitActiveAccount && isRetryableModelSelectionError(errorMessage) && markCurrentAccountFailure(activeAccountProvider, errorMessage)) {
+        const nextAccount = authStorage.selectAccount(activeAccountProvider);
         if (nextAccount) {
-          piLog.warn(`Auth account for ${activeProvider} failed during prompt (${errorMessage}); retrying with ${nextAccount.label}`);
+          piLog.warn(`Auth account for ${activeAccountProvider} failed during prompt (${errorMessage}); retrying with ${nextAccount.label}`);
           try {
             session.dispose();
           } catch (disposeErr: unknown) {
@@ -1505,7 +1565,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
             piLog.warn(`Failed to dispose session during auth account fallback swap: ${msg}`);
           }
 
-          const nextSessionResult = await createSessionWithAccountFallback(activeModel);
+          const nextSessionResult = await createSessionWithAccountFallback(activeModel, usingFallback ? activeFallbackCandidate : undefined);
           const nextSession = nextSessionResult.session as PromptableSession;
           installToolResultContentGuard(nextSession as unknown as AgentToolHookSession);
           installMessageContentGuard(
@@ -1526,7 +1586,11 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         }
       }
 
-      if (fallbackModels.length === 0 || usingFallback || !isRetryableModelSelectionError(errorMessage)) {
+      const fallbackStartIndex = usingFallback && activeFallbackCandidate
+        ? fallbackCandidates.indexOf(activeFallbackCandidate) + 1
+        : 0;
+      const remainingFallbackCandidates = fallbackCandidates.slice(Math.max(0, fallbackStartIndex));
+      if (remainingFallbackCandidates.length === 0 || !isRetryableModelSelectionError(errorMessage)) {
         throw err;
       }
 
@@ -1539,11 +1603,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       }
 
       let lastFallbackError: unknown = err;
-      for (const candidate of fallbackModels) {
+      for (const candidate of remainingFallbackCandidates) {
         let fallbackSession: PromptableSession | undefined;
         try {
-          const fallbackSessionResult = await createSessionWithAccountFallback(candidate);
-          await emitFallbackUsed("prompt-time", candidate);
+          const fallbackSessionResult = await createSessionWithAccountFallback(candidate.model, candidate);
+          activeFallbackCandidate = candidate;
+          await emitFallbackUsed("prompt-time", candidate.model);
           fallbackSession = fallbackSessionResult.session as PromptableSession;
           installToolResultContentGuard(fallbackSession as unknown as AgentToolHookSession);
           installMessageContentGuard(
@@ -1603,7 +1668,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           if (!isRetryableModelSelectionError(fallbackErrorMessage)) {
             throw fallbackErr;
           }
-          piLog.warn(`Fallback model ${candidate.provider}/${candidate.id} failed during prompt (${fallbackErrorMessage}); trying next fallback`);
+          piLog.warn(`Fallback model ${candidate.model.provider}/${candidate.model.id} failed during prompt (${fallbackErrorMessage}); trying next fallback`);
         }
       }
       throw lastFallbackError instanceof Error ? lastFallbackError : err;

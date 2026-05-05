@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -11,12 +11,15 @@ import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelReg
 type AuthAction = "status" | "login" | "add-account" | "api-key" | "remove-account";
 
 interface CliHomeProvider {
-  providerId: "claude-cli" | "cursor";
+  providerId: "claude-cli" | "cursor" | "google-gemini-cli";
   displayName: string;
   binary: string;
   loginArgs: string[];
   statusArgs: string[];
   env(home: string): NodeJS.ProcessEnv;
+  browserSuppressionEnv?: NodeJS.ProcessEnv;
+  prepareHome?(home: string): void;
+  identityHint?(home: string, statusText: string): { material: string; label?: string; hint?: string };
 }
 
 const PROVIDER_ALIASES: Record<string, string> = {
@@ -28,6 +31,10 @@ const PROVIDER_ALIASES: Record<string, string> = {
   "claude-cli": "claude-cli",
   cursor: "cursor",
   "cursor-agent": "cursor",
+  gemini: "google-gemini-cli",
+  "gemini-cli": "google-gemini-cli",
+  google: "google-gemini-cli",
+  "google-gemini-cli": "google-gemini-cli",
   minimax: "minimax",
 };
 
@@ -36,12 +43,15 @@ const CLI_HOME_PROVIDERS: Record<string, CliHomeProvider> = {
     providerId: "claude-cli",
     displayName: "Claude",
     binary: "claude",
-    loginArgs: ["auth", "login"],
+    loginArgs: ["auth", "login", "--claudeai"],
     statusArgs: ["auth", "status"],
     env: (home) => ({
       HOME: home,
       CLAUDE_CONFIG_DIR: join(home, ".claude"),
     }),
+    browserSuppressionEnv: {
+      BROWSER: "true",
+    },
   },
   cursor: {
     providerId: "cursor",
@@ -53,6 +63,48 @@ const CLI_HOME_PROVIDERS: Record<string, CliHomeProvider> = {
       HOME: home,
       CURSOR_AGENT_HOME: join(home, ".cursor-agent"),
     }),
+    browserSuppressionEnv: {
+      NO_OPEN_BROWSER: "1",
+    },
+  },
+  "google-gemini-cli": {
+    providerId: "google-gemini-cli",
+    displayName: "Google Gemini CLI",
+    binary: "gemini",
+    loginArgs: [],
+    statusArgs: ["--version"],
+    env: (home) => ({
+      HOME: home,
+      GEMINI_FORCE_FILE_STORAGE: "true",
+      NO_BROWSER: "true",
+    }),
+    browserSuppressionEnv: {
+      NO_BROWSER: "true",
+    },
+    prepareHome: (home) => {
+      const geminiDir = join(home, ".gemini");
+      mkdirSync(geminiDir, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(geminiDir, "settings.json"),
+        `${JSON.stringify({ security: { auth: { selectedType: "oauth-personal" } } }, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+    },
+    identityHint: (home, statusText) => {
+      try {
+        const parsed = JSON.parse(readFileSync(join(home, ".gemini", "google_accounts.json"), "utf-8")) as { active?: unknown };
+        if (typeof parsed.active === "string" && parsed.active.trim()) {
+          return {
+            material: parsed.active.trim(),
+            label: parsed.active.trim(),
+            hint: parsed.active.trim(),
+          };
+        }
+      } catch {
+        // Fall back to status text below.
+      }
+      return { material: statusText || home };
+    },
   },
 };
 
@@ -141,10 +193,12 @@ function runProcess(
 async function captureCliHomeAccount(provider: CliHomeProvider, accountStore: MultiAccountAuthStore): Promise<AddAccountResult> {
   const home = join(getHomeDir(), ".fusion", "agent", "account-homes", provider.providerId, String(Date.now()));
   mkdirSync(home, { recursive: true, mode: 0o700 });
+  provider.prepareHome?.(home);
   const env = provider.env(home);
+  const loginEnv = { ...env, ...(provider.browserSuppressionEnv ?? {}) };
 
   console.log(`Starting ${provider.displayName} login in an isolated Fusion account home.`);
-  const login = await runProcess(provider.binary, provider.loginArgs, { env, stdio: "inherit" });
+  const login = await runProcess(provider.binary, provider.loginArgs, { env: loginEnv, stdio: "inherit" });
   if (login.code !== 0) {
     throw new Error(`${provider.displayName} login failed with exit code ${login.code ?? "unknown"}`);
   }
@@ -155,15 +209,19 @@ async function captureCliHomeAccount(provider: CliHomeProvider, accountStore: Mu
     code: 1,
   }));
   const identityText = `${status.stdout}\n${status.stderr}`.trim() || home;
-  const identityFingerprint = stableHash(provider.providerId, identityText);
-  const identityLabel = identityText.split(/\r?\n/).find((line) => line.trim())?.trim();
+  const identity = provider.identityHint?.(home, identityText) ?? {
+    material: identityText,
+    label: identityText.split(/\r?\n/).find((line) => line.trim())?.trim(),
+    hint: identityText.split(/\r?\n/).find((line) => line.trim())?.trim(),
+  };
+  const identityFingerprint = stableHash(provider.providerId, identity.material);
 
   return accountStore.addCliHomeAccount({
     providerId: provider.providerId,
     home,
     identityFingerprint,
-    identityLabel,
-    accountDisplayHint: identityLabel,
+    identityLabel: identity.label,
+    accountDisplayHint: identity.hint,
     metadata: {
       source: "fusion-cli-login",
       binary: provider.binary,
@@ -243,7 +301,7 @@ export async function runAuth(args: string[]): Promise<void> {
     case "login":
     case "add-account": {
       if (!providerId) {
-        throw new Error(`Usage: fn auth ${action} <codex|claude|cursor|minimax>`);
+        throw new Error(`Usage: fn auth ${action} <codex|claude|cursor|gemini|minimax>`);
       }
       if (providerId === "minimax") {
         await addApiKeyAccount(providerId, getFlagValue(args, "--api-key"), getFlagValue(args, "--env"));

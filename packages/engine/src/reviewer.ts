@@ -246,7 +246,7 @@ export interface ReviewOptions {
   /** Fallback model ID used with `fallbackProvider`. */
   fallbackModelId?: string;
   /** Ordered fallback models inherited from project/global settings. */
-  modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
+  modelFallbackChain?: Array<{ provider?: string; modelId?: string; accountId?: string; accountProvider?: string }>;
   /** Route reviewer calls through Fusion's DSPy declarative bridge. */
   routeViaDspy?: boolean;
   /** Project-level validator fallback provider override. Takes precedence over global fallback. */

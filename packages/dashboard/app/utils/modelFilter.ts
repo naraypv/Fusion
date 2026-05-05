@@ -144,7 +144,7 @@ export function filterModels(models: ModelInfo[], filter: string): ModelInfo[] {
   const terms = filter.toLowerCase().trim().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return models;
   return models.filter((m) => {
-    const haystack = `${m.provider} ${m.id} ${m.name}`;
+    const haystack = `${m.provider} ${m.id} ${m.name} ${m.accountLabel ?? ""} ${m.accountDisplayHint ?? ""}`;
     return terms.every((term) => termMatches(term, haystack));
   });
 }

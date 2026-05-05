@@ -1,6 +1,8 @@
 import { Loader2 } from "lucide-react";
-import type { AuthAccountSummary } from "../api";
+import type { AuthAccountSummary, ManualOAuthCodeInfo } from "../api";
 import { ProviderIcon } from "./ProviderIcon";
+import { LoginInstructions } from "./LoginInstructions";
+import { OAuthManualCodeForm } from "./OAuthManualCodeForm";
 
 interface CliAccountProviderCardProps {
   providerId: string;
@@ -8,6 +10,14 @@ interface CliAccountProviderCardProps {
   authenticated: boolean;
   accounts?: AuthAccountSummary[];
   busy?: boolean;
+  loginInProgress?: boolean;
+  instructions?: string;
+  manualCode?: ManualOAuthCodeInfo;
+  manualCodeValue?: string;
+  manualCodeSubmitInProgress?: boolean;
+  onManualCodeChange?: (value: string) => void;
+  onManualCodeSubmit?: () => void;
+  onCancelLogin?: () => void;
   onAddAccount: () => void;
 }
 
@@ -17,6 +27,14 @@ export function CliAccountProviderCard({
   authenticated,
   accounts = [],
   busy = false,
+  loginInProgress = false,
+  instructions,
+  manualCode,
+  manualCodeValue = "",
+  manualCodeSubmitInProgress = false,
+  onManualCodeChange,
+  onManualCodeSubmit,
+  onCancelLogin,
   onAddAccount,
 }: CliAccountProviderCardProps) {
   return (
@@ -33,25 +51,57 @@ export function CliAccountProviderCard({
           </span>
         </div>
         <div className="auth-provider-cli-actions">
-          <button
-            type="button"
-            className="btn btn-primary btn-sm"
-            onClick={onAddAccount}
-            disabled={busy}
-          >
-            {busy ? (
-              <>
-                <Loader2 size={12} className="animate-spin" />
-                Working…
-              </>
-            ) : accounts.length > 0 ? (
-              "Add another account"
-            ) : (
-              "Login"
-            )}
-          </button>
+          {loginInProgress ? (
+            <>
+              <button type="button" className="btn btn-sm" disabled>
+                Waiting for login…
+              </button>
+              {onCancelLogin && (
+                <button type="button" className="btn btn-sm" onClick={onCancelLogin}>
+                  Cancel
+                </button>
+              )}
+            </>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={onAddAccount}
+              disabled={busy}
+            >
+              {busy ? (
+                <>
+                  <Loader2 size={12} className="animate-spin" />
+                  Working…
+                </>
+              ) : accounts.length > 0 ? (
+                "Add another account"
+              ) : (
+                "Login"
+              )}
+            </button>
+          )}
         </div>
       </div>
+      {instructions && (loginInProgress || busy) && (
+        <LoginInstructions
+          instructions={instructions}
+          data-testid={`auth-login-instructions-${providerId}`}
+        />
+      )}
+      {manualCode && (loginInProgress || busy) && onManualCodeChange && onManualCodeSubmit && (
+        <OAuthManualCodeForm
+          value={manualCodeValue}
+          onChange={onManualCodeChange}
+          onSubmit={onManualCodeSubmit}
+          prompt={manualCode.prompt}
+          placeholder={manualCode.placeholder}
+          helpText={manualCode.helpText}
+          disabled={manualCodeSubmitInProgress}
+          submitLabel={manualCodeSubmitInProgress ? "Submitting…" : "Submit code"}
+          data-testid={`auth-manual-code-${providerId}`}
+        />
+      )}
       {accounts.length > 0 && (
         <div className="auth-account-list" data-testid={`auth-account-list-${providerId}`}>
           {accounts.map((account) => (

@@ -5,8 +5,11 @@ import {
   setClaudeCliEnabled,
   type AuthAccountSummary,
   type ClaudeCliStatus,
+  type ManualOAuthCodeInfo,
 } from "../api";
 import { ProviderIcon } from "./ProviderIcon";
+import { LoginInstructions } from "./LoginInstructions";
+import { OAuthManualCodeForm } from "./OAuthManualCodeForm";
 
 /**
  * "Anthropic — via Claude CLI" provider card.
@@ -39,6 +42,14 @@ interface ClaudeCliProviderCardProps {
   onToggled?: (nextEnabled: boolean) => void;
   accounts?: AuthAccountSummary[];
   addAccountBusy?: boolean;
+  loginInProgress?: boolean;
+  instructions?: string;
+  manualCode?: ManualOAuthCodeInfo;
+  manualCodeValue?: string;
+  manualCodeSubmitInProgress?: boolean;
+  onManualCodeChange?: (value: string) => void;
+  onManualCodeSubmit?: () => void;
+  onCancelLogin?: () => void;
   onAddAccount?: () => void;
   /** Render a smaller card with the description and status tucked behind a disclosure triangle. */
   compact?: boolean;
@@ -49,6 +60,14 @@ export function ClaudeCliProviderCard({
   onToggled,
   accounts = [],
   addAccountBusy = false,
+  loginInProgress = false,
+  instructions,
+  manualCode,
+  manualCodeValue = "",
+  manualCodeSubmitInProgress = false,
+  onManualCodeChange,
+  onManualCodeSubmit,
+  onCancelLogin,
   onAddAccount,
   compact = false,
 }: ClaudeCliProviderCardProps) {
@@ -178,7 +197,18 @@ export function ClaudeCliProviderCard({
           {busy === "enabling" ? "Enabling…" : "Enable"}
         </button>
       )}
-      {onAddAccount && (
+      {onAddAccount && loginInProgress ? (
+        <>
+          <button type="button" className="btn btn-sm" disabled>
+            Waiting for login…
+          </button>
+          {onCancelLogin && (
+            <button type="button" className="btn btn-sm" onClick={onCancelLogin}>
+              Cancel
+            </button>
+          )}
+        </>
+      ) : onAddAccount ? (
         <button
           type="button"
           className="btn btn-primary btn-sm"
@@ -192,7 +222,7 @@ export function ClaudeCliProviderCard({
         >
           {addAccountBusy ? "Working…" : accounts.length > 0 ? "Add another account" : "Login"}
         </button>
-      )}
+      ) : null}
     </>
   );
 
@@ -220,6 +250,25 @@ export function ClaudeCliProviderCard({
             {lastAction && <ClaudeCliActionToast action={lastAction} />}
           </div>
         </details>
+        {instructions && (loginInProgress || addAccountBusy) && (
+          <LoginInstructions
+            instructions={instructions}
+            data-testid="auth-login-instructions-claude-cli"
+          />
+        )}
+        {manualCode && (loginInProgress || addAccountBusy) && onManualCodeChange && onManualCodeSubmit && (
+          <OAuthManualCodeForm
+            value={manualCodeValue}
+            onChange={onManualCodeChange}
+            onSubmit={onManualCodeSubmit}
+            prompt={manualCode.prompt}
+            placeholder={manualCode.placeholder}
+            helpText={manualCode.helpText}
+            disabled={manualCodeSubmitInProgress}
+            submitLabel={manualCodeSubmitInProgress ? "Submitting…" : "Submit code"}
+            data-testid="auth-manual-code-claude-cli"
+          />
+        )}
         {accounts.length > 0 && (
           <div className="auth-account-list" data-testid="auth-account-list-claude-cli">
             {accounts.map((account) => (
@@ -256,6 +305,25 @@ export function ClaudeCliProviderCard({
       </div>
       <div className="onboarding-provider-card__actions">{actions}</div>
       {lastAction && <ClaudeCliActionToast action={lastAction} />}
+      {instructions && (loginInProgress || addAccountBusy) && (
+        <LoginInstructions
+          instructions={instructions}
+          data-testid="onboarding-login-instructions-claude-cli"
+        />
+      )}
+      {manualCode && (loginInProgress || addAccountBusy) && onManualCodeChange && onManualCodeSubmit && (
+        <OAuthManualCodeForm
+          value={manualCodeValue}
+          onChange={onManualCodeChange}
+          onSubmit={onManualCodeSubmit}
+          prompt={manualCode.prompt}
+          placeholder={manualCode.placeholder}
+          helpText={manualCode.helpText}
+          disabled={manualCodeSubmitInProgress}
+          submitLabel={manualCodeSubmitInProgress ? "Submitting…" : "Submit code"}
+          data-testid="onboarding-manual-code-claude-cli"
+        />
+      )}
     </div>
   );
 }

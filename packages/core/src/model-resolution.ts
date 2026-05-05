@@ -8,6 +8,8 @@ export interface ResolvedModelSelection {
 export interface ResolvedModelFallbackEntry {
   provider: string;
   modelId: string;
+  accountId?: string;
+  accountProvider?: string;
   priority: number;
 }
 
@@ -50,13 +52,19 @@ function normalizeFallbackChain(chain: ModelFallbackChainEntry[] | undefined): R
     .map((entry, index) => ({
       provider: entry.provider?.trim() ?? "",
       modelId: entry.modelId?.trim() ?? "",
+      accountId: entry.accountId?.trim(),
+      accountProvider: entry.accountProvider?.trim(),
       enabled: entry.enabled !== false,
       priority: index + 1,
     }))
-    .filter((entry): entry is ResolvedModelFallbackEntry & { enabled: boolean } =>
-      entry.enabled && Boolean(entry.provider && entry.modelId),
-    )
-    .map(({ provider, modelId, priority }) => ({ provider, modelId, priority }));
+    .filter((entry) => entry.enabled && Boolean(entry.provider && entry.modelId))
+    .map(({ provider, modelId, accountId, accountProvider, priority }) => ({
+      provider,
+      modelId,
+      ...(accountId ? { accountId } : {}),
+      ...(accountProvider ? { accountProvider } : {}),
+      priority,
+    }));
 }
 
 export function resolveModelFallbackChain(settings?: Partial<Settings>): ResolvedModelFallbackEntry[] {

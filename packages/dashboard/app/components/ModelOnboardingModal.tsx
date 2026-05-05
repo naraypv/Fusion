@@ -10,6 +10,7 @@ import {
   logoutProvider,
   cancelProviderLogin,
   submitProviderManualCode,
+  addCliAccountProvider,
   saveApiKey,
   clearApiKey,
   fetchModels,
@@ -83,6 +84,7 @@ const PROVIDER_INFO: Record<string, ProviderInfo> = {
   "openai-codex": { description: "Codex models by OpenAI — optimized for coding tasks" },
   google: { description: "Gemini models — multimodal with strong reasoning" },
   gemini: { description: "Gemini models — multimodal with strong reasoning" },
+  "google-gemini-cli": { description: "Gemini CLI OAuth — Google account login for coding agents" },
   ollama: {
     description: "Run open-source models locally on your machine",
     apiKeyInfo: {
@@ -168,6 +170,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   openrouter: "OpenRouter",
   google: "Google",
   gemini: "Gemini",
+  "google-gemini-cli": "Google Gemini CLI",
   minimax: "MiniMax",
   ollama: "Ollama",
   zai: "Zhipu AI",
@@ -193,7 +196,7 @@ function getProviderDisplayName(providerId: string): string {
     .join(" ");
 }
 
-const QUICK_START_PROVIDER_IDS = ["anthropic", "openai", "google", "gemini", "ollama"] as const;
+const QUICK_START_PROVIDER_IDS = ["anthropic", "openai", "google", "gemini", "google-gemini-cli", "ollama"] as const;
 
 const ONBOARDING_CURATED_PROVIDER_FAMILY_ORDER = [
   "anthropic",
@@ -215,6 +218,7 @@ const ONBOARDING_PROVIDER_FAMILY_ALIASES: Record<string, (typeof ONBOARDING_CURA
   "openai-codex": "openai-codex",
   google: "gemini",
   gemini: "gemini",
+  "google-gemini-cli": "gemini",
   minimax: "minimax",
   kimi: "kimi",
   moonshot: "kimi",
@@ -223,7 +227,7 @@ const ONBOARDING_PROVIDER_FAMILY_ALIASES: Record<string, (typeof ONBOARDING_CURA
 };
 
 const ONBOARDING_PROVIDER_ALIAS_ORDER: Record<string, string[]> = {
-  gemini: ["google", "gemini"],
+  gemini: ["google", "gemini", "google-gemini-cli"],
   kimi: ["kimi", "moonshot", "kimi-coding"],
 };
 
@@ -1090,14 +1094,22 @@ export function ModelOnboardingModal({
       pollCountRef.current = 0;
 
       try {
-        const { url, instructions, manualCode } = await loginProvider(providerId);
+        const usesCliAccountLogin =
+          providerId === "claude-cli" ||
+          providerId === "cursor" ||
+          providerId === "google-gemini-cli";
+        const { url, instructions, manualCode } = usesCliAccountLogin
+          ? await addCliAccountProvider(providerId)
+          : await loginProvider(providerId);
         if (instructions?.trim()) {
           setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
         }
         if (manualCode) {
           setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
         }
-        window.open(appendTokenQuery(url), "_blank");
+        if (url) {
+          window.open(appendTokenQuery(url), "_blank");
+        }
 
         // Poll for auth completion
         pollIntervalRef.current = setInterval(async () => {
@@ -1776,6 +1788,17 @@ export function ModelOnboardingModal({
         <ClaudeCliProviderCard
           key={provider.id}
           authenticated={provider.authenticated}
+          accounts={provider.accounts}
+          addAccountBusy={authActionInProgress === "claude-cli"}
+          loginInProgress={provider.loginInProgress || authActionInProgress === "claude-cli"}
+          instructions={loginInstructions["claude-cli"]}
+          manualCode={manualCodeConfigs["claude-cli"]}
+          manualCodeValue={manualCodeInputs["claude-cli"] ?? ""}
+          manualCodeSubmitInProgress={manualCodeSubmitInProgress === "claude-cli"}
+          onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "claude-cli": value }))}
+          onManualCodeSubmit={() => void handleSubmitManualCode("claude-cli")}
+          onCancelLogin={() => void handleCancelLogin("claude-cli")}
+          onAddAccount={() => handleLogin("claude-cli")}
           onToggled={() => {
             void loadAuthStatus();
           }}

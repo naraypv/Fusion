@@ -34,6 +34,27 @@ interface DropdownPosition {
   maxHeight: number;
 }
 
+function modelOptionValue(model: ModelInfo): string {
+  const base = `${model.provider}/${model.id}`;
+  return model.accountId ? `${base}?account=${encodeURIComponent(model.accountId)}` : base;
+}
+
+function parseModelOptionValue(value: string): { provider?: string; modelId?: string; accountId?: string } {
+  const slashIdx = value.indexOf("/");
+  if (slashIdx === -1) return {};
+  const provider = value.slice(0, slashIdx);
+  const rawModel = value.slice(slashIdx + 1);
+  const queryIdx = rawModel.indexOf("?account=");
+  if (queryIdx === -1) {
+    return { provider, modelId: rawModel };
+  }
+  return {
+    provider,
+    modelId: rawModel.slice(0, queryIdx),
+    accountId: decodeURIComponent(rawModel.slice(queryIdx + "?account=".length)),
+  };
+}
+
 /**
  * CustomModelDropdown - A dropdown component combining selection with icon-enhanced provider groups.
  *
@@ -89,11 +110,9 @@ export function CustomModelDropdown({
   const favoritedModelEntries = useMemo(() => {
     const result: Array<{ model: ModelInfo; fullId: string }> = [];
     for (const fullId of favoriteModels) {
-      const slashIdx = fullId.indexOf("/");
-      if (slashIdx === -1) continue;
-      const provider = fullId.slice(0, slashIdx);
-      const modelId = fullId.slice(slashIdx + 1);
-      const model = filteredModels.find((m) => m.provider === provider && m.id === modelId);
+      const { provider, modelId, accountId } = parseModelOptionValue(fullId);
+      if (!provider || !modelId) continue;
+      const model = filteredModels.find((m) => m.provider === provider && m.id === modelId && m.accountId === accountId);
       if (model) {
         result.push({ model, fullId });
       }
@@ -162,9 +181,10 @@ export function CustomModelDropdown({
     sortedProviderEntries.forEach(([provider, providerModels]) => {
       options.push({ type: "provider", value: `__group_${provider}`, label: provider, provider });
       providerModels.forEach((m) => {
+        const optionValue = modelOptionValue(m);
         options.push({
           type: "model",
-          value: `${m.provider}/${m.id}`,
+          value: optionValue,
           label: m.name,
           provider: m.provider,
         });
@@ -180,11 +200,9 @@ export function CustomModelDropdown({
       return noChangeLabel;
     }
     if (!value) return "Use default";
-    const slashIdx = value.indexOf("/");
-    if (slashIdx === -1) return value;
-    const provider = value.slice(0, slashIdx);
-    const modelId = value.slice(slashIdx + 1);
-    const model = models.find((m) => m.provider === provider && m.id === modelId);
+    const { provider, modelId, accountId } = parseModelOptionValue(value);
+    if (!provider || !modelId) return value;
+    const model = models.find((m) => m.provider === provider && m.id === modelId && m.accountId === accountId);
     return model?.name || value;
   }, [hasNoChangeOption, noChangeLabel, noChangeValue, value, models]);
 
@@ -576,7 +594,7 @@ export function CustomModelDropdown({
           
           // Filter out favorited models - they already appear in the favorites section
           const nonFavoritedModels = providerModels.filter((m) => {
-            const optionValue = `${m.provider}/${m.id}`;
+            const optionValue = modelOptionValue(m);
             return !favoriteModels.includes(optionValue);
           });
           
@@ -604,7 +622,7 @@ export function CustomModelDropdown({
                 )}
               </div>
               {nonFavoritedModels.map((m) => {
-                const optionValue = `${m.provider}/${m.id}`;
+                const optionValue = modelOptionValue(m);
                 const optionIndex = optionsList.findIndex((opt) => opt.value === optionValue);
                 const isHighlighted = highlightedIndex === optionIndex;
                 const isSelected = value === optionValue;

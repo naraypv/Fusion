@@ -53,6 +53,9 @@ import {
   registerProcess,
   killAllProcesses,
   cleanupSystemPromptFile,
+  setFusionClaudeCliAccountEnv,
+  getFusionClaudeCliAccountEnv,
+  clearFusionClaudeCliAccountEnv,
 } from "../process-manager";
 
 describe("buildClaudeSpawnArgs", () => {
@@ -128,6 +131,19 @@ describe("spawnClaude", () => {
     expect(options.stdio).toEqual(["pipe", "pipe", "pipe"]);
   });
 
+  it("passes account-scoped environment variables to the Claude subprocess", () => {
+    spawnClaude("claude-sonnet-4-5-20250929", undefined, {
+      env: {
+        HOME: "/tmp/fusion-account-home",
+        CLAUDE_CONFIG_DIR: "/tmp/fusion-account-home/.claude",
+      },
+    });
+
+    const options = (spawn as any).mock.calls[0][2];
+    expect(options.env.HOME).toBe("/tmp/fusion-account-home");
+    expect(options.env.CLAUDE_CONFIG_DIR).toBe("/tmp/fusion-account-home/.claude");
+  });
+
   it("passes cwd from options when provided", () => {
     spawnClaude("claude-sonnet-4-5-20250929", undefined, {
       cwd: "/custom/path",
@@ -172,6 +188,15 @@ describe("spawnClaude", () => {
     const proc = spawnClaude("claude-sonnet-4-5-20250929");
     expect(proc).toBeDefined();
     expect(proc.pid).toBe(12345);
+  });
+});
+
+describe("Fusion Claude CLI account environment registry", () => {
+  it("stores and clears account env by session id", () => {
+    setFusionClaudeCliAccountEnv("session-1", { HOME: "/tmp/account-1" });
+    expect(getFusionClaudeCliAccountEnv("session-1")).toEqual({ HOME: "/tmp/account-1" });
+    clearFusionClaudeCliAccountEnv("session-1");
+    expect(getFusionClaudeCliAccountEnv("session-1")).toBeUndefined();
   });
 });
 

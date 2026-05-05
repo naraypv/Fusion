@@ -323,7 +323,7 @@ Usage:
   fn settings export [opts]              Export settings to a JSON file
   fn settings import <file> [opts]       Import settings from a JSON file
   fn auth status [provider]              List configured auth accounts
-  fn auth login <codex|claude|cursor|minimax>
+  fn auth login <codex|claude|cursor|gemini|minimax>
                                       Start a login/key capture and store it as an account
   fn auth add-account <provider>         Add another account without logging out
   fn auth add-account minimax --api-key <key>

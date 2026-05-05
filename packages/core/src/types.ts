@@ -163,6 +163,8 @@ export interface ModelPreset {
 export interface ModelFallbackChainEntry {
   provider?: string;
   modelId?: string;
+  accountId?: string;
+  accountProvider?: string;
   enabled?: boolean;
 }
 

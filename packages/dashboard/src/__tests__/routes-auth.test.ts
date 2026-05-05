@@ -30,6 +30,7 @@ import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
+import * as cliAccountAuthModule from "../cli-account-auth.js";
 import * as droidCliProbeModule from "../droid-cli-probe.js";
 import * as llamaCppProbeModule from "../llama-cpp-probe.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
@@ -313,10 +314,10 @@ describe("GET /models", () => {
     store = createMockStore();
   });
 
-  function buildApp(modelRegistry?: ModelRegistryLike) {
+  function buildApp(modelRegistry?: ModelRegistryLike, authStorage?: AuthStorageLike) {
     const app = express();
     app.use(express.json());
-    app.use("/api", createApiRoutes(store, { modelRegistry }));
+    app.use("/api", createApiRoutes(store, { modelRegistry, authStorage }));
     return app;
   }
 
@@ -330,6 +331,47 @@ describe("GET /models", () => {
       { provider: "openai", id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128000 },
     ]);
     expect(modelRegistry.refresh).toHaveBeenCalled();
+  });
+
+  it("adds account-specific model rows for multi-account fallback selection", async () => {
+    const modelRegistry = createMockModelRegistry({
+      getAvailable: vi.fn().mockReturnValue([
+        { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (CLI)", provider: "pi-claude-cli", reasoning: true, contextWindow: 200000 },
+      ]),
+    });
+    const authStorage = createMockAuthStorage({
+      listAccounts: vi.fn((provider?: string) => provider === "claude-cli"
+        ? [{
+            id: "claude-cli-account-1",
+            providerId: "claude-cli",
+            label: "Claude account 1",
+            credentialKind: "cli_oauth_home",
+            accountDisplayHint: "user@example.com",
+            priority: 100,
+            status: "active",
+            createdAt: "2026-05-05T00:00:00.000Z",
+            updatedAt: "2026-05-05T00:00:00.000Z",
+          }]
+        : []),
+    } as Partial<AuthStorageLike>);
+    const globalStore = createMockGlobalSettingsStore();
+    (globalStore.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ useClaudeCli: true });
+    (store.getGlobalSettingsStore as ReturnType<typeof vi.fn>).mockReturnValue(globalStore);
+
+    const res = await GET(buildApp(modelRegistry, authStorage), "/api/models");
+
+    expect(res.status).toBe(200);
+    expect(res.body.models).toContainEqual({
+      provider: "pi-claude-cli",
+      id: "claude-sonnet-4-5",
+      name: "Claude Sonnet 4.5 (CLI) — Claude account 1",
+      reasoning: true,
+      contextWindow: 200000,
+      accountId: "claude-cli-account-1",
+      accountProvider: "claude-cli",
+      accountLabel: "Claude account 1",
+      accountDisplayHint: "user@example.com",
+    });
   });
 
   it("returns empty array when no model registry is provided", async () => {
@@ -563,7 +605,7 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     // Filter out synthetic CLI providers — they have dedicated route tests.
     // Structural assertions here are about OAuth + API-key paths only.
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "google-gemini-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
       { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
@@ -588,7 +630,7 @@ describe("GET /auth/status", () => {
     const res = await GET(buildApp(), "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "google-gemini-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
       { id: "openai-codex", name: "OpenAI Codex", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
       { id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
@@ -1254,6 +1296,74 @@ describe("POST /auth/cancel", () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("provider is required");
+  });
+});
+
+describe("POST /auth/cli-account", () => {
+  let store: TaskStore;
+  let authStorage: AuthStorageLike;
+
+  beforeEach(() => {
+    store = createMockStore();
+    authStorage = createMockAuthStorage();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { authStorage }));
+    return app;
+  }
+
+  it("starts CLI OAuth without blocking and returns the provider URL for the dashboard browser", async () => {
+    const submitManualCode = vi.fn().mockReturnValue(true);
+    const cancel = vi.fn();
+    vi.spyOn(cliAccountAuthModule, "startCliAccountLogin").mockResolvedValueOnce({
+      providerId: "claude-cli",
+      url: "https://claude.ai/oauth/authorize?state=test",
+      instructions: "Open from the dashboard browser",
+      manualCode: {
+        prompt: "Paste the Claude authorization code",
+        placeholder: "code...",
+      },
+      completion: new Promise(() => {}),
+      submitManualCode,
+      cancel,
+    });
+
+    const app = buildApp();
+    const res = await REQUEST(app, "POST", "/api/auth/cli-account", JSON.stringify({ provider: "claude-cli" }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      success: true,
+      provider: "claude-cli",
+      url: "https://claude.ai/oauth/authorize?state=test",
+      instructions: "Open from the dashboard browser",
+      manualCode: {
+        prompt: "Paste the Claude authorization code",
+        placeholder: "code...",
+      },
+    });
+
+    const codeRes = await REQUEST(app, "POST", "/api/auth/manual-code", JSON.stringify({
+      provider: "claude-cli",
+      code: "test-code",
+    }), {
+      "Content-Type": "application/json",
+    });
+    expect(codeRes.status).toBe(200);
+    expect(codeRes.body).toEqual({ success: true, submitted: true });
+    expect(submitManualCode).toHaveBeenCalledWith("test-code");
+
+    const cancelRes = await REQUEST(app, "POST", "/api/auth/cancel", JSON.stringify({ provider: "claude-cli" }), {
+      "Content-Type": "application/json",
+    });
+    expect(cancelRes.status).toBe(200);
+    expect(cancelRes.body).toEqual({ success: true, cancelled: true });
+    expect(cancel).toHaveBeenCalled();
   });
 });
 

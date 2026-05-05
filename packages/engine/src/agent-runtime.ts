@@ -48,7 +48,7 @@ export interface AgentRuntimeOptions {
   /** Optional fallback model ID */
   fallbackModelId?: string;
   /** Ordered fallback models tried after the primary model. */
-  modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
+  modelFallbackChain?: Array<{ provider?: string; modelId?: string; accountId?: string; accountProvider?: string }>;
   /** Route this session through Fusion's DSPy declarative bridge. */
   routeViaDspy?: boolean;
   /** Default thinking effort level (e.g. "medium", "high") */

@@ -1,9 +1,71 @@
-import { resolvePlanningSettingsModel } from "@fusion/core";
+import { resolvePlanningSettingsModel, type AccountCredentialSummary } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 
 export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, options, store, runtimeLogger } = ctx;
+
+  type ModelResponseEntry = {
+    provider: string;
+    id: string;
+    name: string;
+    reasoning: boolean;
+    contextWindow: number;
+    accountId?: string;
+    accountProvider?: string;
+    accountLabel?: string;
+    accountDisplayHint?: string;
+  };
+
+  function accountProviderForModelProvider(provider: string): string | undefined {
+    if (provider === "pi-claude-cli") return "claude-cli";
+    if (
+      provider === "openai-codex" ||
+      provider === "anthropic" ||
+      provider === "claude-cli" ||
+      provider === "cursor" ||
+      provider === "minimax" ||
+      provider === "google-gemini-cli"
+    ) {
+      return provider;
+    }
+    return undefined;
+  }
+
+  function appendAccountSpecificModels(models: ModelResponseEntry[]): ModelResponseEntry[] {
+    if (!options?.authStorage?.listAccounts) {
+      return models;
+    }
+
+    const accountsByProvider = new Map<string, AccountCredentialSummary[]>();
+    const accountsFor = (provider: string): AccountCredentialSummary[] => {
+      const cached = accountsByProvider.get(provider);
+      if (cached) return cached;
+      const accounts = options.authStorage!.listAccounts!(provider).filter((account) => account.status !== "disabled");
+      accountsByProvider.set(provider, accounts);
+      return accounts;
+    };
+
+    const expanded: ModelResponseEntry[] = [];
+    for (const model of models) {
+      expanded.push(model);
+      const accountProvider = accountProviderForModelProvider(model.provider);
+      if (!accountProvider) {
+        continue;
+      }
+      for (const account of accountsFor(accountProvider)) {
+        expanded.push({
+          ...model,
+          name: `${model.name} — ${account.label}`,
+          accountId: account.id,
+          accountProvider,
+          accountLabel: account.label,
+          ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
+        });
+      }
+    }
+    return expanded;
+  }
 
   router.get("/models", async (_req, res) => {
     // Get favoriteProviders/favoriteModels and default model from global settings.
@@ -64,7 +126,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
 
     try {
       options.modelRegistry.refresh();
-      let models = options.modelRegistry.getAvailable().map((m) => ({
+      let models: ModelResponseEntry[] = options.modelRegistry.getAvailable().map((m) => ({
         provider: m.provider,
         id: m.id,
         name: m.name,
@@ -87,6 +149,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       if (!useLlamaCpp) {
         models = models.filter((m) => m.provider !== "llama-server");
       }
+      models = appendAccountSpecificModels(models);
 
       res.json({
         models,
