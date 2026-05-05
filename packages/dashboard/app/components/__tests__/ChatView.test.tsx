@@ -2404,6 +2404,7 @@ describe("ChatView mobile behavior", () => {
   });
 
   afterEach(() => {
+    _resetInitialViewportHeight();
     Object.defineProperty(window, "visualViewport", {
       value: savedVisualViewport,
       writable: true,
