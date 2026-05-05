@@ -10,7 +10,7 @@
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput } from "@fusion/core";
 import { dailyMemoryPath, ensureOpenClawMemoryFiles, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
@@ -408,11 +408,19 @@ function normalizeQmdAgentMemoryResultPath(rootDir: string, agentId: string, raw
     return resolveAgentMemoryPath(rootDir, agentId, candidate)?.displayPath ?? fallbackPath;
   }
 
-  const filename = candidate.split("/").pop()?.toLowerCase() ?? "";
-  if (filename === AGENT_MEMORY_FILENAME.toLowerCase()) {
+  const workspacePath = resolve(agentMemoryDirectory(rootDir, agentId)).replace(/\\/g, "/");
+  const candidateAbs = resolve(rootDir, candidate).replace(/\\/g, "/");
+  const relToWorkspace = relative(workspacePath, candidateAbs).replace(/\\/g, "/");
+  if (relToWorkspace && !relToWorkspace.startsWith("..") && !relToWorkspace.includes("/../")) {
+    const maybeDisplayPath = `${agentPrefix}${relToWorkspace}`;
+    return resolveAgentMemoryPath(rootDir, agentId, maybeDisplayPath)?.displayPath ?? fallbackPath;
+  }
+
+  const filename = candidate.split("/").pop() ?? "";
+  if (filename.toLowerCase() === AGENT_MEMORY_FILENAME.toLowerCase()) {
     return agentMemoryDisplayPath(agentId);
   }
-  if (filename === AGENT_DREAMS_FILENAME.toLowerCase()) {
+  if (filename.toLowerCase() === AGENT_DREAMS_FILENAME.toLowerCase()) {
     return agentDreamsDisplayPath(agentId);
   }
   if (DAILY_AGENT_MEMORY_RE.test(filename)) {

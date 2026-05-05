@@ -34,6 +34,7 @@ type ExecFileAsync = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 const qmdRefreshState = new Map<string, { lastStartedAt: number; inFlight?: Promise<void> }>();
+const qmdAgentRefreshState = new Map<string, { lastStartedAt: number; inFlight?: Promise<void> }>();
 let qmdInstallPromise: Promise<boolean> | null = null;
 
 export function shouldSkipBackgroundQmdRefresh(): boolean {
@@ -492,6 +493,13 @@ export function buildQmdRefreshCommands(rootDir: string): string[][] {
     ["update"],
     ["embed"],
   ];
+}
+
+export function qmdAgentMemoryCollectionName(rootDir: string, agentId: string): string {
+  const absoluteRoot = resolve(rootDir);
+  const safeAgentId = agentId.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+  const hash = createHash("sha1").update(`${absoluteRoot}:${agentId}`).digest("hex").slice(0, 12);
+  return `fusion-agent-memory-${safeAgentId.toLowerCase()}-${hash}`;
 }
 
 export function dailyMemoryPath(rootDir: string, date = new Date()): string {
@@ -1096,6 +1104,70 @@ export function scheduleQmdProjectMemoryRefresh(rootDir: string): void {
   }
 
   void refreshQmdProjectMemoryIndex(rootDir).catch(() => {
+    // qmd is optional. Search falls back to local file scanning when refresh fails.
+  });
+}
+
+export async function refreshQmdAgentMemoryIndex(
+  rootDir: string,
+  agentId: string,
+  options?: { force?: boolean; execFileAsync?: ExecFileAsync },
+): Promise<void> {
+  const key = `${resolve(rootDir)}:${agentId}`;
+  const now = Date.now();
+  const current = qmdAgentRefreshState.get(key);
+
+  if (!options?.force) {
+    if (current?.inFlight) {
+      return current.inFlight;
+    }
+    if (current && now - current.lastStartedAt < QMD_REFRESH_INTERVAL_MS) {
+      return;
+    }
+  }
+
+  const promise = (async () => {
+    const execFileAsync = options?.execFileAsync ?? await getDefaultExecFileAsync();
+    const { agentMemoryWorkspacePath } = await import("./memory-dreams.js");
+    const workspacePath = agentMemoryWorkspacePath(rootDir, agentId);
+    await mkdir(workspacePath, { recursive: true });
+
+    try {
+      await execFileAsync("qmd", ["collection", "add", workspacePath, "--name", qmdAgentMemoryCollectionName(rootDir, agentId), "--mask", "**/*.md"], {
+        cwd: rootDir,
+        timeout: 4000,
+        maxBuffer: 512 * 1024,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const stderr = typeof err === "object" && err && "stderr" in err ? String((err as { stderr?: unknown }).stderr ?? "") : "";
+      if (!/already exists|exists/i.test(`${message}\n${stderr}`)) {
+        throw err;
+      }
+    }
+
+    await execFileAsync("qmd", ["update"], { cwd: rootDir, timeout: 30_000, maxBuffer: 1024 * 1024 });
+    await execFileAsync("qmd", ["embed"], { cwd: rootDir, timeout: 120_000, maxBuffer: 1024 * 1024 });
+  })();
+
+  qmdAgentRefreshState.set(key, { lastStartedAt: now, inFlight: promise });
+
+  try {
+    await promise;
+  } finally {
+    const latest = qmdAgentRefreshState.get(key);
+    if (latest?.inFlight === promise) {
+      qmdAgentRefreshState.set(key, { lastStartedAt: latest.lastStartedAt });
+    }
+  }
+}
+
+export function scheduleQmdAgentMemoryRefresh(rootDir: string, agentId: string): void {
+  if (shouldSkipBackgroundQmdRefresh()) {
+    return;
+  }
+
+  void refreshQmdAgentMemoryIndex(rootDir, agentId).catch(() => {
     // qmd is optional. Search falls back to local file scanning when refresh fails.
   });
 }

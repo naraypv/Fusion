@@ -428,7 +428,7 @@ describe("createMemoryTools", () => {
               score: 0.8,
             },
             {
-              path: "qmd://fusion-agent-memory/.fusion/agent-memory/ceo-agent/2026-05-01.md",
+              path: join(tempDir, ".fusion", "agent-memory", "ceo-agent", "2026-05-01.md"),
               snippet: "Daily note about delegation follow-up",
               lineStart: 1,
               lineEnd: 2,

@@ -14,6 +14,7 @@ import {
   processAgentMemoryDreams,
   syncMemoryDreamsAutomation,
 } from "../memory-dreams.js";
+import * as memoryBackend from "../memory-backend.js";
 
 describe("extractDreamProcessorResult", () => {
   it("parses dreams and long-term updates from well-formed output", () => {
@@ -148,6 +149,32 @@ describe("memory-dreams automation", () => {
       await expect(readFile(agentDailyMemoryPath(rootDir, "ceo-agent", date), "utf-8"))
         .resolves.toContain("Processed into dreams");
     } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("schedules qmd refresh for processed agent memory when qmd backend is enabled", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-dreams-qmd-"));
+    const refreshSpy = vi.spyOn(memoryBackend, "scheduleQmdAgentMemoryRefresh").mockImplementation(() => {});
+    try {
+      const date = new Date("2026-04-17T12:00:00.000Z");
+      const agent = {
+        id: "ceo-agent",
+        name: "CEO",
+        role: "executor",
+        state: "idle",
+        metadata: {},
+        createdAt: date.toISOString(),
+        updatedAt: date.toISOString(),
+      } as any;
+
+      await processAgentMemoryDreams(rootDir, [agent], async () => (
+        "## DREAMS\n\nDream signal.\n\n## LONG_TERM_UPDATES\n\n- Durable update."
+      ), date, { memoryBackendType: "qmd" });
+
+      expect(refreshSpy).toHaveBeenCalledWith(rootDir, "ceo-agent");
+    } finally {
+      refreshSpy.mockRestore();
       await rm(rootDir, { recursive: true, force: true });
     }
   });

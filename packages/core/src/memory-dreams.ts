@@ -6,6 +6,8 @@ import {
   ensureOpenClawMemoryFiles,
   memoryDreamsPath,
   memoryLongTermPath,
+  resolveMemoryBackend,
+  scheduleQmdAgentMemoryRefresh,
 } from "./memory-backend.js";
 import type { ScheduledTaskCreateInput } from "./automation.js";
 import type { Agent, ProjectSettings } from "./types.js";
@@ -184,6 +186,7 @@ export async function processAgentMemoryDreams(
   agents: Agent[],
   executePrompt: DreamPromptExecutor,
   date = new Date(),
+  settings?: Partial<ProjectSettings>,
 ): Promise<AgentDreamProcessorResult[]> {
   const dateKey = date.toISOString().slice(0, 10);
   const results: AgentDreamProcessorResult[] = [];
@@ -217,6 +220,9 @@ export async function processAgentMemoryDreams(
     }
     await writeFile(dailyPath, `# Agent Daily Memory ${dateKey}\n\n<!-- Processed into dreams on ${new Date().toISOString()} -->\n`, "utf-8");
     results.push({ agentId: agent.id, ...result });
+    if (resolveMemoryBackend(settings).type === "qmd") {
+      scheduleQmdAgentMemoryRefresh(rootDir, agent.id);
+    }
   }
 
   return results;
