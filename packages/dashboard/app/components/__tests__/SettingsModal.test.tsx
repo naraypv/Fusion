@@ -5,6 +5,10 @@ import { SettingsModal } from "../SettingsModal";
 import { __test_clearCache as clearPluginUiSlotsCache } from "../../hooks/usePluginUiSlots";
 import type { SettingsExportData, UpdateCheckResponse } from "../../api";
 import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
+import {
+  clearPendingAuthLoginUiState,
+  savePendingAuthLoginUiState,
+} from "../../utils/pendingAuthLoginUiState";
 
 // --- API mocks ---
 const mockFetchSettings = vi.fn();
@@ -255,6 +259,10 @@ describe("SettingsModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearPluginUiSlotsCache();
+    clearPendingAuthLoginUiState("anthropic");
+    clearPendingAuthLoginUiState("claude-cli");
+    clearPendingAuthLoginUiState("cursor");
+    clearPendingAuthLoginUiState("google-gemini-cli");
     mockUseMobileKeyboard.mockReturnValue({
       keyboardOpen: false,
       keyboardOverlap: 0,
@@ -1241,6 +1249,47 @@ describe("SettingsModal", () => {
 
       await waitFor(() => {
         expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "resumed-claude-code");
+      });
+    });
+
+    it("restores the Claude CLI manual-code box from browser cache when the server status omits it", async () => {
+      savePendingAuthLoginUiState("claude-cli", {
+        instructions: "Finish Claude sign-in from the restored browser prompt.",
+        manualCode: {
+          prompt: "Paste the Claude authorization code",
+          placeholder: "code...",
+          helpText: "Submit the code here.",
+        },
+      });
+      mockFetchClaudeCliStatus.mockResolvedValue({
+        binary: { available: true, version: "claude 1.0.0", probeDurationMs: 1 },
+        enabled: true,
+        extension: null,
+        ready: true,
+      });
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [{
+          id: "claude-cli",
+          name: "Anthropic — via Claude CLI",
+          authenticated: true,
+          type: "cli",
+          loginInProgress: true,
+          supportsMultipleAccounts: true,
+          accountCount: 0,
+          accounts: [],
+        }],
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
+      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
+      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "cached-claude-code");
+      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
+
+      await waitFor(() => {
+        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "cached-claude-code");
       });
     });
 

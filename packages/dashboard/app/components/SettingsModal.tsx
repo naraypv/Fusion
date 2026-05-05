@@ -48,6 +48,11 @@ import { useNodes } from "../hooks/useNodes";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { NodeHealthDot } from "./NodeHealthDot";
 import { filterVisibleOnboardingAndSettingsProviders } from "./providerVisibility";
+import {
+  clearPendingAuthLoginUiState,
+  getPendingAuthLoginUiState,
+  savePendingAuthLoginUiState,
+} from "../utils/pendingAuthLoginUiState";
 
 // ---------------------------------------------------------------------------
 // GitHub star count — fetched once per session, cached in localStorage (1 h).
@@ -758,6 +763,11 @@ export function SettingsModal({
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.loginInstructions?.trim()) {
             next[provider.id] = provider.loginInstructions;
+            continue;
+          }
+          const pending = provider.loginInProgress ? getPendingAuthLoginUiState(provider.id) : undefined;
+          if (pending?.instructions?.trim()) {
+            next[provider.id] = pending.instructions;
           }
         }
         for (const [providerId, instructions] of Object.entries(prev)) {
@@ -773,6 +783,11 @@ export function SettingsModal({
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.manualCode) {
             next[provider.id] = provider.manualCode;
+            continue;
+          }
+          const pending = provider.loginInProgress ? getPendingAuthLoginUiState(provider.id) : undefined;
+          if (pending?.manualCode) {
+            next[provider.id] = pending.manualCode;
           }
         }
         for (const [providerId, manualCode] of Object.entries(prev)) {
@@ -1007,6 +1022,7 @@ export function SettingsModal({
   }, []);
 
   const clearAuthLoginUiState = useCallback((providerId: string) => {
+    clearPendingAuthLoginUiState(providerId);
     setLoginInstructions((prev) => {
       if (!(providerId in prev)) {
         return prev;
@@ -1046,6 +1062,7 @@ export function SettingsModal({
       if (manualCode) {
         setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
       }
+      savePendingAuthLoginUiState(providerId, { instructions, manualCode });
       window.open(appendTokenQuery(url), "_blank");
 
       // Poll for auth completion every 2 seconds
@@ -1211,6 +1228,10 @@ export function SettingsModal({
       if (result.manualCode) {
         setManualCodeConfigs((prev) => ({ ...prev, [providerId]: result.manualCode! }));
       }
+      savePendingAuthLoginUiState(providerId, {
+        instructions: result.instructions,
+        manualCode: result.manualCode,
+      });
       if (result.url) {
         setAuthProviders((prev) => prev.map((provider) =>
           provider.id === providerId ? { ...provider, loginInProgress: true } : provider,

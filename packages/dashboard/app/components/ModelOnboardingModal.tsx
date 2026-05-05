@@ -32,6 +32,11 @@ import { CustomProviderForm } from "./CustomProviderForm";
 import { PluginSlot } from "./PluginSlot";
 import { appendTokenQuery } from "../auth";
 import { filterVisibleOnboardingAndSettingsProviders } from "./providerVisibility";
+import {
+  clearPendingAuthLoginUiState,
+  getPendingAuthLoginUiState,
+  savePendingAuthLoginUiState,
+} from "../utils/pendingAuthLoginUiState";
 
 const mapLegacyCustomProviderToConfig = (
   provider: CustomProvider | CustomProviderConfig,
@@ -742,6 +747,11 @@ export function ModelOnboardingModal({
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.loginInstructions?.trim()) {
             next[provider.id] = provider.loginInstructions;
+            continue;
+          }
+          const pending = provider.loginInProgress ? getPendingAuthLoginUiState(provider.id) : undefined;
+          if (pending?.instructions?.trim()) {
+            next[provider.id] = pending.instructions;
           }
         }
         for (const [providerId, instructions] of Object.entries(prev)) {
@@ -757,6 +767,11 @@ export function ModelOnboardingModal({
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.manualCode) {
             next[provider.id] = provider.manualCode;
+            continue;
+          }
+          const pending = provider.loginInProgress ? getPendingAuthLoginUiState(provider.id) : undefined;
+          if (pending?.manualCode) {
+            next[provider.id] = pending.manualCode;
           }
         }
         for (const [providerId, manualCode] of Object.entries(prev)) {
@@ -1102,6 +1117,7 @@ export function ModelOnboardingModal({
       });
 
       const clearAuthLoginUiState = () => {
+        clearPendingAuthLoginUiState(providerId);
         setLoginInstructions((prev) => {
           if (!(providerId in prev)) {
             return prev;
@@ -1149,6 +1165,7 @@ export function ModelOnboardingModal({
         if (manualCode) {
           setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
         }
+        savePendingAuthLoginUiState(providerId, { instructions, manualCode });
         if (url) {
           window.open(appendTokenQuery(url), "_blank");
         }
@@ -1261,6 +1278,7 @@ export function ModelOnboardingModal({
 
   // Cancellation handler for in-progress logins
   const handleCancelLogin = useCallback(async (providerId: string) => {
+    clearPendingAuthLoginUiState(providerId);
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
