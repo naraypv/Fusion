@@ -56,6 +56,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
     rejectInput: (error: Error) => void;
     inputSubmitted: boolean;
     manualCode?: ManualCodeConfig;
+    instructions?: string;
   };
 
   /**
@@ -154,15 +155,23 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
     accountCount: number;
     supportsMultipleAccounts: boolean;
     lastLoginResult?: SafeAddAccountResult;
+    loginInstructions?: string;
+    manualCode?: ManualCodeConfig;
   } {
     const accounts = getProviderAccounts(storage, provider.id);
     const lastLoginResult = lastLoginResults.get(provider.id);
+    const oauthLogin = loginInProgress.get(provider.id);
+    const cliLogin = isCliAccountProvider(provider.id) ? cliAccountLoginInProgress.get(provider.id) : undefined;
+    const loginInstructions = cliLogin?.instructions ?? oauthLogin?.instructions;
+    const manualCode = cliLogin?.manualCode ?? oauthLogin?.manualCode;
     return {
       ...provider,
       accounts,
       accountCount: accounts.length,
       supportsMultipleAccounts: isMultiAccountProvider(provider.id) || accounts.length > 0,
       ...(lastLoginResult ? { lastLoginResult } : {}),
+      ...(loginInstructions ? { loginInstructions } : {}),
+      ...(manualCode ? { manualCode } : {}),
     };
   }
 
@@ -319,6 +328,8 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         accountCount: number;
         supportsMultipleAccounts: boolean;
         lastLoginResult?: SafeAddAccountResult;
+        loginInstructions?: string;
+        manualCode?: ManualCodeConfig;
       }[] = oauthProviders.map((p) => ({
         ...withAccountStatus(storage, {
           id: p.id,
@@ -912,9 +923,11 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
       // Start login flow in background — don't await the full login
       const loginPromise = storage.login(provider, {
         onAuth: (info) => {
+          const instructions = appendManualCodeHint(info.instructions, provider, origin);
+          pendingLogin.instructions = instructions;
           authResolve({
             url: info.url,
-            instructions: appendManualCodeHint(info.instructions, provider, origin),
+            instructions,
           });
         },
         onPrompt: async () => await pendingLogin.inputPromise,

@@ -63,6 +63,28 @@ function getNodeStatusLabel(status: "online" | "offline" | "connecting" | "error
   return "Offline";
 }
 
+function areStringRecordsEqual(left: Record<string, string>, right: Record<string, string>): boolean {
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) return false;
+  return leftKeys.every((key) => left[key] === right[key]);
+}
+
+function areManualCodeRecordsEqual(
+  left: Record<string, ManualOAuthCodeInfo>,
+  right: Record<string, ManualOAuthCodeInfo>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) return false;
+  return leftKeys.every((key) => {
+    const leftConfig = left[key];
+    const rightConfig = right[key];
+    return Boolean(rightConfig)
+      && leftConfig.prompt === rightConfig.prompt
+      && leftConfig.placeholder === rightConfig.placeholder
+      && leftConfig.helpText === rightConfig.helpText;
+  });
+}
+
 /**
  * Has the user already clicked the "Star on GitHub" button at any point in
  * the past? Used to permanently hide the button afterward — clicking opens
@@ -733,13 +755,33 @@ export function SettingsModal({
       setAuthProviders(visibleProviders);
       setLoginInstructions((prev) => {
         const next: Record<string, string> = {};
+        for (const provider of visibleProviders) {
+          if (provider.loginInProgress && provider.loginInstructions?.trim()) {
+            next[provider.id] = provider.loginInstructions;
+          }
+        }
         for (const [providerId, instructions] of Object.entries(prev)) {
           const provider = visibleProviders.find((candidate) => candidate.id === providerId);
-          if (provider && !provider.authenticated) {
+          if (provider && provider.loginInProgress && !(providerId in next)) {
             next[providerId] = instructions;
           }
         }
-        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+        return areStringRecordsEqual(prev, next) ? prev : next;
+      });
+      setManualCodeConfigs((prev) => {
+        const next: Record<string, ManualOAuthCodeInfo> = {};
+        for (const provider of visibleProviders) {
+          if (provider.loginInProgress && provider.manualCode) {
+            next[provider.id] = provider.manualCode;
+          }
+        }
+        for (const [providerId, manualCode] of Object.entries(prev)) {
+          const provider = visibleProviders.find((candidate) => candidate.id === providerId);
+          if (provider && provider.loginInProgress && !(providerId in next)) {
+            next[providerId] = manualCode;
+          }
+        }
+        return areManualCodeRecordsEqual(prev, next) ? prev : next;
       });
     } catch {
       // Silently fail — auth may not be configured

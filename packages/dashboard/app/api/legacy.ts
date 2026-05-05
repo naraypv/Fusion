@@ -1282,6 +1282,10 @@ export interface AuthProvider {
   supportsMultipleAccounts?: boolean;
   /** Last OAuth/API-key add-account result for status polling and duplicate-account messaging. */
   lastLoginResult?: AuthAddAccountResult;
+  /** Instructions for an OAuth/CLI login that is already in progress on the server. */
+  loginInstructions?: string;
+  /** Manual code-entry config for an OAuth/CLI login that is already in progress on the server. */
+  manualCode?: ManualOAuthCodeInfo;
 }
 
 export interface AuthAccountSummary {

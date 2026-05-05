@@ -1349,6 +1349,11 @@ describe("POST /auth/cli-account", () => {
   it("starts CLI OAuth without blocking and returns the provider URL for the dashboard browser", async () => {
     const submitManualCode = vi.fn().mockReturnValue(true);
     const cancel = vi.fn();
+    const probeSpy = vi.spyOn(claudeCliProbeModule, "probeClaudeCli").mockResolvedValue({
+      available: true,
+      version: "claude 1.0.0",
+      probeDurationMs: 10,
+    });
     vi.spyOn(cliAccountAuthModule, "startCliAccountLogin").mockResolvedValueOnce({
       providerId: "claude-cli",
       url: "https://claude.ai/oauth/authorize?state=test",
@@ -1379,6 +1384,18 @@ describe("POST /auth/cli-account", () => {
       },
     });
 
+    const statusRes = await GET(app, "/api/auth/status");
+    const claudeProvider = statusRes.body.providers.find((p: any) => p.id === "claude-cli");
+    expect(claudeProvider).toMatchObject({
+      id: "claude-cli",
+      loginInProgress: true,
+      loginInstructions: "Open from the dashboard browser",
+      manualCode: {
+        prompt: "Paste the Claude authorization code",
+        placeholder: "code...",
+      },
+    });
+
     const codeRes = await REQUEST(app, "POST", "/api/auth/manual-code", JSON.stringify({
       provider: "claude-cli",
       code: "test-code",
@@ -1395,6 +1412,7 @@ describe("POST /auth/cli-account", () => {
     expect(cancelRes.status).toBe(200);
     expect(cancelRes.body).toEqual({ success: true, cancelled: true });
     expect(cancel).toHaveBeenCalled();
+    probeSpy.mockRestore();
   });
 });
 

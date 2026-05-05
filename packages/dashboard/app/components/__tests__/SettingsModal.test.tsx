@@ -1191,6 +1191,59 @@ describe("SettingsModal", () => {
       });
     });
 
+    it("restores the Claude CLI manual-code box from an in-progress status refresh", async () => {
+      mockFetchClaudeCliStatus.mockResolvedValue({
+        binary: { available: true, version: "claude 1.0.0", probeDurationMs: 1 },
+        enabled: true,
+        extension: null,
+        ready: true,
+      });
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [{
+          id: "claude-cli",
+          name: "Anthropic — via Claude CLI",
+          authenticated: true,
+          type: "cli",
+          loginInProgress: true,
+          supportsMultipleAccounts: true,
+          accountCount: 1,
+          accounts: [{
+            id: "claude-cli-account-1",
+            providerId: "claude-cli",
+            label: "Claude account 1",
+            credentialKind: "cli_oauth_home",
+            accountDisplayHint: "user@example.com",
+            priority: 100,
+            status: "active",
+            createdAt: "2026-05-05T00:00:00.000Z",
+            updatedAt: "2026-05-05T00:00:00.000Z",
+          }],
+          loginInstructions: "Finish Claude sign-in in the browser, then paste the code below.",
+          manualCode: {
+            prompt: "Paste the Claude authorization code",
+            placeholder: "code...",
+            helpText: "Submit the code here.",
+          },
+        }],
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const claudeCard = await screen.findByTestId("claude-cli-provider-card");
+      expect(within(claudeCard).getByRole("button", { name: "Waiting for login…" })).toBeInTheDocument();
+      expect(within(claudeCard).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
+      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
+
+      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "resumed-claude-code");
+      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
+
+      await waitFor(() => {
+        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "resumed-claude-code");
+      });
+    });
+
     it("scrolls settings content to top after API key save succeeds", async () => {
       mockFetchAuthStatus.mockResolvedValueOnce({
         providers: [{ id: "openai", name: "OpenAI", authenticated: false, type: "api_key" }],
