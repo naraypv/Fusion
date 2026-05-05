@@ -1789,6 +1789,26 @@ export function TaskDetailContent({
                     </span>
                   </div>
                 )}
+                {(task.prInfo?.number || task.mergeDetails?.prNumber) && (
+                  <div className="detail-provenance detail-pr-link-row">
+                    <GitBranch aria-hidden="true" />
+                    <span>
+                      PR{" "}
+                      {task.prInfo?.url ? (
+                        <a
+                          className="detail-provenance-link"
+                          href={task.prInfo.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          #{task.prInfo.number}
+                        </a>
+                      ) : (
+                        <span>#{task.prInfo?.number ?? task.mergeDetails?.prNumber}</span>
+                      )}
+                    </span>
+                  </div>
+                )}
               </div>
             </>
           )}

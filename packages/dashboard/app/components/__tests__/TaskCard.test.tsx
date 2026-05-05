@@ -59,6 +59,53 @@ describe("TaskCard", () => {
     expect(screen.getByText("FN-001")).toBeDefined();
   });
 
+  it("clicking PR badge link does not open the task detail modal", () => {
+    const onOpenDetail = vi.fn();
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          prInfo: {
+            url: "https://github.com/owner/repo/pull/42",
+            number: 42,
+            status: "open",
+            title: "PR",
+            headBranch: "fusion/fn-001",
+            baseBranch: "main",
+            commentCount: 0,
+          } as any,
+        })}
+        onOpenDetail={onOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "#42" }));
+    expect(onOpenDetail).not.toHaveBeenCalled();
+  });
+
+  it("clicking issue badge text does not open the task detail modal", () => {
+    const onOpenDetail = vi.fn();
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          issueInfo: {
+            url: "https://github.com/owner/repo/issues/123",
+            number: 123,
+            state: "open",
+            title: "Issue",
+          } as any,
+        })}
+        onOpenDetail={onOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("#123"));
+    expect(onOpenDetail).not.toHaveBeenCalled();
+  });
+
   it("renders the status badge when task.status is set", () => {
     render(
       <TaskCard

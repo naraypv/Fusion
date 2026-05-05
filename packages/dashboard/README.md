@@ -466,6 +466,8 @@ The dashboard exposes two automated completion strategies in Settings:
 
 When the merge strategy is **Pull request**:
 
+- Task cards render the PR badge as a direct GitHub link (`#<number>`) that opens the PR in a new tab without triggering the card detail modal
+- The task detail modal surfaces linked PR numbers as direct GitHub links for both in-review and completed tasks (not just inside the in-review PR section)
 - The task's PR section shows whether kb is waiting on checks/reviews or has merged successfully
 - Required checks must pass before kb merges the PR; optional checks do not block auto-merge
 - A blocking review state (for example, active changes requested) prevents auto-merge until cleared

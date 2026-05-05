@@ -17,39 +17,31 @@ function getIssueModifierClass(state: string, stateReason?: string): string {
 }
 
 export function GitHubBadge({ prInfo, issueInfo, onIssueRefresh: _onIssueRefresh }: GitHubBadgeProps) {
-  const handlePrClick = () => {
-    if (prInfo?.url) {
-      window.open(prInfo.url, "_blank", "noopener,noreferrer");
-    }
-  };
-
-  const handleIssueClick = () => {
-    if (issueInfo?.url) {
-      window.open(issueInfo.url, "_blank", "noopener,noreferrer");
-    }
-  };
-
   return (
     <>
       {prInfo && (
-        <span
+        <a
           className={`card-github-badge card-github-badge--${prInfo.status}`}
           title={`PR #${prInfo.number}: ${prInfo.title}`}
-          onClick={handlePrClick}
+          href={prInfo.url}
+          target="_blank"
+          rel="noopener noreferrer"
         >
           <GitPullRequest size={12} />
           <span>#{prInfo.number}</span>
-        </span>
+        </a>
       )}
       {issueInfo && (
-        <span
+        <a
           className={`card-github-badge ${getIssueModifierClass(issueInfo.state, issueInfo.stateReason)}`}
           title={`Issue #${issueInfo.number}: ${issueInfo.title}`}
-          onClick={handleIssueClick}
+          href={issueInfo.url}
+          target="_blank"
+          rel="noopener noreferrer"
         >
           <CircleDot size={12} />
           <span>#{issueInfo.number}</span>
-        </span>
+        </a>
       )}
     </>
   );

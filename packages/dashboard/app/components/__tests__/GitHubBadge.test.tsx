@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import type { IssueInfo, PrInfo } from "@fusion/core";
 import { GitHubBadge } from "../GitHubBadge";
 
@@ -141,56 +141,23 @@ describe("GitHubBadge", () => {
     });
   });
 
-  describe("Click behavior", () => {
-    it("opens PR URL in new tab when PR badge is clicked", () => {
-      const mockOpen = vi.fn();
-      vi.stubGlobal("open", mockOpen);
-
+  describe("Link behavior", () => {
+    it("renders PR badge as a semantic link", () => {
       render(<GitHubBadge prInfo={mockPrInfo} />);
 
-      const badge = screen.getByTitle("PR #42: Fix critical bug");
-      fireEvent.click(badge);
-
-      expect(mockOpen).toHaveBeenCalledWith(
-        "https://github.com/owner/repo/pull/42",
-        "_blank",
-        "noopener,noreferrer"
-      );
-
-      vi.unstubAllGlobals();
+      const badge = screen.getByRole("link", { name: "#42" });
+      expect(badge).toHaveAttribute("href", "https://github.com/owner/repo/pull/42");
+      expect(badge).toHaveAttribute("target", "_blank");
+      expect(badge).toHaveAttribute("rel", "noopener noreferrer");
     });
 
-    it("opens Issue URL in new tab when Issue badge is clicked", () => {
-      const mockOpen = vi.fn();
-      vi.stubGlobal("open", mockOpen);
-
+    it("renders Issue badge as a semantic link", () => {
       render(<GitHubBadge issueInfo={mockIssueInfo} />);
 
-      const badge = screen.getByTitle("Issue #123: Feature request: dark mode");
-      fireEvent.click(badge);
-
-      expect(mockOpen).toHaveBeenCalledWith(
-        "https://github.com/owner/repo/issues/123",
-        "_blank",
-        "noopener,noreferrer"
-      );
-
-      vi.unstubAllGlobals();
-    });
-
-    it("does not open window when PR badge is clicked but URL is missing", () => {
-      const mockOpen = vi.fn();
-      vi.stubGlobal("open", mockOpen);
-
-      const prWithoutUrl: PrInfo = { ...mockPrInfo, url: "" };
-      render(<GitHubBadge prInfo={prWithoutUrl} />);
-
-      const badge = screen.getByTitle("PR #42: Fix critical bug");
-      fireEvent.click(badge);
-
-      expect(mockOpen).not.toHaveBeenCalled();
-
-      vi.unstubAllGlobals();
+      const badge = screen.getByRole("link", { name: "#123" });
+      expect(badge).toHaveAttribute("href", "https://github.com/owner/repo/issues/123");
+      expect(badge).toHaveAttribute("target", "_blank");
+      expect(badge).toHaveAttribute("rel", "noopener noreferrer");
     });
   });
 

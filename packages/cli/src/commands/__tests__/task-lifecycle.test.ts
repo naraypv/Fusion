@@ -22,7 +22,16 @@ interface MockTask {
   title: string;
   description: string;
   worktree?: string;
-  prInfo?: unknown;
+  prInfo?: {
+    number: number;
+    url: string;
+    status: "open" | "closed" | "merged";
+    headBranch?: string;
+    baseBranch?: string;
+    title?: string;
+    commentCount?: number;
+    lastCheckedAt?: string;
+  };
   column: string;
 }
 
@@ -40,6 +49,28 @@ function makeStore(task: MockTask, settings: Record<string, unknown> = {}) {
     logEntry: vi.fn().mockResolvedValue(undefined),
     getActiveMergingTask: vi.fn().mockReturnValue(null),
     _updates: updates,
+  });
+}
+
+function makeStatefulStore(task: MockTask, settings: Record<string, unknown> = {}) {
+  const emitter = new EventEmitter();
+  let state = structuredClone(task);
+  return Object.assign(emitter, {
+    getTask: vi.fn(async () => structuredClone(state)),
+    getSettings: vi.fn().mockResolvedValue({ requirePrApproval: false, ...settings }),
+    updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      state = { ...state, ...patch };
+    }),
+    updatePrInfo: vi.fn(async (_id: string, prInfo: MockTask["prInfo"]) => {
+      state = { ...state, prInfo: prInfo ?? undefined };
+      return structuredClone(state);
+    }),
+    moveTask: vi.fn(async (_id: string, column: string) => {
+      state = { ...state, column };
+    }),
+    logEntry: vi.fn().mockResolvedValue(undefined),
+    getActiveMergingTask: vi.fn().mockReturnValue(null),
+    _getState: () => state,
   });
 }
 
@@ -238,6 +269,59 @@ describe("processPullRequestMergeTask", () => {
     expect(github.mergePr).not.toHaveBeenCalled();
     expect(store.updateTask).toHaveBeenCalledWith("FN-9004", { status: null, mergeRetries: 0 });
     expect(store.moveTask).toHaveBeenCalledWith("FN-9004", "done");
+  });
+
+  it("preserves PR number/url through create, refresh, and merge completion", async () => {
+    const task: MockTask = {
+      id: "FN-9103",
+      title: "test",
+      description: "desc",
+      column: "in-review",
+    };
+    const store = makeStatefulStore(task);
+
+    const createdPr = {
+      number: 123,
+      url: "https://github.com/x/y/pull/123",
+      status: "open" as const,
+      headBranch: "fusion/fn-9103",
+      baseBranch: "main",
+      title: "PR title",
+      commentCount: 0,
+    };
+    const mergedPr = {
+      ...createdPr,
+      status: "merged" as const,
+      commentCount: 2,
+    };
+
+    const github = {
+      findPrForBranch: vi.fn(async () => null),
+      createPr: vi.fn(async () => createdPr),
+      getPrMergeStatus: vi.fn(async () => ({
+        prInfo: { ...createdPr, commentCount: 1 },
+        reviewDecision: "APPROVED",
+        checks: [],
+        mergeReady: true,
+        blockingReasons: [],
+      })),
+      mergePr: vi.fn(async () => mergedPr),
+    };
+
+    const result = await processPullRequestMergeTask(
+      store as never,
+      "/repo",
+      task.id,
+      github as never,
+      () => undefined,
+    );
+
+    expect(result).toBe("merged");
+    const persisted = (store as { _getState: () => MockTask })._getState();
+    expect(persisted.column).toBe("done");
+    expect(persisted.prInfo?.number).toBe(123);
+    expect(persisted.prInfo?.url).toBe("https://github.com/x/y/pull/123");
+    expect(store.updatePrInfo).toHaveBeenCalledTimes(3);
   });
 
   describe("requirePrApproval", () => {

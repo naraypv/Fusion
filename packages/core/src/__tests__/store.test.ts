@@ -5721,6 +5721,29 @@ Task with acceptance criteria
       expect(updated.log.some((l) => l.action === "PR linked" && l.outcome?.includes("#42"))).toBe(true);
     });
 
+    it("keeps PR number/url after moving task to done", async () => {
+      const task = await createTestTask();
+      const prInfo = {
+        url: "https://github.com/owner/repo/pull/42",
+        number: 42,
+        status: "open" as const,
+        title: "Fix the bug",
+        headBranch: "kb-001-fix-bug",
+        baseBranch: "main",
+        commentCount: 0,
+      };
+
+      await store.updatePrInfo(task.id, prInfo);
+      await store.moveTask(task.id, "todo");
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.moveTask(task.id, "done");
+
+      const updated = await store.getTask(task.id);
+      expect(updated.prInfo?.number).toBe(42);
+      expect(updated.prInfo?.url).toBe("https://github.com/owner/repo/pull/42");
+    });
+
     it("updates existing PR info with new values", async () => {
       const task = await createTestTask();
       const prInfo1 = {

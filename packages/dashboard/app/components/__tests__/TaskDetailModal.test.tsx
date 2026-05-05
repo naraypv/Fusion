@@ -2971,6 +2971,60 @@ describe("TaskDetailModal", () => {
       expect(screen.queryByText("Merge & Close")).toBeNull();
     });
 
+    it("shows linked PR number in detail metadata for in-review tasks", () => {
+      render(
+        <TaskDetailModal
+          task={makeTask({ column: "in-review" as Column, prInfo: {
+            url: "https://github.com/owner/repo/pull/42",
+            number: 42,
+            status: "open",
+            title: "Task",
+            headBranch: "fusion/fn-099",
+            baseBranch: "main",
+            commentCount: 0,
+          } })}
+          onClose={noop}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      expect(screen.getByRole("link", { name: "#42" })).toHaveAttribute("href", "https://github.com/owner/repo/pull/42");
+    });
+
+    it("shows linked PR number in merge details for done tasks", () => {
+      render(
+        <TaskDetailModal
+          task={makeTask({
+            column: "done" as Column,
+            prInfo: {
+              url: "https://github.com/owner/repo/pull/42",
+              number: 42,
+              status: "merged",
+              title: "Task",
+              headBranch: "fusion/fn-099",
+              baseBranch: "main",
+              commentCount: 0,
+            },
+            mergeDetails: { prNumber: 42 },
+          })}
+          onClose={noop}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+
+      const links = screen.getAllByRole("link", { name: "#42" });
+      expect(links.length).toBeGreaterThan(0);
+      expect(links[0]).toHaveAttribute("href", "https://github.com/owner/repo/pull/42");
+    });
+
     it("shows PR automation waiting label instead of Merge & Close when awaiting PR checks", () => {
       render(
         <TaskDetailModal
