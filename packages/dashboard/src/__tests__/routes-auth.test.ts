@@ -1167,6 +1167,37 @@ describe("POST /auth/login", () => {
       helpText: "After sign-in, OpenAI may redirect to a localhost callback that cannot open from this dashboard host. Copy the full browser URL from the address bar and paste it here.",
     });
   });
+
+  it("returns an Anthropic manual-code prompt for OAuth code login", async () => {
+    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: "anthropic", name: "Anthropic" },
+    ]);
+    (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation((_provider: string, callbacks: any) => {
+      callbacks.onAuth({
+        url: "https://claude.com/cai/oauth/authorize?code=true&state=test-state",
+        instructions: "Open in browser",
+      });
+      return new Promise(() => {});
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/auth/login",
+      JSON.stringify({ provider: "anthropic", origin: "http://localhost:4040" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe("https://claude.com/cai/oauth/authorize?code=true&state=test-state");
+    expect(res.body.instructions).toContain("copy the one-time authorization code");
+    expect(res.body.manualCode).toEqual({
+      prompt: "Paste the Anthropic authorization code",
+      placeholder: "code...",
+      helpText: "After Anthropic sign-in, copy the one-time authorization code from the browser and submit it here so Fusion can finish adding this account.",
+    });
+  });
+
   it("returns 400 when provider is missing", async () => {
     const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({}), {
       "Content-Type": "application/json",
@@ -1427,6 +1458,49 @@ describe("POST /auth/manual-code", () => {
     expect(submitRes.body).toEqual({ success: true, submitted: true });
     await vi.waitFor(() => {
       expect(submittedCode).toBe("http://localhost:1455/auth/callback?code=test-code&state=test-state");
+    });
+  });
+
+  it("submits pasted Anthropic authorization code into an active OAuth login", async () => {
+    let submittedCode: string | undefined;
+    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: "anthropic", name: "Anthropic" },
+    ]);
+    (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_provider: string, callbacks: {
+        onAuth: (info: { url: string; instructions?: string }) => void;
+        onPrompt?: () => Promise<string>;
+      }) => {
+        callbacks.onAuth({
+          url: "https://claude.com/cai/oauth/authorize?code=true&state=test-state",
+        });
+        submittedCode = await callbacks.onPrompt?.();
+      },
+    );
+
+    const app = buildApp();
+    const loginRes = await REQUEST(
+      app,
+      "POST",
+      "/api/auth/login",
+      JSON.stringify({ provider: "anthropic", origin: "http://localhost:4040" }),
+      { "Content-Type": "application/json" },
+    );
+    expect(loginRes.status).toBe(200);
+    expect(loginRes.body.manualCode?.prompt).toBe("Paste the Anthropic authorization code");
+
+    const submitRes = await REQUEST(
+      app,
+      "POST",
+      "/api/auth/manual-code",
+      JSON.stringify({ provider: "anthropic", code: "claude-test-code" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(submitRes.status).toBe(200);
+    expect(submitRes.body).toEqual({ success: true, submitted: true });
+    await vi.waitFor(() => {
+      expect(submittedCode).toBe("claude-test-code");
     });
   });
 

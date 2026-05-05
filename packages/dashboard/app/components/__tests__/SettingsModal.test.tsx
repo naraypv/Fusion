@@ -13,9 +13,11 @@ const mockExportSettings = vi.fn();
 const mockUpdateSettings = vi.fn();
 const mockUpdateGlobalSettings = vi.fn();
 const mockFetchAuthStatus = vi.fn();
+const mockFetchClaudeCliStatus = vi.fn();
 const mockLoginProvider = vi.fn();
 const mockLogoutProvider = vi.fn();
 const mockCancelProviderLogin = vi.fn();
+const mockSubmitProviderManualCode = vi.fn();
 const mockSaveApiKey = vi.fn();
 const mockAddCliAccountProvider = vi.fn();
 const mockFetchModels = vi.fn();
@@ -67,9 +69,11 @@ vi.mock("../../api", async (importOriginal) => {
     exportSettings: (...args: unknown[]) => mockExportSettings(...args),
     importSettings: (...args: unknown[]) => mockImportSettings(...args),
     fetchAuthStatus: (...args: unknown[]) => mockFetchAuthStatus(...args),
+    fetchClaudeCliStatus: (...args: unknown[]) => mockFetchClaudeCliStatus(...args),
     loginProvider: (...args: unknown[]) => mockLoginProvider(...args),
     logoutProvider: (...args: unknown[]) => mockLogoutProvider(...args),
     cancelProviderLogin: (...args: unknown[]) => mockCancelProviderLogin(...args),
+    submitProviderManualCode: (...args: unknown[]) => mockSubmitProviderManualCode(...args),
     saveApiKey: (...args: unknown[]) => mockSaveApiKey(...args),
     addCliAccountProvider: (...args: unknown[]) => mockAddCliAccountProvider(...args),
     fetchModels: (...args: unknown[]) => mockFetchModels(...args),
@@ -273,12 +277,19 @@ describe("SettingsModal", () => {
     mockFetchSettings.mockResolvedValue(defaultSettings);
     mockFetchSettingsByScope.mockResolvedValue({ global: defaultSettings, project: {} });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
+    mockFetchClaudeCliStatus.mockResolvedValue({
+      binary: { available: true, version: "1.0.0", probeDurationMs: 1 },
+      enabled: false,
+      extension: null,
+      ready: false,
+    });
     mockFetchModels.mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] });
     mockFetchCustomProviders.mockResolvedValue({ providers: [] });
     mockCreateCustomProvider.mockResolvedValue({ provider: {} });
     mockUpdateCustomProvider.mockResolvedValue({ provider: {} });
     mockDeleteCustomProvider.mockResolvedValue(undefined);
     mockCancelProviderLogin.mockResolvedValue({ success: true, cancelled: true });
+    mockSubmitProviderManualCode.mockResolvedValue({ success: true, submitted: true });
     mockSaveApiKey.mockResolvedValue(undefined);
     mockTestNotification.mockResolvedValue({ success: true });
     mockFetchBackups.mockResolvedValue({ backups: [], totalSize: 0 });
@@ -1099,6 +1110,85 @@ describe("SettingsModal", () => {
       const codexCard = screen.getByTestId("auth-provider-icon-openai-codex").closest(".auth-provider-card") as HTMLElement;
       expect(within(codexCard).getByRole("button", { name: "Add another account" })).toBeInTheDocument();
       expect(within(codexCard).getByRole("button", { name: "Logout" })).toBeInTheDocument();
+    });
+
+    it("shows the Anthropic manual-code box during OAuth login", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth" }],
+      });
+      mockLoginProvider.mockResolvedValue({
+        url: "https://claude.com/cai/oauth/authorize?code=true",
+        instructions: "Finish Anthropic sign-in in the browser.",
+        manualCode: {
+          prompt: "Paste the Anthropic authorization code",
+          placeholder: "code...",
+          helpText: "Submit the code here.",
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
+
+      expect(openSpy).toHaveBeenCalledWith("https://claude.com/cai/oauth/authorize?code=true", "_blank");
+      const manualCodeForm = await screen.findByTestId("auth-manual-code-anthropic");
+      expect(manualCodeForm).toHaveTextContent("Paste the Anthropic authorization code");
+
+      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "anthropic-code-123");
+      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
+
+      await waitFor(() => {
+        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("anthropic", "anthropic-code-123");
+      });
+    });
+
+    it("shows the Claude CLI manual-code box during add-account login", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [{
+          id: "claude-cli",
+          name: "Anthropic — via Claude CLI",
+          authenticated: false,
+          type: "cli",
+          loginInProgress: false,
+          accounts: [],
+          accountCount: 0,
+        }],
+      });
+      mockAddCliAccountProvider.mockResolvedValue({
+        success: true,
+        provider: "claude-cli",
+        url: "https://claude.com/cai/oauth/authorize?code=true",
+        instructions: "Finish Claude sign-in in the browser.",
+        manualCode: {
+          prompt: "Paste the Claude authorization code",
+          placeholder: "code...",
+          helpText: "Submit the code here.",
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const claudeCard = screen.getByTestId("claude-cli-provider-card");
+      await waitFor(() => {
+        expect(within(claudeCard).getByRole("button", { name: "Login" })).toBeEnabled();
+      });
+      await userEvent.click(within(claudeCard).getByRole("button", { name: "Login" }));
+
+      expect(openSpy).toHaveBeenCalledWith("https://claude.com/cai/oauth/authorize?code=true", "_blank");
+      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
+      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
+
+      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "claude-code-123");
+      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
+
+      await waitFor(() => {
+        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "claude-code-123");
+      });
     });
 
     it("scrolls settings content to top after API key save succeeds", async () => {

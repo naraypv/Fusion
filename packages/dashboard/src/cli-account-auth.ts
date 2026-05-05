@@ -350,6 +350,7 @@ export function startCliAccountLogin(
       completionResolve = resolveCompletion;
       completionReject = rejectCompletion;
     });
+    let startupTimeout: NodeJS.Timeout | undefined;
 
     const rejectStart = (error: Error) => {
       if (started) {
@@ -364,6 +365,10 @@ export function startCliAccountLogin(
       const url = extractFirstUrl(output);
       if (!url) return;
       started = true;
+      if (startupTimeout) {
+        clearTimeout(startupTimeout);
+        startupTimeout = undefined;
+      }
       resolve({
         providerId,
         url,
@@ -381,11 +386,11 @@ export function startCliAccountLogin(
       });
     };
 
-    const timeout = setTimeout(() => {
+    startupTimeout = setTimeout(() => {
       rejectStart(new Error(`${config.displayName} login did not produce an authorization URL within 30 seconds`));
       child.kill("SIGTERM");
     }, 30_000);
-    timeout.unref();
+    startupTimeout.unref();
 
     const onData = (chunk: Buffer) => {
       output += chunk.toString("utf-8");
@@ -394,14 +399,24 @@ export function startCliAccountLogin(
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
     child.on("error", (error) => {
-      clearTimeout(timeout);
+      if (startupTimeout) {
+        clearTimeout(startupTimeout);
+        startupTimeout = undefined;
+      }
       rejectStart(error);
     });
     child.on("close", (code) => {
-      clearTimeout(timeout);
+      if (startupTimeout) {
+        clearTimeout(startupTimeout);
+        startupTimeout = undefined;
+      }
       if (code !== 0) {
         const message = stripAnsi(output).trim();
         rejectStart(new Error(`${config.displayName} login failed with exit code ${code ?? "unknown"}${message ? `: ${message}` : ""}`));
+        return;
+      }
+      if (!started) {
+        rejectStart(new Error(`${config.displayName} login completed before Fusion received an authorization URL`));
         return;
       }
 

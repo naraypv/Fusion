@@ -250,18 +250,26 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
   }
 
   function getManualCodeConfig(providerId: string, origin: string | undefined): ManualCodeConfig | undefined {
-    if (providerId !== "openai-codex") {
-      return undefined;
+    if (providerId === "anthropic") {
+      return {
+        prompt: "Paste the Anthropic authorization code",
+        placeholder: "code...",
+        helpText: "After Anthropic sign-in, copy the one-time authorization code from the browser and submit it here so Fusion can finish adding this account.",
+      };
     }
 
-    const remoteDashboard = origin !== undefined && !isLocalhostOrigin(origin);
-    return {
-      prompt: "Paste the final redirect URL or authorization code",
-      placeholder: "http://localhost:1455/auth/callback?code=...&state=... or just the code",
-      helpText: remoteDashboard
-        ? "After sign-in, OpenAI may redirect to a localhost callback that cannot open from this dashboard host. Copy the full browser URL from the address bar and paste it here."
-        : "If the browser cannot finish the localhost callback automatically, copy the full browser URL from the address bar and paste it here.",
-    };
+    if (providerId === "openai-codex") {
+      const remoteDashboard = origin !== undefined && !isLocalhostOrigin(origin);
+      return {
+        prompt: "Paste the final redirect URL or authorization code",
+        placeholder: "http://localhost:1455/auth/callback?code=...&state=... or just the code",
+        helpText: remoteDashboard
+          ? "After sign-in, OpenAI may redirect to a localhost callback that cannot open from this dashboard host. Copy the full browser URL from the address bar and paste it here."
+          : "If the browser cannot finish the localhost callback automatically, copy the full browser URL from the address bar and paste it here.",
+      };
+    }
+
+    return undefined;
   }
 
   function appendManualCodeHint(
