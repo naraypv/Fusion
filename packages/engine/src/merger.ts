@@ -2582,6 +2582,14 @@ export async function aiMergeTask(
 ): Promise<MergeResult> {
   throwIfAborted(options.signal, taskId);
 
+  // Validate task state before touching git. Invalid/requeued tasks should
+  // fail without stashing, resetting, or otherwise mutating the checkout.
+  const task = await store.getTask(taskId);
+  const mergeBlocker = getTaskMergeBlocker(task);
+  if (mergeBlocker) {
+    throw new Error(`Cannot merge ${taskId}: ${mergeBlocker}`);
+  }
+
   // Pre-merge guard against the common single-checkout setup where rootDir
   // is the developer's working tree. The merge flow below issues several
   // `git reset --hard/--merge` calls and forced checkouts that would
@@ -2590,13 +2598,6 @@ export async function aiMergeTask(
   // for the full rationale.
   const autostashRef = await stashUnrelatedRootDirChanges(rootDir, taskId);
   try {
-
-  // 1. Validate task state
-  const task = await store.getTask(taskId);
-  const mergeBlocker = getTaskMergeBlocker(task);
-  if (mergeBlocker) {
-    throw new Error(`Cannot merge ${taskId}: ${mergeBlocker}`);
-  }
 
   const branch = task.branch || `fusion/${taskId.toLowerCase()}`;
   const sourceIssueRef = buildSourceIssueRef(task.sourceIssue);

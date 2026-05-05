@@ -45,6 +45,7 @@ function initRepo(dir: string): string {
   writeFileSync(join(dir, "README.md"), "# repo\n");
   git("git add README.md");
   git('git commit -m "chore: initial commit"');
+  git("git branch -M main");
 
   return git("git rev-parse HEAD");
 }
