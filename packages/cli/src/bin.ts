@@ -125,6 +125,7 @@ async function loadCommandHandlers() {
   const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
   const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
   const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice } = await import("./commands/mission.js");
+  const { runPlansList, runPlansStatus, runPlansTransition } = await import("./commands/plans.js");
   const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
   const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = await import("./commands/node.js");
   const { runInit } = await import("./commands/init.js");
@@ -184,6 +185,9 @@ async function loadCommandHandlers() {
     runMissionShow,
     runMissionDelete,
     runMissionActivateSlice,
+    runPlansList,
+    runPlansStatus,
+    runPlansTransition,
     runProjectList,
     runProjectAdd,
     runProjectRemove,
@@ -286,6 +290,10 @@ Usage:
   fn mission show | info <id>         Show mission details
   fn mission delete <id> [--force]    Delete a mission
   fn mission activate-slice <id>      Mark a slice active
+  fn plans list | ls [--json]         List stored Fusion plans
+  fn plans status <id> [--json]       Show a stored Fusion plan and ledger count
+  fn plans transition <plan> <goal> <status> [--reason <text>] [--json]
+                                      Apply a validated plan-goal transition
   fn project list | ls [--json]       List all registered projects
   fn project add [name] [path] [opts]  Register a new project
   fn project remove | rm <name> [--force]
@@ -520,6 +528,9 @@ async function main() {
     runMissionShow,
     runMissionDelete,
     runMissionActivateSlice,
+    runPlansList,
+    runPlansStatus,
+    runPlansTransition,
     runProjectList,
     runProjectAdd,
     runProjectRemove,
@@ -1185,6 +1196,35 @@ async function main() {
           default:
             console.error(`Unknown subcommand: mission ${subcommand || ""}`);
             console.log("Try: fn mission create | list | show | delete | activate-slice");
+            process.exit(1);
+        }
+        break;
+      }
+
+      case "plans": {
+        const subcommand = args[1];
+        switch (subcommand) {
+          case "list":
+          case "ls": {
+            await runPlansList({ projectName, json: args.includes("--json") });
+            break;
+          }
+          case "status":
+          case "show": {
+            await runPlansStatus(args[2], { projectName, json: args.includes("--json") });
+            break;
+          }
+          case "transition": {
+            await runPlansTransition(args[2], args[3], args[4], {
+              projectName,
+              json: args.includes("--json"),
+              reason: getFlagValue(args, "--reason"),
+            });
+            break;
+          }
+          default:
+            console.error(`Unknown subcommand: plans ${subcommand || ""}`);
+            console.log("Try: fn plans list | status | transition");
             process.exit(1);
         }
         break;

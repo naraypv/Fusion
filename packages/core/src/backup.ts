@@ -412,7 +412,7 @@ export async function syncBackupAutomation(
   // Uses `npx runfusion.ai` so backups work even when only the zero-install
   // path (`npx runfusion.ai`) has been used and `fn` is not on PATH.
   // Sentinel command intercepted in-process by the engine's cron/routine
-  // runner (see `isInProcessBackupCommand` in @fusion/engine). Stored as a
+  // runner (see `isInProcessBackupCommand` in the engine package). Stored as a
   // command rather than a step so existing UI listings still display it as
   // a single-line action. Falls back to the npx shell-out only when read by
   // a runner that does not implement the in-process interception (e.g.
@@ -469,7 +469,7 @@ export async function syncBackupRoutine(
   }
 
   // Sentinel command intercepted in-process by the engine's cron/routine
-  // runner (see `isInProcessBackupCommand` in @fusion/engine). Stored as a
+  // runner (see `isInProcessBackupCommand` in the engine package). Stored as a
   // command rather than a step so existing UI listings still display it as
   // a single-line action. Falls back to the npx shell-out only when read by
   // a runner that does not implement the in-process interception (e.g.

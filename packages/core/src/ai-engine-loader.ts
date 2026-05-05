@@ -1,5 +1,5 @@
 /**
- * Shared lazy accessor for `@fusion/engine`'s `createFnAgent`.
+ * Shared lazy accessor for the engine package's `createFnAgent`.
  *
  * Core can't import engine statically (engine depends on core, so a static
  * import would create a cycle). Instead, engine wires its `createFnAgent` in
@@ -27,7 +27,7 @@ export interface AgentMessage {
 }
 
 /**
- * Wire engine's `createFnAgent` into core. Called by `@fusion/engine` at module
+ * Wire engine's `createFnAgent` into core. Called by the engine package at module
  * load. Tests can also call this with a stub.
  */
 export function setCreateFnAgent(fn: CreateFnAgent | undefined): void {
@@ -35,7 +35,7 @@ export function setCreateFnAgent(fn: CreateFnAgent | undefined): void {
 }
 
 /**
- * Returns `createFnAgent` from `@fusion/engine`, or `undefined` if engine has
+ * Returns the engine-registered `createFnAgent`, or `undefined` if engine has
  * not registered itself yet (typical in tests).
  */
 export async function getFnAgent(): Promise<CreateFnAgent> {
@@ -44,7 +44,7 @@ export async function getFnAgent(): Promise<CreateFnAgent> {
 
 /**
  * Wire engine's plugin-facing AI session factory into core.
- * Called by `@fusion/engine` at module load; tests may register stubs.
+ * Called by the engine package at module load; tests may register stubs.
  */
 export function setCreateAiSessionFactory(fn: CreateAiSessionFactory | undefined): void {
   createAiSessionFactory = fn;

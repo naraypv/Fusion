@@ -62,6 +62,7 @@ import { getTaskCompletionBlockerForStore } from "./task-completion.js";
 import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
 import { createRunVerificationTool } from "./run-verification-tool.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
+import { buildBoundPlanGoalPromptContext, persistBoundPlanGoalCompletion } from "./planned-execution.js";
 
 // Re-export for backward compatibility (tests import from executor.ts)
 export { summarizeToolArgs } from "./agent-logger.js";
@@ -2915,7 +2916,12 @@ export class TaskExecutor {
               "Review the current state of your worktree and proceed with the next pending step.",
             ].join("\n"));
           } else {
-            const agentPrompt = buildExecutionPrompt(detail, this.rootDir, settings, worktreePath);
+            const basePrompt = buildExecutionPrompt(detail, this.rootDir, settings, worktreePath);
+            const planGoalContext = await buildBoundPlanGoalPromptContext({
+              fusionDir: this.store.getFusionDir(),
+              taskId: task.id,
+            });
+            const agentPrompt = planGoalContext ? `${basePrompt}\n\n${planGoalContext}` : basePrompt;
             await promptWithFallback(session, agentPrompt);
           }
 
@@ -3893,6 +3899,18 @@ export class TaskExecutor {
           await store.updateTask(taskId, { paused: false, status: null });
         }
         await store.logEntry(taskId, "Task marked done by agent");
+        const planCompletion = await persistBoundPlanGoalCompletion({
+          fusionDir: store.getFusionDir(),
+          taskId,
+          reason: params.summary,
+          evidence: { source: "fn_task_done" },
+        });
+        if (planCompletion) {
+          await store.logEntry(
+            taskId,
+            `Plan goal completed: ${planCompletion.planId}/${planCompletion.goalId}`,
+          );
+        }
 
         const latestTask = await store.getTask(taskId);
         let latestColumn = latestTask.column;

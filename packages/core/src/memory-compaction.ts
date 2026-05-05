@@ -6,7 +6,7 @@
  * architectural conventions, pitfalls, and decisions.
  *
  * Features:
- * - Dynamic import of @fusion/engine for AI agent creation
+ * - Engine-registered AI agent creation
  * - Read-only tool access (prevents accidental memory modification during compaction)
  * - Session disposal in finally block to prevent leaks
  * - AiServiceError for AI-related failures

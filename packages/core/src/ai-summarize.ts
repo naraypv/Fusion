@@ -7,7 +7,7 @@
  *
  * Features:
  * - Rate limiting per IP (10 requests per hour)
- * - Dynamic import of @fusion/engine for AI agent creation
+ * - Engine-registered AI agent creation
  * - Text length validation (201-2000 characters)
  */
 

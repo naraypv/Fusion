@@ -2,13 +2,49 @@ export { COLUMNS, COLUMN_LABELS, COLUMN_DESCRIPTIONS, VALID_TRANSITIONS, DEFAULT
 export type { Column, IssueInfo, IssueState, TaskSourceIssue, PrInfo, PrStatus, Task, TaskTokenUsage, TaskAttachment, TaskComment, TaskCommentInput, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, TaskCreateInput, TaskSource, SourceType, TaskDetail, InboxTask, TodoList, TodoItem, TodoListCreateInput, TodoListUpdateInput, TodoItemCreateInput, TodoItemUpdateInput, TodoListWithItems, AgentLogEntry, AgentLogType, AgentRole, BoardConfig, MergeDetails, MergeResult, MergeConflictStrategy, CanonicalMergeConflictStrategy, Settings, GlobalSettings, ProjectSettings, WebSearchBackend, ResearchEnabledSources, ResearchGlobalDefaults, ResearchProjectLimits, ResearchProjectSettings, SettingsScope, DaemonTokenSettings, TaskStep, StepStatus, TaskLogEntry, RunMutationContext, ActivityLogEntry, ActivityEventType, ThinkingLevel, ThemeMode, ColorTheme, ExecutionMode, TaskPriority, UnavailableNodePolicy, PlanningQuestion, PlanningSummary, PlanningResponse, PlanningQuestionType, ArchivedTaskEntry, BatchStatusRequest, BatchStatusResponse, BatchStatusEntry, BatchStatusResult, ModelPreset, WorkflowStep, WorkflowStepMode, WorkflowStepPhase, WorkflowStepInput, WorkflowStepResult, WorkflowStepTemplate, Agent, OrgTreeNode, AgentState, AgentDetail, AgentCreateInput, AgentUpdateInput, AgentApiKey, AgentApiKeyCreateResult, AgentCapability, AgentPromptTemplate, AgentPromptsConfig, AgentPermission, TaskAssignSource, AgentAccessState, AgentHeartbeatConfig, AgentBudgetConfig, AgentBudgetStatus, InstructionsBundleConfig, MessageResponseMode, AgentHeartbeatEvent, AgentHeartbeatRun, BlockedStateSnapshot, HeartbeatInvocationSource, AgentTaskSession, AgentRating, AgentRatingSummary, AgentRatingInput, AgentConfigSnapshot, RevisionFieldDiff, AgentConfigRevision, AgentStats, ReflectionTrigger, ReflectionMetrics, AgentReflection, AgentPerformanceSummary, NtfyNotificationEvent, NotificationEvent, NotificationPayload, NotificationProviderConfig, CustomProvider, SteeringComment, ParticipantType, MessageType, Message, MessageCreateInput, MessageFilter, MessageMetadata, MessageReplyReference, Mailbox, CheckoutLease, RunAuditDomain, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter } from "./types.js";
 export { AGENT_VALID_TRANSITIONS } from "./types.js";
 export {
+  PLAN_FORMAT_VERSION,
+  PLAN_GOAL_STATUSES,
+  PLAN_STATUSES,
+  applyGoalTransition,
+  assertValidPlanArtifact,
+  canTransitionGoal,
+  getReadyGoals,
+  isPlanBinding,
+  isPlanGoalStatus,
+  isPlanStatus,
+  PlanStore,
+  validatePlanArtifact,
+  exportSlopJanitorGoalDirectory,
+  exportSlopJanitorPlan,
+  importSlopJanitorPlan,
+} from "./plans/index.js";
+export type {
+  ApplyGoalTransitionOptions,
+  ApplyGoalTransitionResult,
+  CreatePlanOptions,
+  PlanArtifact,
+  PlanBinding,
+  PlanGoal,
+  PlanGoalStatus,
+  PlanLedgerEvent,
+  PlanStoreOptions,
+  PlanStatus,
+  PlanTransitionError,
+  PlanTransitionErrorCode,
+  PlanValidation,
+  PlanValidationError,
+  PlanValidationErrorCode,
+  SlopJanitorExportOptions,
+  TransitionGoalResult,
+} from "./plans/index.js";
+export {
   BUILTIN_AGENT_PROMPTS,
   resolveAgentPrompt,
   getAvailableTemplates,
   getTemplatesForRole,
 } from "./agent-prompts.js";
 
-// ── Engine wiring (set by @fusion/engine at module load) ────────────
+// ── Engine wiring (set by the engine package at module load) ─────────
 export { setCreateFnAgent, getFnAgent, type AgentMessage } from "./ai-engine-loader.js";
 
 // ── Prompt Overrides ─────────────────────────────────────────────────

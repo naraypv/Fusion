@@ -9,7 +9,7 @@
  * NOTE: The built-in prompt texts are derived from the engine's hardcoded prompts
  * (EXECUTOR_SYSTEM_PROMPT, TRIAGE_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT, and the
  * merger prompt). They should be kept in sync when the engine prompts change.
- * Since @fusion/core cannot import @fusion/engine (circular dependency), these
+ * Since core cannot import the engine package (circular dependency), these
  * are maintained as inline strings.
  *
  * @module agent-prompts

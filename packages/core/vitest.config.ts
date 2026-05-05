@@ -1,10 +1,17 @@
 import { defineConfig } from "vitest/config";
 import { resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { computeMaxWorkers } from "./src/__test-utils__/vitest-workers";
 
 const maxWorkers = computeMaxWorkers();
+const workspaceRoot = resolve(__dirname, "../..");
 
 export default defineConfig({
+  server: {
+    fs: {
+      allow: [workspaceRoot, tmpdir()],
+    },
+  },
   resolve: {
     alias: {
       "@fusion/test-utils": resolve(__dirname, "./src/__test-utils__/workspace.ts"),
