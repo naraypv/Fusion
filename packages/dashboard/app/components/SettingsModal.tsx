@@ -208,6 +208,21 @@ function accountResultToast(result: AuthProvider["lastLoginResult"] | undefined)
   };
 }
 
+const REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS = new Set([
+  "openai-codex",
+  "codex",
+  "anthropic",
+  "claude-cli",
+  "cursor",
+  "minimax",
+]);
+
+function canAddAnotherAuthAccount(provider: AuthProvider): boolean {
+  return provider.supportsMultipleAccounts === true
+    || (provider.accountCount ?? 0) > 0
+    || REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS.has(provider.id);
+}
+
 function fallbackChainSlots(chain: ModelFallbackChainEntry[] | undefined): ModelFallbackChainEntry[] {
   return Array.from({ length: MODEL_FALLBACK_CHAIN_SLOT_COUNT }, (_unused, index) => chain?.[index] ?? {});
 }
@@ -5287,7 +5302,9 @@ export function SettingsModal({
                   {claudeCliProvider?.authenticated && claudeCliCard}
                   {cursorProvider?.authenticated && cursorCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
-                  {authenticatedProviders.map((provider) => (
+                  {authenticatedProviders.map((provider) => {
+                    const canAddAnotherAccount = canAddAnotherAuthAccount(provider);
+                    return (
                     <div key={provider.id} className="auth-provider-card auth-provider-card--authenticated">
                       <div className="auth-provider-header">
                         <div className="auth-provider-info">
@@ -5331,11 +5348,12 @@ export function SettingsModal({
                                 </button>
                               )}
                               <button
+                                type="button"
                                 className="btn btn-primary btn-sm"
                                 onClick={() => handleSaveApiKey(provider.id)}
                                 disabled={authActionInProgress === provider.id}
                               >
-                                {provider.authenticated ? "Add another account" : "Save"}
+                                {provider.authenticated && canAddAnotherAccount ? "Add another account" : "Save"}
                               </button>
                             </div>
                             {authActionInProgress === provider.id && (
@@ -5362,8 +5380,9 @@ export function SettingsModal({
                               </div>
                             ) : (
                               <div className="auth-provider-actions-row">
-                                {provider.supportsMultipleAccounts && (
+                                {canAddAnotherAccount && (
                                   <button
+                                    type="button"
                                     className="btn btn-primary btn-sm"
                                     onClick={() => handleLogin(provider.id, true)}
                                   >
@@ -5371,6 +5390,7 @@ export function SettingsModal({
                                   </button>
                                 )}
                                 <button
+                                  type="button"
                                   className="btn btn-sm"
                                   onClick={() => handleLogout(provider.id)}
                                 >
@@ -5416,7 +5436,8 @@ export function SettingsModal({
                         </div>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               {showAvailableGroup && (

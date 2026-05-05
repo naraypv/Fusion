@@ -1199,6 +1199,7 @@
 .auth-provider-info strong {
   font-weight: 500;
   color: var(--text);
+  overflow-wrap: anywhere;
 }
 .auth-provider-icon-slot {
   display: inline-flex;
@@ -1224,12 +1225,17 @@
   flex-direction: column;
   gap: 4px;
   align-items: flex-end;
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 .auth-apikey-input-row {
   display: flex;
   gap: 6px;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 .auth-apikey-input {
   background: var(--bg-input);
@@ -1238,7 +1244,7 @@
   color: var(--text);
   padding: 6px 10px;
   font-size: 13px;
-  width: 180px;
+  width: min(100%, calc(var(--space-xl) * 8));
   font-family: monospace;
 }
 .auth-apikey-input:focus {
@@ -1263,6 +1269,10 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-sm);
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .auth-provider-cli-actions {

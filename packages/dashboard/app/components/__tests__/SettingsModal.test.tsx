@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { SettingsModal } from "../SettingsModal";
 import { __test_clearCache as clearPluginUiSlotsCache } from "../../hooks/usePluginUiSlots";
 import type { SettingsExportData, UpdateCheckResponse } from "../../api";
+import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
 
 // --- API mocks ---
 const mockFetchSettings = vi.fn();
@@ -234,6 +235,17 @@ describe("SettingsModal", () => {
     const generalHeading = screen.getByRole("heading", { name: "General" });
     expect(generalHeading).toHaveClass("settings-section-heading");
     expect(container.querySelectorAll(".settings-section-heading").length).toBeGreaterThan(0);
+  });
+
+  it("keeps authentication account action rows from clipping add-account controls", () => {
+    const css = loadAllAppCssBaseOnly();
+    const oauthActions = css.match(/\.auth-provider-actions-row\s*\{([^}]+)\}/)?.[1] ?? "";
+    const apiKeyActions = css.match(/\.auth-apikey-input-row\s*\{([^}]+)\}/)?.[1] ?? "";
+
+    expect(oauthActions).toContain("flex-wrap: wrap");
+    expect(oauthActions).toContain("flex: 0 0 auto");
+    expect(apiKeyActions).toContain("flex-wrap: wrap");
+    expect(apiKeyActions).toContain("justify-content: flex-end");
   });
 
   beforeEach(() => {
@@ -1065,6 +1077,28 @@ describe("SettingsModal", () => {
       await waitFor(() => {
         expect(mockCancelProviderLogin).toHaveBeenCalledWith("github-copilot");
       });
+    });
+
+    it("shows add another account for authenticated Codex OAuth even when no account rows exist yet", async () => {
+      mockFetchAuthStatus.mockResolvedValue({
+        providers: [
+          {
+            id: "openai-codex",
+            name: "ChatGPT Plus/Pro (Codex Subscription)",
+            authenticated: true,
+            type: "oauth",
+            accountCount: 0,
+            accounts: [],
+          },
+        ],
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const codexCard = screen.getByTestId("auth-provider-icon-openai-codex").closest(".auth-provider-card") as HTMLElement;
+      expect(within(codexCard).getByRole("button", { name: "Add another account" })).toBeInTheDocument();
+      expect(within(codexCard).getByRole("button", { name: "Logout" })).toBeInTheDocument();
     });
 
     it("scrolls settings content to top after API key save succeeds", async () => {
