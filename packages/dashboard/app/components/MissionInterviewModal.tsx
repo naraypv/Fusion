@@ -356,7 +356,7 @@ export function MissionInterviewModal({
         setMissionGoal(persisted);
       }
     }
-  }, [isOpen]); // intentional: only re-run on open/close, not on every keystroke
+  }, [isOpen]);
 
   // Auto-start when initialGoal prop is provided
   useEffect(() => {
