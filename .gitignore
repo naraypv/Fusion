@@ -26,6 +26,10 @@ kb.db/
 .agent/goals/
 .agent/work/
 .agent/active
+.agent/reference-cache/
+.agent/secrets/
+.agent/state/
+.agent/tmp/
 
 # Stray worktrees accidentally created at the repo root by the executor
 # or by manual `git worktree add` invocations. Without this, any such
