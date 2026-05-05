@@ -14,7 +14,7 @@ export interface DspyRoutingMetadata {
   modelId?: string;
 }
 
-export const DEFAULT_DSPY_ADAPTER_ROOT = "/media/naray/backup_np_2/github/dspy_adapter";
+export const DEFAULT_DSPY_ADAPTER_ROOT = "/media/naray/backup_np_2/github/dspy";
 export const DSPY_ACCOUNT_REGISTRY_VERSION = 1;
 
 interface DspyAccountRef {
@@ -118,7 +118,8 @@ export function syncFusionAccountsToDspyRegistry(options: {
   defaultModelId?: string;
 } = {}): DspyAccountRegistrySyncResult {
   const accountStore = options.accountStore ?? new MultiAccountAuthStore();
-  const registryPath = options.registryPath ?? join(getHomeDir(), ".fusion", "dspy", "accounts.json");
+  const registryPath = options.registryPath
+    ?? join(process.env.DSPY_ACCOUNT_CONFIG_DIR ?? join(getHomeDir(), ".fusion", "dspy"), "accounts.json");
   const accounts = accountStore
     .list()
     .map((account) => toDspyAccountRef(account, options.defaultModelId))
@@ -135,6 +136,7 @@ export function syncFusionAccountsToDspyRegistry(options: {
   } catch {
     // Best effort for non-POSIX filesystems.
   }
+  process.env.DSPY_ACCOUNT_CONFIG_DIR = dirname(registryPath);
 
   return { path: registryPath, accountsWritten: accounts.length };
 }
@@ -165,10 +167,12 @@ export function buildDspyRoutedSystemPrompt(systemPrompt: string, metadata: Dspy
   const routingContract = [
     "<fusion-dspy-routing>",
     `adapter_root: ${metadata.adapterRoot}`,
+    ...(metadata.accountRegistryPath ? [`account_config_dir: ${dirname(metadata.accountRegistryPath)}`] : []),
     ...(metadata.accountRegistryPath ? [`account_registry: ${metadata.accountRegistryPath}`] : []),
     `module: ${metadata.moduleName}`,
     `signature: ${metadata.signatureName}(system_prompt, user_request, tool_context, account_pool_state) -> agent_response`,
     "predictor: dspy.ChainOfThought",
+    "lm: dspy.SubscriptionLM.from_registry(providers=['codex', 'claude', 'cursor', 'minimax'])",
     "routing: all LLM completions for this Fusion session are declared as DSPy program calls before provider execution",
     "quality_contract: preserve the existing Fusion behavior while treating instructions, inputs, outputs, and tool observations as typed DSPy fields",
     "</fusion-dspy-routing>",

@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { MultiAccountAuthStore } from "@fusion/core";
 import {
   DEFAULT_DSPY_ADAPTER_ROOT,
@@ -11,6 +11,11 @@ import {
 } from "../dspy-bridge.js";
 
 describe("DSPy bridge", () => {
+  afterEach(() => {
+    delete process.env.DSPY_ACCOUNT_CONFIG_DIR;
+    delete process.env.FUSION_DSPY_ADAPTER_ROOT;
+  });
+
   it("leaves prompts unchanged when routing is disabled", () => {
     const metadata = createDspyRoutingMetadata({ enabled: false });
     expect(buildDspyRoutedSystemPrompt("base system", metadata)).toBe("base system");
@@ -24,6 +29,7 @@ describe("DSPy bridge", () => {
     expect(prompt).toContain("<fusion-dspy-routing>");
     expect(prompt).toContain("FusionAgentCall(system_prompt, user_request, tool_context, account_pool_state) -> agent_response");
     expect(prompt).toContain("dspy.ChainOfThought");
+    expect(prompt).toContain("dspy.SubscriptionLM.from_registry");
   });
 
   it("projects Fusion accounts into a DSPy SubscriptionLM-compatible registry without raw secrets", () => {
@@ -45,6 +51,7 @@ describe("DSPy bridge", () => {
     const parsed = JSON.parse(raw) as { accounts: Array<Record<string, unknown>> };
 
     expect(result.accountsWritten).toBe(2);
+    expect(process.env.DSPY_ACCOUNT_CONFIG_DIR).toBe(dirname(result.path));
     expect(raw).not.toContain("mm-secret");
     expect(parsed.accounts.map((account) => account.provider)).toEqual(["claude", "minimax"]);
     expect(parsed.accounts[0]?.home).toBe(join(dir, "claude-home", ".claude"));
