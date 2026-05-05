@@ -6251,9 +6251,15 @@ ${stepsSection}`;
       } catch (err) {
         // Best-effort flush — entries for deleted tasks will fail FK check.
         // Log the error instead of silently swallowing it.
-        console.warn(`[fusion] Could not flush remaining agent log entries on close (${this.db.path}):`, err);
+        console.warn(`[fusion] Could not flush remaining agent log entries on close:`, err);
       }
     }
+    // Cancel any retry timer armed by a failed flush — the DB is about to close.
+    if (this.agentLogFlushTimer) {
+      clearTimeout(this.agentLogFlushTimer);
+      this.agentLogFlushTimer = null;
+    }
+    this.agentLogBuffer.length = 0;
     if (this._db) {
       this._db.close();
       this._db = null;
