@@ -32,6 +32,21 @@ export function useModalResizePersist(
     const node = ref.current;
     if (!node) return;
 
+    // On mobile, modals render full-screen via CSS (height: 100dvh) and the
+    // resize grip is disabled. Replaying a desktop-saved pixel height here
+    // would override the mobile CSS and leave the modal stuck at a partial
+    // height. Skip restoration; also clear any width/height left over from
+    // a prior desktop render of the same modal instance.
+    const isMobile =
+      typeof window !== "undefined" &&
+      ("ontouchstart" in window || navigator.maxTouchPoints > 0) &&
+      window.innerWidth <= 768;
+    if (isMobile) {
+      node.style.removeProperty("width");
+      node.style.removeProperty("height");
+      return;
+    }
+
     // Apply the persisted size on open.
     try {
       const raw = localStorage.getItem(storageKey);

@@ -1,5 +1,5 @@
 import "./PlanningModeModal.css";
-import { useState, useCallback, useEffect, useRef, useMemo, type CSSProperties } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import type { Task, PlanningQuestion, PlanningSummary } from "@fusion/core";
 import { getErrorMessage } from "@fusion/core";
 import {
@@ -193,13 +193,30 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     useMobileKeyboard({ enabled: viewportMode === "mobile" });
   useMobileScrollLock(viewportMode === "mobile" && isOpen);
 
-  const modalKeyboardStyle: CSSProperties = keyboardOpen
-    ? ({
-        "--keyboard-overlap": `${keyboardOverlap}px`,
-        "--vv-offset-top": `${viewportOffsetTop}px`,
-        ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
-      } as CSSProperties)
-    : {};
+  // Drive --vv-height / --keyboard-overlap / --vv-offset-top imperatively
+  // rather than via React's style prop. Reason: when React removes a CSS
+  // custom property between renders it sets it to empty string instead of
+  // calling removeProperty(). On iOS Safari that leaves the variable defined
+  // as "", so `height: var(--vv-height, 100dvh)` resolves to empty (the
+  // fallback only applies when the var is *undefined*) and the modal
+  // collapses to content height after the keyboard is dismissed.
+  useEffect(() => {
+    const node = modalRef.current;
+    if (!node) return;
+    if (keyboardOpen) {
+      node.style.setProperty("--keyboard-overlap", `${keyboardOverlap}px`);
+      node.style.setProperty("--vv-offset-top", `${viewportOffsetTop}px`);
+      if (viewportHeight !== null) {
+        node.style.setProperty("--vv-height", `${viewportHeight}px`);
+      } else {
+        node.style.removeProperty("--vv-height");
+      }
+    } else {
+      node.style.removeProperty("--keyboard-overlap");
+      node.style.removeProperty("--vv-offset-top");
+      node.style.removeProperty("--vv-height");
+    }
+  }, [keyboardOpen, keyboardOverlap, viewportOffsetTop, viewportHeight]);
 
   // Mirror streamingOutput into a ref so SSE handlers can read the latest
   // value without stale closure issues.
@@ -1568,7 +1585,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       role="dialog"
       aria-modal="true"
     >
-      <div className="modal modal-lg planning-modal" ref={modalRef} style={modalKeyboardStyle}>
+      <div className="modal modal-lg planning-modal" ref={modalRef}>
         <div className="modal-header">
           <div className="detail-title-row">
             {mobileShowDetail && (
