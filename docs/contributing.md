@@ -64,7 +64,13 @@ Fusion codifies workspace verification as a deterministic contract:
   2. `pnpm test:full`
   3. `pnpm build`
 
-CI uses `pnpm verify:workspace` directly, so changes that reintroduce hidden test pre-build dependencies fail fast.
+GitHub Actions now runs deterministic test sharding via `pnpm test:ci:shard --shard <index> --total <count>` in both PR checks and manual CI, while keeping local semantics unchanged:
+
+- `pnpm test` remains changed-only local iteration.
+- `pnpm test:full` remains the canonical full local suite.
+- `pnpm verify:workspace` remains the canonical local lint -> test -> build gate.
+
+`test:ci:shard` is a CI-focused entrypoint (`scripts/ci-test-shard.mjs`) that partitions a fixed package list by shard index modulo total shard count so coverage is deterministic and reproducible.
 
 `pnpm test` now uses a changed-only entrypoint (`scripts/test-changed.mjs`) for faster local iteration. It resolves the comparison base from `.changeset/config.json` (`baseBranch`) and runs only affected package test scripts using safe package-first filtering (`pnpm --filter <pkg> test`). It automatically falls back to the full suite when the run is forced (CI / `--full`), the git comparison base or diff cannot be resolved, no changes are detected, or shared/root test infrastructure changes.
 
@@ -176,8 +182,8 @@ Use project memory for reusable patterns, constraints, and pitfalls that should 
 Fusion can automatically extract insights from memory and prune transient content. Enable via `insightExtractionEnabled` setting:
 
 - `.fusion/memory/MEMORY.md` — Canonical long-term memory source (inside the layered `.fusion/memory/` workspace) compacted/pruned by extraction jobs
-- `.fusion/memory-insights.md` — Distilled insights output
-- `.fusion/memory-audit.md` — Audit report after each extraction (includes pruning outcome)
+- `.fusion/memory/memory-insights.md` — Distilled insights output
+- `.fusion/memory/memory-audit.md` — Audit report after each extraction (includes pruning outcome)
 
 See [Settings Reference](./settings-reference.md#background-memory-summarization--audit) for configuration details.
 

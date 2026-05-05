@@ -4,12 +4,12 @@ import {
   Bot, Heart, Activity, Pause, Play, Square, Trash2, RefreshCw, 
   Settings, FileText, ActivitySquare, X, Copy, 
   ExternalLink, CheckCircle, XCircle, Loader2, GitBranch, ListChecks,
-  ChevronDown, ChevronRight, BarChart3, BookOpen, Eye, FileEdit
+  ChevronDown, ChevronRight, ChevronLeft, BarChart3, BookOpen, Eye, FileEdit
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo } from "../api";
-import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure } from "../api";
+import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure, updateGlobalSettings } from "../api";
 import type { Agent } from "../api";
 import type { AgentLogEntry, Task } from "@fusion/core";
 import { getErrorMessage } from "@fusion/core";
@@ -62,6 +62,7 @@ interface AgentDetailViewProps {
   addToast: (message: string, type?: "success" | "error") => void;
   onChildClick?: (childId: string) => void;
   inline?: boolean;
+  showInlineBackButton?: boolean;
   initialTab?: TabId;
   initialRunId?: string | null;
   preferActiveRun?: boolean;
@@ -111,6 +112,7 @@ const MEMORY_LAYER_DESCRIPTIONS: Record<MemoryFileInfo["layer"], string> = {
 };
 
 const DEFAULT_HEARTBEAT_INTERVAL_LABEL = formatHeartbeatInterval(DEFAULT_HEARTBEAT_INTERVAL_MS);
+const CONFIG_AUTOSAVE_DEBOUNCE_MS = 700;
 
 function pickDefaultAgentMemoryPath(files: MemoryFileInfo[], currentPath: string): string {
   if (files.some((file) => file.path === currentPath)) {
@@ -122,7 +124,7 @@ function pickDefaultAgentMemoryPath(files: MemoryFileInfo[], currentPath: string
     ?? "";
 }
 
-export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, initialTab, initialRunId, preferActiveRun = false }: AgentDetailViewProps) {
+export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, showInlineBackButton = false, initialTab, initialRunId, preferActiveRun = false }: AgentDetailViewProps) {
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const { confirm } = useConfirm();
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
@@ -493,6 +495,17 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
         <div className="agent-detail-header">
           {/* Identity area: icon + name + badges */}
           <div className="agent-detail-identity">
+            {inline && showInlineBackButton ? (
+              <button
+                type="button"
+                className="btn agent-detail-inline-back"
+                onClick={onClose}
+                aria-label="Back to agents"
+              >
+                <ChevronLeft size={16} />
+                Agents
+              </button>
+            ) : null}
             <div className="agent-detail-icon">
               <Bot size={20} />
             </div>
@@ -691,7 +704,8 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
           )}
 
           {activeTab === "config" && (
-            <ConfigTab 
+            <ConfigTab
+              key={agent.id}
               agent={agent}
               projectId={projectId}
               addToast={addToast}
@@ -886,7 +900,7 @@ function DashboardTab({
           </div>
           <div>
             <p className="dashboard-summary-label">Status</p>
-            <p className="dashboard-summary-health-row"><span className={cn("status-dot", agent.state === "running" && "status-dot--running")} />{health.label}{health.reason && <span className="text-secondary" style={{ marginLeft: 'var(--space-xs)', fontSize: '12px' }} title={health.reason}>({health.reason})</span>}</p>
+            <p className="dashboard-summary-health-row"><span className={cn("status-dot", agent.state === "running" && "status-dot--running")} />{health.label}{health.reason && <span className="text-secondary dashboard-summary-health-reason" title={health.reason}>({health.reason})</span>}</p>
           </div>
         </div>
       </section>
@@ -2037,7 +2051,7 @@ function MemoryTab({
           <div className="config-field">
             <label htmlFor="agent-memory-file-select">Memory Files</label>
             <span className="config-hint config-hint--block">
-              Full OpenClaw memory files at <code>.fusion/agent-memory/{agent.id}/</code> (MEMORY.md, DREAMS.md, and daily notes).
+              Full OpenClaw memory files at <code>agent/{agent.name || agent.id}/memory/</code> (MEMORY.md, DREAMS.md, and daily notes).
             </span>
 
             <select
@@ -2878,6 +2892,8 @@ function ConfigTab({
   // Model/runtime selector state
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [favoriteProviders, setFavoriteProviders] = useState<string[]>([]);
+  const [favoriteModels, setFavoriteModels] = useState<string[]>([]);
   const [availableRuntimes, setAvailableRuntimes] = useState<PluginRuntimeInfo[]>([]);
   const [runtimesLoading, setRuntimesLoading] = useState(false);
 
@@ -2936,12 +2952,48 @@ function ConfigTab({
   useEffect(() => {
     setModelsLoading(true);
     fetchModels()
-      .then((response) => setAvailableModels(response.models))
+      .then((response) => {
+        setAvailableModels(response.models);
+        setFavoriteProviders(response.favoriteProviders);
+        setFavoriteModels(response.favoriteModels);
+      })
       .catch(() => {
         // Gracefully handle unavailable models endpoint
       })
       .finally(() => setModelsLoading(false));
   }, []);
+
+  const handleToggleFavorite = useCallback(async (provider: string) => {
+    const currentFavorites = favoriteProviders;
+    const isFavorite = currentFavorites.includes(provider);
+    const newFavorites = isFavorite
+      ? currentFavorites.filter((p) => p !== provider)
+      : [provider, ...currentFavorites];
+
+    setFavoriteProviders(newFavorites);
+
+    try {
+      await updateGlobalSettings({ favoriteProviders: newFavorites, favoriteModels });
+    } catch {
+      setFavoriteProviders(currentFavorites);
+    }
+  }, [favoriteProviders, favoriteModels]);
+
+  const handleToggleModelFavorite = useCallback(async (modelId: string) => {
+    const currentFavorites = favoriteModels;
+    const isFavorite = currentFavorites.includes(modelId);
+    const newFavorites = isFavorite
+      ? currentFavorites.filter((m) => m !== modelId)
+      : [modelId, ...currentFavorites];
+
+    setFavoriteModels(newFavorites);
+
+    try {
+      await updateGlobalSettings({ favoriteProviders, favoriteModels: newFavorites });
+    } catch {
+      setFavoriteModels(currentFavorites);
+    }
+  }, [favoriteProviders, favoriteModels]);
 
   useEffect(() => {
     setRuntimesLoading(true);
@@ -2980,9 +3032,12 @@ function ConfigTab({
   const [isSaving, setIsSaving] = useState(false);
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [justSaved, setJustSaved] = useState(false);
+  const [autoSaveError, setAutoSaveError] = useState<string | null>(null);
   const isDeletableState = agent.state === "idle" || agent.state === "terminated";
   const justSavedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousAgentRuntimeSyncRef = useRef<{ id: string; updatedAt: string } | null>(null);
+  const lastSavedSignatureRef = useRef<string | null>(null);
+  const saveRevisionRef = useRef(0);
 
   useEffect(() => {
     return () => {
@@ -3138,11 +3193,9 @@ function ConfigTab({
     }
   };
 
-  const handleSave = async () => {
-    // Validate advanced settings
-    const validationErrors = validateAdvancedSettings(formValues);
+  const validationErrors = useMemo(() => {
+    const nextErrors = validateAdvancedSettings(formValues);
 
-    // Validate heartbeat settings
     for (const [key, config] of Object.entries({
       heartbeatIntervalMs: { label: "Heartbeat Interval", min: 1 },
       heartbeatTimeoutMs: { label: "Heartbeat Timeout", min: 5 },
@@ -3152,25 +3205,24 @@ function ConfigTab({
       if (!raw) continue;
       const num = Number(raw);
       if (Number.isNaN(num) || !Number.isFinite(num)) {
-        validationErrors[key] = `"${config.label}" must be a valid number`;
+        nextErrors[key] = `"${config.label}" must be a valid number`;
       } else if (num < config.min) {
-        validationErrors[key] = `"${config.label}" must be at least ${config.min.toLocaleString()}`;
+        nextErrors[key] = `"${config.label}" must be at least ${config.min.toLocaleString()}`;
       }
     }
 
     const messageResponseModeForValidation = heartbeatValues.messageResponseMode?.trim();
     if (messageResponseModeForValidation && !["immediate", "on-heartbeat"].includes(messageResponseModeForValidation)) {
-      validationErrors.messageResponseMode = "\"Message Response Mode\" must be either immediate or on-heartbeat";
+      nextErrors.messageResponseMode = "\"Message Response Mode\" must be either immediate or on-heartbeat";
     }
 
-    // Validate budget settings
     const tokenBudgetRaw = budgetValues.tokenBudget?.trim();
     if (tokenBudgetRaw) {
       const num = Number(tokenBudgetRaw);
       if (Number.isNaN(num) || !Number.isFinite(num)) {
-        validationErrors.tokenBudget = "\"Token Budget\" must be a valid number";
+        nextErrors.tokenBudget = "\"Token Budget\" must be a valid number";
       } else if (num <= 0) {
-        validationErrors.tokenBudget = "\"Token Budget\" must be greater than 0";
+        nextErrors.tokenBudget = "\"Token Budget\" must be greater than 0";
       }
     }
 
@@ -3178,15 +3230,15 @@ function ConfigTab({
     if (usageThresholdRaw) {
       const num = Number(usageThresholdRaw);
       if (Number.isNaN(num) || !Number.isFinite(num)) {
-        validationErrors.usageThreshold = "\"Usage Threshold\" must be a valid number";
+        nextErrors.usageThreshold = "\"Usage Threshold\" must be a valid number";
       } else if (num < 1 || num > 100) {
-        validationErrors.usageThreshold = "\"Usage Threshold\" must be between 1 and 100";
+        nextErrors.usageThreshold = "\"Usage Threshold\" must be between 1 and 100";
       }
     }
 
     const budgetPeriodRaw = budgetValues.budgetPeriod?.trim();
     if (budgetPeriodRaw && !["daily", "weekly", "monthly", "lifetime"].includes(budgetPeriodRaw)) {
-      validationErrors.budgetPeriod = "\"Budget Period\" must be one of: daily, weekly, monthly, lifetime";
+      nextErrors.budgetPeriod = "\"Budget Period\" must be one of: daily, weekly, monthly, lifetime";
     }
 
     const resetDayRaw = budgetValues.resetDay?.trim();
@@ -3194,22 +3246,24 @@ function ConfigTab({
     if (resetDayRaw) {
       const num = Number(resetDayRaw);
       if (Number.isNaN(num) || !Number.isFinite(num)) {
-        validationErrors.resetDay = "\"Reset Day\" must be a valid number";
+        nextErrors.resetDay = "\"Reset Day\" must be a valid number";
       } else if (periodForResetDay === "weekly") {
         if (num < 0 || num > 6 || !Number.isInteger(num)) {
-          validationErrors.resetDay = "\"Reset Day\" must be between 0 (Sunday) and 6 (Saturday) for weekly period";
+          nextErrors.resetDay = "\"Reset Day\" must be between 0 (Sunday) and 6 (Saturday) for weekly period";
         }
       } else if (periodForResetDay === "monthly") {
         if (num < 1 || num > 31 || !Number.isInteger(num)) {
-          validationErrors.resetDay = "\"Reset Day\" must be between 1 and 31 for monthly period";
+          nextErrors.resetDay = "\"Reset Day\" must be between 1 and 31 for monthly period";
         }
       }
     }
 
+    return nextErrors;
+  }, [formValues, heartbeatValues, budgetValues]);
+
+  const buildSavePayload = useCallback(() => {
     if (Object.keys(validationErrors).length > 0) {
-      setErrors(validationErrors);
-      addToast("Please fix validation errors before saving", "error");
-      return;
+      return null;
     }
 
     // Build the metadata payload — only include non-empty values
@@ -3321,32 +3375,99 @@ function ConfigTab({
       }
     }
 
+    return {
+      name: nameValue.trim() || undefined,
+      role: roleValue,
+      title: titleValue.trim() || undefined,
+      icon: iconValue.trim() || undefined,
+      reportsTo: reportsToValue.trim() || undefined,
+      metadata: newMetadata,
+      runtimeConfig: newRuntimeConfig,
+      bundleConfig: newBundleConfig,
+    };
+  }, [agent.metadata, agent.runtimeConfig, budgetValues, bundleEntryFile, bundleExternalPath, bundleFiles, bundleMode, formValues, heartbeatEnabled, heartbeatValues, iconValue, modelValue, nameValue, reportsToValue, roleValue, runtimeMode, selectedRuntimeId, selectedSkills, titleValue, validationErrors]);
+
+  const persistSettings = useCallback(async (showValidationToast: boolean, source: "auto" | "manual") => {
+    const payload = buildSavePayload();
+    if (!payload) {
+      setErrors(validationErrors);
+      if (showValidationToast) {
+        addToast("Please fix validation errors before saving", "error");
+      }
+      if (source === "auto") {
+        setAutoSaveError("Fix validation errors to save changes");
+      }
+      return false;
+    }
+
+    const signature = JSON.stringify(payload);
+    if (signature === lastSavedSignatureRef.current) {
+      return false;
+    }
+
+    const revision = ++saveRevisionRef.current;
+    setErrors({});
+    setAutoSaveError(null);
     setIsSaving(true);
     try {
-      await updateAgent(agent.id, {
-        name: nameValue.trim() || undefined,
-        role: roleValue,
-        title: titleValue.trim() || undefined,
-        icon: iconValue.trim() || undefined,
-        reportsTo: reportsToValue.trim() || undefined,
-        metadata: newMetadata,
-        runtimeConfig: newRuntimeConfig,
-        bundleConfig: newBundleConfig,
-      }, projectId);
-      addToast("Settings saved", "success");
+      await updateAgent(agent.id, payload, projectId);
+      if (revision !== saveRevisionRef.current) {
+        return false;
+      }
+      lastSavedSignatureRef.current = signature;
+      if (source === "manual") {
+        addToast("Settings saved", "success");
+      }
+      setAutoSaveError(null);
       setJustSaved(true);
-      // Auto-hide the saved indicator after 3 seconds
       if (justSavedTimeoutRef.current) {
         clearTimeout(justSavedTimeoutRef.current);
       }
       justSavedTimeoutRef.current = setTimeout(() => setJustSaved(false), 3000);
       await onSaved();
+      return true;
     } catch (err) {
-      addToast(`Failed to save settings: ${getErrorMessage(err)}`, "error");
+      if (revision === saveRevisionRef.current) {
+        const message = getErrorMessage(err);
+        setAutoSaveError(message);
+        addToast(`Failed to save settings: ${message}`, "error");
+      }
+      return false;
     } finally {
-      setIsSaving(false);
+      if (revision === saveRevisionRef.current) {
+        setIsSaving(false);
+      }
     }
+  }, [addToast, agent.id, buildSavePayload, onSaved, projectId, validationErrors]);
+
+  const handleSave = async () => {
+    await persistSettings(true, "manual");
   };
+
+  useEffect(() => {
+    if (!hasChanges || isSaving) {
+      return;
+    }
+
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors);
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      void persistSettings(false, "auto");
+    }, CONFIG_AUTOSAVE_DEBOUNCE_MS);
+
+    return () => clearTimeout(timeout);
+  }, [hasChanges, isSaving, persistSettings, validationErrors]);
+
+  const saveStatusLabel = isSaving
+    ? "Saving changes…"
+    : autoSaveError
+      ? `Save failed: ${autoSaveError}`
+      : !hasChanges && justSaved
+        ? "All changes saved"
+        : null;
 
   return (
     <div className="config-tab">
@@ -3496,6 +3617,10 @@ function ConfigTab({
                 placeholder="Use global default"
                 label="Agent Model"
                 disabled={modelsLoading}
+                favoriteProviders={favoriteProviders}
+                onToggleFavorite={handleToggleFavorite}
+                favoriteModels={favoriteModels}
+                onToggleModelFavorite={handleToggleModelFavorite}
               />
             </div>
           ) : (
@@ -3900,10 +4025,10 @@ function ConfigTab({
               </>
             )}
           </button>
-          {!hasChanges && justSaved && (
-            <span className="config-saved-indicator">
-              <CheckCircle size={14} />
-              Settings saved
+          {saveStatusLabel && (
+            <span className={cn("config-saved-indicator", autoSaveError && "config-saved-indicator--error")}>
+              {isSaving ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle size={14} />}
+              {saveStatusLabel}
             </span>
           )}
         </div>

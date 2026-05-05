@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render } from "ink-testing-library";
 import { DashboardApp } from "../app.js";
 import { DashboardTUI } from "../controller.js";
+import { createInitialState } from "../state.js";
 import type { ProjectItem, TaskItem, AgentItem, AgentDetailItem, ModelItem, SettingsValues, TaskDetailData } from "../state.js";
 
 function newController(): DashboardTUI {
@@ -155,12 +156,19 @@ afterEach(() => {
 });
 
 async function waitForFrameContains(lastFrame: () => string | undefined, text: string, timeoutMs = 3000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if ((lastFrame() ?? "").includes(text)) return;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  throw new Error(`Timed out waiting for frame to include: ${text}`);
+  await vi.waitFor(() => {
+    expect(lastFrame() ?? "").toContain(text);
+  }, { timeout: timeoutMs });
+}
+
+async function flushFrames() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+async function focusSettingsDetailPane(stdin: { write: (chunk: string) => void }, lastFrame: () => string | undefined) {
+  stdin.write("\u001b[C");
+  await waitForFrameContains(lastFrame, "[C/V/X/P/L/U/K/R] remote actions");
 }
 
 function findTokenPosition(frame: string, token: string): { row: number; col: number } {
@@ -218,11 +226,28 @@ describe("DashboardApp smoke", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("board");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await waitForFrameContains(lastFrame, "alpha");
     const frame = lastFrame() ?? "";
     // Board shows the currently selected project; first project "alpha" is selected by default
     expect(frame).toContain("alpha");
     unmount();
+  });
+});
+
+describe("Default active section", () => {
+  it("createInitialState defaults to system panel", () => {
+    const state = createInitialState();
+    expect(state.activeSection).toBe("system");
+  });
+
+  it("DashboardTUI controller defaults to system panel", () => {
+    const controller = newController();
+    expect(controller.getSnapshot().activeSection).toBe("system");
+  });
+
+  it("createInitialState defaults to mouseEnabled = true", () => {
+    const state = createInitialState();
+    expect(state.mouseEnabled).toBe(true);
   });
 });
 
@@ -294,7 +319,7 @@ describe("Agents view", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("agents");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await waitForFrameContains(lastFrame, "worker-1");
     const frame = lastFrame() ?? "";
     expect(frame).toContain("worker-1");
     expect(frame).toContain("worker-2");
@@ -309,7 +334,7 @@ describe("Agents view", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("agents");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await flushFrames();
     expect(lastFrame() ?? "").toContain("Agent Detail");
     unmount();
   });
@@ -375,7 +400,7 @@ describe("Settings view", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("settings");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await waitForFrameContains(lastFrame, "Max Concurrent");
     const frame = lastFrame() ?? "";
     expect(frame).toContain("Settings");
     expect(frame).toContain("Max Concurrent");
@@ -393,7 +418,7 @@ describe("Settings view", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("settings");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await waitForFrameContains(lastFrame, "Available Models");
     const frame = lastFrame() ?? "";
     expect(frame).toContain("Available Models");
     expect(frame).toContain("Claude 3.5 Sonnet");
@@ -435,14 +460,12 @@ describe("Settings view", () => {
     controller.setInteractiveView("settings");
 
     const { lastFrame, stdin, unmount } = render(renderDashboardAppNode(controller));
-    await waitForFrameContains(lastFrame, "Remote");
+    await waitForFrameContains(lastFrame, "Provider: cloudflare");
     expect(lastFrame() ?? "").toContain("cloudflare");
 
-    stdin.write("\u001B[C");
-    await new Promise((r) => setTimeout(r, 20));
+    await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("C");
-    await new Promise((r) => setTimeout(r, 20));
-    expect(activateProvider).toHaveBeenCalledWith("cloudflare");
+    await vi.waitFor(() => expect(activateProvider).toHaveBeenCalledWith("cloudflare"));
 
     stdin.write("V");
     await waitForFrameContains(lastFrame, "Remote tunnel starting");
@@ -471,8 +494,7 @@ describe("Settings view", () => {
     const { lastFrame, stdin, unmount } = render(renderDashboardAppNode(controller));
     await waitForFrameContains(lastFrame, "──── Remote ────");
 
-    stdin.write("\u001B[C");
-    await new Promise((r) => setTimeout(r, 20));
+    await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("L");
     await waitForFrameContains(lastFrame, "TTL ms:");
     stdin.write("\r");
@@ -507,8 +529,8 @@ describe("Settings view", () => {
     controller.setInteractiveView("settings");
 
     const { lastFrame, stdin, unmount } = render(renderDashboardAppNode(controller));
-    stdin.write("\u001B[C");
-    await new Promise((r) => setTimeout(r, 20));
+    await waitForFrameContains(lastFrame, "──── Remote ────");
+    await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("P");
     await waitForFrameContains(lastFrame, "Persistent token: tok_****");
     expect(regeneratePersistentToken).toHaveBeenCalledTimes(1);
@@ -530,12 +552,11 @@ describe("Settings view", () => {
     const { lastFrame, stdin, unmount } = render(renderDashboardAppNode(controller));
     await waitForFrameContains(lastFrame, "──── Remote ────");
 
-    stdin.write("\u001B[C");
-    await new Promise((r) => setTimeout(r, 20));
+    await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("L");
     await waitForFrameContains(lastFrame, "TTL ms:");
     stdin.write("a");
-    await new Promise((r) => setTimeout(r, 20));
+    await flushFrames();
     expect(controller.getSnapshot().interactiveView).toBe("settings");
     unmount();
   });
@@ -557,8 +578,8 @@ describe("Settings view", () => {
     controller.setInteractiveView("settings");
 
     const { lastFrame, stdin, unmount } = render(renderDashboardAppNode(controller));
-    stdin.write("\u001B[C");
-    await new Promise((r) => setTimeout(r, 20));
+    await waitForFrameContains(lastFrame, "──── Remote ────");
+    await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("K");
     await waitForFrameContains(lastFrame, "▀▀▀ASCII-QR▀▀▀");
     unmount();
@@ -580,7 +601,7 @@ describe("Board view", () => {
     controller.setMode("interactive");
     controller.setInteractiveView("board");
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 30));
+    await waitForFrameContains(lastFrame, "TODO");
     const frame = lastFrame() ?? "";
     expect(frame).toContain("TODO");
     expect(frame).toContain("IN PROGRESS");
@@ -599,7 +620,7 @@ describe("LogsPanel indicator", () => {
     // Select index 1 (middle entry)
     controller.setSelectedLogIndex(1);
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const frame = lastFrame() ?? "";
     expect(frame).toContain("▶");
     unmount();
@@ -612,7 +633,7 @@ describe("LogsPanel indicator", () => {
     controller.log("only message", "test");
     controller.setSelectedLogIndex(0);
     const { lastFrame, unmount } = render(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const frame = lastFrame() ?? "";
     // The selected entry shows the arrow; it should appear at least once
     expect(frame).toContain("▶");
@@ -634,7 +655,7 @@ describe("StatusModeGrid layout stability", () => {
     controller.log("small", "worker");
     controller.log("ok", "db");
     rendered.rerender(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
 
     const shortFrame = rendered.lastFrame() ?? "";
     const shortSystem = findTokenPosition(shortFrame, "System");
@@ -654,7 +675,7 @@ describe("StatusModeGrid layout stability", () => {
       "super-verbose-component-prefix",
     );
     rendered.rerender(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
 
     const longFrame = rendered.lastFrame() ?? "";
     const longSystem = findTokenPosition(longFrame, "System");
@@ -693,7 +714,7 @@ describe("StatsPanel memory row", () => {
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 120, 24);
     rendered.rerender(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
 
     const frame = rendered.lastFrame() ?? "";
     const pctIndex = frame.indexOf("75.0%");
@@ -718,7 +739,7 @@ describe("LogsPanel narrow formatting", () => {
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 60, 24);
     rendered.rerender(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const frame = rendered.lastFrame() ?? "";
 
     expect(frame).toContain("narrow entry");
@@ -739,7 +760,7 @@ describe("LogsPanel narrow formatting", () => {
     const narrowRender = render(renderDashboardAppNode(narrowController));
     setTerminalSize(narrowRender, 60, 24);
     narrowRender.rerender(renderDashboardAppNode(narrowController));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const narrowFrame = narrowRender.lastFrame() ?? "";
     expect(narrowFrame).toContain("[very-…]");
     narrowRender.unmount();
@@ -753,7 +774,7 @@ describe("LogsPanel narrow formatting", () => {
     const wideRender = render(renderDashboardAppNode(wideController));
     setTerminalSize(wideRender, 120, 24);
     wideRender.rerender(renderDashboardAppNode(wideController));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const wideFrame = wideRender.lastFrame() ?? "";
     expect(wideFrame).toContain("[very-long-sco");
     expect(wideFrame).not.toContain("[very-…]");
@@ -770,7 +791,7 @@ describe("LogsPanel narrow formatting", () => {
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 120, 24);
     rendered.rerender(renderDashboardAppNode(controller));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushFrames();
     const frame = rendered.lastFrame() ?? "";
 
     expect(frame).toContain("wide timestamp");

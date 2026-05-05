@@ -585,6 +585,32 @@ describe("SettingsModal", () => {
   });
 
   describe("Project Models", () => {
+    it("saves opencode-go startup model sync toggle in global settings", async () => {
+      mockFetchModels.mockResolvedValue({
+        models: MODEL_FIXTURE,
+        favoriteProviders: [],
+        favoriteModels: [],
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      await userEvent.click(screen.getByRole("button", { name: "Models" }));
+      const checkbox = await screen.findByLabelText("Sync opencode-go model list at startup");
+      expect(checkbox).toBeChecked();
+
+      await userEvent.click(checkbox);
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateGlobalSettings).toHaveBeenCalled();
+      });
+
+      expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ opencodeGoModelSync: false }),
+      );
+    });
+
     it("renders a project-scoped default model lane", async () => {
       mockFetchSettings.mockResolvedValue({
         ...defaultSettings,
@@ -2724,6 +2750,20 @@ describe("SettingsModal", () => {
       await userEvent.click(screen.getByText("Save"));
 
       expect(await screen.findByText("Research max concurrent runs must be at least 1.")).toBeInTheDocument();
+    });
+
+    it("shows incomplete research defaults guidance when no search provider is set", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { researchView: true },
+        researchGlobalDefaults: {},
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchGlobalSection();
+
+      expect(await screen.findByText(/Research defaults are incomplete/i)).toBeInTheDocument();
     });
 
     it("shows missing credentials warning and routes CTA to Authentication", async () => {

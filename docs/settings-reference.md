@@ -55,6 +55,7 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `favoriteProviders` | `string[]` | `undefined` | Pinned providers shown first in model selectors. |
 | `favoriteModels` | `string[]` | `undefined` | Pinned models in `{provider}/{modelId}` format. |
 | `openrouterModelSync` | `boolean` | `true` | Sync OpenRouter model catalog into model pickers at startup. |
+| `opencodeGoModelSync` | `boolean` | `true` | Sync opencode-go model catalog at startup via `opencode models opencode --refresh`, normalizing discovered `opencode/...` IDs into the `opencode-go` provider surface used by `/api/models`. |
 | `updateCheckEnabled` | `boolean` | `true` | When enabled, Fusion performs a daily npm registry check for new `@runfusion/fusion` versions and shows update notices in CLI/dashboard. |
 | `autoReloadOnVersionChange` | `boolean` | `true` | When enabled (default), the dashboard automatically reloads when a new build version is detected via `/version.json` polling or service worker activation. Set to `false` to suppress automatic reloads — the user must manually refresh to pick up updates. |
 | `modelOnboardingComplete` | `boolean` | `undefined` | Whether AI onboarding has been completed or dismissed. |
@@ -289,6 +290,12 @@ The standalone Research route is feature-gated separately via `experimentalFeatu
 When that flag is disabled, the Settings modal also hides both Research sections (`Research Defaults` and project `Research`) and falls back to the first visible section if a hidden research section is requested directly.
 
 Research failures are normalized to a shared error-code contract (`FEATURE_DISABLED`, `MISSING_CREDENTIALS`, `PROVIDER_UNAVAILABLE`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`, `RUN_CANCELLED`, `RETRY_EXHAUSTED`, `INVALID_TRANSITION`, `NON_RETRYABLE_PROVIDER_ERROR`, `INTERNAL_ERROR`) with retryability metadata so dashboard, API, CLI, and agent tooling show consistent recovery guidance.
+
+Recovery entrypoints in the dashboard:
+- **Settings → Research Defaults**: fix missing default provider configuration and provider-level readiness.
+- **Settings → Authentication**: repair missing provider credentials (`MISSING_CREDENTIALS`).
+- **Settings → Research (project)**: re-enable project research or source toggles when runs are blocked by project settings.
+- **Settings → Experimental Features**: enable `researchView` when the standalone Research route/surfaces are hidden.
 
 **Credential storage rule:** API keys for Research providers are not stored in settings JSON. They are managed through the existing auth storage pipeline (`/api/auth/status`, `POST /api/auth/api-key`, `DELETE /api/auth/api-key`) and persisted in auth credential storage with masked hints in API responses.
 
@@ -542,7 +549,7 @@ fn plugin install ./plugins/fusion-plugin-hermes-runtime
 fn plugin install ./plugins/fusion-plugin-openclaw-runtime
 ```
 
-> 💡 In the dashboard, go to **Settings → Plugins → Fusion Plugins**. The **Bundled Runtime Plugins** section surfaces Hermes, Paperclip, and OpenClaw directly from shipped manifests, shows install status, and provides one-click install actions for runtimes that are not yet installed.
+> 💡 In the dashboard, go to **Settings → Plugins → Fusion Plugins**. The **Bundled Plugins** section surfaces Agent Browser, Hermes, Paperclip, OpenClaw, and Droid directly from shipped manifests, shows install status, and provides one-click install actions for plugins that are not yet installed.
 
 2. Create agents with the appropriate `runtimeConfig`:
 
@@ -842,15 +849,15 @@ Fusion can automatically extract insights from project memory and prune transien
 
 1. **Scheduled Extraction**: When `insightExtractionEnabled` is `true`, a background automation runs on the configured `insightExtractionSchedule` (default: daily at 2 AM).
 
-2. **AI-Powered Analysis**: The automation uses an AI agent to read canonical long-term memory (`.fusion/memory/MEMORY.md`) from the layered `.fusion/memory/` workspace plus `.fusion/memory-insights.md`, extract new insights, and produce a pruned working memory candidate.
+2. **AI-Powered Analysis**: The automation uses an AI agent to read canonical long-term memory (`.fusion/memory/MEMORY.md`) from the layered `.fusion/memory/` workspace plus `.fusion/memory/memory-insights.md`, extract new insights, and produce a pruned working memory candidate.
 
-3. **Insight Merging**: New insights are automatically merged into `.fusion/memory-insights.md` under the appropriate category (Patterns, Principles, Conventions, Pitfalls, Context). Duplicates are skipped.
+3. **Insight Merging**: New insights are automatically merged into `.fusion/memory/memory-insights.md` under the appropriate category (Patterns, Principles, Conventions, Pitfalls, Context). Duplicates are skipped.
 
 4. **Memory Pruning**: The AI agent also produces a pruned version of working memory containing only durable items:
    - **Preserved**: Architecture, Conventions, Pitfalls, Context sections with durable content
    - **Pruned**: Task-specific notes, one-time observations, outdated entries
 
-5. **Audit Report**: After each extraction run, a `.fusion/memory-audit.md` file is generated with:
+5. **Audit Report**: After each extraction run, a `.fusion/memory/memory-audit.md` file is generated with:
    - Working memory status (presence, size, sections)
    - Insights memory status (insight counts by category)
    - Last extraction results (success/failure, insight count, duplicates skipped)
@@ -864,8 +871,8 @@ Fusion can automatically extract insights from project memory and prune transien
 |------|-------------|
 | `.fusion/memory/MEMORY.md` | Long-term memory (updated when pruning is applied and validated) |
 | Legacy top-level memory file | Deprecated migration fallback (compatibility only; not canonical storage) |
-| `.fusion/memory-insights.md` | Long-term insights distilled from working memory |
-| `.fusion/memory-audit.md` | Human-readable audit report after each extraction |
+| `.fusion/memory/memory-insights.md` | Long-term insights distilled from working memory |
+| `.fusion/memory/memory-audit.md` | Human-readable audit report after each extraction |
 
 ### Settings Interaction
 

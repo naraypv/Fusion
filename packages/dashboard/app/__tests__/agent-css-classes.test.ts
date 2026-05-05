@@ -96,6 +96,14 @@ describe("Agent CSS classes", () => {
     expect(hasClass(".agent-system-filter")).toBe(true);
     expect(hasClass(".agent-controls-actions")).toBe(true);
     expect(hasClass(".agent-global-controls")).toBe(true);
+    expect(hasClass(".agent-org-chart-shell")).toBe(true);
+    expect(hasClass(".agent-org-chart-controls")).toBe(true);
+    expect(hasClass(".agent-org-chart-viewport")).toBe(true);
+    expect(hasClass(".agent-org-chart-canvas")).toBe(true);
+    expect(hasClass(".agent-org-chart-canvas--zoom-75")).toBe(true);
+    expect(hasClass(".agent-org-chart-canvas--zoom-100")).toBe(true);
+    expect(hasClass(".agent-org-chart-canvas--zoom-125")).toBe(true);
+    expect(hasClass(".agent-org-chart-canvas--zoom-150")).toBe(true);
     expect(hasClass(".agent-board")).toBe(true);
     expect(hasClass(".agent-board-card")).toBe(true);
     expect(hasClass(".agent-board-card--idle")).toBe(true);
@@ -156,6 +164,11 @@ describe("Agent CSS classes", () => {
     expect(viewContent).toContain("min-height: 0");
   });
 
+  it("removes legacy standalone mobile back-row classes from AgentsView", () => {
+    expect(hasClass(".agents-mobile-back-row")).toBe(false);
+    expect(hasClass(".agents-mobile-back-btn")).toBe(false);
+  });
+
   it("should visually group the filter controls", () => {
     const filtersBlock = extractRuleBlock(".agent-controls-filters");
     expect(filtersBlock).toContain("padding: var(--space-xs) var(--space-sm)");
@@ -172,6 +185,8 @@ describe("Agent CSS classes", () => {
     expect(orgChartSection).toContain("padding: var(--space-lg)");
     expect(orgChartSection).toContain("--org-chart-node-width: calc(var(--space-xl) * 9 + var(--space-xs))");
     expect(orgChartSection).toContain("min-height: var(--org-chart-node-width)");
+    expect(orgChartSection).toContain("touch-action: pan-x pan-y");
+    expect(orgChartSection).toContain("transform-origin: top left");
     expect(orgChartSection).toContain("border: 1px solid var(--border)");
     expect(orgChartSection).toContain("color: var(--text)");
     expect(orgChartSection).toContain("color: var(--text-muted)");
@@ -196,6 +211,7 @@ describe("Agent CSS classes", () => {
     expect(hasClass(".agent-detail-actions")).toBe(true);
     // Redesigned compact header structure
     expect(hasClass(".agent-detail-identity")).toBe(true);
+    expect(hasClass(".agent-detail-inline-back")).toBe(true);
     expect(hasClass(".agent-detail-controls")).toBe(true);
     expect(hasClass(".agent-detail-utility-actions")).toBe(true);
     expect(hasClass(".agent-detail-tabs")).toBe(true);

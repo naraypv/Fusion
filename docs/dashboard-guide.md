@@ -16,7 +16,8 @@ Features:
 - Inline quick entry creation
 - PR/issue badges with live updates
 - GitHub provenance marker on task cards imported from GitHub (`sourceType: github_import`), shown alongside existing footer metadata like timers
-- Column ordering semantics: `triage`, `todo`, `in-progress`, `in-review`, and `archived` stay priority-ordered; `done` is ordered by most recent completion first (`columnMovedAt`, then `updatedAt`, then `createdAt` fallback)
+- Agent-created provenance badge in task card headers for agent-originated tasks (`sourceType: agent_heartbeat` or `sourceType: automation`, or legacy tasks with `sourceAgentId`), with labels preferring `sourceMetadata.agentName` over raw agent IDs
+- Column ordering semantics: `todo` mirrors scheduler pickup order (priority descending, then oldest `createdAt`, then task ID); `triage`, `in-progress`, `in-review`, and `archived` remain priority-first with task-ID tie-breaks; `done` is ordered by most recent completion first (`columnMovedAt`, then `updatedAt`, then `createdAt` fallback)
 
 ![Board view](./screenshots/dashboard-overview.png)
 
@@ -59,6 +60,7 @@ Quick Chat is an optional floating panel for fast, project-scoped assistant conv
 - Resume lookups still use targeted session queries instead of loading the full active-session list first
 - Tool-call summaries in the floating quick-chat panel are intentionally condensed into a single-line header row (especially on small screens) so tool name + status stay scannable without multi-line wrapping
 - On mobile viewports, opening Quick Chat auto-focuses the composer as soon as it is ready so the keyboard opens immediately
+- FAB dragging uses pointer events with document-level move/up tracking and a 5px drag threshold so Android touch drags reposition reliably while short taps still open Quick Chat
 
 ## Mailbox View
 

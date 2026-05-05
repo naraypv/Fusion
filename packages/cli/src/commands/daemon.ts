@@ -54,11 +54,17 @@ import {
   resolveDroidCliExtensionPaths,
   setCachedDroidCliResolution,
 } from "./droid-cli-extension.js";
+import {
+  getCachedLlamaCppResolution,
+  resolveLlamaCppExtensionPaths,
+  setCachedLlamaCppResolution,
+} from "./llama-cpp-extension.js";
 import { resolveSelfExtension } from "./self-extension.js";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import { ensureBundledDependencyGraphPluginInstalled } from "../plugins/bundled-plugin-install.js";
+import { syncStartupModels } from "./startup-model-sync.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let daemonStartTime = 0;
@@ -473,6 +479,24 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
     })();
 
+    const llamaCppPaths = await (async () => {
+      try {
+        const globalSettings = await store.getGlobalSettingsStore().getSettings();
+        const result = resolveLlamaCppExtensionPaths(globalSettings);
+        setCachedLlamaCppResolution(result.resolution);
+        if (result.warning) {
+          console.warn(`[extensions] llama-cpp: ${result.warning}`);
+        }
+        return result.paths;
+      } catch (err) {
+        console.warn(
+          `[extensions] Unable to evaluate useLlamaCpp setting: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        setCachedLlamaCppResolution(null);
+        return [];
+      }
+    })();
+
     // Always prefer Fusion's vendored `@fusion/pi-claude-cli` over any
     // external `pi-claude-cli` install. Drops shadowing externals (e.g. a
     // global `npm install -g pi-claude-cli`) so the upstream's once-and-lock
@@ -492,7 +516,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     );
 
     const extensionsResult = await discoverAndLoadExtensions(
-      [...reconciledExtensionPaths, ...droidCliPaths],
+      [...reconciledExtensionPaths, ...droidCliPaths, ...llamaCppPaths],
       cwd,
       join(cwd, ".fusion", "disabled-auto-extension-discovery"),
     );
@@ -524,6 +548,13 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     createExtensionRuntime();
     modelRegistry.refresh();
   }
+
+  void syncStartupModels({
+    getSettings: () => store.getSettings(),
+    authStorage: dashboardAuthStorage,
+    modelRegistry,
+    log: (scope, message) => console.log(`[${scope}] ${message}`),
+  });
 
   // ── Skills adapter for skills discovery and execution toggling ─────────────
   const skillsAdapter = packageManager
@@ -577,6 +608,17 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     },
     getDroidCliExtensionStatus: () => {
       const r = getCachedDroidCliResolution();
+      if (!r) return null;
+      if (r.status === "ok") {
+        return { status: "ok", path: r.path, packageVersion: r.packageVersion };
+      }
+      if (r.status === "not-installed") {
+        return { status: "not-installed" };
+      }
+      return { status: r.status, reason: r.reason };
+    },
+    getLlamaCppExtensionStatus: () => {
+      const r = getCachedLlamaCppResolution();
       if (!r) return null;
       if (r.status === "ok") {
         return { status: "ok", path: r.path, packageVersion: r.packageVersion };

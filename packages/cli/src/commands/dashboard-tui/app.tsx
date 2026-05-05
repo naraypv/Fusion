@@ -267,6 +267,24 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
             <Text dimColor>Uptime</Text>
             <Text>{formatUptime(Date.now() - info.startTimeMs)}</Text>
           </Box>
+          {isFocused && (
+            // Inline hint row — only shown when the System panel is focused.
+            // Discoverability for Enter / [c] / [M] since mouse-mode blocks
+            // click-drag selection of the token. Single <Text wrap="truncate-end">
+            // so on narrow terminals the hint clips cleanly to one row instead
+            // of wrapping into 2-3 lines and overflowing the SYSTEM_HEIGHT
+            // budget. Disappears when the user moves focus.
+            <Box flexShrink={0}>
+              <Text dimColor wrap="truncate-end">
+                <Text color="cyanBright">[Enter]</Text> open URL
+                {info.authToken ? (
+                  <Text> · <Text color="cyanBright">[c]</Text> copy token</Text>
+                ) : null}
+                {" · "}
+                <Text color="cyanBright">[M]</Text> mouse {state.mouseEnabled ? "on" : "off (drag to select)"}
+              </Text>
+            </Box>
+          )}
         </Box>
       )}
     </Panel>
@@ -683,6 +701,10 @@ function HelpOverlay() {
     ["[k]", "Kill all vitest processes (Utilities)"],
     ["[v]", "Toggle auto-kill vitest on memory pressure (Utilities)"],
     ["[+/-]", "Adjust vitest kill memory threshold (Utilities)"],
+    ["[Enter]", "Open dashboard URL in browser (System)"],
+    ["[c]", "Copy auth token to clipboard (System)"],
+    ["[M]", "Toggle mouse mode (off → click-drag selects text; works under tmux)"],
+    ["[Shift+drag]", "Bypass mouse mode to select text (most native terminals; not tmux)"],
     ["[↑/↓/k/j]", "Navigate list / log entries"],
     ["[Home / G]", "First / last log entry (Logs)"],
     ["[Enter/Space]", "Expand log entry (Logs)"],
@@ -748,7 +770,10 @@ function StatusModeGrid({
   // System panel is normally 4 rows (border 2 + 2 content rows so chips wrap to
   // a second line). When auth is on, the Token chip is long enough that it
   // routinely wraps to a third row; bump to 5 so it isn't clipped.
-  const SYSTEM_HEIGHT = state.systemInfo?.authToken ? 5 : 4;
+  // Add one extra row when the System panel is focused so the inline
+  // [Enter]/[c]/[M] hint isn't clipped against Logs.
+  const systemFocused = focused === "system";
+  const SYSTEM_HEIGHT = (state.systemInfo?.authToken ? 5 : 4) + (systemFocused ? 1 : 0);
   const bottomShare = Math.min(10, Math.max(6, Math.floor(middleHeight * 0.35)));
   const logsShare = Math.max(1, middleHeight - SYSTEM_HEIGHT - bottomShare);
   // LogsPanel chrome: border 2 + title 1 + filter 1 = 4.
@@ -2375,19 +2400,7 @@ function SettingsInteractiveView({ state, controller }: { state: DashboardState;
       return;
     }
 
-    if (!detailFocused) {
-      if (key.upArrow || input === "k") {
-        setSelectedIndex((i) => Math.max(0, i - 1));
-        return;
-      }
-      if (key.downArrow || input === "j") {
-        setSelectedIndex((i) => Math.min(SETTING_DEFS.length - 1, i + 1));
-        return;
-      }
-      return;
-    }
-
-    if (!selectedDef || !localSettings) return;
+    const inputUpper = input.toUpperCase();
 
     if (ttlInputMode) {
       if (key.escape) {
@@ -2397,13 +2410,13 @@ function SettingsInteractiveView({ state, controller }: { state: DashboardState;
       return;
     }
 
-    const inputUpper = input.toUpperCase();
-
     if (inputUpper === "R") {
       void refreshRemoteStatus();
       setStatusMsg("Remote status refreshed");
       return;
     }
+
+    if (!localSettings) return;
 
     if (data?.remote && inputUpper === "C") {
       const provider = localSettings.remoteActiveProvider;
@@ -2460,6 +2473,20 @@ function SettingsInteractiveView({ state, controller }: { state: DashboardState;
         .catch((err) => setStatusMsg(`Error: ${err instanceof Error ? err.message : String(err)}`));
       return;
     }
+
+    if (!detailFocused) {
+      if (key.upArrow || input === "k") {
+        setSelectedIndex((i) => Math.max(0, i - 1));
+        return;
+      }
+      if (key.downArrow || input === "j") {
+        setSelectedIndex((i) => Math.min(SETTING_DEFS.length - 1, i + 1));
+        return;
+      }
+      return;
+    }
+
+    if (!selectedDef) return;
 
     if (selectedDef.type === "boolean" && input === " ") {
       const current = localSettings[selectedDef.key] as boolean;
@@ -4096,7 +4123,7 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     }
 
     // Number keys 1-5 always jump to a status-mode section (matching the
-    // [1]System [2]Logs [3]Utilities [4]Stats [5]Settings tabs in the
+    // [1]System [2]Logs [3]Stats [4]Utilities [5]Settings tabs in the
     // MainHeader). They switch back from interactive mode if needed —
     // the interactive views still have letter shortcuts (b/a/g/t).
     const sectionForNumber: Record<string, SectionId | undefined> = {
@@ -4130,6 +4157,44 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     if (key.return && state.activeSection === "system" && state.systemInfo) {
       const url = state.systemInfo.tokenizedUrl ?? state.systemInfo.baseUrl;
       openInBrowser(url);
+      return;
+    }
+
+    // System panel: [c] copies the auth token to the clipboard. Mouse mode
+    // is on for log scrolling, which blocks normal click-drag selection of
+    // the token text in the panel — this gives users a keyboard path.
+    if (
+      (input === "c" || input === "C") &&
+      state.activeSection === "system" &&
+      state.systemInfo?.authToken
+    ) {
+      const token = state.systemInfo.authToken;
+      void copyToClipboard(token).then((ok) => {
+        controller.flashClipboard(ok);
+        if (ok) {
+          controller.log("Auth token copied to clipboard.", "clipboard");
+        } else {
+          controller.warn(
+            "Clipboard copy failed (no pbcopy/xclip/wl-copy/clip available).",
+            "clipboard",
+          );
+        }
+      });
+      return;
+    }
+
+    // [M] toggles mouse reporting. With it off, native click-drag selection
+    // works (the only path that works under tmux's `mouse on`); cost is
+    // wheel-scroll on Logs/Files/Git stops working until re-enabled.
+    if (input === "M") {
+      const next = !state.mouseEnabled;
+      controller.setMouseEnabled(next);
+      controller.log(
+        next
+          ? "Mouse mode ON — wheel scrolls panels."
+          : "Mouse mode OFF — click-drag to select text; press M to restore wheel.",
+        "mouse",
+      );
       return;
     }
 

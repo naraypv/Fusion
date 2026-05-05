@@ -22,7 +22,7 @@ import { buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity } 
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import { createHash } from "node:crypto";
-import { createTaskCreateTool, createTaskLogToolWithContext, createTaskDocumentWriteTool, createTaskDocumentReadTool, createListAgentsTool, createDelegateTaskTool, createSendMessageTool, createReadMessagesTool, createMemoryTools, taskCreateParams } from "./agent-tools.js";
+import { createTaskCreateTool, createTaskLogToolWithContext, createTaskDocumentWriteTool, createTaskDocumentReadTool, createListAgentsTool, createDelegateTaskTool, createGetAgentConfigTool, createUpdateAgentConfigTool, createSendMessageTool, createReadMessagesTool, createMemoryTools, taskCreateParams } from "./agent-tools.js";
 import { AgentLogger } from "./agent-logger.js";
 import { resolveAgentInstructionsWithRatings, buildSystemPromptWithInstructions, resolveAgentHeartbeatProcedure } from "./agent-instructions.js";
 import { heartbeatLog, formatError } from "./logger.js";
@@ -127,6 +127,15 @@ export function formatDuration(ms: number): string {
   return `${minutes}m`;
 }
 
+function formatRelativeTime(iso?: string | null): string {
+  if (!iso) return "never";
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return "unknown";
+  const elapsed = Date.now() - parsed;
+  if (elapsed < 0) return "just now";
+  return `${formatDuration(elapsed)} ago`;
+}
+
 /** Compare blocked-state snapshots to decide whether blocked messaging is duplicate noise. */
 export function isBlockedStateDuplicate(current: BlockedStateSnapshot, previous: BlockedStateSnapshot): boolean {
   return current.blockedBy === previous.blockedBy && current.contextHash === previous.contextHash;
@@ -150,6 +159,7 @@ Your job:
 2. Do ONE useful action that changes project clarity or flow.
 3. Use fn_task_create to spawn follow-up work, fn_task_log to record observations, and fn_task_document_write for durable artifacts.
 4. Use fn_list_agents + fn_delegate_task when work should be assigned to a specific capable agent now.
+5. Use fn_get_agent_config and fn_update_agent_config to tune direct reports before delegating recurring work.
 5. Call fn_heartbeat_done when finished with an optional summary of what was accomplished.
 
 Examples of ONE useful action:
@@ -173,6 +183,7 @@ Use this decision rule:
 - **Task document (fn_task_document_write):** when findings are structured and likely useful across future sessions for the same task.
 - **Create task (fn_task_create):** when someone must do new executable work.
 - **Delegate task (fn_delegate_task):** when that new work should go to a specific agent based on role/availability.
+- **Manage report config (fn_get_agent_config / fn_update_agent_config):** when direct reports need heartbeat, instruction, or personality tuning.
 
 Prefer fn_task_create when assignment is unclear and scheduler routing is fine.
 Prefer fn_delegate_task when immediate ownership by a specific agent materially reduces latency or risk.
@@ -231,6 +242,7 @@ Your job:
 2. Do ONE useful action: analyze, create follow-up tasks, delegate work, or update memory.
 3. Use fn_task_create to spawn follow-up work.
 4. Use fn_list_agents and fn_delegate_task to coordinate with other agents.
+5. Use fn_get_agent_config and fn_update_agent_config to read/tune direct-report agents for better routing outcomes.
 5. Call fn_heartbeat_done when finished with an optional summary of what was accomplished.
 
 Examples of ONE useful action:
@@ -244,6 +256,7 @@ Keep work lightweight — this is a single-pass ambient check, not a full implem
 You have readonly file access plus:
 - fn_task_create
 - fn_list_agents and fn_delegate_task
+- fn_get_agent_config and fn_update_agent_config (for direct reports only)
 - fn_memory_search, fn_memory_get, and fn_memory_append
 - fn_heartbeat_done
 - fn_send_message and fn_read_messages when messaging is enabled for this run (they may not always be available)
@@ -1351,7 +1364,7 @@ export class HeartbeatMonitor {
         // For no-task runs, exclude fn_task_log and document tools (they require a taskId)
         let heartbeatTools: ToolDefinition[];
         if (isNoTaskRun) {
-          // No-task runs: fn_task_create, fn_list_agents, fn_delegate_task, messaging, memory, fn_heartbeat_done
+          // No-task runs: fn_task_create, fn_list_agents, fn_delegate_task, fn_get_agent_config, fn_update_agent_config, messaging, memory, fn_heartbeat_done
           heartbeatTools = [];
 
           // fn_task_create tool
@@ -1364,6 +1377,8 @@ export class HeartbeatMonitor {
           // Agent delegation tools
           heartbeatTools.push(createListAgentsTool(this.store));
           heartbeatTools.push(createDelegateTaskTool(this.store, taskStore, { rootDir: this.rootDir }));
+          heartbeatTools.push(createGetAgentConfigTool(this.store, agentId));
+          heartbeatTools.push(createUpdateAgentConfigTool(this.store, agentId));
 
           // Messaging tools — when MessageStore is available
           if (this.messageStore) {
@@ -1504,6 +1519,7 @@ export class HeartbeatMonitor {
           const customProcedure = await resolveAgentHeartbeatProcedure(agent, rootDir);
           const heartbeatProcedureText = customProcedure
             ?? (isNoTaskRun ? HEARTBEAT_NO_TASK_PROCEDURE : HEARTBEAT_PROCEDURE);
+          const reportsHealthSection = await this.buildReportsHealthSection(agent.id, this.store);
 
           if (isNoTaskRun) {
             // No-task heartbeat: agent has identity but no assigned task
@@ -1572,6 +1588,7 @@ export class HeartbeatMonitor {
               "",
               "Your soul, instructions, and memory are already loaded in the system prompt.",
               "Focus on work that benefits the project without requiring a specific task context.",
+              ...(reportsHealthSection ? ["", reportsHealthSection] : []),
               "",
               "Call fn_heartbeat_done when finished.",
             ].join("\n");
@@ -1659,6 +1676,7 @@ export class HeartbeatMonitor {
               taskDetail!.prompt ? `PROMPT.md:\n${taskDetail!.prompt}` : "No PROMPT.md available.",
               ...triggeringCommentLines,
               ...pendingMessagesLines,
+              ...(reportsHealthSection ? ["", reportsHealthSection] : []),
               "",
               "Run the Heartbeat Procedure above. Call fn_heartbeat_done when finished.",
             ].join("\n");
@@ -1818,6 +1836,76 @@ export class HeartbeatMonitor {
     });
   }
 
+  private async buildReportsHealthSection(agentId: string, agentStore: AgentStore): Promise<string | null> {
+    const getReports = (agentStore as AgentStore & { getAgentsByReportsTo?: (id: string) => Promise<Agent[]> }).getAgentsByReportsTo;
+    if (typeof getReports !== "function") {
+      return null;
+    }
+
+    let reports: Agent[];
+    try {
+      reports = await getReports(agentId);
+    } catch (err) {
+      heartbeatLog.warn(`Failed to load reports for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    if (reports.length === 0) {
+      return null;
+    }
+
+    const now = Date.now();
+    const rows = reports.map((report) => {
+      const timeoutMs = this.resolveAgentConfig(report.id).heartbeatTimeoutMs;
+      const lastHeartbeatTs = report.lastHeartbeatAt ? Date.parse(report.lastHeartbeatAt) : NaN;
+      const heartbeatAgeMs = Number.isFinite(lastHeartbeatTs) ? Math.max(0, now - lastHeartbeatTs) : Infinity;
+
+      let health = "healthy";
+      if (report.state === "paused") {
+        health = report.pauseReason ? `paused (${report.pauseReason})` : "paused";
+      } else if (report.state === "terminated") {
+        health = "terminated";
+      } else if (report.state === "error") {
+        health = "**stuck**";
+      } else if (report.state === "running") {
+        health = heartbeatAgeMs <= timeoutMs * 2 ? "healthy" : "**stuck**";
+      } else if ((report.state === "active" || report.state === "idle") && heartbeatAgeMs > timeoutMs * 3) {
+        health = "**stale**";
+      }
+
+      const task = report.taskId ?? "—";
+      const state = report.state;
+      const heartbeat = formatRelativeTime(report.lastHeartbeatAt);
+      return `| ${report.name} | ${state} | ${task} | ${heartbeat} | ${health} |`;
+    });
+
+    const hasStuck = rows.some((row) => row.includes("**stuck**"));
+    const hasStale = rows.some((row) => row.includes("**stale**"));
+    const hasTerminated = rows.some((row) => row.includes("terminated"));
+
+    const actionLines = ["### Actions for Unresponsive Reports"];
+    if (hasStuck) {
+      actionLines.push("- For **stuck** reports: consider sending a message via fn_send_message asking for status, or reassigning their task via fn_delegate_task to a healthy agent.");
+    }
+    if (hasStale) {
+      actionLines.push("- For **stale** reports: the agent may have lost its heartbeat trigger — create a follow-up task to investigate.");
+    }
+    if (hasTerminated) {
+      actionLines.push("- For **terminated** reports: if they had active work, reassign their tasks or spawn replacement agents.");
+    }
+
+    return [
+      "## Reports Health Check",
+      "",
+      `You have ${reports.length} agent(s) reporting to you. Review their status and intervene if any are unresponsive.`, 
+      "",
+      "| Name | State | Task | Last Heartbeat | Health |",
+      "|------|-------|------|----------------|--------|",
+      ...rows,
+      "",
+      ...actionLines,
+    ].join("\n");
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Heartbeat tools: createHeartbeatTools / clearRunState
   // ─────────────────────────────────────────────────────────────────────────
@@ -1891,6 +1979,8 @@ export class HeartbeatMonitor {
     // Agent delegation tools — discover and delegate work to other agents
     tools.push(createListAgentsTool(this.store));
     tools.push(createDelegateTaskTool(this.store, taskStore, { rootDir: this.rootDir }));
+    tools.push(createGetAgentConfigTool(this.store, agentId));
+    tools.push(createUpdateAgentConfigTool(this.store, agentId));
 
     // Messaging tools — when MessageStore is available, agents can send and receive messages
     if (messageStore) {

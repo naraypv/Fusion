@@ -45,6 +45,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   favoriteProviders: undefined,
   favoriteModels: undefined,
   openrouterModelSync: true,
+  opencodeGoModelSync: true,
   updateCheckEnabled: true,
   fnBinaryCheckEnabled: true,
   updateCheckFrequency: "daily",
@@ -53,6 +54,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   modelOnboardingComplete: undefined,
   useClaudeCli: undefined,
   useDroidCli: undefined,
+  useLlamaCpp: undefined,
   // Global baseline lanes for per-role model selection
   executionGlobalProvider: undefined,
   executionGlobalModelId: undefined,

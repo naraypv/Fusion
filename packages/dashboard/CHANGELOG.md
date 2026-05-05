@@ -1,5 +1,43 @@
 # @fusion/dashboard
 
+## 0.19.0
+
+### Patch Changes
+
+- 082c62a: Fix a cross-agent overwrite bug in the Agents split view. The Config tab's form state was initialized once at mount and never resynced on `agent` change, while the master-detail layout reused the same `<AgentDetailView>` / `<ConfigTab>` instance across selections (no `key`). Switching agents while sitting on the Config tab made `hasChanges` evaluate true (stale form values vs. the newly loaded agent), and the 700ms autosave then wrote the previously-viewed agent's name/role/title/icon/model/skills onto the newly-selected agent's row. Adds `key={selectedAgentId}` to `<AgentDetailView>` and `key={agent.id}` to `<ConfigTab>` so both remount with fresh state on every agent transition.
+- Updated dependencies [54f2832]
+  - @fusion/engine@0.19.0
+  - @fusion/core@0.19.0
+  - @fusion-plugin-examples/dependency-graph@0.1.8
+  - @fusion-plugin-examples/droid-runtime@0.1.3
+  - @fusion-plugin-examples/hermes-runtime@0.2.27
+  - @fusion-plugin-examples/openclaw-runtime@0.2.27
+  - @fusion-plugin-examples/paperclip-runtime@0.2.27
+
+## 0.18.1
+
+### Patch Changes
+
+- @fusion/core@0.18.1
+- @fusion/engine@0.18.1
+- @fusion-plugin-examples/dependency-graph@0.1.7
+- @fusion-plugin-examples/droid-runtime@0.1.2
+- @fusion-plugin-examples/hermes-runtime@0.2.26
+- @fusion-plugin-examples/openclaw-runtime@0.2.26
+- @fusion-plugin-examples/paperclip-runtime@0.2.26
+
+## 0.18.0
+
+### Patch Changes
+
+- @fusion/core@0.18.0
+- @fusion/engine@0.18.0
+- @fusion-plugin-examples/dependency-graph@0.1.6
+- @fusion-plugin-examples/droid-runtime@0.1.1
+- @fusion-plugin-examples/hermes-runtime@0.2.25
+- @fusion-plugin-examples/openclaw-runtime@0.2.25
+- @fusion-plugin-examples/paperclip-runtime@0.2.25
+
 ## 0.17.2
 
 ### Patch Changes

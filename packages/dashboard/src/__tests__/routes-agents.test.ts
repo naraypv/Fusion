@@ -1840,6 +1840,51 @@ describe("Agent create/update routes", () => {
     });
   });
 
+  it("POST /api/agents returns 409 for duplicate non-ephemeral names", async () => {
+    const first = await REQUEST(
+      buildAgentApp(),
+      "POST",
+      "/api/agents",
+      JSON.stringify({
+        name: "Duplicate Agent",
+        role: "executor",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(first.status).toBe(201);
+
+    const duplicate = await REQUEST(
+      buildAgentApp(),
+      "POST",
+      "/api/agents",
+      JSON.stringify({
+        name: "Duplicate Agent",
+        role: "reviewer",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(duplicate.status).toBe(409);
+    expect(duplicate.body).toEqual({
+      error: "Agent with this name already exists",
+      name: "Duplicate Agent",
+    });
+
+    const differentName = await REQUEST(
+      buildAgentApp(),
+      "POST",
+      "/api/agents",
+      JSON.stringify({
+        name: "Unique Agent",
+        role: "reviewer",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(differentName.status).toBe(201);
+  });
+
   it("POST /api/agents returns 400 when soul exceeds 10,000 characters", async () => {
     const longSoul = "x".repeat(10001);
     const res = await REQUEST(
@@ -3836,7 +3881,7 @@ describe("remote access auth login-url endpoints", () => {
     expect(persistentLoginUrl.pathname).toBe("/remote-login");
     expect(persistentLoginUrl.searchParams.get("rt")).toMatch(/^frt_[A-Za-z0-9_-]+$/);
     expect(res.body.expiresAt).toBeUndefined();
-    expect(store.updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith(expect.objectContaining({
       remoteAccess: expect.objectContaining({
         tokenStrategy: expect.objectContaining({
           persistent: expect.objectContaining({

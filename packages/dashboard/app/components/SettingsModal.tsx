@@ -28,6 +28,7 @@ const PiExtensionsManager = lazy(() => import("./PiExtensionsManager").then((m) 
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
 import { CliBinaryPanel } from "./CliBinaryPanel";
 import { DroidCliProviderCard } from "./DroidCliProviderCard";
+import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
 import { HermesRuntimeCard } from "./HermesRuntimeCard";
 import { OpenClawRuntimeCard } from "./OpenClawRuntimeCard";
 import { PaperclipRuntimeCard } from "./PaperclipRuntimeCard";
@@ -2215,8 +2216,8 @@ export function SettingsModal({
               </>
             )}
 
-            {/* --- OpenRouter Model Sync --- */}
-            <h4 className="settings-section-heading settings-section-heading--spaced">OpenRouter Models</h4>
+            {/* --- Startup Model Sync --- */}
+            <h4 className="settings-section-heading settings-section-heading--spaced">Startup Model Sync</h4>
             <div className="form-group">
               <label htmlFor="openrouterModelSync" className="checkbox-label">
                 <input
@@ -2225,12 +2226,26 @@ export function SettingsModal({
                   checked={form.openrouterModelSync !== false}
                   onChange={(e) => setForm((f) => ({ ...f, openrouterModelSync: e.target.checked }))}
                 />
-                Sync OpenRouter model list at dashboard startup
+                Sync OpenRouter model list at startup
               </label>
               <small>
-                When enabled, the dashboard fetches the latest available models from the OpenRouter
-                API on startup, so the model picker always shows the most up-to-date catalog. Disable
-                to skip the initial API call and use only the built-in model list.
+                When enabled, startup fetches the latest available models from the OpenRouter API so
+                model pickers always include the newest catalog.
+              </small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="opencodeGoModelSync" className="checkbox-label">
+                <input
+                  id="opencodeGoModelSync"
+                  type="checkbox"
+                  checked={form.opencodeGoModelSync !== false}
+                  onChange={(e) => setForm((f) => ({ ...f, opencodeGoModelSync: e.target.checked }))}
+                />
+                Sync opencode-go model list at startup
+              </label>
+              <small>
+                When enabled, startup refreshes models through the local <code>opencode models opencode --refresh</code>
+                flow and publishes them under the opencode-go provider in model pickers.
               </small>
             </div>
 
@@ -2272,7 +2287,7 @@ export function SettingsModal({
             <h4 className="settings-section-heading">Token Cap</h4>
             <div className="form-group">
               <label htmlFor="tokenCap">Token Cap</label>
-              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+              <div className="settings-token-cap-row">
                 <input
                   id="tokenCap"
                   type="number"
@@ -2321,7 +2336,7 @@ export function SettingsModal({
 
                   return (
                     <div className="form-group" key={lane.laneId}>
-                      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.25rem" }}>
+                      <div className="settings-model-lane-label-row">
                         <label htmlFor={`${lane.laneId}Model`}>{laneLabel}</label>
                         <span
                           className={`settings-lane-badge ${isOverridden ? "settings-lane-badge--override" : "settings-lane-badge--inherited"}`}
@@ -2330,8 +2345,8 @@ export function SettingsModal({
                           {isOverridden ? "Override (Project)" : "Inherited (Global)"}
                         </span>
                       </div>
-                      <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
-                        <div style={{ flex: 1 }}>
+                      <div className="settings-model-lane-control-row">
+                        <div className="settings-model-lane-control-main">
                           <CustomModelDropdown
                             id={`${lane.laneId}Model`}
                             label={laneLabel}
@@ -2738,7 +2753,7 @@ export function SettingsModal({
                 </div>
 
                 <div className="form-group">
-                  <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
+                  <div className="modal-actions settings-summarization-actions">
                     <button
                       type="button"
                       className="btn btn-sm"
@@ -3883,6 +3898,7 @@ export function SettingsModal({
       case "research-global": {
         const providerStatuses = authProviders.filter((provider) => provider.id === "brave" || provider.id === "tavily");
         const hasMissingResearchCredential = providerStatuses.some((provider) => !provider.authenticated);
+        const hasSearchProvider = Boolean(form.researchGlobalDefaults?.searchProvider?.trim());
 
         return (
           <>
@@ -3925,6 +3941,11 @@ export function SettingsModal({
                 }
               />
             </div>
+            {!hasSearchProvider && (
+              <div className="settings-empty-state" role="alert">
+                Research defaults are incomplete: choose a default search provider before running research.
+              </div>
+            )}
             {hasMissingResearchCredential && (
               <div className="settings-empty-state" role="alert">
                 Missing credentials for one or more research providers.
@@ -5027,6 +5048,7 @@ export function SettingsModal({
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
         const droidCliProvider = cliAuthProviders.find((p) => p.id === "droid-cli");
+        const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
         const hasDroidPluginSlot = getSlotsForId("settings-provider-card").some(
           (entry) => entry.pluginId === "fusion-plugin-droid-runtime",
         );
@@ -5048,14 +5070,25 @@ export function SettingsModal({
             }}
           />
         ) : null;
+        const llamaCppCard = llamaCppProvider ? (
+          <LlamaCppProviderCard
+            compact
+            authenticated={llamaCppProvider.authenticated}
+            onToggled={() => {
+              void loadAuthStatus();
+            }}
+          />
+        ) : null;
         const showAuthenticatedGroup =
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
-          || ((droidCliProvider?.authenticated ?? false) && !hasDroidPluginSlot);
+          || ((droidCliProvider?.authenticated ?? false) && !hasDroidPluginSlot)
+          || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
-          || (droidCliProvider && !droidCliProvider.authenticated && !hasDroidPluginSlot);
+          || (droidCliProvider && !droidCliProvider.authenticated && !hasDroidPluginSlot)
+          || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
           <>
             <h4 className="settings-section-heading">Authentication</h4>
@@ -5079,6 +5112,7 @@ export function SettingsModal({
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
                   {droidCliProvider?.authenticated && droidCliCard}
+                  {llamaCppProvider?.authenticated && llamaCppCard}
                   {authenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card auth-provider-card--authenticated">
                       <div className="auth-provider-header">
@@ -5173,6 +5207,7 @@ export function SettingsModal({
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
                   {droidCliProvider && !droidCliProvider.authenticated && droidCliCard}
+                  {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card">
                       <div className="auth-provider-header">

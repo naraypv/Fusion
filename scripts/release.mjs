@@ -16,11 +16,13 @@
 //   pnpm release --dry-run    # preview only — exit before any file/git/npm changes
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync, statSync, existsSync, unlinkSync, mkdtempSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync, writeFileSync, statSync, existsSync, unlinkSync, mkdtempSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+
+import { extractVersionNotes } from "./lib/extract-version-notes.mjs";
 
 const args = new Set(process.argv.slice(2));
 const DRY_RUN = args.has("--dry-run");
@@ -279,6 +281,104 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Pack @runfusion/fusion and runfusion.ai, install them into a clean temp dir
+ * with plain `npm` (mimicking the `npx runfusion.ai` install path), and invoke
+ * the bin with --help. Throws via fail() on any error.
+ *
+ * Why this exists: the workspace install hides missing-from-published-deps
+ * bugs because pnpm hoists devDeps. Issue #33 (dockerode missing in published
+ * dependencies) shipped because no check ever ran against a real npm install.
+ */
+function runReleaseSmoke() {
+  const repoRoot = resolve(".");
+  const fusionDir = join(repoRoot, "packages", "cli");
+  const aliasDir = join(repoRoot, "packages", "cli-alias");
+  const smokeDir = mkdtempSync(join(tmpdir(), "fusion-smoke-"));
+  const packDir = join(smokeDir, "tarballs");
+  spawnSync("mkdir", ["-p", packDir]);
+
+  const packOne = (cwd) => {
+    const r = spawnSync("pnpm", ["pack", "--pack-destination", packDir], {
+      cwd,
+      stdio: "pipe",
+      encoding: "utf8",
+    });
+    if (r.status !== 0) {
+      cleanupSmoke(smokeDir);
+      fail(`pnpm pack failed in ${cwd}:\n${r.stderr || r.stdout}`);
+    }
+  };
+  packOne(fusionDir);
+  packOne(aliasDir);
+
+  const tarballs = readdirSync(packDir).filter((f) => f.endsWith(".tgz"));
+  const fusionTarball = tarballs.find((f) => f.startsWith("runfusion-fusion-"));
+  const aliasTarball = tarballs.find((f) => f.startsWith("runfusion.ai-"));
+  if (!fusionTarball || !aliasTarball) {
+    cleanupSmoke(smokeDir);
+    fail(`Could not find packed tarballs in ${packDir}: ${tarballs.join(", ")}`);
+  }
+  const fusionTarballPath = join(packDir, fusionTarball);
+  const aliasTarballPath = join(packDir, aliasTarball);
+
+  const installDir = join(smokeDir, "install");
+  spawnSync("mkdir", ["-p", installDir]);
+  // Override @runfusion/fusion to the local tarball — without this, npm tries
+  // to fetch the version-matching tarball from the registry (which we haven't
+  // published yet).
+  writeFileSync(
+    join(installDir, "package.json"),
+    JSON.stringify(
+      {
+        name: "fusion-smoke-test",
+        version: "0.0.0",
+        private: true,
+        overrides: { "@runfusion/fusion": `file:${fusionTarballPath}` },
+      },
+      null,
+      2,
+    ),
+  );
+
+  const npmInstall = spawnSync(
+    "npm",
+    ["install", "--no-audit", "--no-fund", "--ignore-scripts", aliasTarballPath],
+    { cwd: installDir, stdio: "pipe", encoding: "utf8" },
+  );
+  if (npmInstall.status !== 0) {
+    cleanupSmoke(smokeDir);
+    fail(`npm install of packed tarballs failed:\n${npmInstall.stderr || npmInstall.stdout}`);
+  }
+
+  // Invoke the bin via the alias entry. Exercises the same import graph as
+  // `npx runfusion.ai` and surfaces ERR_MODULE_NOT_FOUND for any externalized
+  // module that isn't a real published dep (the dockerode bug).
+  const aliasBin = join(installDir, "node_modules", "runfusion.ai", "index.js");
+  if (!existsSync(aliasBin)) {
+    cleanupSmoke(smokeDir);
+    fail(`Smoke install missing alias bin at ${aliasBin}`);
+  }
+  const invoke = spawnSync("node", [aliasBin, "--help"], {
+    cwd: installDir,
+    stdio: "pipe",
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (invoke.status !== 0) {
+    cleanupSmoke(smokeDir);
+    fail(
+      `Packed bin failed to start (exit ${invoke.status}):\n--- stdout ---\n${invoke.stdout}\n--- stderr ---\n${invoke.stderr}`,
+    );
+  }
+
+  cleanupSmoke(smokeDir);
+}
+
+function cleanupSmoke(dir) {
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
+
 function findPackageDir(name) {
   // Most packages live under packages/<basename>; do an exact match on package.json name.
   const roots = ["packages"];
@@ -400,6 +500,17 @@ run(
   { allowFail: true }
 );
 
+// --- Pre-publish smoke ----------------------------------------------------
+// Pack the public CLI tarballs, install them with plain `npm` into a clean
+// temp dir, and exercise the bin to verify a real `npx runfusion.ai` install
+// would succeed. Catches missing-published-deps (dockerode-class), missing
+// files-glob entries, broken bin shebangs, etc. that the workspace install
+// masks via pnpm hoisting.
+
+info("Running pre-publish smoke (pack + clean-install + invoke bin)…");
+runReleaseSmoke();
+ok("Pre-publish smoke passed.");
+
 // --- Publish --------------------------------------------------------------
 
 info("Publishing to npm (non-private packages only)…");
@@ -414,4 +525,47 @@ info(`Creating and pushing tag v${version}…`);
 run(`git tag v${version}`);
 run(`git push origin v${version}`);
 
-ok(`Released v${version}. The 'v${version}' tag will trigger release.yml for binary builds.`);
+// --- GitHub Release ------------------------------------------------------
+
+let githubReleaseStatus = "not-created";
+const changelogContent = readFileSync("CHANGELOG.md", "utf8");
+const releaseNotes = extractVersionNotes(changelogContent, version);
+const ghCheck = spawnSync("gh", ["--version"], { stdio: "pipe" });
+
+if (ghCheck.status !== 0) {
+  githubReleaseStatus = "missing-gh";
+  warn(`⚠ gh CLI not found. Create the GitHub Release manually:\n  gh release create v${version} --title "v${version}" --latest`);
+} else {
+  let notesFile;
+  try {
+    const notesDir = mkdtempSync(join(tmpdir(), "fusion-release-notes-"));
+    notesFile = join(notesDir, `v${version}-notes.md`);
+    writeFileSync(notesFile, `${releaseNotes}\n`, "utf8");
+
+    const ghCreate = spawnSync(
+      "gh",
+      ["release", "create", `v${version}`, "--title", `v${version}`, "--notes-file", notesFile, "--latest"],
+      { stdio: "inherit" }
+    );
+
+    if (ghCreate.status !== 0) {
+      warn(`GitHub Release creation failed for v${version}. You can retry manually with gh release create.`);
+    } else {
+      githubReleaseStatus = "created";
+    }
+  } catch (error) {
+    warn(`GitHub Release creation failed for v${version}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (notesFile && existsSync(notesFile)) {
+      unlinkSync(notesFile);
+    }
+  }
+}
+
+if (githubReleaseStatus === "created") {
+  ok(`Released v${version}. Published to npm, tag pushed, GitHub Release created.`);
+} else if (githubReleaseStatus === "missing-gh") {
+  ok(`Released v${version}. Published to npm, tag pushed. GitHub Release skipped (gh CLI not found).`);
+} else {
+  ok(`Released v${version}. Published to npm, tag pushed. GitHub Release was not created (see warnings above).`);
+}

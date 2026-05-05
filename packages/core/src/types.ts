@@ -1350,6 +1350,11 @@ export interface GlobalSettings {
    *  the OpenRouter API at startup so the model picker shows all available
    *  OpenRouter models (not just the static built-in list). Default: true. */
   openrouterModelSync?: boolean;
+  /** When true, startup refreshes the opencode-go model catalog via
+   *  `opencode models opencode --refresh` so model pickers expose an up-to-date
+   *  opencode-go provider list without waiting for a later session bootstrap.
+   *  Default: true. */
+  opencodeGoModelSync?: boolean;
   /** When true (default), checks npm for new versions of @runfusion/fusion and
    *  shows update notices in the CLI and dashboard. The actual cadence is
    *  governed by `updateCheckFrequency`. Disabled = no automatic checks at all. */
@@ -1403,6 +1408,13 @@ export interface GlobalSettings {
    *  by the dashboard auth toggle. Setting this field explicitly (true/false)
    *  always wins. */
   useDroidCli?: boolean;
+  /** When true, enable llama.cpp model-provider support (provider ID: `llama-server`)
+   *  via Fusion's bundled `@fusion/pi-llama-cpp` extension.
+   *
+   *  When left undefined, llama.cpp routing stays disabled unless explicitly enabled
+   *  by the dashboard auth toggle. Setting this field explicitly (true/false)
+   *  always wins. */
+  useLlamaCpp?: boolean;
   /** Global baseline AI model provider for task execution (executor agent).
    *  This is the global lane that project-level `executionProvider` can override.
    *  Must be set together with `executionGlobalModelId`. Falls back to
@@ -1950,7 +1962,7 @@ export interface ProjectSettings {
   /** When true, enables periodic AI-powered extraction of insights from working memory
    *  into a distilled long-term memory file. Creates an automation schedule that reads
    *  `.fusion/memory/MEMORY.md`, identifies patterns/principles/pitfalls, and writes to
-   *  `.fusion/memory-insights.md`. Default: false. */
+   *  `.fusion/memory/memory-insights.md`. Default: false. */
   insightExtractionEnabled?: boolean;
   /** Cron expression for insight extraction schedule. Only used when
    *  insightExtractionEnabled is true. Default: "0 2 * * *" (daily at 2 AM). */

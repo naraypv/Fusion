@@ -47,10 +47,12 @@ import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from 
 import { evaluateSpecStaleness, getPromptPath } from "./spec-staleness.js";
 import {
   createDelegateTaskTool,
+  createGetAgentConfigTool,
   createListAgentsTool,
   createMemoryTools,
   createReadMessagesTool,
   createReflectOnPerformanceTool,
+  createUpdateAgentConfigTool,
   createResearchTools,
   createSendMessageTool,
   createTaskCreateTool as sharedCreateTaskCreateTool,
@@ -68,8 +70,10 @@ import { buildBoundPlanGoalPromptContext, persistBoundPlanGoalCompletion } from 
 export { summarizeToolArgs } from "./agent-logger.js";
 export {
   createDelegateTaskTool,
+  createGetAgentConfigTool,
   createListAgentsTool,
   createReadMessagesTool,
+  createUpdateAgentConfigTool,
   createSendMessageTool,
   createTaskCreateTool,
   createTaskDocumentReadTool,
@@ -2767,6 +2771,10 @@ export class TaskExecutor {
         ...(this.options.agentStore ? [
           createListAgentsTool(this.options.agentStore),
           createDelegateTaskTool(this.options.agentStore, this.store, { rootDir: this.rootDir }),
+          ...(assignedAgentId ? [
+            createGetAgentConfigTool(this.options.agentStore, assignedAgentId),
+            createUpdateAgentConfigTool(this.options.agentStore, assignedAgentId),
+          ] : []),
         ] : []),
         // Messaging tools — allows executor agents to send and receive messages.
         ...(this.options.messageStore && assignedAgentId ? [

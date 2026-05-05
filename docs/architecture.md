@@ -169,13 +169,18 @@ Concrete references:
 
 ### Research Runs
 
-- `ResearchStore` (`research-store.ts`, `research-types.ts`, `research-settings.ts`) persists bounded research runs, sources/events, and exports
-- Backed by `research_runs`, `research_exports`, and `research_run_events`
-- Engine orchestration is implemented in `packages/engine/src/research-orchestrator.ts` + `research-step-runner.ts`
-- Dashboard/API surface is implemented under `/api/research` (`packages/dashboard/src/research-routes.ts`) with `ResearchView.tsx` in the app
-- CLI surface is implemented in `packages/cli/src/commands/research.ts` with six subcommands (create, list, show, export, cancel, retry)
-- Agent tool surface is exposed via `packages/cli/src/extension.ts` (fn_research_run, fn_research_list, fn_research_get, fn_research_cancel)
-- **Boundary note:** research and insights are parallel subsystems sharing host infrastructure, not one table/store family
+- `ResearchStore` (`research-store.ts`, `research-types.ts`, `research-settings.ts`) persists bounded research runs, sources/events, exports, lifecycle metadata, and retry/cancel state transitions.
+- Backed by `research_runs`, `research_exports`, and `research_run_events`.
+- Engine orchestration is implemented in `packages/engine/src/research-orchestrator.ts` + `research-step-runner.ts`.
+- Dashboard/API surface is implemented under `/api/research` (`packages/dashboard/src/research-routes.ts`) with `ResearchView.tsx` in the app.
+- CLI surface is implemented in `packages/cli/src/commands/research.ts` with six subcommands (create, list, show, export, cancel, retry).
+- Agent tool surface is exposed via `packages/cli/src/extension.ts` (`fn_research_run`, `fn_research_list`, `fn_research_get`, `fn_research_cancel`, `fn_research_retry`).
+- **Boundary contract (FN-3292):**
+  - `ResearchStore` owns persistence and lifecycle writes (status transitions, lifecycle event log rows, sources/results snapshots).
+  - `ResearchStepRunner` owns provider I/O concerns only (provider selection, timeout/abort/provider-error classification, synthesis call execution); it does not read/write run state.
+  - `ResearchOrchestrator` owns sequencing and failure policy (phase progression, provider fallback, partial-step continuation, terminal status choice) and interacts with store only through public store methods.
+  - Provider substitution must remain data-driven: source metadata can carry provider identity, and fetching should resolve providers per source rather than relying on provider ordering.
+- **Boundary note:** research and insights are parallel subsystems sharing host infrastructure, not one table/store family.
 
 ### Plugin System
 
@@ -432,7 +437,7 @@ Operator setup + troubleshooting guide: **[Remote Access runbook](./remote-acces
 
 Key server capabilities:
 - REST APIs for tasks, git, GitHub, agents, missions, planning, automations/routines, settings
-- System stats snapshot and vitest process controls APIs (`GET /api/system-stats`, `POST /api/kill-vitest`) exposing dashboard process/system telemetry (including host memory rendered as both numeric values and a visual usage bar in the System Stats modal), task/agent aggregates, and manual vitest process termination
+- System stats snapshot and vitest process controls APIs (`GET /api/system-stats`, `POST /api/kill-vitest`) exposing dashboard process/system telemetry (including app CPU percentage and host memory rendered as numeric values with visual usage bars in the System Stats modal), task/agent aggregates, and manual vitest process termination
 - Remote access APIs (`/api/remote/*`) for provider config, activation, tunnel lifecycle, status, token issuance, authenticated URL generation, and QR payload generation
   - Operational runbook (prereqs/security/troubleshooting): [`docs/remote-access.md`](./remote-access.md)
   - `/api/remote/tunnel/start`, `/api/remote/tunnel/stop`, and `/api/remote/tunnel/kill-external` cover tunnel lifecycle and external funnel cleanup.
@@ -492,7 +497,7 @@ Key server capabilities:
 - App entry: `packages/dashboard/app/main.tsx`
 - Root composition: `packages/dashboard/app/App.tsx`
 - Core board components: `Board.tsx`, `Column.tsx`, `TaskCard.tsx`, `TaskDetailModal.tsx`, `ListView.tsx`
-- **Board column ordering (board view only)**: task cards within each board column are sorted by priority descending (`urgent` → `high` → `normal` → `low`) and then by numeric task ID ascending (lower ID first). Missing or invalid priority values normalize to `normal`. In the `in-review` column, tasks with `status === "merging"` or `status === "merging-pr"` are pinned above non-merging tasks, with the priority-then-ID ordering applied within each pinned/non-pinned group.
+- **Board column ordering (board view only)**: `todo` cards mirror scheduler pickup order (priority descending, then `createdAt` ascending/FIFO within each priority tier, then task ID ascending). `triage`, `in-progress`, and `archived` use priority descending then task ID ascending, with missing/invalid priority normalized to `normal`. `done` is completion-recency ordered (`columnMovedAt`, then `updatedAt`, then `createdAt`, newest first). In `in-review`, merge-active tasks (`status === "merging"`, `"merging-pr"`, or `"merging-fix"`) are pinned above non-merging tasks, with priority-then-ID ordering within each group.
 - Task detail surface is shared through `TaskDetailContent` (exported from `TaskDetailModal.tsx`): desktop/tablet `ListView` renders it inline in the split right pane, while mobile and non-list entry points continue using `TaskDetailModal`.
 - In desktop split mode, `ListView` now uses a compact sidebar-first control layout (count/actions/summary chips + collapsible "View options" panel) to keep list controls dense alongside the inline detail pane; mobile keeps the card-first flow with a toolbar "View options" entry point for the same visibility/filter toggles.
 - Chat system UI: `ChatView.tsx`, `QuickChatFAB.tsx`

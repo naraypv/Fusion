@@ -2,6 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
+const { mockSyncStartupModels } = vi.hoisted(() => ({
+  mockSyncStartupModels: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("../startup-model-sync.js", () => ({
+  syncStartupModels: mockSyncStartupModels,
+}));
+
 const CLI_PACKAGE_VERSION = (
   JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf-8")) as { version: string }
 ).version;
@@ -735,6 +743,13 @@ async function runDashboard(...args: Parameters<typeof runDashboardImpl>): Retur
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+describe("runDashboard — startup model sync", () => {
+  it("invokes shared startup model sync", async () => {
+    await runDashboard(0, { open: false });
+    expect(mockSyncStartupModels).toHaveBeenCalledTimes(1);
+  });
+});
+
 function resetGitHubMocks() {
   mockFindPrForBranch.mockReset();
   mockCreatePr.mockReset();
@@ -1087,6 +1102,34 @@ describe("runDashboard — PR-first auto-merge queue", () => {
 
     await runDashboard(0, { open: false });
     await new Promise((r) => setTimeout(r, 100));
+
+    expect(mockCreatePr).toHaveBeenCalledWith({
+      title: "FN-093: Task",
+      body: "Automated PR for FN-093.\n\nDescription",
+      head: "fusion/fn-093",
+    });
+    expect(aiMergeTask).not.toHaveBeenCalled();
+  });
+
+  it("manual onMerge still uses PR lifecycle when autoMerge is disabled", async () => {
+    const { aiMergeTask } = await import("@fusion/engine");
+    const { createServer } = await import("@fusion/dashboard");
+
+    mockStore.getSettings.mockResolvedValue({
+      maxConcurrent: 1,
+      maxWorktrees: 2,
+      autoMerge: false,
+      mergeStrategy: "pull-request",
+      pollIntervalMs: 60_000,
+      enginePaused: false,
+      globalPause: false,
+    });
+
+    await runDashboard(0, { open: false, dev: true });
+
+    const createServerCall = (createServer as ReturnType<typeof vi.fn>).mock.calls[0];
+    const serverOpts = createServerCall[1] as { onMerge: (taskId: string) => Promise<unknown> };
+    await serverOpts.onMerge("FN-093");
 
     expect(mockCreatePr).toHaveBeenCalledWith({
       title: "FN-093: Task",
