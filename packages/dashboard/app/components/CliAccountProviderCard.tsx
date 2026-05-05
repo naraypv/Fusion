@@ -74,7 +74,7 @@ export function CliAccountProviderCard({
                   <Loader2 size={12} className="animate-spin" />
                   Working…
                 </>
-              ) : accounts.length > 0 ? (
+              ) : authenticated || accounts.length > 0 ? (
                 "Add another account"
               ) : (
                 "Login"

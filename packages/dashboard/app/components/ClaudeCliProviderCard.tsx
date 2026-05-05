@@ -220,7 +220,7 @@ export function ClaudeCliProviderCard({
               : undefined
           }
         >
-          {addAccountBusy ? "Working…" : accounts.length > 0 ? "Add another account" : "Login"}
+          {addAccountBusy ? "Working…" : authenticated || accounts.length > 0 ? "Add another account" : "Login"}
         </button>
       ) : null}
     </>

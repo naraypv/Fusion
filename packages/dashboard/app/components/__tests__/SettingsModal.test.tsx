@@ -1151,7 +1151,7 @@ describe("SettingsModal", () => {
         providers: [{
           id: "claude-cli",
           name: "Anthropic — via Claude CLI",
-          authenticated: false,
+          authenticated: true,
           type: "cli",
           loginInProgress: false,
           accounts: [],
@@ -1175,9 +1175,9 @@ describe("SettingsModal", () => {
 
       const claudeCard = screen.getByTestId("claude-cli-provider-card");
       await waitFor(() => {
-        expect(within(claudeCard).getByRole("button", { name: "Login" })).toBeEnabled();
+        expect(within(claudeCard).getByRole("button", { name: "Add another account" })).toBeEnabled();
       });
-      await userEvent.click(within(claudeCard).getByRole("button", { name: "Login" }));
+      await userEvent.click(within(claudeCard).getByRole("button", { name: "Add another account" }));
 
       expect(openSpy).toHaveBeenCalledWith("https://claude.com/cai/oauth/authorize?code=true", "_blank");
       const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
