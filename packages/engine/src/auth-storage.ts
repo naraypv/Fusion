@@ -4,8 +4,13 @@ import { join } from "node:path";
 import {
   choosePreferredStoredCredential,
   getCodexCliAuthPath,
+  getFusionAccountsPath,
+  MultiAccountAuthStore,
   readStoredCredentialsFromAuthFile,
   shouldHydrateStoredCredential,
+  type AccountCredentialRecord,
+  type AccountCredentialSummary,
+  type AccountFailureState,
   type StoredAuthCredential,
 } from "@fusion/core";
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
@@ -14,6 +19,18 @@ import { getOAuthProvider } from "@mariozechner/pi-ai/oauth";
 import type { OAuthCredentials } from "@mariozechner/pi-ai/oauth";
 
 type StoredCredential = StoredAuthCredential;
+
+export interface FusionAuthStorageOptions {
+  selectedAccountIds?: Record<string, string | undefined>;
+  accountStore?: MultiAccountAuthStore;
+}
+
+export interface FusionAuthStorageExtras {
+  listAccounts(providerId?: string): AccountCredentialSummary[];
+  selectAccount(providerId: string): AccountCredentialRecord | undefined;
+  markAccountFailure(accountId: string, failure: AccountFailureState, cooldownMs?: number): AccountCredentialRecord | undefined;
+  markAccountSuccess(accountId: string): AccountCredentialRecord | undefined;
+}
 
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
@@ -135,11 +152,15 @@ function readModelsJsonApiKeys(home = getHomeDir()): Map<string, string> {
   return apiKeys;
 }
 
-export function createFusionAuthStorage(): AuthStorage {
+export function createFusionAuthStorage(options: FusionAuthStorageOptions = {}): AuthStorage {
   const primary = AuthStorage.create(getFusionAuthPath());
+  const accountStore = options.accountStore ?? new MultiAccountAuthStore(getFusionAccountsPath());
+  const selectedAccountIds = options.selectedAccountIds ?? {};
   let supplementalCredentials = readSupplementalCredentials();
   // models.json provider API keys — final fallback after primary auth and supplemental auth.json files
   let modelsJsonApiKeys = readModelsJsonApiKeys();
+  const accountCredential = (provider: string): StoredCredential | undefined =>
+    accountStore.credentialFor(provider, selectedAccountIds[provider]);
 
   const syncSupplementalOauthCredentials = () => {
     for (const [provider, credential] of Object.entries(supplementalCredentials)) {
@@ -177,6 +198,7 @@ export function createFusionAuthStorage(): AuthStorage {
 
       if (prop === "get") {
         return (provider: string) =>
+          accountCredential(provider) ??
           choosePreferredStoredCredential(
             target.get(provider) as StoredCredential | undefined,
             supplementalCredentials[provider],
@@ -184,22 +206,31 @@ export function createFusionAuthStorage(): AuthStorage {
       }
 
       if (prop === "has") {
-        return (provider: string) => target.has(provider) || provider in supplementalCredentials || modelsJsonApiKeys.has(provider);
+        return (provider: string) =>
+          accountStore.list(provider).length > 0 ||
+          target.has(provider) ||
+          provider in supplementalCredentials ||
+          modelsJsonApiKeys.has(provider);
       }
 
       if (prop === "hasAuth") {
-        return (provider: string) => target.hasAuth(provider) || Boolean(supplementalCredentials[provider]) || modelsJsonApiKeys.has(provider);
+        return (provider: string) =>
+          accountStore.list(provider).length > 0 ||
+          target.hasAuth(provider) ||
+          Boolean(supplementalCredentials[provider]) ||
+          modelsJsonApiKeys.has(provider);
       }
 
       if (prop === "getAll") {
         return () => {
           const providerIds = new Set([
+            ...accountStore.list().map((account) => account.providerId),
             ...Object.keys(supplementalCredentials),
             ...Object.keys(target.getAll() as Record<string, StoredCredential>),
           ]);
           const merged: Record<string, StoredCredential> = {};
           for (const providerId of providerIds) {
-            const credential = choosePreferredStoredCredential(
+            const credential = accountCredential(providerId) ?? choosePreferredStoredCredential(
               (target.get(providerId) as StoredCredential | undefined),
               supplementalCredentials[providerId],
             );
@@ -212,22 +243,52 @@ export function createFusionAuthStorage(): AuthStorage {
       }
 
       if (prop === "list") {
-        return () => Array.from(new Set([...Object.keys(supplementalCredentials), ...target.list(), ...modelsJsonApiKeys.keys()]));
+        return () => Array.from(new Set([
+          ...accountStore.list().map((account) => account.providerId),
+          ...Object.keys(supplementalCredentials),
+          ...target.list(),
+          ...modelsJsonApiKeys.keys(),
+        ]));
       }
 
       if (prop === "getApiKey") {
         return async (provider: string) => {
-          // 1. Primary Fusion auth
+          // 1. Selected multi-account credential
+          const selectedAccountKey = resolveStoredCredentialApiKey(provider, accountCredential(provider));
+          if (selectedAccountKey) return selectedAccountKey;
+
+          // 2. Primary Fusion auth
           const primaryKey = await target.getApiKey(provider);
           if (primaryKey) return primaryKey;
 
-          // 2. Supplemental auth.json credentials (.pi + .codex)
+          // 3. Supplemental auth.json credentials (.pi + .codex)
           const supplementalKey = resolveStoredCredentialApiKey(provider, supplementalCredentials[provider]);
           if (supplementalKey) return supplementalKey;
 
-          // 3. models.json provider API keys (e.g., kimi-coding, lmstudio)
+          // 4. models.json provider API keys (e.g., kimi-coding, lmstudio)
           return modelsJsonApiKeys.get(provider);
         };
+      }
+
+      if (prop === "listAccounts") {
+        return (provider?: string) => accountStore.listSummaries(provider);
+      }
+
+      if (prop === "selectAccount") {
+        return (provider: string) => {
+          const account = accountStore.selectAccount({ providerId: provider });
+          selectedAccountIds[provider] = account?.id;
+          return account;
+        };
+      }
+
+      if (prop === "markAccountFailure") {
+        return (accountId: string, failure: AccountFailureState, cooldownMs?: number) =>
+          accountStore.markFailure({ accountId, failure, cooldownMs });
+      }
+
+      if (prop === "markAccountSuccess") {
+        return (accountId: string) => accountStore.markSuccess(accountId);
       }
 
       return Reflect.get(target, prop, receiver);

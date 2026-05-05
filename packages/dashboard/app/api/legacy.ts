@@ -1269,6 +1269,39 @@ export interface AuthProvider {
   type?: "oauth" | "api_key" | "cli";
   /** Masked hint of the stored API key (first 3 + bullets + last 4 chars) */
   keyHint?: string;
+  /** Configured accounts for multi-account-capable providers. Raw credentials are never returned. */
+  accounts?: AuthAccountSummary[];
+  /** Number of configured accounts for this provider. */
+  accountCount?: number;
+  /** True when the provider supports adding another account without logging out. */
+  supportsMultipleAccounts?: boolean;
+  /** Last OAuth/API-key add-account result for status polling and duplicate-account messaging. */
+  lastLoginResult?: AuthAddAccountResult;
+}
+
+export interface AuthAccountSummary {
+  id: string;
+  providerId: string;
+  label: string;
+  credentialKind: "oauth" | "api_key" | "cli_oauth_home" | "env_api_key";
+  accountDisplayHint?: string;
+  priority: number;
+  status: "active" | "cooldown" | "disabled";
+  createdAt: string;
+  updatedAt: string;
+  cooldownUntil?: string;
+  failureCount?: number;
+  lastFailure?: {
+    kind: "rate_limit" | "quota" | "auth" | "transient" | "unknown";
+    message: string;
+    at: string;
+  };
+}
+
+export interface AuthAddAccountResult {
+  status: "added" | "same-account";
+  message: string;
+  account: AuthAccountSummary;
 }
 
 export interface ManualOAuthCodeInfo {
@@ -1337,6 +1370,11 @@ export interface LlamaCppStatus {
 /** Probe the local Claude CLI binary + setting + extension state. */
 export function fetchClaudeCliStatus(): Promise<ClaudeCliStatus> {
   return api<ClaudeCliStatus>("/providers/claude-cli/status");
+}
+
+/** Probe the local Cursor Agent binary + configured account state. */
+export function fetchCursorAgentStatus(): Promise<ClaudeCliStatus> {
+  return api<ClaudeCliStatus>("/providers/cursor/status");
 }
 
 /**
@@ -1639,6 +1677,14 @@ export function setClaudeCliEnabled(
   });
 }
 
+/** Start a CLI-backed account login from the dashboard server process. */
+export function addCliAccountProvider(provider: string): Promise<{ success: boolean; result: AuthAddAccountResult }> {
+  return api<{ success: boolean; result: AuthAddAccountResult }>("/auth/cli-account", {
+    method: "POST",
+    body: JSON.stringify({ provider }),
+  });
+}
+
 /** Enable or disable the Droid CLI provider. Refuses enable if binary is missing. */
 export function setDroidCliEnabled(
   enabled: boolean,
@@ -1772,18 +1818,20 @@ export function fetchAuthStatus(): Promise<{
 }
 
 /** Initiate OAuth login for a provider. Returns the auth URL to open in a new tab. */
-export function loginProvider(provider: string): Promise<{
+export function loginProvider(provider: string, options: { addAnother?: boolean } = {}): Promise<{
   url: string;
   instructions?: string;
   manualCode?: ManualOAuthCodeInfo;
+  addAnother?: boolean;
 }> {
   return api<{
     url: string;
     instructions?: string;
     manualCode?: ManualOAuthCodeInfo;
+    addAnother?: boolean;
   }>("/auth/login", {
     method: "POST",
-    body: JSON.stringify({ provider, origin: window.location.origin }),
+    body: JSON.stringify({ provider, origin: window.location.origin, addAnother: options.addAnother === true }),
   });
 }
 
@@ -1812,8 +1860,8 @@ export function cancelProviderLogin(provider: string): Promise<{ success: boolea
 }
 
 /** Save an API key for an API-key-backed provider. */
-export function saveApiKey(provider: string, apiKey: string): Promise<{ success: boolean }> {
-  return api<{ success: boolean }>("/auth/api-key", {
+export function saveApiKey(provider: string, apiKey: string): Promise<{ success: boolean; result?: AuthAddAccountResult }> {
+  return api<{ success: boolean; result?: AuthAddAccountResult }>("/auth/api-key", {
     method: "POST",
     body: JSON.stringify({ provider, apiKey }),
   });

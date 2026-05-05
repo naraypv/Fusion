@@ -22,7 +22,7 @@ import type {
   ChatSessionCreateInput,
   Settings,
 } from "@fusion/core";
-import { summarizeTitle } from "@fusion/core";
+import { resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy, summarizeTitle } from "@fusion/core";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
@@ -444,7 +444,7 @@ export class ChatManager {
       getRuntimeById?(runtimeId: string): unknown;
       createRuntimeContext?(pluginId: string): Promise<unknown>;
     },
-    private getSettings?: () => Promise<Pick<Settings, "fallbackProvider" | "fallbackModelId" | "defaultProvider" | "defaultModelId"> | undefined> | Pick<Settings, "fallbackProvider" | "fallbackModelId" | "defaultProvider" | "defaultModelId"> | undefined,
+    private getSettings?: () => Promise<Partial<Settings> | undefined> | Partial<Settings> | undefined,
   ) {}
 
   private async getChatModelSettings(): Promise<{
@@ -452,6 +452,8 @@ export class ChatManager {
     fallbackModelId?: string;
     defaultProvider?: string;
     defaultModelId?: string;
+    modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
+    routeViaDspy?: boolean;
   }> {
     if (!this.getSettings) {
       return {};
@@ -464,6 +466,8 @@ export class ChatManager {
         fallbackModelId: settings?.fallbackModelId ?? undefined,
         defaultProvider: settings?.defaultProvider ?? undefined,
         defaultModelId: settings?.defaultModelId ?? undefined,
+        modelFallbackChain: resolveModelFallbackChain(settings),
+        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -857,6 +861,10 @@ export class ChatManager {
               fallbackModelId: chatModelSettings.fallbackModelId,
             }
           : {}),
+        ...(allowFallback && chatModelSettings.modelFallbackChain && chatModelSettings.modelFallbackChain.length > 0
+          ? { modelFallbackChain: chatModelSettings.modelFallbackChain }
+          : {}),
+        routeViaDspy: chatModelSettings.routeViaDspy,
         onFallbackModelUsed: (payload: {
           primaryModel: string;
           fallbackModel: string;

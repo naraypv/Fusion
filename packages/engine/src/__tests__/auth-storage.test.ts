@@ -3,7 +3,8 @@ import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createFusionAuthStorage, getFusionAuthPath } from "../auth-storage.js";
+import { MultiAccountAuthStore } from "@fusion/core";
+import { createFusionAuthStorage, getFusionAuthPath, type FusionAuthStorageExtras } from "../auth-storage.js";
 
 function encodeBase64Url(value: string): string {
   return Buffer.from(value, "utf-8").toString("base64url");
@@ -57,6 +58,46 @@ describe("createFusionAuthStorage", () => {
     expect(await authStorage.getApiKey("minimax")).toBe("legacy-minimax-key");
     expect(authStorage.get("minimax")).toEqual({ type: "api_key", key: "legacy-minimax-key" });
     expect(existsSync(getFusionAuthPath(homeDir))).toBe(true);
+  });
+
+  it("uses multi-account credentials before legacy and primary auth storage", async () => {
+    const accountStore = new MultiAccountAuthStore(join(homeDir, ".fusion", "agent", "accounts.json"));
+    accountStore.addApiKeyAccount("minimax", "account-key");
+
+    const legacyAgentDir = join(homeDir, ".pi", "agent");
+    mkdirSync(legacyAgentDir, { recursive: true });
+    writeFileSync(
+      join(legacyAgentDir, "auth.json"),
+      JSON.stringify({
+        minimax: { type: "api_key", key: "legacy-key" },
+      }),
+    );
+
+    const authStorage = createFusionAuthStorage({ accountStore });
+    authStorage.set("minimax", { type: "api_key", key: "primary-key" });
+
+    expect(await authStorage.getApiKey("minimax")).toBe("account-key");
+    expect(authStorage.get("minimax")).toEqual({ type: "api_key", key: "account-key" });
+    expect(authStorage.list()).toContain("minimax");
+  });
+
+  it("selects the next account when the current account enters cooldown", async () => {
+    const accountStore = new MultiAccountAuthStore(join(homeDir, ".fusion", "agent", "accounts.json"));
+    const first = accountStore.addApiKeyAccount("minimax", "first-key", { priority: 1 }).account;
+    accountStore.addApiKeyAccount("minimax", "second-key", { priority: 2 });
+    const authStorage = createFusionAuthStorage({ accountStore }) as ReturnType<typeof createFusionAuthStorage> & FusionAuthStorageExtras;
+
+    expect(authStorage.selectAccount("minimax")?.id).toBe(first.id);
+    expect(await authStorage.getApiKey("minimax")).toBe("first-key");
+
+    authStorage.markAccountFailure(first.id, {
+      kind: "quota",
+      message: "quota exhausted",
+      at: new Date().toISOString(),
+    }, 60_000);
+
+    expect(authStorage.selectAccount("minimax")?.label).toBe("MiniMax account 2");
+    expect(await authStorage.getApiKey("minimax")).toBe("second-key");
   });
 
   it("reads non-expired legacy Pi OAuth credentials as fallback", async () => {

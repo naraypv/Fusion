@@ -648,6 +648,38 @@ function DroidCliIcon({ size, color, label = "Factory AI — via Droid CLI" }: {
   );
 }
 
+function CursorAgentIcon({ size, color, label = "Cursor — via Cursor Agent" }: { size: number; color: string; label?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      data-testid="cursor-agent-icon"
+      aria-label={label}
+    >
+      <path
+        d="M4 3.5 20 12 4 20.5v-17Z"
+        fill={color}
+      />
+      <path
+        d="M8 8.8 14.8 12 8 15.2V8.8Z"
+        fill="var(--provider-icon-contrast)"
+      />
+      <rect x="13" y="13" width="10" height="9" rx="1.5" fill={color} />
+      <path
+        d="M15.2 16.2l1.6 1.4-1.6 1.4M18.6 19.6h2.4"
+        stroke="var(--provider-icon-contrast)"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
+  );
+}
+
 const providerConfig: Record<
   string,
   { component: typeof AnthropicIcon; color: string; label?: string }
@@ -657,6 +689,7 @@ const providerConfig: Record<
   "claude-cli": { component: ClaudeCliIcon, color: "var(--provider-anthropic)", label: "Anthropic — via Claude CLI" },
   "pi-claude-cli": { component: ClaudeCliIcon, color: "var(--provider-anthropic)", label: "Anthropic — via Claude CLI" },
   "droid-cli": { component: DroidCliIcon, color: "var(--provider-openai)", label: "Factory AI — via Droid CLI" },
+  cursor: { component: CursorAgentIcon, color: "var(--text)", label: "Cursor — via Cursor Agent" },
   "llama-cpp": { component: LlamaCppIcon, color: "var(--provider-ollama)", label: "llama.cpp" },
   "llama-server": { component: LlamaCppIcon, color: "var(--provider-ollama)", label: "llama.cpp" },
 

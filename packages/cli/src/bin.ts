@@ -122,6 +122,7 @@ async function loadCommandHandlers() {
   const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
   const { runSettingsExport } = await import("./commands/settings-export.js");
   const { runSettingsImport } = await import("./commands/settings-import.js");
+  const { runAuth } = await import("./commands/auth.js");
   const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
   const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
   const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice } = await import("./commands/mission.js");
@@ -173,6 +174,7 @@ async function loadCommandHandlers() {
     runSettingsSet,
     runSettingsExport,
     runSettingsImport,
+    runAuth,
     runGitStatus,
     runGitFetch,
     runGitPull,
@@ -320,6 +322,12 @@ Usage:
   fn settings set unavailableNodePolicy <block|fallback-local>
   fn settings export [opts]              Export settings to a JSON file
   fn settings import <file> [opts]       Import settings from a JSON file
+  fn auth status [provider]              List configured auth accounts
+  fn auth login <codex|claude|cursor|minimax>
+                                      Start a login/key capture and store it as an account
+  fn auth add-account <provider>         Add another account without logging out
+  fn auth add-account minimax --api-key <key>
+  fn auth api-key add <provider> --env <ENV_VAR>
 
   fn git status              Show current branch, commit, dirty state, ahead/behind
   fn git push                Push current branch
@@ -519,6 +527,7 @@ async function main() {
     runSettingsSet,
     runSettingsExport,
     runSettingsImport,
+    runAuth,
     runGitStatus,
     runGitFetch,
     runGitPull,
@@ -659,6 +668,11 @@ async function main() {
           global: args.includes("--global") ? true : undefined,
           json: args.includes("--json"),
         });
+        break;
+      }
+
+      case "auth": {
+        await runAuth(args.slice(1));
         break;
       }
 

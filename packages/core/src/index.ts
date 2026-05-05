@@ -1,5 +1,5 @@
 export { COLUMNS, COLUMN_LABELS, COLUMN_DESCRIPTIONS, VALID_TRANSITIONS, DEFAULT_SETTINGS, DEFAULT_GLOBAL_SETTINGS, DEFAULT_PROJECT_SETTINGS, GLOBAL_SETTINGS_KEYS, PROJECT_SETTINGS_KEYS, isGlobalSettingsKey, isProjectSettingsKey, THINKING_LEVELS, THEME_MODES, COLOR_THEMES, WORKFLOW_STEP_TEMPLATES, AGENT_PERMISSIONS, agentToConfigSnapshot, diffConfigSnapshots, isEphemeralAgent, hasAgentIdentity, CheckoutConflictError, DEFAULT_HEARTBEAT_PROCEDURE_PATH, getDefaultHeartbeatProcedurePath, EXECUTION_MODES, DEFAULT_EXECUTION_MODE, TASK_PRIORITIES, DEFAULT_TASK_PRIORITY, validateMessageMetadata, normalizeMergeConflictStrategy, buildResearchDocumentKey } from "./types.js";
-export type { Column, IssueInfo, IssueState, TaskSourceIssue, PrInfo, PrStatus, Task, TaskTokenUsage, TaskAttachment, TaskComment, TaskCommentInput, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, TaskCreateInput, TaskSource, SourceType, TaskDetail, InboxTask, TodoList, TodoItem, TodoListCreateInput, TodoListUpdateInput, TodoItemCreateInput, TodoItemUpdateInput, TodoListWithItems, AgentLogEntry, AgentLogType, AgentRole, BoardConfig, MergeDetails, MergeResult, MergeConflictStrategy, CanonicalMergeConflictStrategy, Settings, GlobalSettings, ProjectSettings, WebSearchBackend, ResearchEnabledSources, ResearchGlobalDefaults, ResearchProjectLimits, ResearchProjectSettings, SettingsScope, DaemonTokenSettings, TaskStep, StepStatus, TaskLogEntry, RunMutationContext, ActivityLogEntry, ActivityEventType, ThinkingLevel, ThemeMode, ColorTheme, ExecutionMode, TaskPriority, UnavailableNodePolicy, PlanningQuestion, PlanningSummary, PlanningResponse, PlanningQuestionType, ArchivedTaskEntry, BatchStatusRequest, BatchStatusResponse, BatchStatusEntry, BatchStatusResult, ModelPreset, WorkflowStep, WorkflowStepMode, WorkflowStepPhase, WorkflowStepInput, WorkflowStepResult, WorkflowStepTemplate, Agent, OrgTreeNode, AgentState, AgentDetail, AgentCreateInput, AgentUpdateInput, AgentApiKey, AgentApiKeyCreateResult, AgentCapability, AgentPromptTemplate, AgentPromptsConfig, AgentPermission, TaskAssignSource, AgentAccessState, AgentHeartbeatConfig, AgentBudgetConfig, AgentBudgetStatus, InstructionsBundleConfig, MessageResponseMode, AgentHeartbeatEvent, AgentHeartbeatRun, BlockedStateSnapshot, HeartbeatInvocationSource, AgentTaskSession, AgentRating, AgentRatingSummary, AgentRatingInput, AgentConfigSnapshot, RevisionFieldDiff, AgentConfigRevision, AgentStats, ReflectionTrigger, ReflectionMetrics, AgentReflection, AgentPerformanceSummary, NtfyNotificationEvent, NotificationEvent, NotificationPayload, NotificationProviderConfig, CustomProvider, SteeringComment, ParticipantType, MessageType, Message, MessageCreateInput, MessageFilter, MessageMetadata, MessageReplyReference, Mailbox, CheckoutLease, RunAuditDomain, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter } from "./types.js";
+export type { Column, IssueInfo, IssueState, TaskSourceIssue, PrInfo, PrStatus, Task, TaskTokenUsage, TaskAttachment, TaskComment, TaskCommentInput, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, TaskCreateInput, TaskSource, SourceType, TaskDetail, InboxTask, TodoList, TodoItem, TodoListCreateInput, TodoListUpdateInput, TodoItemCreateInput, TodoItemUpdateInput, TodoListWithItems, AgentLogEntry, AgentLogType, AgentRole, BoardConfig, MergeDetails, MergeResult, MergeConflictStrategy, CanonicalMergeConflictStrategy, Settings, GlobalSettings, ProjectSettings, WebSearchBackend, ResearchEnabledSources, ResearchGlobalDefaults, ResearchProjectLimits, ResearchProjectSettings, SettingsScope, DaemonTokenSettings, TaskStep, StepStatus, TaskLogEntry, RunMutationContext, ActivityLogEntry, ActivityEventType, ThinkingLevel, ThemeMode, ColorTheme, ExecutionMode, TaskPriority, UnavailableNodePolicy, PlanningQuestion, PlanningSummary, PlanningResponse, PlanningQuestionType, ArchivedTaskEntry, BatchStatusRequest, BatchStatusResponse, BatchStatusEntry, BatchStatusResult, ModelPreset, ModelFallbackChainEntry, WorkflowStep, WorkflowStepMode, WorkflowStepPhase, WorkflowStepInput, WorkflowStepResult, WorkflowStepTemplate, Agent, OrgTreeNode, AgentState, AgentDetail, AgentCreateInput, AgentUpdateInput, AgentApiKey, AgentApiKeyCreateResult, AgentCapability, AgentPromptTemplate, AgentPromptsConfig, AgentPermission, TaskAssignSource, AgentAccessState, AgentHeartbeatConfig, AgentBudgetConfig, AgentBudgetStatus, InstructionsBundleConfig, MessageResponseMode, AgentHeartbeatEvent, AgentHeartbeatRun, BlockedStateSnapshot, HeartbeatInvocationSource, AgentTaskSession, AgentRating, AgentRatingSummary, AgentRatingInput, AgentConfigSnapshot, RevisionFieldDiff, AgentConfigRevision, AgentStats, ReflectionTrigger, ReflectionMetrics, AgentReflection, AgentPerformanceSummary, NtfyNotificationEvent, NotificationEvent, NotificationPayload, NotificationProviderConfig, CustomProvider, SteeringComment, ParticipantType, MessageType, Message, MessageCreateInput, MessageFilter, MessageMetadata, MessageReplyReference, Mailbox, CheckoutLease, RunAuditDomain, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter } from "./types.js";
 export { AGENT_VALID_TRANSITIONS } from "./types.js";
 export {
   PLAN_FORMAT_VERSION,
@@ -225,6 +225,25 @@ export {
 } from "./backup.js";
 export type { BackupInfo, BackupOptions } from "./backup.js";
 export {
+  MULTI_ACCOUNT_AUTH_VERSION,
+  MultiAccountAuthStore,
+  getFusionAccountsPath,
+  summarizeAccount,
+} from "./multi-account-auth.js";
+export type {
+  AccountAuthFile,
+  AccountCredentialKind,
+  AccountCredentialRecord,
+  AccountCredentialStatus,
+  AccountCredentialSummary,
+  AccountFailureState,
+  AccountSelectionOptions,
+  AddAccountResult,
+  AddCliHomeAccountOptions,
+  AddCredentialAccountOptions,
+  MarkAccountFailureOptions,
+} from "./multi-account-auth.js";
+export {
   exportSettings,
   importSettings,
   validateImportData,
@@ -271,15 +290,17 @@ export {
 } from "./ai-summarize.js";
 export {
   resolveExecutionSettingsModel,
+  resolveModelFallbackChain,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTaskExecutionModel,
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,
   resolveTitleSummarizerSettingsModel,
   resolveValidatorSettingsModel,
 } from "./model-resolution.js";
-export type { ResolvedModelSelection } from "./model-resolution.js";
+export type { ResolvedModelFallbackEntry, ResolvedModelSelection } from "./model-resolution.js";
 
 // ── Memory Compaction ─────────────────────────────────────────────────
 

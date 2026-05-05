@@ -10,7 +10,9 @@ import {
   buildExecutionMemoryInstructions,
   getTaskMergeBlocker,
   resolveAgentPrompt,
+  resolveModelFallbackChain,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   type RunCommandResult,
 } from "@fusion/core";
 import { findWorktreeUser } from "./merger.js";
@@ -2820,6 +2822,8 @@ export class TaskExecutor {
         );
         const executorFallbackProvider = settings.fallbackProvider;
         const executorFallbackModelId = settings.fallbackModelId;
+        const executorModelFallbackChain = resolveModelFallbackChain(settings);
+        const executorRouteViaDspy = resolveRouteAllLlmCallsViaDspy(settings);
         const executorThinkingLevel = detail.thinkingLevel ?? settings.defaultThinkingLevel;
 
         // Determine whether we're resuming a previous session (pause/resume)
@@ -2857,6 +2861,8 @@ export class TaskExecutor {
           defaultModelId: executorModelId,
           fallbackProvider: executorFallbackProvider,
           fallbackModelId: executorFallbackModelId,
+          modelFallbackChain: executorModelFallbackChain,
+          routeViaDspy: executorRouteViaDspy,
           defaultThinkingLevel: executorThinkingLevel,
           sessionManager,
           // Skill selection: use assigned agent skills if available, otherwise role fallback
@@ -3166,6 +3172,8 @@ export class TaskExecutor {
                 defaultModelId: executorModelId,
                 fallbackProvider: executorFallbackProvider,
                 fallbackModelId: executorFallbackModelId,
+                modelFallbackChain: executorModelFallbackChain,
+                routeViaDspy: executorRouteViaDspy,
                 defaultThinkingLevel: executorThinkingLevel,
                 sessionManager: SessionManager.create(worktreePath),
                 // Skill selection: use assigned agent skills if available, otherwise role fallback
@@ -4008,6 +4016,8 @@ export class TaskExecutor {
               defaultModelId: settings.defaultModelId,
               fallbackProvider: settings.fallbackProvider,
               fallbackModelId: settings.fallbackModelId,
+              modelFallbackChain: resolveModelFallbackChain(settings),
+              routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
               defaultThinkingLevel: detail.thinkingLevel ?? settings.defaultThinkingLevel,
               // Task-level validator override (from task)
               taskValidatorProvider: detail.validatorModelProvider,
@@ -5247,6 +5257,8 @@ and show an appropriate message to the user.\`
         defaultModelId: modelId,
         fallbackProvider: settings.fallbackProvider,
         fallbackModelId: settings.fallbackModelId,
+        modelFallbackChain: resolveModelFallbackChain(settings),
+        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
         defaultThinkingLevel: settings.defaultThinkingLevel,
         // Skill selection: use assigned agent skills if available, otherwise role fallback
         ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -6801,6 +6813,8 @@ Child agent: ${agent.id} (${name})`;
             defaultModelId: childExecutorModelId,
             fallbackProvider: settings.fallbackProvider,
             fallbackModelId: settings.fallbackModelId,
+            modelFallbackChain: resolveModelFallbackChain(settings),
+            routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
             // Skill selection: use assigned agent skills if available, otherwise role fallback
             ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
           });

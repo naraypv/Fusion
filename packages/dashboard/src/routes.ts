@@ -12,7 +12,15 @@ import * as nodeFs from "node:fs";
 import os from "node:os";
 import v8 from "node:v8";
 
-import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType } from "@fusion/core";
+import type {
+  AccountCredentialSummary,
+  AddAccountResult,
+  TaskStore,
+  ScheduleType,
+  ActivityEventType,
+  ModelPreset,
+  RoutineTriggerType,
+} from "@fusion/core";
 import {
   type Task,
   type PiExtensionEntry,
@@ -159,12 +167,12 @@ export interface AuthStorageLike {
       onProgress?: (message: string) => void;
       signal?: AbortSignal;
     },
-  ): Promise<void>;
+  ): Promise<AddAccountResult | void>;
   logout(provider: string): void;
   /** Get providers that accept API keys (non-OAuth). Returns provider id and name. */
   getApiKeyProviders?(): Array<{ id: string; name: string }>;
   /** Save an API key for a provider. Creates or overwrites the existing key. */
-  setApiKey?(providerId: string, apiKey: string): void;
+  setApiKey?(providerId: string, apiKey: string): AddAccountResult | void;
   /** Remove the stored API key for a provider. No-op if not set. */
   clearApiKey?(providerId: string): void;
   /** Check if a provider has an API key configured. */
@@ -173,6 +181,10 @@ export interface AuthStorageLike {
   getApiKey?(providerId: string): string | null | undefined | Promise<string | null | undefined>;
   /** Get raw stored credentials for usage providers. */
   get?(providerId: string): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
+  /** List configured account records without returning raw credentials. */
+  listAccounts?(providerId?: string): AccountCredentialSummary[];
+  /** Remove one account record without requiring provider-wide logout. */
+  removeAccount?(accountId: string): boolean;
 }
 
 /**

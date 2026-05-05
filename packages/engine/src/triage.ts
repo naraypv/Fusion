@@ -9,6 +9,8 @@ import type {
 import {
   buildTriageMemoryInstructions,
   resolveAgentPrompt,
+  resolveModelFallbackChain,
+  resolveRouteAllLlmCallsViaDspy,
   sortTasksByPriorityThenAgeAndId,
 } from "@fusion/core";
 import type { ImageContent } from "@mariozechner/pi-ai";
@@ -1027,6 +1029,8 @@ export class TriageProcessor {
           fallbackModelId: settings.planningFallbackProvider && settings.planningFallbackModelId
             ? settings.planningFallbackModelId
             : settings.fallbackModelId,
+          modelFallbackChain: resolveModelFallbackChain(settings),
+          routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
           defaultThinkingLevel: settings.defaultThinkingLevel,
           // Skill selection: use assigned agent skills if available, otherwise role fallback
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),

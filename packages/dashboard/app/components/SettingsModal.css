@@ -1265,6 +1265,106 @@
   gap: var(--space-sm);
 }
 
+.auth-provider-cli-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.auth-provider-cli-details {
+  padding: 0 var(--space-md) var(--space-sm);
+  color: var(--text-muted);
+}
+
+.auth-provider-cli-details summary {
+  cursor: pointer;
+  color: var(--text);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+}
+
+.auth-provider-cli-details-body {
+  display: grid;
+  gap: var(--space-sm);
+  padding-top: var(--space-sm);
+}
+
+.auth-account-list {
+  display: grid;
+  gap: var(--space-xs);
+  padding: 0 var(--space-md) var(--space-md);
+}
+
+.auth-account-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--card) 72%, transparent);
+}
+
+.auth-account-label {
+  min-width: 0;
+  color: var(--text);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-account-hint {
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-account-status {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+  text-transform: capitalize;
+}
+
+.auth-account-status--active {
+  color: var(--color-success);
+}
+
+.auth-account-status--cooldown {
+  color: var(--color-warning);
+}
+
+.auth-account-status--disabled {
+  color: var(--text-dim);
+}
+
+.settings-fallback-chain {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.settings-fallback-chain-row {
+  display: grid;
+  grid-template-columns: minmax(calc(var(--space-2xl) * 2), calc(var(--space-2xl) * 3)) minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.settings-fallback-chain-row label {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+}
+
 /* === Key Hint === */
 .auth-key-hint {
   font-family: var(--font-mono);
@@ -1623,10 +1723,23 @@
     flex-basis: 100%;
   }
 
+  .auth-account-list {
+    padding-inline: var(--space-md);
+  }
+
+  .auth-account-row {
+    flex-wrap: wrap;
+  }
+
   .auth-apikey-section {
     width: 100%;
     flex-basis: 100%;
     align-items: flex-end;
+  }
+
+  .settings-fallback-chain-row {
+    grid-template-columns: 1fr;
+    gap: var(--space-xs);
   }
 
   .auth-apikey-input-row {

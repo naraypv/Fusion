@@ -5,8 +5,11 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import {
   choosePreferredStoredCredential,
+  MultiAccountAuthStore,
   readStoredCredentialsFromAuthFile,
   shouldHydrateStoredCredential,
+  type AccountCredentialSummary,
+  type AddAccountResult,
   type StoredAuthCredential,
 } from "@fusion/core";
 import { getOAuthProvider } from "@mariozechner/pi-ai/oauth";
@@ -20,14 +23,16 @@ export interface DashboardAuthStorage {
   reload(): void;
   getOAuthProviders(): Array<{ id: string; name: string }>;
   hasAuth(provider: string): boolean;
-  login(providerId: string, callbacks: LoginCallbacks): Promise<void>;
+  login(providerId: string, callbacks: LoginCallbacks): Promise<AddAccountResult | void>;
   logout(provider: string): void;
   getApiKeyProviders(): Array<{ id: string; name: string }>;
-  setApiKey(providerId: string, apiKey: string): void;
+  setApiKey(providerId: string, apiKey: string): AddAccountResult | void;
   clearApiKey(providerId: string): void;
   hasApiKey(providerId: string): boolean;
   getApiKey(providerId: string): Promise<string | undefined>;
   get(providerId: string): { type?: string; key?: string } | undefined;
+  listAccounts?(providerId?: string): AccountCredentialSummary[];
+  removeAccount?(accountId: string): boolean;
 }
 
 interface ReadFallbackAuthStorage {
@@ -82,8 +87,11 @@ export function wrapAuthStorageWithApiKeyProviders(
   authStorage: AuthStorage,
   modelRegistry: ModelRegistry,
   readFallbackAuthStorages: ReadFallbackAuthStorage[] = [],
+  accountStore = new MultiAccountAuthStore(),
 ): DashboardAuthStorage {
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, readFallbackAuthStorages);
+  const accountCredential = (providerId: string): StoredCredential | undefined =>
+    accountStore.credentialFor(providerId);
 
   return {
     reload: () => mergedAuthStorage.reload(),
@@ -92,12 +100,18 @@ export function wrapAuthStorageWithApiKeyProviders(
         .getOAuthProviders()
         .filter((provider) => !OAUTH_TO_API_KEY_RECLASSIFICATIONS.has(provider.id))
         .map((provider) => ({ id: provider.id, name: provider.name })),
-    hasAuth: (provider) => mergedAuthStorage.hasAuth(provider),
-    login: (providerId, callbacks) =>
-      mergedAuthStorage.login(
+    hasAuth: (provider) => accountStore.list(provider).length > 0 || mergedAuthStorage.hasAuth(provider),
+    login: async (providerId, callbacks) => {
+      await mergedAuthStorage.login(
         providerId as Parameters<AuthStorage["login"]>[0],
         callbacks as Parameters<AuthStorage["login"]>[1],
-      ),
+      );
+      const credential = mergedAuthStorage.get(providerId);
+      if (credential?.type === "oauth" || credential?.type === "api_key") {
+        return accountStore.addCredentialAccount(providerId, credential, { metadata: { source: "fusion-login" } });
+      }
+      return undefined;
+    },
     logout: (provider) => mergedAuthStorage.logout(provider),
     getApiKeyProviders: () => {
       // Use the reclassified (filtered) OAuth provider list so that providers
@@ -135,16 +149,23 @@ export function wrapAuthStorageWithApiKeyProviders(
     },
     setApiKey: (providerId, apiKey) => {
       mergedAuthStorage.set(providerId, { type: "api_key", key: apiKey });
+      return accountStore.addApiKeyAccount(providerId, apiKey, { metadata: { source: "fusion-api-key" } });
     },
     clearApiKey: (providerId) => {
       mergedAuthStorage.remove(providerId);
     },
     hasApiKey: (providerId) => {
-      const credential = mergedAuthStorage.get(providerId);
+      const credential = accountCredential(providerId) ?? mergedAuthStorage.get(providerId);
       return credential?.type === "api_key" && !!credential.key;
     },
-    getApiKey: (providerId) => mergedAuthStorage.getApiKey(providerId),
-    get: (providerId) => mergedAuthStorage.get(providerId),
+    getApiKey: async (providerId) => {
+      const storedAccountKey = resolveStoredCredentialApiKey(providerId, accountCredential(providerId));
+      if (storedAccountKey) return storedAccountKey;
+      return mergedAuthStorage.getApiKey(providerId);
+    },
+    get: (providerId) => accountCredential(providerId) ?? mergedAuthStorage.get(providerId),
+    listAccounts: (providerId) => accountStore.listSummaries(providerId),
+    removeAccount: (accountId) => accountStore.removeAccount(accountId),
   };
 }
 

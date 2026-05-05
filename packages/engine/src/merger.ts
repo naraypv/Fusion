@@ -31,7 +31,9 @@ import { join } from "node:path";
 import {
   getTaskMergeBlocker,
   normalizeMergeConflictStrategy,
+  resolveModelFallbackChain,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
   summarizeCommitBody,
@@ -704,6 +706,8 @@ Do not refactor, rename broadly, or make opportunistic improvements.
         : settings.defaultModelId,
       fallbackProvider: settings.fallbackProvider,
       fallbackModelId: settings.fallbackModelId,
+      modelFallbackChain: resolveModelFallbackChain(settings),
+      routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       defaultThinkingLevel: settings.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -2278,6 +2282,8 @@ You are assisting with a paused \`git pull --rebase\`.
       : settings.defaultModelId,
     fallbackProvider: settings.fallbackProvider,
     fallbackModelId: settings.fallbackModelId,
+    modelFallbackChain: resolveModelFallbackChain(settings),
+    routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
     defaultThinkingLevel: settings.defaultThinkingLevel,
     taskId,
     onFallbackModelUsed: createFallbackModelObserver({
@@ -4819,6 +4825,8 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
       : settings.defaultModelId,
     fallbackProvider: settings.fallbackProvider,
     fallbackModelId: settings.fallbackModelId,
+    modelFallbackChain: resolveModelFallbackChain(settings),
+    routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
     defaultThinkingLevel: settings.defaultThinkingLevel,
     // Skill selection: use assigned agent skills if available, otherwise role fallback
     ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -5413,6 +5421,8 @@ If issues are found that need attention, describe them clearly and include concr
       defaultModelId: stepModelId,
       fallbackProvider: settings.fallbackProvider,
       fallbackModelId: settings.fallbackModelId,
+      modelFallbackChain: resolveModelFallbackChain(settings),
+      routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       defaultThinkingLevel: settings.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(postMergeSkillContext?.skillSelectionContext ? { skillSelection: postMergeSkillContext.skillSelectionContext } : {}),

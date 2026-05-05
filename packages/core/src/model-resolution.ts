@@ -1,8 +1,14 @@
-import type { Settings } from "./types.js";
+import type { ModelFallbackChainEntry, Settings } from "./types.js";
 
 export interface ResolvedModelSelection {
   provider?: string;
   modelId?: string;
+}
+
+export interface ResolvedModelFallbackEntry {
+  provider: string;
+  modelId: string;
+  priority: number;
 }
 
 type ModelPair =
@@ -33,6 +39,49 @@ function pickFirstModelPair(...pairs: ModelPair[]): ResolvedModelSelection {
     }
   }
   return {};
+}
+
+function normalizeFallbackChain(chain: ModelFallbackChainEntry[] | undefined): ResolvedModelFallbackEntry[] {
+  if (!Array.isArray(chain)) {
+    return [];
+  }
+  return chain
+    .slice(0, 10)
+    .map((entry, index) => ({
+      provider: entry.provider?.trim() ?? "",
+      modelId: entry.modelId?.trim() ?? "",
+      enabled: entry.enabled !== false,
+      priority: index + 1,
+    }))
+    .filter((entry): entry is ResolvedModelFallbackEntry & { enabled: boolean } =>
+      entry.enabled && Boolean(entry.provider && entry.modelId),
+    )
+    .map(({ provider, modelId, priority }) => ({ provider, modelId, priority }));
+}
+
+export function resolveModelFallbackChain(settings?: Partial<Settings>): ResolvedModelFallbackEntry[] {
+  const projectChain = normalizeFallbackChain(settings?.projectModelFallbackChain);
+  if (projectChain.length > 0) {
+    return projectChain;
+  }
+
+  const globalChain = normalizeFallbackChain(settings?.modelFallbackChain);
+  if (globalChain.length > 0) {
+    return globalChain;
+  }
+
+  if (settings?.fallbackProvider && settings.fallbackModelId) {
+    return [{ provider: settings.fallbackProvider, modelId: settings.fallbackModelId, priority: 1 }];
+  }
+
+  return [];
+}
+
+export function resolveRouteAllLlmCallsViaDspy(settings?: Partial<Settings>): boolean {
+  if (typeof settings?.projectRouteAllLlmCallsViaDspy === "boolean") {
+    return settings.projectRouteAllLlmCallsViaDspy;
+  }
+  return settings?.routeAllLlmCallsViaDspy === true;
 }
 
 export function resolveProjectDefaultModel(settings?: Partial<Settings>): ResolvedModelSelection {

@@ -563,11 +563,11 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     // Filter out synthetic CLI providers — they have dedicated route tests.
     // Structural assertions here are about OAuth + API-key paths only.
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
+      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
     expect(authStorage.reload).toHaveBeenCalled();
   });
@@ -588,13 +588,13 @@ describe("GET /auth/status", () => {
     const res = await GET(buildApp(), "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false },
-      { id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
-      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key" },
+      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
   });
 

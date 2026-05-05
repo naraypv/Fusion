@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveExecutionSettingsModel,
+  resolveModelFallbackChain,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTaskExecutionModel,
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,
@@ -115,5 +117,57 @@ describe("model-resolution", () => {
         },
       ),
     ).toEqual({ provider: "openai", modelId: "gpt-4.1" });
+  });
+
+  it("resolves project fallback chain before global chain and legacy fallback pair", () => {
+    expect(
+      resolveModelFallbackChain({
+        fallbackProvider: "legacy",
+        fallbackModelId: "legacy-model",
+        modelFallbackChain: [
+          { provider: "global-1", modelId: "global-model-1" },
+        ],
+        projectModelFallbackChain: [
+          { provider: "project-1", modelId: "project-model-1" },
+          { provider: "project-2", modelId: "project-model-2", enabled: false },
+          { provider: "project-3", modelId: "project-model-3" },
+        ],
+      }),
+    ).toEqual([
+      { provider: "project-1", modelId: "project-model-1", priority: 1 },
+      { provider: "project-3", modelId: "project-model-3", priority: 3 },
+    ]);
+
+    expect(
+      resolveModelFallbackChain({
+        fallbackProvider: "legacy",
+        fallbackModelId: "legacy-model",
+        modelFallbackChain: [{ provider: "global-1", modelId: "global-model-1" }],
+      }),
+    ).toEqual([{ provider: "global-1", modelId: "global-model-1", priority: 1 }]);
+
+    expect(
+      resolveModelFallbackChain({
+        fallbackProvider: "legacy",
+        fallbackModelId: "legacy-model",
+      }),
+    ).toEqual([{ provider: "legacy", modelId: "legacy-model", priority: 1 }]);
+  });
+
+  it("resolves DSPy routing with project override before global toggle", () => {
+    expect(resolveRouteAllLlmCallsViaDspy({ routeAllLlmCallsViaDspy: true })).toBe(true);
+    expect(resolveRouteAllLlmCallsViaDspy({ routeAllLlmCallsViaDspy: false })).toBe(false);
+    expect(
+      resolveRouteAllLlmCallsViaDspy({
+        routeAllLlmCallsViaDspy: true,
+        projectRouteAllLlmCallsViaDspy: false,
+      }),
+    ).toBe(false);
+    expect(
+      resolveRouteAllLlmCallsViaDspy({
+        routeAllLlmCallsViaDspy: false,
+        projectRouteAllLlmCallsViaDspy: true,
+      }),
+    ).toBe(true);
   });
 });

@@ -18,11 +18,15 @@ import {
 // ── Mock Setup ──────────────────────────────────────────────────────────────
 
 // Mock summarizeTitle using vi.hoisted so it's available at module hoisting time
-const { mockSummarizeTitle } = vi.hoisted(() => ({
+const { mockSummarizeTitle, mockResolveModelFallbackChain, mockResolveRouteAllLlmCallsViaDspy } = vi.hoisted(() => ({
   mockSummarizeTitle: vi.fn(),
+  mockResolveModelFallbackChain: vi.fn(() => []),
+  mockResolveRouteAllLlmCallsViaDspy: vi.fn(() => false),
 }));
 
 vi.mock("@fusion/core", () => ({
+  resolveModelFallbackChain: mockResolveModelFallbackChain,
+  resolveRouteAllLlmCallsViaDspy: mockResolveRouteAllLlmCallsViaDspy,
   summarizeTitle: mockSummarizeTitle,
 }));
 

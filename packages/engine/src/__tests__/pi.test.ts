@@ -814,9 +814,9 @@ describe("piLog structured diagnostics", () => {
     });
 
     expect(warnSpy).toHaveBeenCalledWith(
-      "Primary model failed (429 Too Many Requests), trying fallback",
+      "Primary model failed (429 Too Many Requests), trying fallback chain",
     );
-    expect(logSpy).toHaveBeenCalledWith("Fallback session created successfully");
+    expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(/^Fallback session created successfully/));
   });
 
   it("logs error when session creation fails with non-retryable error", async () => {

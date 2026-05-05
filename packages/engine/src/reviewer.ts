@@ -9,7 +9,7 @@
  */
 
 import type { TaskStore, TaskComment, AgentPromptsConfig, Settings } from "@fusion/core";
-import { buildReviewerMemoryInstructions, resolveAgentPrompt } from "@fusion/core";
+import { buildReviewerMemoryInstructions, resolveAgentPrompt, resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
 import { describeModel, promptWithFallback } from "./pi.js";
 import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
@@ -245,6 +245,10 @@ export interface ReviewOptions {
   fallbackProvider?: string;
   /** Fallback model ID used with `fallbackProvider`. */
   fallbackModelId?: string;
+  /** Ordered fallback models inherited from project/global settings. */
+  modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
+  /** Route reviewer calls through Fusion's DSPy declarative bridge. */
+  routeViaDspy?: boolean;
   /** Project-level validator fallback provider override. Takes precedence over global fallback. */
   projectValidatorFallbackProvider?: string;
   /** Project-level validator fallback model ID override. Takes precedence over global fallback. */
@@ -384,6 +388,8 @@ export async function reviewStep(
   const validatorFallbackModelId = options.projectValidatorFallbackProvider && options.projectValidatorFallbackModelId
     ? options.projectValidatorFallbackModelId
     : options.fallbackModelId;
+  const validatorFallbackChain = options.settings ? resolveModelFallbackChain(options.settings) : options.modelFallbackChain;
+  const routeViaDspy = options.settings ? resolveRouteAllLlmCallsViaDspy(options.settings) : options.routeViaDspy;
 
   // Resolve per-agent custom instructions for the reviewer role
   let reviewerInstructions = "";
@@ -488,6 +494,8 @@ export async function reviewStep(
       defaultModelId: validatorModelId,
       fallbackProvider: validatorFallbackProvider,
       fallbackModelId: validatorFallbackModelId,
+      modelFallbackChain: validatorFallbackChain,
+      routeViaDspy,
       defaultThinkingLevel: options.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),

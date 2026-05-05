@@ -1,7 +1,8 @@
-import { isGhAvailable, isGhAuthenticated } from "@fusion/core";
+import { isGhAvailable, isGhAuthenticated, MultiAccountAuthStore, type AccountCredentialSummary, type AddAccountResult } from "@fusion/core";
 import { probeClaudeCli } from "../claude-cli-probe.js";
 import { probeDroidCli } from "../droid-cli-probe.js";
 import { probeLlamaCpp } from "../llama-cpp-probe.js";
+import { captureCliAccount, probeCliAccountProvider, type CliAccountProviderId } from "../cli-account-auth.js";
 import { ApiError, badRequest, conflict } from "../api-error.js";
 import { clearUsageCache } from "../usage.js";
 import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js";
@@ -62,9 +63,67 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
    * Maps provider ID → pending interactive login state.
    */
   const loginInProgress = new Map<string, PendingLogin>();
+  const cliAccountLoginInProgress = new Set<CliAccountProviderId>();
 
   const OAUTH_SESSION_TTL_MS = 5 * 60 * 1000;
   const oauthSessions = new Map<string, { port: number; path: string; originalRedirectUri: string; expiresAt: number }>();
+  const multiAccountProviderIds = new Set(["openai-codex", "anthropic", "claude-cli", "cursor", "minimax"]);
+  type SafeAddAccountResult = {
+    status: AddAccountResult["status"];
+    message: string;
+    account: AccountCredentialSummary;
+  };
+  const lastLoginResults = new Map<string, SafeAddAccountResult>();
+
+  function isMultiAccountProvider(providerId: string): boolean {
+    return multiAccountProviderIds.has(providerId);
+  }
+
+  function toSafeAddAccountResult(result: AddAccountResult): SafeAddAccountResult {
+    const account = result.account;
+    return {
+      status: result.status,
+      message: result.message,
+      account: {
+        id: account.id,
+        providerId: account.providerId,
+        label: account.label,
+        credentialKind: account.credentialKind,
+        ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
+        priority: account.priority,
+        status: account.status,
+        createdAt: account.createdAt,
+        updatedAt: account.updatedAt,
+        ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),
+        ...(typeof account.failureCount === "number" ? { failureCount: account.failureCount } : {}),
+        ...(account.lastFailure ? { lastFailure: account.lastFailure } : {}),
+      },
+    };
+  }
+
+  function getProviderAccounts(storage: AuthStorageLike, providerId: string): AccountCredentialSummary[] {
+    return storage.listAccounts?.(providerId) ?? [];
+  }
+
+  function withAccountStatus<T extends { id: string }>(
+    storage: AuthStorageLike,
+    provider: T,
+  ): T & {
+    accounts: AccountCredentialSummary[];
+    accountCount: number;
+    supportsMultipleAccounts: boolean;
+    lastLoginResult?: SafeAddAccountResult;
+  } {
+    const accounts = getProviderAccounts(storage, provider.id);
+    const lastLoginResult = lastLoginResults.get(provider.id);
+    return {
+      ...provider,
+      accounts,
+      accountCount: accounts.length,
+      supportsMultipleAccounts: isMultiAccountProvider(provider.id) || accounts.length > 0,
+      ...(lastLoginResult ? { lastLoginResult } : {}),
+    };
+  }
 
   function isLocalhostOrigin(origin: string): boolean {
     try {
@@ -207,12 +266,18 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         type: "oauth" | "api_key" | "cli";
         keyHint?: string;
         loginInProgress?: boolean;
+        accounts: AccountCredentialSummary[];
+        accountCount: number;
+        supportsMultipleAccounts: boolean;
+        lastLoginResult?: SafeAddAccountResult;
       }[] = oauthProviders.map((p) => ({
-        id: p.id,
-        name: p.name,
-        authenticated: storage.hasAuth(p.id) && !isExpiredOauthCredential(p.id, storage),
-        type: "oauth" as const,
-        loginInProgress: loginInProgress.has(p.id),
+        ...withAccountStatus(storage, {
+          id: p.id,
+          name: p.name,
+          authenticated: storage.hasAuth(p.id) && !isExpiredOauthCredential(p.id, storage),
+          type: "oauth" as const,
+          loginInProgress: loginInProgress.has(p.id),
+        }),
       }));
 
       // Include API-key-backed providers if supported
@@ -228,13 +293,13 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
               keyHint = maskApiKey(cred.key);
             }
           }
-          providers.push({
+          providers.push(withAccountStatus(storage, {
             id: p.id,
             name: p.name,
             authenticated: storage.hasApiKey ? storage.hasApiKey(p.id) : false,
             type: "api_key" as const,
             keyHint,
-          });
+          }));
         }
       }
 
@@ -256,12 +321,27 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         const extension = options?.getClaudeCliExtensionStatus?.() ?? null;
         const binary = await probeClaudeCli();
         const extensionOk = extension === null || extension.status === "ok";
-        providers.push({
+        const accounts = getProviderAccounts(storage, "claude-cli");
+        providers.push(withAccountStatus(storage, {
           id: "claude-cli",
           name: "Anthropic — via Claude CLI",
-          authenticated: enabled && binary.available && extensionOk,
+          authenticated: (enabled || accounts.length > 0) && binary.available && extensionOk,
           type: "cli" as const,
-        });
+        }));
+      }
+
+      // Inject the synthetic "Cursor — via Cursor Agent" provider. It is
+      // account-backed, so the authenticated state comes from Fusion's
+      // multi-account store rather than a global toggle.
+      {
+        const cursorProbe = await probeCliAccountProvider("cursor");
+        const accounts = getProviderAccounts(storage, "cursor");
+        providers.push(withAccountStatus(storage, {
+          id: "cursor",
+          name: "Cursor — via Cursor Agent",
+          authenticated: accounts.length > 0 && cursorProbe.available,
+          type: "cli" as const,
+        }));
       }
 
       // Inject the synthetic "Factory AI — via Droid CLI" provider.
@@ -276,12 +356,12 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         const droidExtension = options?.getDroidCliExtensionStatus?.() ?? null;
         const droidBinary = await probeDroidCli();
         const droidExtensionOk = droidExtension === null || droidExtension.status === "ok";
-        providers.push({
+        providers.push(withAccountStatus(storage, {
           id: "droid-cli",
           name: "Factory AI — via Droid CLI",
           authenticated: droidEnabled && droidBinary.available && droidExtensionOk,
           type: "cli" as const,
-        });
+        }));
       }
 
       // Inject synthetic llama.cpp provider.
@@ -296,12 +376,12 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         const llamaExtension = options?.getLlamaCppExtensionStatus?.() ?? null;
         const extensionOk = llamaExtension === null || llamaExtension.status === "ok";
         const probe = await probeLlamaCpp();
-        providers.push({
+        providers.push(withAccountStatus(storage, {
           id: "llama-cpp",
           name: "llama.cpp — via HTTP server",
           authenticated: llamaEnabled && probe.reachable && extensionOk,
           type: "cli" as const,
-        });
+        }));
       }
 
       const ghCli = {
@@ -511,6 +591,82 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
     }
   });
 
+  router.get("/providers/cursor/status", async (_req, res) => {
+    try {
+      const binary = await probeCliAccountProvider("cursor");
+      const storage = getAuthStorage();
+      const accounts = storage.listAccounts?.("cursor") ?? [];
+      res.json({
+        binary,
+        enabled: accounts.length > 0,
+        extension: null,
+        ready: binary.available && accounts.length > 0,
+      });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.post("/auth/cli-account", async (req, res) => {
+    const provider = req.body?.provider as unknown;
+    try {
+      if (provider !== "claude-cli" && provider !== "cursor") {
+        throw badRequest("provider must be claude-cli or cursor");
+      }
+      if (cliAccountLoginInProgress.has(provider)) {
+        throw conflict(`CLI login already in progress for ${provider}`);
+      }
+
+      cliAccountLoginInProgress.add(provider);
+      const result = await captureCliAccount(provider, new MultiAccountAuthStore());
+      const safeResult = toSafeAddAccountResult(result);
+      lastLoginResults.set(provider, safeResult);
+
+      if (provider === "claude-cli" && store) {
+        let prev = false;
+        try {
+          const priorGlobal = await store.getGlobalSettingsStore().getSettings();
+          prev = priorGlobal.useClaudeCli === true;
+        } catch {
+          // Unreadable prior — enabling below still makes the new account usable.
+        }
+        const settings = await store.updateGlobalSettings({ useClaudeCli: true });
+        invalidateAllGlobalSettingsCaches();
+        const engineManager = options?.engineManager;
+        if (engineManager) {
+          for (const engine of engineManager.getAllEngines().values()) {
+            engine.getTaskStore().getGlobalSettingsStore().invalidateCache();
+          }
+        }
+        const next = settings.useClaudeCli === true;
+        if (options?.onUseClaudeCliToggled && prev !== next) {
+          try {
+            options.onUseClaudeCliToggled(prev, next);
+          } catch (hookErr) {
+            console.warn(
+              `[auth/cli-account] onUseClaudeCliToggled callback threw: ${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
+            );
+          }
+        }
+      }
+
+      clearUsageCache();
+      res.json({ success: true, provider, result: safeResult });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    } finally {
+      if (provider === "claude-cli" || provider === "cursor") {
+        cliAccountLoginInProgress.delete(provider);
+      }
+    }
+  });
+
   router.get("/providers/droid-cli/status", async (_req, res) => {
     try {
       const binary = await probeDroidCli();
@@ -637,12 +793,15 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
    */
   router.post("/auth/login", async (req, res) => {
     try {
-      const { provider, origin } = req.body;
+      const { provider, origin, addAnother } = req.body;
       if (!provider || typeof provider !== "string") {
         throw badRequest("provider is required");
       }
       if (origin !== undefined && typeof origin !== "string") {
         throw badRequest("origin must be a string when provided");
+      }
+      if (addAnother !== undefined && typeof addAnother !== "boolean") {
+        throw badRequest("addAnother must be a boolean when provided");
       }
 
       // Prevent concurrent logins for the same provider
@@ -715,8 +874,12 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
       }, 30_000);
 
       loginPromise
-        .then(() => {
-          // Login completed (user finished OAuth in browser)
+        .then((result) => {
+          if (result) {
+            lastLoginResults.set(provider, toSafeAddAccountResult(result));
+          } else {
+            lastLoginResults.delete(provider);
+          }
         })
         .catch((err) => {
           // Login failed — also reject auth URL if not yet received
@@ -745,6 +908,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         url: responseUrl,
         instructions: authInfo.instructions,
         manualCode: pendingLogin.manualCode,
+        addAnother: addAnother === true,
       });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -923,9 +1087,10 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         throw badRequest(`Unknown API key provider: ${provider}`);
       }
 
-      storage.setApiKey(provider, apiKey.trim());
+      const result = storage.setApiKey(provider, apiKey.trim());
+      const safeResult = result ? toSafeAddAccountResult(result) : undefined;
       clearUsageCache();
-      res.json({ success: true });
+      res.json({ success: true, ...(safeResult ? { result: safeResult } : {}) });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;

@@ -7,10 +7,11 @@ import {
   isProjectSettingsKey,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTitleSummarizerSettingsModel,
 } from "@fusion/core";
-import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
+import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, ModelFallbackChainEntry, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, addCliAccountProvider } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemoteDetailed, RemoteSettings, RemoteStatus, UpdateCheckResponse } from "../api";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
@@ -26,6 +27,7 @@ import { useModalResizePersist } from "../hooks/useModalResizePersist";
 const PluginManager = lazy(() => import("./PluginManager").then((m) => ({ default: m.PluginManager })));
 const PiExtensionsManager = lazy(() => import("./PiExtensionsManager").then((m) => ({ default: m.PiExtensionsManager })));
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
+import { CliAccountProviderCard } from "./CliAccountProviderCard";
 import { CliBinaryPanel } from "./CliBinaryPanel";
 import { DroidCliProviderCard } from "./DroidCliProviderCard";
 import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
@@ -179,6 +181,7 @@ type SettingsSection = {
 const MOBILE_SETTINGS_MEDIA_QUERY = "(max-width: 768px)";
 const DEFAULT_MEMORY_EDITOR_PATH = ".fusion/memory/DREAMS.md";
 const MEMORY_FILE_OPTION_LABEL_MAX_CHARS = 72;
+const MODEL_FALLBACK_CHAIN_SLOT_COUNT = 10;
 
 function truncateMiddle(value: string, maxChars: number): string {
   if (value.length <= maxChars) {
@@ -196,6 +199,21 @@ function formatMemoryFileOptionLabel(file: MemoryFileInfo): string {
   return truncateMiddle(fullLabel, MEMORY_FILE_OPTION_LABEL_MAX_CHARS);
 }
 
+function accountResultToast(result: AuthProvider["lastLoginResult"] | undefined): { message: string; type: ToastType } {
+  if (!result) {
+    return { message: "Login successful", type: "success" };
+  }
+
+  return {
+    message: result.message,
+    type: result.status === "same-account" ? "warning" : "success",
+  };
+}
+
+function fallbackChainSlots(chain: ModelFallbackChainEntry[] | undefined): ModelFallbackChainEntry[] {
+  return Array.from({ length: MODEL_FALLBACK_CHAIN_SLOT_COUNT }, (_unused, index) => chain?.[index] ?? {});
+}
+
 const SETTINGS_SECTIONS: SettingsSection[] = [
   // Account group (scope-less items — independent of settings storage)
   { id: "__account_header", label: "Account", scope: undefined, isGroupHeader: true },
@@ -208,6 +226,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "notifications", label: "Notifications", scope: "global" },
   { id: "node-sync", label: "Node Sync", scope: "global" },
   { id: "global-models", label: "Models", scope: "global" },
+  { id: "dspy-global", label: "DSPy", scope: "global" },
   { id: "research-global", label: "Research Defaults", scope: "global" },
   { id: "experimental", label: "Experimental Features", scope: "global" },
   { id: "remote", label: "Remote Access", scope: "global" },
@@ -222,6 +241,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "__project_header", label: "Project", scope: undefined, isGroupHeader: true },
   { id: "general", label: "Project General", scope: "project" },
   { id: "project-models", label: "Project Models", scope: "project" },
+  { id: "dspy-project", label: "DSPy", scope: "project" },
   { id: "scheduling", label: "Scheduling", scope: "project" },
   { id: "node-routing", label: "Node Routing", scope: "project" },
   { id: "worktrees", label: "Worktrees", scope: "project" },
@@ -958,12 +978,13 @@ export function SettingsModal({
     });
   }, []);
 
-  const handleLogin = useCallback(async (providerId: string) => {
+  const handleLogin = useCallback(async (providerId: string, addAnother = false) => {
     setAuthActionInProgress(providerId);
     clearAuthLoginUiState(providerId);
+    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
 
     try {
-      const { url, instructions, manualCode } = await loginProvider(providerId);
+      const { url, instructions, manualCode } = await loginProvider(providerId, { addAnother });
       if (instructions?.trim()) {
         setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
       }
@@ -979,14 +1000,20 @@ export function SettingsModal({
           const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
           setAuthProviders(visibleProviders);
           const provider = visibleProviders.find((p) => p.id === providerId);
-          if (provider?.authenticated) {
+          const result = provider?.lastLoginResult;
+          const addAnotherCompleted =
+            addAnother &&
+            (Boolean(result) || ((provider?.accountCount ?? 0) > startingAccountCount));
+          const loginCompleted = addAnother ? addAnotherCompleted : provider?.authenticated;
+          if (loginCompleted) {
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
             }
             setAuthActionInProgress(null);
             clearAuthLoginUiState(providerId);
-            addToast("Login successful", "success");
+            const toast = accountResultToast(result);
+            addToast(toast.message, toast.type);
             scrollSettingsToTop();
             return;
           }
@@ -1016,7 +1043,7 @@ export function SettingsModal({
       setAuthActionInProgress(null);
       clearAuthLoginUiState(providerId);
     }
-  }, [addToast, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
+  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleSubmitManualCode = useCallback(async (providerId: string) => {
     const code = manualCodeInputs[providerId]?.trim();
@@ -1096,14 +1123,19 @@ export function SettingsModal({
       return next;
     });
     try {
-      await saveApiKey(providerId, key);
+      const result = await saveApiKey(providerId, key);
       setApiKeyInputs((prev) => {
         const next = { ...prev };
         delete next[providerId];
         return next;
       });
       await loadAuthStatus();
-      addToast("API key saved", "success");
+      if (result?.result) {
+        const toast = accountResultToast(result.result);
+        addToast(toast.message, toast.type);
+      } else {
+        addToast("API key saved", "success");
+      }
       scrollSettingsToTop();
     } catch (err) {
       setApiKeyErrors((prev) => ({ ...prev, [providerId]: getErrorMessage(err) || "Failed to save API key" }));
@@ -1111,6 +1143,21 @@ export function SettingsModal({
       setAuthActionInProgress(null);
     }
   }, [apiKeyInputs, addToast, loadAuthStatus, scrollSettingsToTop]);
+
+  const handleAddCliAccount = useCallback(async (providerId: string) => {
+    setAuthActionInProgress(providerId);
+    try {
+      const result = await addCliAccountProvider(providerId);
+      await loadAuthStatus();
+      const toast = accountResultToast(result.result);
+      addToast(toast.message, toast.type);
+      scrollSettingsToTop();
+    } catch (err) {
+      addToast(getErrorMessage(err) || "CLI login failed", "error");
+    } finally {
+      setAuthActionInProgress(null);
+    }
+  }, [addToast, loadAuthStatus, scrollSettingsToTop]);
 
   const handleClearApiKey = useCallback(async (providerId: string) => {
     setAuthActionInProgress(providerId);
@@ -1458,6 +1505,104 @@ export function SettingsModal({
       [lane.projectProviderKey]: undefined,
       [lane.projectModelKey]: undefined,
     }));
+  }
+
+  function updateModelFallbackChainValue(
+    scope: "global" | "project",
+    index: number,
+    value: string,
+  ): void {
+    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
+    setForm((current) => {
+      const next = fallbackChainSlots(current[key]);
+      if (!value) {
+        next[index] = {};
+      } else {
+        const slashIdx = value.indexOf("/");
+        next[index] = {
+          provider: value.slice(0, slashIdx),
+          modelId: value.slice(slashIdx + 1),
+          enabled: true,
+        };
+      }
+      return { ...current, [key]: next };
+    });
+  }
+
+  function renderModelFallbackChain(scope: "global" | "project") {
+    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
+    const slots = fallbackChainSlots(form[key]);
+    return (
+      <div className="settings-fallback-chain">
+        {slots.map((entry, index) => {
+          const value = entry.provider && entry.modelId ? `${entry.provider}/${entry.modelId}` : "";
+          return (
+            <div className="settings-fallback-chain-row" key={`${scope}-fallback-${index}`}>
+              <label htmlFor={`${scope}-fallback-chain-${index}`}>Priority {index + 1}</label>
+              <CustomModelDropdown
+                id={`${scope}-fallback-chain-${index}`}
+                label={`Priority ${index + 1}`}
+                models={availableModels}
+                value={value}
+                onChange={(selected) => updateModelFallbackChainValue(scope, index, selected)}
+                placeholder="No fallback"
+                favoriteProviders={favoriteProviders}
+                onToggleFavorite={handleToggleFavorite}
+                favoriteModels={favoriteModels}
+                onToggleModelFavorite={handleToggleModelFavorite}
+              />
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderDspyRoutingControls(scope: "global" | "project") {
+    const enabled = scope === "global"
+      ? form.routeAllLlmCallsViaDspy === true
+      : resolveRouteAllLlmCallsViaDspy(form);
+    const inherited = form.routeAllLlmCallsViaDspy === true;
+    return (
+      <>
+        {renderScopeBanner()}
+        <h4 className="settings-section-heading">DSPy Routing</h4>
+        <div className="form-group">
+          <label htmlFor={`${scope}-route-all-llm-calls-via-dspy`} className="checkbox-label">
+            <input
+              id={`${scope}-route-all-llm-calls-via-dspy`}
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                if (scope === "global") {
+                  setForm((current) => ({ ...current, routeAllLlmCallsViaDspy: checked }));
+                  return;
+                }
+                setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: checked }));
+              }}
+            />
+            Route all LLM calls via DSPy
+          </label>
+          <small>
+            {scope === "global"
+              ? "Applies to all projects unless a project override is set."
+              : inherited && form.projectRouteAllLlmCallsViaDspy === undefined
+                ? "Currently inherited from the global DSPy routing setting."
+                : "Overrides the global DSPy routing setting for this project."}
+          </small>
+        </div>
+        {scope === "project" && form.projectRouteAllLlmCallsViaDspy !== undefined && (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: undefined }))}
+          >
+            Reset to global
+          </button>
+        )}
+      </>
+    );
   }
 
   const openOverlapPathPicker = useCallback((index: number) => {
@@ -2137,6 +2282,12 @@ export function SettingsModal({
                   />
                   <small>Used automatically if the primary default model hits a retryable provider error like rate limiting or overload.</small>
                 </div>
+
+                <div className="form-group">
+                  <label>Model Fallback Chain</label>
+                  {renderModelFallbackChain("global")}
+                  <small>Priority 1 is tried first, then priority 2 through 10 when a retryable model/provider failure occurs.</small>
+                </div>
               </>
             )}
             {(() => {
@@ -2252,6 +2403,9 @@ export function SettingsModal({
           </>
         );
       }
+
+      case "dspy-global":
+        return renderDspyRoutingControls("global");
 
       case "project-models": {
         const presets = form.modelPresets || [];
@@ -2444,6 +2598,11 @@ export function SettingsModal({
                     onToggleModelFavorite={handleToggleModelFavorite}
                   />
                   <small>Used if the reviewer model fails due to rate limits or provider overload. Defaults to the global fallback model.</small>
+                </div>
+                <div className="form-group">
+                  <label>Project Model Fallback Chain</label>
+                  {renderModelFallbackChain("project")}
+                  <small>When any project fallback slots are set, this ordered chain overrides the global chain for this project.</small>
                 </div>
               </>
             )}
@@ -2789,6 +2948,9 @@ export function SettingsModal({
           </>
         );
       }
+
+      case "dspy-project":
+        return renderDspyRoutingControls("project");
 
       case "appearance":
         return (
@@ -5028,7 +5190,7 @@ export function SettingsModal({
           </>
         );
       case "authentication": {
-        // CLI-backed providers (currently just claude-cli) render their own
+        // CLI-backed providers render their own
         // compact card with Enable/Disable + Test actions — bypassing the
         // OAuth/API-key rendering below. Filter them out of the standard
         // sort and render alongside.
@@ -5047,6 +5209,7 @@ export function SettingsModal({
         // CLI-backed providers live in whichever bucket matches their current
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
+        const cursorProvider = cliAuthProviders.find((p) => p.id === "cursor");
         const droidCliProvider = cliAuthProviders.find((p) => p.id === "droid-cli");
         const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
         const hasDroidPluginSlot = getSlotsForId("settings-provider-card").some(
@@ -5056,8 +5219,25 @@ export function SettingsModal({
           <ClaudeCliProviderCard
             compact
             authenticated={claudeCliProvider.authenticated}
+            accounts={claudeCliProvider.accounts}
+            addAccountBusy={authActionInProgress === "claude-cli"}
+            onAddAccount={() => {
+              void handleAddCliAccount("claude-cli");
+            }}
             onToggled={() => {
               void loadAuthStatus();
+            }}
+          />
+        ) : null;
+        const cursorCard = cursorProvider ? (
+          <CliAccountProviderCard
+            providerId="cursor"
+            name={cursorProvider.name}
+            authenticated={cursorProvider.authenticated}
+            accounts={cursorProvider.accounts}
+            busy={authActionInProgress === "cursor"}
+            onAddAccount={() => {
+              void handleAddCliAccount("cursor");
             }}
           />
         ) : null;
@@ -5082,11 +5262,13 @@ export function SettingsModal({
         const showAuthenticatedGroup =
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
+          || (cursorProvider?.authenticated ?? false)
           || ((droidCliProvider?.authenticated ?? false) && !hasDroidPluginSlot)
           || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
+          || (cursorProvider && !cursorProvider.authenticated)
           || (droidCliProvider && !droidCliProvider.authenticated && !hasDroidPluginSlot)
           || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
@@ -5111,6 +5293,7 @@ export function SettingsModal({
                 <div className="auth-provider-group">
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
+                  {cursorProvider?.authenticated && cursorCard}
                   {droidCliProvider?.authenticated && droidCliCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
                   {authenticatedProviders.map((provider) => (
@@ -5147,7 +5330,7 @@ export function SettingsModal({
                                 onChange={(e) => setApiKeyInputs((prev) => ({ ...prev, [provider.id]: e.target.value }))}
                                 disabled={authActionInProgress === provider.id}
                               />
-                              {provider.authenticated && !apiKeyInputs[provider.id] ? (
+                              {provider.authenticated && (
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => handleClearApiKey(provider.id)}
@@ -5155,15 +5338,14 @@ export function SettingsModal({
                                 >
                                   Clear
                                 </button>
-                              ) : (
-                                <button
-                                  className="btn btn-primary btn-sm"
-                                  onClick={() => handleSaveApiKey(provider.id)}
-                                  disabled={authActionInProgress === provider.id}
-                                >
-                                  Save
-                                </button>
                               )}
+                              <button
+                                className="btn btn-primary btn-sm"
+                                onClick={() => handleSaveApiKey(provider.id)}
+                                disabled={authActionInProgress === provider.id}
+                              >
+                                {provider.authenticated ? "Add another account" : "Save"}
+                              </button>
                             </div>
                             {authActionInProgress === provider.id && (
                               <small className="auth-apikey-progress">Saving…</small>
@@ -5176,7 +5358,7 @@ export function SettingsModal({
                           <div>
                             {authActionInProgress === provider.id ? (
                               <button className="btn btn-sm" disabled>
-                                Logging out…
+                                Working…
                               </button>
                             ) : provider.loginInProgress ? (
                               <div className="auth-provider-actions-row">
@@ -5188,16 +5370,60 @@ export function SettingsModal({
                                 </button>
                               </div>
                             ) : (
-                              <button
-                                className="btn btn-sm"
-                                onClick={() => handleLogout(provider.id)}
-                              >
-                                Logout
-                              </button>
+                              <div className="auth-provider-actions-row">
+                                {provider.supportsMultipleAccounts && (
+                                  <button
+                                    className="btn btn-primary btn-sm"
+                                    onClick={() => handleLogin(provider.id, true)}
+                                  >
+                                    Add another account
+                                  </button>
+                                )}
+                                <button
+                                  className="btn btn-sm"
+                                  onClick={() => handleLogout(provider.id)}
+                                >
+                                  Logout
+                                </button>
+                              </div>
+                            )}
+                            {loginInstructions[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
+                              <LoginInstructions
+                                instructions={loginInstructions[provider.id]}
+                                data-testid={`auth-login-instructions-${provider.id}`}
+                              />
+                            )}
+                            {manualCodeConfigs[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
+                              <OAuthManualCodeForm
+                                value={manualCodeInputs[provider.id] ?? ""}
+                                onChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [provider.id]: value }))}
+                                onSubmit={() => void handleSubmitManualCode(provider.id)}
+                                prompt={manualCodeConfigs[provider.id].prompt}
+                                placeholder={manualCodeConfigs[provider.id].placeholder}
+                                helpText={manualCodeConfigs[provider.id].helpText}
+                                disabled={manualCodeSubmitInProgress === provider.id}
+                                submitLabel={manualCodeSubmitInProgress === provider.id ? "Submitting…" : "Submit code"}
+                                data-testid={`auth-manual-code-${provider.id}`}
+                              />
                             )}
                           </div>
                         )}
                       </div>
+                      {provider.accounts && provider.accounts.length > 0 && (
+                        <div className="auth-account-list" data-testid={`auth-account-list-${provider.id}`}>
+                          {provider.accounts.map((account) => (
+                            <div key={account.id} className="auth-account-row">
+                              <span className="auth-account-label">{account.label}</span>
+                              {account.accountDisplayHint && (
+                                <span className="auth-account-hint">{account.accountDisplayHint}</span>
+                              )}
+                              <span className={`auth-account-status auth-account-status--${account.status}`}>
+                                {account.status}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -5206,6 +5432,7 @@ export function SettingsModal({
                 <div className="auth-provider-group">
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
+                  {cursorProvider && !cursorProvider.authenticated && cursorCard}
                   {droidCliProvider && !droidCliProvider.authenticated && droidCliCard}
                   {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
@@ -5299,6 +5526,21 @@ export function SettingsModal({
                           </div>
                         )}
                       </div>
+                      {provider.accounts && provider.accounts.length > 0 && (
+                        <div className="auth-account-list" data-testid={`auth-account-list-${provider.id}`}>
+                          {provider.accounts.map((account) => (
+                            <div key={account.id} className="auth-account-row">
+                              <span className="auth-account-label">{account.label}</span>
+                              {account.accountDisplayHint && (
+                                <span className="auth-account-hint">{account.accountDisplayHint}</span>
+                              )}
+                              <span className={`auth-account-status auth-account-status--${account.status}`}>
+                                {account.status}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

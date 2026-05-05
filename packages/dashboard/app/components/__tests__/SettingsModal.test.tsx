@@ -15,6 +15,7 @@ const mockLoginProvider = vi.fn();
 const mockLogoutProvider = vi.fn();
 const mockCancelProviderLogin = vi.fn();
 const mockSaveApiKey = vi.fn();
+const mockAddCliAccountProvider = vi.fn();
 const mockFetchModels = vi.fn();
 const mockFetchCustomProviders = vi.fn();
 const mockCreateCustomProvider = vi.fn();
@@ -68,6 +69,7 @@ vi.mock("../../api", async (importOriginal) => {
     logoutProvider: (...args: unknown[]) => mockLogoutProvider(...args),
     cancelProviderLogin: (...args: unknown[]) => mockCancelProviderLogin(...args),
     saveApiKey: (...args: unknown[]) => mockSaveApiKey(...args),
+    addCliAccountProvider: (...args: unknown[]) => mockAddCliAccountProvider(...args),
     fetchModels: (...args: unknown[]) => mockFetchModels(...args),
     fetchCustomProviders: (...args: unknown[]) => mockFetchCustomProviders(...args),
     createCustomProvider: (...args: unknown[]) => mockCreateCustomProvider(...args),
@@ -2848,4 +2850,3 @@ describe("SettingsModal", () => {
     });
   });
 });
-

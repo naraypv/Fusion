@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 import {
   fetchClaudeCliStatus,
   setClaudeCliEnabled,
+  type AuthAccountSummary,
   type ClaudeCliStatus,
 } from "../api";
 import { ProviderIcon } from "./ProviderIcon";
@@ -36,6 +37,9 @@ interface ClaudeCliProviderCardProps {
   authenticated: boolean;
   /** Optional callback fired after Enable/Disable to let the parent refetch the provider list. */
   onToggled?: (nextEnabled: boolean) => void;
+  accounts?: AuthAccountSummary[];
+  addAccountBusy?: boolean;
+  onAddAccount?: () => void;
   /** Render a smaller card with the description and status tucked behind a disclosure triangle. */
   compact?: boolean;
 }
@@ -43,6 +47,9 @@ interface ClaudeCliProviderCardProps {
 export function ClaudeCliProviderCard({
   authenticated,
   onToggled,
+  accounts = [],
+  addAccountBusy = false,
+  onAddAccount,
   compact = false,
 }: ClaudeCliProviderCardProps) {
   const [status, setStatus] = useState<ClaudeCliStatus | null>(null);
@@ -171,6 +178,21 @@ export function ClaudeCliProviderCard({
           {busy === "enabling" ? "Enabling…" : "Enable"}
         </button>
       )}
+      {onAddAccount && (
+        <button
+          type="button"
+          className="btn btn-primary btn-sm"
+          onClick={onAddAccount}
+          disabled={busy !== null || addAccountBusy || !binaryAvailable}
+          title={
+            !binaryAvailable
+              ? "`claude` binary not detected on PATH — install Claude CLI first."
+              : undefined
+          }
+        >
+          {addAccountBusy ? "Working…" : accounts.length > 0 ? "Add another account" : "Login"}
+        </button>
+      )}
     </>
   );
 
@@ -198,6 +220,21 @@ export function ClaudeCliProviderCard({
             {lastAction && <ClaudeCliActionToast action={lastAction} />}
           </div>
         </details>
+        {accounts.length > 0 && (
+          <div className="auth-account-list" data-testid="auth-account-list-claude-cli">
+            {accounts.map((account) => (
+              <div key={account.id} className="auth-account-row">
+                <span className="auth-account-label">{account.label}</span>
+                {account.accountDisplayHint && (
+                  <span className="auth-account-hint">{account.accountDisplayHint}</span>
+                )}
+                <span className={`auth-account-status auth-account-status--${account.status}`}>
+                  {account.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   }

@@ -210,7 +210,20 @@ describe("loginProvider", () => {
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/login", {
       headers: { "Content-Type": "application/json" },
       method: "POST",
-      body: JSON.stringify({ provider: "anthropic", origin: window.location.origin }),
+      body: JSON.stringify({ provider: "anthropic", origin: window.location.origin, addAnother: false }),
+    });
+  });
+
+  it("sends the add another account flag", async () => {
+    const response = { url: "https://auth.example.com/login", instructions: "Open in browser" };
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, response));
+
+    await loginProvider("anthropic", { addAnother: true });
+
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/auth/login", {
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({ provider: "anthropic", origin: window.location.origin, addAnother: true }),
     });
   });
 
@@ -809,4 +822,3 @@ describe("fetchAgentChildren", () => {
     await expect(fetchAgentChildren("agent-001")).rejects.toThrow("Internal server error");
   });
 });
-

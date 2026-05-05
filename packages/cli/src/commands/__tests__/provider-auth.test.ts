@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempWorkspace } from "@fusion/test-utils";
+import { MultiAccountAuthStore } from "@fusion/core";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "../provider-auth.js";
 
 function makeAuthStorage(credentials: Record<string, { type: string; key?: string; access?: string; refresh?: string; expires?: number }> = {}) {
@@ -196,7 +197,7 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
       });
     });
 
-    it("detects anthropic as authenticated via hasApiKey after storing API key", () => {
+  it("detects anthropic as authenticated via hasApiKey after storing API key", () => {
       const fusionAuth = makeAuthStorage({
         anthropic: { type: "api_key", key: "sk-ant-api03-test" },
       });
@@ -209,5 +210,56 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
 
       expect(wrapped.hasApiKey("anthropic")).toBe(true);
     });
+  });
+
+  it("records API-key providers as multi-account credentials and reports duplicate keys", async () => {
+    const tempDir = tempWorkspace("fusion-provider-auth-accounts-");
+    const accountStore = new MultiAccountAuthStore(join(tempDir, "accounts.json"));
+    const fusionAuth = makeAuthStorage();
+    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+
+    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [], accountStore);
+    const first = wrapped.setApiKey("minimax", "minimax-key-1")!;
+    const duplicate = wrapped.setApiKey("minimax", "minimax-key-1")!;
+    const second = wrapped.setApiKey("minimax", "minimax-key-2")!;
+
+    expect(first.status).toBe("added");
+    expect(duplicate.status).toBe("same-account");
+    expect(second.status).toBe("added");
+    expect(wrapped.listAccounts?.("minimax")).toHaveLength(2);
+    expect(await wrapped.getApiKey("minimax")).toBe("minimax-key-1");
+  });
+
+  it("captures completed OAuth logins as multi-account credentials", async () => {
+    const tempDir = tempWorkspace("fusion-provider-auth-oauth-accounts-");
+    const accountStore = new MultiAccountAuthStore(join(tempDir, "accounts.json"));
+    const credentials: Record<string, { type: string; access?: string; refresh?: string; expires?: number; accountId?: string }> = {};
+    const fusionAuth = makeAuthStorage(credentials as any);
+    fusionAuth.getOAuthProviders = vi.fn(() => [{ id: "openai-codex", name: "OpenAI Codex" }]);
+    fusionAuth.login = vi.fn(async (provider: string, callbacks: { onAuth: (info: { url: string }) => void }) => {
+      callbacks.onAuth({ url: "https://auth.example.com/login" });
+      credentials[provider] = {
+        type: "oauth",
+        access: "access-token",
+        refresh: "refresh-token",
+        expires: Date.now() + 60_000,
+        accountId: "acct-oauth",
+      };
+    });
+    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+
+    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [], accountStore);
+    const result = await wrapped.login("openai-codex", {
+      onAuth: vi.fn(),
+      onPrompt: vi.fn(),
+    });
+    const duplicate = await wrapped.login("openai-codex", {
+      onAuth: vi.fn(),
+      onPrompt: vi.fn(),
+    });
+
+    expect(result?.status).toBe("added");
+    expect(duplicate?.status).toBe("same-account");
+    expect(wrapped.listAccounts?.("openai-codex")).toHaveLength(1);
   });
 });
