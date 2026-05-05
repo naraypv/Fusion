@@ -518,7 +518,7 @@ function createMockAuthStorage(overrides: Partial<AuthStorageLike> = {}): AuthSt
   return {
     reload: vi.fn(),
     getOAuthProviders: vi.fn().mockReturnValue([
-      { id: "anthropic", name: "Anthropic" },
+      { id: "github-copilot", name: "GitHub Copilot" },
     ]),
     hasAuth: vi.fn().mockReturnValue(false),
     get: vi.fn().mockReturnValue(undefined),
@@ -565,7 +565,7 @@ describe("GET /auth/status", () => {
     // Structural assertions here are about OAuth + API-key paths only.
     const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
@@ -574,7 +574,7 @@ describe("GET /auth/status", () => {
 
   it("includes oauth and model-registry-derived API key providers in one response", async () => {
     (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
-      { id: "anthropic", name: "Anthropic" },
+      { id: "openai-codex", name: "OpenAI Codex" },
       { id: "github-copilot", name: "GitHub Copilot" },
     ]);
     (authStorage.getApiKeyProviders as ReturnType<typeof vi.fn>).mockReturnValue([
@@ -582,7 +582,7 @@ describe("GET /auth/status", () => {
       { id: "kimi-coding", name: "Kimi" },
       { id: "acme-extension", name: "Acme Extension" },
     ]);
-    (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "anthropic");
+    (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "openai-codex");
     (authStorage.hasApiKey as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "acme-extension");
 
     const res = await GET(buildApp(), "/api/auth/status");
@@ -590,7 +590,7 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "droid-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "anthropic", name: "Anthropic", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "openai-codex", name: "OpenAI Codex", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
       { id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
@@ -610,7 +610,7 @@ describe("GET /auth/status", () => {
   it("treats expired oauth credentials as unauthenticated", async () => {
     (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockReturnValue(true);
     (authStorage.get as ReturnType<typeof vi.fn>).mockImplementation((provider: string) =>
-      provider === "anthropic"
+      provider === "github-copilot"
         ? { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() - 1_000 }
         : undefined,
     );
@@ -618,8 +618,8 @@ describe("GET /auth/status", () => {
     const res = await GET(buildApp(), "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const anthropic = res.body.providers.find((p: any) => p.id === "anthropic");
-    expect(anthropic.authenticated).toBe(false);
+    const githubCopilot = res.body.providers.find((p: any) => p.id === "github-copilot");
+    expect(githubCopilot.authenticated).toBe(false);
   });
 
   it("reports loginInProgress for oauth providers with active logins", async () => {
@@ -634,14 +634,14 @@ describe("GET /auth/status", () => {
     );
 
     const app = buildApp();
-    const loginRequest = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const loginRequest = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const statusRes = await GET(app, "/api/auth/status");
-    const anthropic = statusRes.body.providers.find((p: any) => p.id === "anthropic");
-    expect(anthropic.loginInProgress).toBe(true);
+    const githubCopilot = statusRes.body.providers.find((p: any) => p.id === "github-copilot");
+    expect(githubCopilot.loginInProgress).toBe(true);
 
     releaseLogin?.();
     await loginRequest;
@@ -1025,7 +1025,7 @@ describe("POST /auth/login", () => {
   }
 
   it("returns auth URL for valid provider", async () => {
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
@@ -1047,7 +1047,7 @@ describe("POST /auth/login", () => {
       buildApp(),
       "POST",
       "/api/auth/login",
-      JSON.stringify({ provider: "anthropic", origin: "https://my-host.example.com" }),
+      JSON.stringify({ provider: "github-copilot", origin: "https://my-host.example.com" }),
       { "Content-Type": "application/json" },
     );
 
@@ -1071,7 +1071,7 @@ describe("POST /auth/login", () => {
         buildApp(),
         "POST",
         "/api/auth/login",
-        JSON.stringify({ provider: "anthropic", origin }),
+        JSON.stringify({ provider: "github-copilot", origin }),
         { "Content-Type": "application/json" },
       );
 
@@ -1089,7 +1089,7 @@ describe("POST /auth/login", () => {
       return Promise.resolve();
     });
 
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
@@ -1156,18 +1156,18 @@ describe("POST /auth/login", () => {
 
     const app = buildApp();
 
-    const firstRequest = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const firstRequest = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const secondResponse = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const secondResponse = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
     expect(secondResponse.status).toBe(409);
-    expect(secondResponse.body.error).toBe("Login already in progress for anthropic");
+    expect(secondResponse.body.error).toBe("Login already in progress for github-copilot");
 
     releaseLogin?.();
     await firstRequest;
@@ -1178,7 +1178,7 @@ describe("POST /auth/login", () => {
       return Promise.reject(new Error("OAuth failed"));
     });
 
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
@@ -1218,18 +1218,18 @@ describe("POST /auth/cancel", () => {
     );
 
     const app = buildApp();
-    const firstLogin = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const firstLogin = REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const cancelRes = await REQUEST(app, "POST", "/api/auth/cancel", JSON.stringify({ provider: "anthropic" }), {
+    const cancelRes = await REQUEST(app, "POST", "/api/auth/cancel", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
     expect(cancelRes.status).toBe(200);
     expect(cancelRes.body).toEqual({ success: true, cancelled: true });
 
-    const retryRes = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "anthropic" }), {
+    const retryRes = await REQUEST(app, "POST", "/api/auth/login", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
     expect(retryRes.status).toBe(200);
@@ -1239,7 +1239,7 @@ describe("POST /auth/cancel", () => {
   });
 
   it("returns success when there is no active login", async () => {
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/cancel", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/cancel", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
@@ -1377,7 +1377,7 @@ describe("GET /auth/oauth-callback", () => {
         app,
         "POST",
         "/api/auth/login",
-        JSON.stringify({ provider: "anthropic", origin: "https://remote.example.com" }),
+        JSON.stringify({ provider: "github-copilot", origin: "https://remote.example.com" }),
         { "Content-Type": "application/json" },
       );
       expect(loginRes.status).toBe(200);
@@ -1421,13 +1421,13 @@ describe("POST /auth/logout", () => {
   }
 
   it("removes credentials for a provider", async () => {
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/logout", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/logout", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(authStorage.logout).toHaveBeenCalledWith("anthropic");
+    expect(authStorage.logout).toHaveBeenCalledWith("github-copilot");
   });
 
   it("returns 400 when provider is missing", async () => {
@@ -1444,7 +1444,7 @@ describe("POST /auth/logout", () => {
       throw new Error("logout failed");
     });
 
-    const res = await REQUEST(buildApp(), "POST", "/api/auth/logout", JSON.stringify({ provider: "anthropic" }), {
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/logout", JSON.stringify({ provider: "github-copilot" }), {
       "Content-Type": "application/json",
     });
 

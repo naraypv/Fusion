@@ -33,6 +33,7 @@ vi.mock("../../api", () => ({
   fetchWorkspaceFileContent: vi.fn(),
   saveWorkspaceFileContent: vi.fn(),
   fetchDiscoveredSkills: vi.fn(),
+  fetchSkillContent: vi.fn(),
   fetchModels: vi.fn(),
   fetchPluginRuntimes: vi.fn(),
   upgradeAgentHeartbeatProcedure: vi.fn(),
@@ -117,7 +118,7 @@ vi.mock("../../hooks/useConfirm", () => ({
   useConfirm: () => ({ confirm: mockConfirm }),
 }));
 
-import { fetchAgent, fetchAgents, updateAgent, updateAgentState, deleteAgent, fetchAgentChildren, fetchAgentRunLogs, fetchAgentRuns, fetchAgentRunDetail, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchDiscoveredSkills, fetchModels, fetchPluginRuntimes, fetchAgentLogsWithMeta, upgradeAgentHeartbeatProcedure, updateGlobalSettings } from "../../api";
+import { fetchAgent, fetchAgents, updateAgent, updateAgentState, deleteAgent, fetchAgentChildren, fetchAgentRunLogs, fetchAgentRuns, fetchAgentRunDetail, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchDiscoveredSkills, fetchSkillContent, fetchModels, fetchPluginRuntimes, fetchAgentLogsWithMeta, upgradeAgentHeartbeatProcedure, updateGlobalSettings } from "../../api";
 import { subscribeSse } from "../../sse-bus";
 
 const mockFetchAgent = vi.mocked(fetchAgent);
@@ -139,6 +140,7 @@ const mockUpdateAgentMemory = vi.mocked(updateAgentMemory);
 const mockFetchWorkspaceFileContent = vi.mocked(fetchWorkspaceFileContent);
 const mockSaveWorkspaceFileContent = vi.mocked(saveWorkspaceFileContent);
 const mockFetchDiscoveredSkills = vi.mocked(fetchDiscoveredSkills);
+const mockFetchSkillContent = vi.mocked(fetchSkillContent);
 const mockFetchModels = vi.mocked(fetchModels);
 const mockFetchPluginRuntimes = vi.mocked(fetchPluginRuntimes);
 const mockFetchAgentLogsWithMeta = vi.mocked(fetchAgentLogsWithMeta);
@@ -229,6 +231,7 @@ describe("AgentDetailView", () => {
     mockUpdateAgentInstructions.mockResolvedValue({} as any);
     // Default: return skills
     mockFetchDiscoveredSkills.mockResolvedValue(MOCK_SKILLS);
+    mockFetchSkillContent.mockResolvedValue({ skillMd: "# Skill", files: [] });
     mockFetchModels.mockResolvedValue({
       models: [
         { provider: "openai", id: "gpt-4o", name: "gpt-4o", reasoning: false, contextWindow: 128000 },
@@ -299,8 +302,12 @@ describe("AgentDetailView", () => {
     await userEvent.click(screen.getByLabelText("Back to agents"));
     expect(onClose).toHaveBeenCalledTimes(1);
 
-    const identityContainer = document.querySelector(".agent-detail-identity");
+    const header = document.querySelector(".agent-detail-header");
+    const identityContainer = header?.querySelector(".agent-detail-identity");
+    const actionsContainer = header?.querySelector(".agent-detail-header-actions");
     expect(identityContainer?.querySelector(".agent-detail-inline-back")).toBeTruthy();
+    expect(actionsContainer?.querySelector('[aria-label="Refresh"]')).toBeTruthy();
+    expect(actionsContainer?.querySelector(".agent-detail-mobile-icon-control")).toBeTruthy();
   });
 
   it("keeps modal mode as dialog with close button", async () => {
@@ -562,6 +569,33 @@ describe("AgentDetailView", () => {
     await waitFor(() => {
       expect(screen.getByText("Role: executor")).toBeInTheDocument();
     });
+  });
+
+  it("renders assigned skills as readable badges with full id tooltip", async () => {
+    mockFetchAgent.mockResolvedValue(createMockAgent({
+      metadata: {
+        skills: [
+          "/Users/test/.agents/skills/fusion/SKILL.md",
+          "simple-skill",
+        ],
+      },
+    }));
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("fusion")).toBeInTheDocument();
+      expect(screen.getByText("simple-skill")).toBeInTheDocument();
+    });
+
+    const fusionBadge = screen.getByText("fusion").closest(".dashboard-summary-skill-badge");
+    expect(fusionBadge).toHaveAttribute("title", "/Users/test/.agents/skills/fusion/SKILL.md");
   });
 
   it("displays state badge", async () => {
@@ -872,7 +906,7 @@ describe("AgentDetailView", () => {
     });
   });
 
-  it("keeps desktop header actions on one row and mobile uses explicit two-row header contracts", () => {
+  it("keeps mobile inline header controls on the same row as identity", () => {
     const stylesContent = loadAllAppCss();
 
     expect(stylesContent).toContain(".agent-detail-header-actions {");
@@ -881,11 +915,12 @@ describe("AgentDetailView", () => {
 
     expect(stylesContent).toContain("@media (max-width: 768px)");
     expect(stylesContent).toContain(".agent-detail-header {");
-    expect(stylesContent).toContain("grid-template-rows: auto auto;");
+    expect(stylesContent).toContain("grid-template-columns: minmax(0, 1fr) auto;");
     expect(stylesContent).toContain(".agent-detail-identity {");
-    expect(stylesContent).toContain("grid-row: 1;");
+    expect(stylesContent).toContain("grid-column: 1;");
     expect(stylesContent).toContain(".agent-detail-header-actions {");
-    expect(stylesContent).toContain("grid-row: 2;");
+    expect(stylesContent).toContain("grid-column: 2;");
+    expect(stylesContent).toContain(".agent-detail-mobile-icon-control .agent-detail-control-label {");
   });
 
   it("shows statistics section on dashboard", async () => {
@@ -4121,7 +4156,91 @@ describe("AgentDetailView", () => {
       );
 
       await waitFor(() => {
-        expect(screen.getByText("Skills: skill-1, skill-2")).toBeInTheDocument();
+        expect(screen.getByText("skill-1")).toBeInTheDocument();
+        expect(screen.getByText("skill-2")).toBeInTheDocument();
+      });
+
+      const skillBadges = document.querySelectorAll(".dashboard-summary-skill-badge");
+      expect(skillBadges).toHaveLength(2);
+    });
+
+    it("loads and displays skill details when a dashboard skill badge is clicked", async () => {
+      const user = userEvent.setup();
+      const agentWithSkills = createMockAgent({
+        metadata: { skills: ["/Users/test/.agents/skills/fusion/SKILL.md"] },
+      });
+      mockFetchAgent.mockResolvedValue(agentWithSkills);
+      mockFetchSkillContent.mockResolvedValue({
+        skillMd: "# Fusion Skill",
+        files: [],
+      });
+
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />,
+      );
+
+      const badge = await screen.findByRole("button", { name: "View details for fusion" });
+      await user.click(badge);
+
+      await waitFor(() => {
+        expect(mockFetchSkillContent).toHaveBeenCalledWith("/Users/test/.agents/skills/fusion/SKILL.md", undefined);
+        expect(screen.getByText("# Fusion Skill")).toBeInTheDocument();
+      });
+    });
+
+    it("shows error state and supports retry when skill content loading fails", async () => {
+      const user = userEvent.setup();
+      const agentWithSkills = createMockAgent({
+        metadata: { skills: ["skill-1"] },
+      });
+      mockFetchAgent.mockResolvedValue(agentWithSkills);
+      mockFetchSkillContent
+        .mockRejectedValueOnce(new Error("Failed to load skill content"))
+        .mockResolvedValueOnce({ skillMd: "# Recovered", files: [] });
+
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />,
+      );
+
+      await user.click(await screen.findByRole("button", { name: "View details for skill-1" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Failed to load skill content")).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByRole("button", { name: "Retry" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("# Recovered")).toBeInTheDocument();
+      });
+    });
+
+    it("shows fallback when skill content has no SKILL.md body", async () => {
+      const user = userEvent.setup();
+      const agentWithSkills = createMockAgent({ metadata: { skills: ["skill-1"] } });
+      mockFetchAgent.mockResolvedValue(agentWithSkills);
+      mockFetchSkillContent.mockResolvedValue({ skillMd: "", files: [] });
+
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />,
+      );
+
+      await user.click(await screen.findByRole("button", { name: "View details for skill-1" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("(No SKILL.md found)")).toBeInTheDocument();
       });
     });
 

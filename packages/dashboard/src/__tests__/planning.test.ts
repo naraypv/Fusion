@@ -13,6 +13,7 @@ import {
   startExistingSession,
   submitResponse,
   retrySession,
+  rewindSession,
   cancelSession,
   stopGeneration,
   getSession,
@@ -994,6 +995,26 @@ describe("planning module", () => {
         response: { "q-scope": "medium" },
         thinkingOutput: "Persisted first-turn thinking",
       });
+    });
+  });
+
+  describe("rewindSession", () => {
+    it("rewinds to the previous question and trims history", async () => {
+      const { sessionId } = await createSession(getUniqueIp(), initialPlan, undefined, TEST_ROOT_DIR);
+      await submitResponse(sessionId, { "q-scope": "medium" }, TEST_ROOT_DIR);
+
+      const rewound = await rewindSession(sessionId, TEST_ROOT_DIR);
+
+      expect(rewound.currentQuestion.id).toBe("q-scope");
+      expect(rewound.history).toHaveLength(0);
+      const session = getSession(sessionId);
+      expect(session?.currentQuestion?.id).toBe("q-scope");
+      expect(session?.history).toHaveLength(0);
+    });
+
+    it("throws when no answered question exists", async () => {
+      const { sessionId } = await createSession(getUniqueIp(), initialPlan, undefined, TEST_ROOT_DIR);
+      await expect(rewindSession(sessionId, TEST_ROOT_DIR)).rejects.toThrow(InvalidSessionStateError);
     });
   });
 

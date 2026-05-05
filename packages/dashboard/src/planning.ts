@@ -1923,6 +1923,52 @@ export async function retrySession(
   await continueAgentConversation(session, replayMessage);
 }
 
+export interface PlanningRewindResult {
+  currentQuestion: PlanningQuestion;
+  history: PlanningHistoryEntry[];
+}
+
+export async function rewindSession(
+  sessionId: string,
+  rootDir?: string,
+  promptOverrides?: PromptOverrideMap,
+): Promise<PlanningRewindResult> {
+  const session = getSession(sessionId);
+  if (!session) {
+    throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
+  }
+
+  if (session.history.length === 0) {
+    throw new InvalidSessionStateError("Planning session has no previous question to rewind to");
+  }
+
+  const rewindEntry = session.history.pop();
+  if (!rewindEntry) {
+    throw new InvalidSessionStateError("Planning session has no previous question to rewind to");
+  }
+
+  disposeSessionAgentForRetry(session);
+
+  session.currentQuestion = rewindEntry.question;
+  session.summary = undefined;
+  session.error = undefined;
+  session.lastGeneratedThinking = session.history[session.history.length - 1]?.thinkingOutput ?? "";
+  session.thinkingOutput = "";
+  session.updatedAt = new Date();
+
+  if (!session.agent && rootDir) {
+    await ensureSessionAgent(session, rootDir, session.history, promptOverrides);
+  }
+
+  persistSession(session, "awaiting_input");
+  planningStreamManager.broadcast(session.id, { type: "question", data: rewindEntry.question });
+
+  return {
+    currentQuestion: rewindEntry.question,
+    history: [...session.history],
+  };
+}
+
 export function stopGeneration(sessionId: string): boolean {
   const session = sessions.get(sessionId);
   const activeGeneration = activeGenerations.get(sessionId);

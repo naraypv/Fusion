@@ -171,7 +171,7 @@ Examples of ONE useful action:
 - DON'T: create vague tasks like "investigate stuff" without actionable scope.
 
 Keep work lightweight — this is a single-pass check, not a full implementation run.
-You have readonly file access plus fn_task_create, fn_task_log, and fn_task_document tools.
+You have coding-capable workspace tools (read/write/edit/bash within worktree boundaries) plus fn_task_create, fn_task_log, and fn_task_document tools.
 
 **Task Documents:** Save important findings with fn_task_document_write(key="...", content="...").
 Documents persist across sessions and are visible in the dashboard's Documents tab.
@@ -253,7 +253,7 @@ Examples of ONE useful action:
 - DON'T: attempt implementation work that requires task-scoped tooling/context.
 
 Keep work lightweight — this is a single-pass ambient check, not a full implementation run.
-You have readonly file access plus:
+You have coding-capable workspace tools (read/write/edit/bash within worktree boundaries) plus:
 - fn_task_create
 - fn_list_agents and fn_delegate_task
 - fn_get_agent_config and fn_update_agent_config (for direct reports only)
@@ -934,7 +934,7 @@ export class HeartbeatMonitor {
    * Implements the Paperclip-style execution model:
    * 1. Wake — start a heartbeat run record
    * 2. Check inbox — resolve the agent's assigned task
-   * 3. Work — run a lightweight agent session with readonly tools + fn_task_create/fn_task_log
+   * 3. Work — run a lightweight agent session with coding-capable tools + fn_task_create/fn_task_log
    * 4. Exit — record results and complete the run
    * 
    * Budget governance:
@@ -1462,7 +1462,7 @@ export class HeartbeatMonitor {
           pluginRunner: this.pluginRunner,
           cwd: rootDir,
           systemPrompt,
-          tools: "readonly",
+          tools: "coding",
           customTools: heartbeatTools,
           ...(() => {
             const { provider, modelId } = extractRuntimeModel(agent.runtimeConfig);

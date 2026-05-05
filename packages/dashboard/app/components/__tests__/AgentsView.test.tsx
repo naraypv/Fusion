@@ -1193,7 +1193,9 @@ describe("AgentsView", () => {
           lastHeartbeatAt: new Date().toISOString(),
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
-          metadata: {},
+          metadata: {
+            skills: ["auto::skills/../../.agents/skills/review/SKILL.md", "auto::skills/../../.agents/skills/fusion/SKILL.md"],
+          },
         },
         children: [
           {
@@ -1289,6 +1291,47 @@ describe("AgentsView", () => {
       await waitFor(() => {
         expect(screen.getByTestId("agent-detail-view")).toHaveTextContent("agent-child-1");
       });
+    });
+
+    it("keeps org chart node metadata compact without skill badges", async () => {
+      mockFetchOrgTree.mockResolvedValue(orgTree);
+      render(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Chief Agent")).toBeTruthy();
+      });
+
+      const rootCard = document.querySelector('[class*="org-chart-node-card--"]');
+      expect(rootCard).toBeTruthy();
+      expect(within(rootCard as HTMLElement).queryByText("review")).toBeNull();
+      expect(within(rootCard as HTMLElement).queryByText("fusion")).toBeNull();
+      expect(within(rootCard as HTMLElement).queryByText("+1")).toBeNull();
+      expect((rootCard as HTMLElement).querySelector(".org-chart-node__skill")).toBeNull();
+    });
+
+    it("sizes org chart subtree containers based on descendant leaf counts", async () => {
+      mockFetchOrgTree.mockResolvedValue(orgTree);
+      const { container } = render(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Chief Agent")).toBeTruthy();
+      });
+
+      const rootNode = screen.getByText("Chief Agent").closest(".org-chart-node") as HTMLElement;
+      const nestedParentNode = screen.getByText("Director One").closest(".org-chart-node") as HTMLElement;
+      const leafNode = screen.getByText("Manager Alpha").closest(".org-chart-node") as HTMLElement;
+      const rootChildren = rootNode.querySelector(":scope > .org-chart-children") as HTMLElement;
+
+      expect(rootNode.style.getPropertyValue("--org-chart-subtree-leaves")).toBe("2");
+      expect(nestedParentNode.style.getPropertyValue("--org-chart-subtree-leaves")).toBe("1");
+      expect(leafNode.style.getPropertyValue("--org-chart-subtree-leaves")).toBe("1");
+      expect(rootChildren).toBeTruthy();
+      expect(rootChildren.className).toContain("org-chart-children");
+      expect(container.querySelectorAll(".org-chart-node--has-children").length).toBeGreaterThan(0);
     });
 
     it("shows mobile zoom controls for org chart and keeps node selection working", async () => {

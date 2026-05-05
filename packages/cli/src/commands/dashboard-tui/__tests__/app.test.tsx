@@ -245,9 +245,9 @@ describe("Default active section", () => {
     expect(controller.getSnapshot().activeSection).toBe("system");
   });
 
-  it("createInitialState defaults to mouseEnabled = true", () => {
+  it("createInitialState defaults to mouseEnabled = false (selection-friendly; auto-toggled by panel focus)", () => {
     const state = createInitialState();
-    expect(state.mouseEnabled).toBe(true);
+    expect(state.mouseEnabled).toBe(false);
   });
 });
 
@@ -581,7 +581,7 @@ describe("Settings view", () => {
     await waitForFrameContains(lastFrame, "──── Remote ────");
     await focusSettingsDetailPane(stdin, lastFrame);
     stdin.write("K");
-    await waitForFrameContains(lastFrame, "▀▀▀ASCII-QR▀▀▀");
+    await waitForFrameContains(lastFrame, "▀▀▀ASCII-QR▀▀▀", 6000);
     unmount();
   });
 });

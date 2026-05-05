@@ -87,6 +87,7 @@ These fields can only be set during update (not on create):
 The agents surface provides:
 
 - Agent-first list/board/tree/org collection in the left pane (primary content appears first)
+- Org chart nodes intentionally stay compact (role/state/health hierarchy signal only) and do not enumerate per-agent skill badges; detailed skills remain in list/board/detail surfaces
 - A cross-pane **Overview** strip above the split layout with summary metrics and a disclosure to expand active/running live cards
 - A compact **Controls** popup for secondary actions (state filter, Show system agents toggle, Import, and global Heartbeat Speed)
 - Detail/config panels
@@ -282,6 +283,14 @@ The custom tab exposes separate fields for:
 - **Instructions Path** (`instructionsPath`) — optional file-backed instructions path
 - **Inline Instructions** (`instructionsText`) — optional inline behavior instructions
 
+For long-form prompt authoring, **Soul**, **Agent Memory**, and **Inline Instructions** now use the same rich editing affordances as other prompt editors in the dashboard:
+
+- Larger default editing surfaces for easier drafting
+- Plain/edit mode and Markdown preview mode
+- Fullscreen expand/collapse editing for long content (safe-area-aware on mobile)
+
+These controls are also available on the editable review step, so prompt content can be reviewed and refined with the same markdown and fullscreen behavior before submit.
+
 ### Final review edits (step 2)
 
 Before clicking **Create**, the final review step remains editable for identity/instruction fields so operators can make last-minute corrections without navigating backward. The review step includes edit-in-place controls for:
@@ -448,6 +457,10 @@ Heartbeat runs are composed from multiple prompt layers so each wake has full id
 1. **System prompt**
    - Task-scoped runs use the task heartbeat system prompt.
    - No-task runs use the ambient/no-task heartbeat system prompt (tool-aligned: no task-scoped tools).
+2. **Workspace tool mode**
+   - Heartbeat sessions are created with coding-capable workspace tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) inside worktree boundary guards.
+   - Heartbeat behavior still stays lightweight: one concrete action per run, then `fn_heartbeat_done`.
+   - Engine-owned heartbeat tools are still layered on top (task creation/log/docs for task-scoped runs; ambient/delegation/memory tools for no-task runs).
 2. **Agent identity and instructions bundle**
    - Inline instructions (`instructionsText`)
    - File-backed instructions (`instructionsPath`)

@@ -486,6 +486,7 @@ describe("executeHeartbeat", () => {
 
       expect(mockedCreateFnAgent).toHaveBeenCalledOnce();
       const callArgs = mockedCreateFnAgent.mock.calls[0]![0]!;
+      expect(callArgs.tools).toBe("coding");
       const toolNames = callArgs.customTools!.map((tool: any) => tool.name);
 
       // Should have fn_task_create, fn_list_agents, fn_delegate_task
@@ -1793,7 +1794,7 @@ describe("executeHeartbeat", () => {
       expect(callArgs.systemPrompt).toContain("fn_memory_search");
       expect(callArgs.systemPrompt).toContain("fn_task_log");
       expect(callArgs.systemPrompt).toContain("fn_task_document_write");
-      expect(callArgs.tools).toBe("readonly");
+      expect(callArgs.tools).toBe("coding");
       // Tools: fn_task_create, fn_task_log, fn_task_document_write, fn_task_document_read, fn_list_agents, fn_delegate_task,
       // fn_get_agent_config, fn_update_agent_config, fn_memory_search, fn_memory_get, fn_memory_append, fn_heartbeat_done
       expect(callArgs.customTools).toHaveLength(12);

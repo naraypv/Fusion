@@ -29,7 +29,6 @@ const PiExtensionsManager = lazy(() => import("./PiExtensionsManager").then((m) 
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
 import { CliAccountProviderCard } from "./CliAccountProviderCard";
 import { CliBinaryPanel } from "./CliBinaryPanel";
-import { DroidCliProviderCard } from "./DroidCliProviderCard";
 import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
 import { HermesRuntimeCard } from "./HermesRuntimeCard";
 import { OpenClawRuntimeCard } from "./OpenClawRuntimeCard";
@@ -46,7 +45,6 @@ import { useConfirm } from "../hooks/useConfirm";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useNodes } from "../hooks/useNodes";
-import { usePluginUiSlots } from "../hooks/usePluginUiSlots";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { NodeHealthDot } from "./NodeHealthDot";
 import { filterVisibleOnboardingAndSettingsProviders } from "./providerVisibility";
@@ -459,7 +457,6 @@ export function SettingsModal({
   } = useWorkspaceFileBrowser("project", overlapPathPickerIndex !== null, projectId);
 
   const { nodes } = useNodes();
-  const { getSlotsForId } = usePluginUiSlots(projectId);
   const experimentalFeatures = form.experimentalFeatures ?? {};
   const remoteAccessEnabled = isExperimentalFeatureEnabled(experimentalFeatures, "remoteAccess");
   const researchViewEnabled = isExperimentalFeatureEnabled(experimentalFeatures, "researchView");
@@ -5210,11 +5207,7 @@ export function SettingsModal({
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
         const cursorProvider = cliAuthProviders.find((p) => p.id === "cursor");
-        const droidCliProvider = cliAuthProviders.find((p) => p.id === "droid-cli");
         const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
-        const hasDroidPluginSlot = getSlotsForId("settings-provider-card").some(
-          (entry) => entry.pluginId === "fusion-plugin-droid-runtime",
-        );
         const claudeCliCard = claudeCliProvider ? (
           <ClaudeCliProviderCard
             compact
@@ -5241,15 +5234,6 @@ export function SettingsModal({
             }}
           />
         ) : null;
-        const droidCliCard = droidCliProvider && !hasDroidPluginSlot ? (
-          <DroidCliProviderCard
-            compact
-            authenticated={droidCliProvider.authenticated}
-            onToggled={() => {
-              void loadAuthStatus();
-            }}
-          />
-        ) : null;
         const llamaCppCard = llamaCppProvider ? (
           <LlamaCppProviderCard
             compact
@@ -5263,13 +5247,11 @@ export function SettingsModal({
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
           || (cursorProvider?.authenticated ?? false)
-          || ((droidCliProvider?.authenticated ?? false) && !hasDroidPluginSlot)
           || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
           || (cursorProvider && !cursorProvider.authenticated)
-          || (droidCliProvider && !droidCliProvider.authenticated && !hasDroidPluginSlot)
           || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
           <>
@@ -5282,8 +5264,18 @@ export function SettingsModal({
               </div>
             ) : (
               <div className="auth-panel-body">
-              <PluginSlot slotId="settings-provider-card" projectId={projectId} renderPlaceholder={false} />
-              <PluginSlot slotId="settings-integration-card" projectId={projectId} renderPlaceholder={false} />
+              <PluginSlot
+                slotId="settings-provider-card"
+                projectId={projectId}
+                renderPlaceholder={false}
+                actions={{ refreshAuthProviders: () => { void loadAuthStatus(); } }}
+              />
+              <PluginSlot
+                slotId="settings-integration-card"
+                projectId={projectId}
+                renderPlaceholder={false}
+                actions={{ refreshAuthProviders: () => { void loadAuthStatus(); } }}
+              />
               {!showAuthenticatedGroup && (
                 <div className="auth-section-hint">
                   Sign in to at least one provider to get started with AI models.
@@ -5294,7 +5286,6 @@ export function SettingsModal({
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
                   {cursorProvider?.authenticated && cursorCard}
-                  {droidCliProvider?.authenticated && droidCliCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
                   {authenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card auth-provider-card--authenticated">
@@ -5433,7 +5424,6 @@ export function SettingsModal({
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
                   {cursorProvider && !cursorProvider.authenticated && cursorCard}
-                  {droidCliProvider && !droidCliProvider.authenticated && droidCliCard}
                   {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card">

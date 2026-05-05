@@ -12,6 +12,7 @@ import {
   mockCreatePlanningDraft,
   mockConnectPlanningStream,
   mockRespondToPlanning,
+  mockRewindPlanningSession,
   mockRetryPlanningSession,
   mockCancelPlanning,
   mockStopPlanningGeneration,
@@ -55,8 +56,8 @@ vi.mock("../../api", () => ({
   createPlanningDraft: (...args: any[]) => mockCreatePlanningDraft(...args),
   connectPlanningStream: (...args: any[]) => mockConnectPlanningStream(...args),
   respondToPlanning: (...args: any[]) => mockRespondToPlanning(...args),
-  retryPlanningSession: (...args: any[]) => mockRetryPlanningSession(...args),
-  cancelPlanning: (...args: any[]) => mockCancelPlanning(...args),
+  rewindPlanningSession: (...args: any[]) => mockRewindPlanningSession(...args),
+  retryPlanningSession: (...args: any[]) => mockRetryPlanningSession(...args),  cancelPlanning: (...args: any[]) => mockCancelPlanning(...args),
   stopPlanningGeneration: (...args: any[]) => mockStopPlanningGeneration(...args),
   updatePlanningSessionDraft: (...args: any[]) => mockUpdatePlanningSessionDraft(...args),
   createTaskFromPlanning: (...args: any[]) => mockCreateTaskFromPlanning(...args),
@@ -121,6 +122,7 @@ describe("PlanningModeModal", () => {
     // the sidebar render rule (preview while title === placeholder) behaves
     // realistically in tests.
     mockCreatePlanningDraft.mockResolvedValue({ sessionId: "draft-123", title: "New planning session" });
+    mockRewindPlanningSession.mockResolvedValue({ currentQuestion: mockQuestion, history: [] });
     mockRetryPlanningSession.mockResolvedValue({ success: true, sessionId: "session-123" });
     mockStartPlanningBreakdown.mockResolvedValue({ sessionId: "session-123", subtasks: [] });
     mockFetchAiSession.mockResolvedValue(null);
@@ -581,6 +583,66 @@ describe("PlanningModeModal", () => {
 
       await screen.findByText("Describe your requirements");
       expect(screen.queryByPlaceholderText("Add any extra context or direction...")).not.toBeInTheDocument();
+    });
+
+    it("rewinds to the previous question when Back is clicked", async () => {
+      let streamHandlers: any;
+      const secondQuestion: PlanningQuestion = {
+        id: "q-requirements",
+        type: "text",
+        question: "What are the key requirements?",
+      };
+
+      mockConnectPlanningStream.mockImplementationOnce((_sessionId: string, _projectId: string | undefined, handlers: any) => {
+        streamHandlers = handlers;
+        setTimeout(() => {
+          handlers.onQuestion?.(mockQuestion);
+        }, 10);
+        return {
+          close: vi.fn(),
+          isConnected: vi.fn().mockReturnValue(true),
+        };
+      });
+
+      mockRespondToPlanning.mockImplementationOnce(async () => {
+        setTimeout(() => {
+          streamHandlers?.onQuestion?.(secondQuestion);
+        }, 10);
+        return { type: "question", data: secondQuestion };
+      });
+
+      mockRewindPlanningSession.mockResolvedValueOnce({
+        currentQuestion: mockQuestion,
+        history: [],
+      });
+
+      render(
+        <PlanningModeModal
+          isOpen={true}
+          onClose={mockOnClose}
+          onTaskCreated={mockOnTaskCreated}
+          onTasksCreated={vi.fn()}
+          tasks={mockTasks}
+        />,
+      );
+
+      fireEvent.change(screen.getByPlaceholderText(/e.g., Build a user authentication/), {
+        target: { value: "Build auth system" },
+      });
+      fireEvent.click(screen.getByText("Start Planning"));
+
+      await screen.findByText("What is the scope?");
+      fireEvent.click(screen.getByText("Medium"));
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+      await screen.findByText("What are the key requirements?");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+
+      await waitFor(() => {
+        expect(mockRewindPlanningSession).toHaveBeenCalledWith("session-123", undefined, expect.any(String));
+      });
+      expect(await screen.findByText("What is the scope?")).toBeInTheDocument();
+      expect(screen.queryByText("What are the key requirements?")).toBeNull();
     });
 
     it("includes _comment in response when comment is filled", async () => {

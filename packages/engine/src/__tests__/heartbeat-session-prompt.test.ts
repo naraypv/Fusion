@@ -88,6 +88,19 @@ describe("createHeartbeatTools", () => {
     mockTaskStore = createMockTaskStoreForTools();
   });
 
+  it("heartbeat task-scoped system prompt documents coding-capable workspace access", () => {
+    expect(HEARTBEAT_SYSTEM_PROMPT).toContain("coding-capable workspace tools");
+    expect(HEARTBEAT_SYSTEM_PROMPT).toContain("fn_task_log");
+    expect(HEARTBEAT_SYSTEM_PROMPT).toContain("fn_task_document_write");
+  });
+
+  it("heartbeat no-task system prompt documents coding-capable workspace access without task-scoped tools", () => {
+    expect(HEARTBEAT_NO_TASK_SYSTEM_PROMPT).toContain("coding-capable workspace tools");
+    expect(HEARTBEAT_NO_TASK_SYSTEM_PROMPT).not.toContain("fn_task_document_write");
+    expect(HEARTBEAT_NO_TASK_SYSTEM_PROMPT).not.toContain("fn_task_document_read");
+    expect(HEARTBEAT_NO_TASK_SYSTEM_PROMPT).not.toContain("fn_task_log");
+  });
+
   it("returns task, delegation, and agent-config tools", () => {
     const store = createMockStore();
     const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });

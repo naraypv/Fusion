@@ -1,5 +1,5 @@
 import "./AgentsView.css";
-import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense, type CSSProperties } from "react";
 import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, ChevronDown, ChevronUp, Filter, Upload, Network, SlidersHorizontal, Copy, Check, ZoomIn, ZoomOut, Minimize2 } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
 import { updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings } from "../api";
@@ -26,6 +26,7 @@ import {
 } from "../utils/heartbeatIntervals";
 import { isEphemeralAgent, getErrorMessage } from "@fusion/core";
 import { relativeTime } from "./AgentDetailView";
+import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
 
 export interface AgentsViewProps {
   addToast: (message: string, type?: "success" | "error") => void;
@@ -46,22 +47,7 @@ const AGENT_ROLES: { value: AgentCapability; label: string; icon: string }[] = [
 
 const HEARTBEAT_MULTIPLIER_PRESETS = [0.1, 0.25, 0.5, 1, 2, 3, 5, 10] as const;
 
-const SKILL_PATH_LABEL_PATTERN = /(?:^|\/)skills\/([^/]+)\/SKILL\.md$/i;
 const ORG_CHART_ZOOM_LEVELS = [0.75, 1, 1.25, 1.5] as const;
-
-export function formatAgentSkillBadgeLabel(skillId: string): string {
-  const trimmedSkillId = skillId.trim();
-  if (!trimmedSkillId) {
-    return skillId;
-  }
-
-  const match = trimmedSkillId.match(SKILL_PATH_LABEL_PATTERN);
-  if (match?.[1]) {
-    return match[1];
-  }
-
-  return trimmedSkillId;
-}
 
 function getStateBadgeClass(state: AgentState): string {
   switch (state) {
@@ -155,28 +141,39 @@ export function CollapsibleErrorDisplay({
   );
 }
 
+function getOrgChartLeafCount(node: OrgTreeNode): number {
+  if (node.children.length === 0) {
+    return 1;
+  }
+
+  return node.children.reduce((sum, child) => sum + getOrgChartLeafCount(child), 0);
+}
+
 function OrgChartNode({
   node,
   onSelect,
   getHealthStatus,
   getRoleIcon,
-  getSkillBadges,
   selectedAgentId,
 }: {
   node: OrgTreeNode;
   onSelect: (id: string) => void;
   getHealthStatus: (agent: Agent) => AgentHealthStatus;
   getRoleIcon: (role: AgentCapability) => string;
-  getSkillBadges: (agent: Agent) => string[];
   selectedAgentId: string | null;
 }) {
   const { agent, children } = node;
   const health = getHealthStatus(agent);
   const stateBadgeClass = getStateBadgeClass(agent.state);
   const stateNodeClass = getStateCardClass("org-chart-node-card", agent.state);
+  const subtreeLeafCount = getOrgChartLeafCount(node);
+  const nodeStyle = { "--org-chart-subtree-leaves": String(subtreeLeafCount) } as CSSProperties;
 
   return (
-    <div className={`org-chart-node${children.length > 0 ? " org-chart-node--has-children" : ""}`}>
+    <div
+      className={`org-chart-node${children.length > 0 ? " org-chart-node--has-children" : ""}`}
+      style={nodeStyle}
+    >
       <div
         className={`${stateNodeClass}${selectedAgentId === agent.id ? " agent-card--selected" : ""}`}
         onClick={() => onSelect(agent.id)}
@@ -205,21 +202,6 @@ function OrgChartNode({
             {health.icon}
             {!health.stateDerived && <span className="text-secondary">{health.label}</span>}
           </span>
-          {/* Org chart: up to 2 skill badges */}
-          {(() => {
-            const skills = getSkillBadges(agent);
-            if (skills.length === 0) return null;
-            const displaySkills = skills.slice(0, 2);
-            const extraCount = skills.length - 2;
-            return (
-              <>
-                {displaySkills.map((skillId) => (
-                  <span key={skillId} className="org-chart-node__skill">{formatAgentSkillBadgeLabel(skillId)}</span>
-                ))}
-                {extraCount > 0 && <span className="org-chart-node__skill">+{extraCount}</span>}
-              </>
-            );
-          })()}
         </div>
       </div>
       {children.length > 0 && (
@@ -231,7 +213,6 @@ function OrgChartNode({
               onSelect={onSelect}
               getHealthStatus={getHealthStatus}
               getRoleIcon={getRoleIcon}
-              getSkillBadges={getSkillBadges}
               selectedAgentId={selectedAgentId}
             />
           ))}
@@ -1026,7 +1007,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                         onSelect={openAgentDetail}
                         getHealthStatus={getHealthStatus}
                         getRoleIcon={getRoleIcon}
-                        getSkillBadges={getSkillBadges}
                         selectedAgentId={selectedAgentId}
                       />
                     ))

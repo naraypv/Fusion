@@ -184,6 +184,8 @@ describe("Agent CSS classes", () => {
     expect(orgChartSection).toContain("gap: var(--space-xl)");
     expect(orgChartSection).toContain("padding: var(--space-lg)");
     expect(orgChartSection).toContain("--org-chart-node-width: calc(var(--space-xl) * 9 + var(--space-xs))");
+    expect(orgChartSection).toContain("--org-chart-sibling-gap: var(--space-xl)");
+    expect(orgChartSection).toContain("--org-chart-children-offset: calc(var(--space-lg) + var(--space-sm))");
     expect(orgChartSection).toContain("min-height: var(--org-chart-node-width)");
     expect(orgChartSection).toContain("touch-action: pan-x pan-y");
     expect(orgChartSection).toContain("transform-origin: top left");
@@ -192,6 +194,8 @@ describe("Agent CSS classes", () => {
     expect(orgChartSection).toContain("color: var(--text-muted)");
     expect(orgChartSection).toContain("border-radius: var(--radius-pill)");
     expect(orgChartSection).toContain("transition: border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast)");
+    expect(orgChartSection).toContain("--org-chart-subtree-leaves-number: var(--org-chart-subtree-leaves, 1)");
+    expect(orgChartSection).toContain("min-width: calc(");
     expect(orgChartSection).not.toContain("var(--border-color)");
     expect(orgChartSection).not.toContain("var(--text-primary)");
     expect(orgChartSection).not.toContain("var(--text-secondary)");
@@ -199,6 +203,19 @@ describe("Agent CSS classes", () => {
   });
 
   // Verify AgentDetailView classes
+  it("encodes compact mobile agent detail header layout contracts", () => {
+    const css = fs.readFileSync(path.join(__dirname, "../components/AgentDetailView.css"), "utf-8");
+    const mobileStart = css.indexOf("@media (max-width: 768px)");
+    const mobileCss = mobileStart >= 0 ? css.slice(mobileStart) : "";
+
+    expect(mobileCss).toContain(".agent-detail-header {");
+    expect(mobileCss).toContain("grid-template-columns: minmax(0, 1fr) auto;");
+    expect(mobileCss).not.toContain("grid-template-rows: auto auto;");
+    expect(mobileCss).toContain(".agent-detail-header-actions {");
+    expect(mobileCss).toContain("grid-column: 2;");
+    expect(mobileCss).toContain(".agent-detail-mobile-icon-control .agent-detail-control-label {");
+  });
+
   it("should define AgentDetailView CSS classes", () => {
     expect(hasClass(".agent-detail-overlay")).toBe(true);
     expect(hasClass(".agent-detail-modal")).toBe(true);
