@@ -6,6 +6,7 @@ import {
   startPlanningStreaming,
   createPlanningDraft,
   respondToPlanning,
+  rewindPlanningSession,
   retryPlanningSession,
   createTaskFromPlanning,
   connectPlanningStream,
@@ -1499,16 +1500,45 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     }
   }, [broadcastCompleted, handleClose, view, onTasksCreated, projectId]);
 
-  const handleBack = useCallback(() => {
-    if (view.type === "question" && responseHistory.length > 0) {
-      // Remove last response and go back
-      const previousResponses = responseHistory.slice(0, -1);
-      setResponseHistory(previousResponses);
-      // Note: We don't actually have a way to go back in the backend,
-      // so we just reset to the question from the initial session
+  const handleBack = useCallback(async () => {
+    if (view.type !== "question" || responseHistory.length === 0) {
+      return;
+    }
+
+    const sessionId = view.session.sessionId;
+    setError(null);
+    setView({ type: "loading" });
+
+    try {
+      const rewound = await rewindPlanningSession(sessionId, projectId, sessionTabId);
+      setResponseHistory(rewound.history.map((entry) => {
+        if (entry.response && typeof entry.response === "object" && !Array.isArray(entry.response)) {
+          return entry.response as QuestionResponse;
+        }
+        return { [entry.question.id]: entry.response };
+      }));
+      setConversationHistory(rewound.history.map((entry) => ({
+        question: entry.question,
+        response:
+          entry.response && typeof entry.response === "object" && !Array.isArray(entry.response)
+            ? (entry.response as Record<string, unknown>)
+            : { [entry.question.id]: entry.response },
+        thinkingOutput: entry.thinkingOutput,
+      })));
+      setStreamingOutput("");
+      setView({
+        type: "question",
+        session: {
+          ...view.session,
+          currentQuestion: rewound.currentQuestion,
+          summary: null,
+        },
+      });
+    } catch (err) {
+      setError(getErrorMessage(err) || "Failed to go back to the previous question");
       setView({ type: "question", session: view.session });
     }
-  }, [view, responseHistory]);
+  }, [projectId, responseHistory.length, sessionTabId, view]);
 
   const getProgress = () => {
     if (view.type === "question") {

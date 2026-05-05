@@ -728,6 +728,48 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
     }
   });
 
+  router.post("/planning/:sessionId/back", async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      if (!sessionId || typeof sessionId !== "string") {
+        throw badRequest("sessionId is required");
+      }
+
+      const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
+        ? req.body.tabId.trim()
+        : undefined;
+      const lockCheck = checkSessionLock(sessionId, tabId, aiSessionStore);
+      if (!lockCheck.allowed) {
+        res.status(409).json({
+          error: "Session locked by another tab",
+          lockedByTab: lockCheck.currentHolder,
+        });
+        return;
+      }
+
+      const { store: scopedStore } = await getProjectContext(req);
+      const settings = await scopedStore.getSettings();
+      const { rewindSession } = await import("../planning.js");
+      const rewound = await rewindSession(
+        sessionId,
+        scopedStore.getRootDir(),
+        settings.promptOverrides,
+      );
+      res.json(rewound);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      if (err instanceof Error && err.name === "SessionNotFoundError") {
+        throw notFound(err instanceof Error ? err.message : String(err));
+      } else if (err instanceof Error && err.name === "InvalidSessionStateError") {
+        throw badRequest(err instanceof Error ? err.message : String(err));
+      } else {
+        rethrowAsApiError(err, "Failed to rewind planning session");
+      }
+    }
+  });
+
   /**
    * POST /api/planning/:sessionId/retry
    * Retry a failed planning session.
@@ -1317,6 +1359,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       "POST /planning/start",
       "POST /planning/start-streaming",
       "POST /planning/respond",
+      "POST /planning/:sessionId/back",
       "POST /planning/:sessionId/retry",
       "POST /planning/:sessionId/stop",
       "POST /planning/cancel",

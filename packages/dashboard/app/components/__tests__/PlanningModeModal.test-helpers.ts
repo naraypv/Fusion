@@ -6,6 +6,7 @@ export const mockStartPlanningStreaming = vi.fn();
 export const mockCreatePlanningDraft = vi.fn();
 export const mockConnectPlanningStream = vi.fn();
 export const mockRespondToPlanning = vi.fn();
+export const mockRewindPlanningSession = vi.fn();
 export const mockRetryPlanningSession = vi.fn();
 export const mockCancelPlanning = vi.fn();
 export const mockStopPlanningGeneration = vi.fn();

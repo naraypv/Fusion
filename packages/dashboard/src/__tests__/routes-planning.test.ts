@@ -1031,6 +1031,37 @@ describe("Planning Mode Routes", () => {
       });
     });
 
+    describe("POST /planning/:sessionId/back", () => {
+      it("rewinds an active planning session", async () => {
+        const rewindSpy = vi.spyOn(planningModule, "rewindSession").mockResolvedValue({
+          currentQuestion: {
+            id: "q-scope",
+            type: "single_select",
+            question: "What is the scope of this plan?",
+            options: [],
+          },
+          history: [],
+        });
+
+        const res = await REQUEST(buildApp(), "POST", "/api/planning/session-123/back");
+
+        expect(res.status).toBe(200);
+        expect(res.body.currentQuestion.id).toBe("q-scope");
+        expect(rewindSpy).toHaveBeenCalledWith("session-123", expect.any(String), undefined);
+      });
+
+      it("returns 400 when there is no previous question", async () => {
+        vi.spyOn(planningModule, "rewindSession").mockRejectedValueOnce(
+          new planningModule.InvalidSessionStateError("Planning session has no previous question to rewind to"),
+        );
+
+        const res = await REQUEST(buildApp(), "POST", "/api/planning/session-400/back");
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toContain("no previous question");
+      });
+    });
+
     describe("POST /planning/:sessionId/retry", () => {
       it("retries a failed planning session", async () => {
         const retrySpy = vi.spyOn(planningModule, "retrySession").mockResolvedValue();

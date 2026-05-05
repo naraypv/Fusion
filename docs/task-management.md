@@ -24,6 +24,7 @@ Use the 💡 button to open planning mode:
 - Create one task or **Break into Tasks** (multi-task generation with dependencies)
 - Break-into-tasks descriptions are structured with subtask-specific guidance first, then a separate larger-plan context section (plus `## Planning Interview Context` when interview history exists)
 - Sessions persist when the modal is closed — resume from the sidebar list at any time; reasoning context is restored automatically
+- Back navigation rewinds the server-side planning session to the previous answered question so you can revise earlier answers and continue from the corrected turn
 
 ### 3) Todo item → Plan Mode
 

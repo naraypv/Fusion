@@ -2704,6 +2704,21 @@ export function respondToPlanning(
   });
 }
 
+/** Rewind a planning session to the previous answered question */
+export function rewindPlanningSession(
+  sessionId: string,
+  projectId?: string,
+  tabId?: string,
+): Promise<{ currentQuestion: PlanningQuestion; history: Array<{ question: PlanningQuestion; response: unknown; thinkingOutput?: string }> }> {
+  return api<{ currentQuestion: PlanningQuestion; history: Array<{ question: PlanningQuestion; response: unknown; thinkingOutput?: string }> }>(
+    withProjectId(`/planning/${encodeURIComponent(sessionId)}/back`, projectId),
+    {
+      method: "POST",
+      ...(tabId ? { body: JSON.stringify({ tabId }) } : {}),
+    },
+  );
+}
+
 /** Retry a failed planning session turn */
 export function retryPlanningSession(
   sessionId: string,
@@ -5308,6 +5323,7 @@ export interface ProjectCreateInput {
 }
 
 export type DockerNodeConfigInfo = DockerNodeConfig;
+export type { DockerNodeConfig };
 
 /** Node information returned by node endpoints */
 export interface NodeInfo {
