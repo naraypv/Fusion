@@ -36,7 +36,7 @@ export function AgentsOverviewBar({
           <span className="agents-overview-bar__title">Overview</span>
         </span>
         <span className="agents-overview-bar__meta text-secondary">
-          {stats?.activeCount ?? 0} active · {activeAgents.length} running
+          {activeAgents.filter((a) => a.state === "active").length} active · {activeAgents.filter((a) => a.state === "running").length} running
         </span>
       </button>
       {isOpen ? (
