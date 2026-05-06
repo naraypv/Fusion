@@ -1901,7 +1901,47 @@ export class ProjectEngine {
   }
 
   private wireSettingsListeners(store: TaskStore): void {
-    // 1. Global pause — terminate active merge session AND abort any running
+    const applyDetectorPauseLifecycle = (paused: boolean, source: string): void => {
+      try {
+        const detector = (this.runtime as any).stuckTaskDetector;
+        if (paused) {
+          detector?.pause?.();
+        } else {
+          detector?.resume?.();
+        }
+      } catch (err: unknown) {
+        runtimeLog.warn(
+          `${source}: stuck detector ${paused ? "pause" : "resume"} hook failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+
+    // 1. Unified pause lifecycle — detector only resumes once BOTH pause sources
+    // are clear, and pauses when either source engages.
+    const onPauseLifecycleTransition = ({
+      settings: s,
+      previous: prev,
+    }: {
+      settings: Settings;
+      previous: Settings;
+    }) => {
+      const wasPaused = prev.globalPause || prev.enginePaused;
+      const isPaused = s.globalPause || s.enginePaused;
+
+      if (!wasPaused && isPaused) {
+        const source = s.globalPause && !prev.globalPause ? "Global pause" : "Engine pause";
+        applyDetectorPauseLifecycle(true, source);
+      }
+
+      if (wasPaused && !isPaused) {
+        const source = prev.globalPause && !s.globalPause ? "Global unpause" : "Engine unpause";
+        applyDetectorPauseLifecycle(false, source);
+      }
+    };
+    store.on("settings:updated", onPauseLifecycleTransition);
+    this.settingsHandlers.push(onPauseLifecycleTransition);
+
+    // 2. Global pause — terminate active merge session AND abort any running
     // deterministic verification (pnpm test/build). The abort controller gates
     // both the AI merge agent and the spawned child processes; without it,
     // verification commands keep churning until they finish naturally.
@@ -1922,7 +1962,7 @@ export class ProjectEngine {
     store.on("settings:updated", onGlobalPause);
     this.settingsHandlers.push(onGlobalPause);
 
-    // 2. Global unpause — resume orphaned tasks + sweep in-review
+    // 3. Global unpause — resume orphaned tasks + sweep in-review
     const onGlobalUnpause = async ({
       settings: s,
       previous: prev,
@@ -1938,7 +1978,7 @@ export class ProjectEngine {
     store.on("settings:updated", onGlobalUnpause);
     this.settingsHandlers.push(onGlobalUnpause);
 
-    // 3. Engine unpause — same as global unpause
+    // 4. Engine unpause — same as global unpause
     const onEngineUnpause = async ({
       settings: s,
       previous: prev,
@@ -1954,7 +1994,7 @@ export class ProjectEngine {
     store.on("settings:updated", onEngineUnpause);
     this.settingsHandlers.push(onEngineUnpause);
 
-    // 4. Stuck task timeout change — trigger immediate check
+    // 5. Stuck task timeout change — trigger immediate check
     const onStuckTimeoutChange = async ({
       settings: s,
       previous: prev,

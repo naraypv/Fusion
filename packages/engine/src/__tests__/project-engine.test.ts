@@ -1561,6 +1561,142 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
     await engine.stop();
   });
+
+  it("calls stuck detector pause/resume hooks for enginePaused transitions", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("calls stuck detector pause/resume hooks for globalPause transitions", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true },
+      { ...baseSettings, globalPause: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false },
+      { ...baseSettings, globalPause: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("does not resume stuck detector until both global and engine pause are cleared", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true, enginePaused: true },
+      { ...baseSettings, globalPause: false, enginePaused: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false, enginePaused: true },
+      { ...baseSettings, globalPause: true, enginePaused: true },
+    );
+    expect(resume).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false, enginePaused: false },
+      { ...baseSettings, globalPause: false, enginePaused: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("reserves stuck-detector checkNow for timeout-setting changes", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const checkNow = vi.fn(async () => undefined);
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause: vi.fn(), resume: vi.fn(), checkNow }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true },
+      { ...baseSettings, globalPause: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false },
+      { ...baseSettings, globalPause: true },
+    );
+
+    expect(checkNow).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, taskStuckTimeoutMs: 600_000 },
+      { ...baseSettings, taskStuckTimeoutMs: 300_000 },
+    );
+
+    expect(checkNow).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
 });
 
 describe("ProjectEngine swallowed error hardening", () => {
@@ -1785,6 +1921,47 @@ describe("ProjectEngine swallowed error hardening", () => {
 
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Stuck-timeout change: detector.checkNow() failed"),
+    );
+
+    await engine.stop();
+  });
+
+  it("warns when stuck-detector pause/resume hooks throw", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+    warnSpy.mockClear();
+
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get() {
+        return {
+          pause: () => {
+            throw new Error("pause hook failed");
+          },
+          resume: () => {
+            throw new Error("resume hook failed");
+          },
+        };
+      },
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Engine pause: stuck detector pause hook failed"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Engine unpause: stuck detector resume hook failed"),
     );
 
     await engine.stop();

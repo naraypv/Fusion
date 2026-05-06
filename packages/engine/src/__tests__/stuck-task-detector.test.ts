@@ -604,6 +604,75 @@ describe("StuckTaskDetector", () => {
     });
   });
 
+  describe("pause lifecycle", () => {
+    it("skips stuck evaluation while paused", async () => {
+      const getSettings = vi.fn().mockResolvedValue({ taskStuckTimeoutMs: 60000 });
+      store = createMockStore({ getSettings });
+      const onStuck = vi.fn();
+      const customDetector = new StuckTaskDetector(store, { onStuck });
+      const session = createMockSession();
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      customDetector.trackTask("FN-001", session);
+      customDetector.pause();
+      vi.advanceTimersByTime(61_000);
+
+      await customDetector.checkNow();
+
+      expect(getSettings).not.toHaveBeenCalled();
+      expect(onStuck).not.toHaveBeenCalled();
+      expect(session.dispose).not.toHaveBeenCalled();
+      expect(customDetector.trackedCount).toBe(1);
+      vi.useRealTimers();
+    });
+
+    it("resets tracked timing on resume so paused interval is not immediately stuck", async () => {
+      store = createMockStore({
+        getSettings: vi.fn().mockResolvedValue({ taskStuckTimeoutMs: 60000 }),
+      });
+      const onStuck = vi.fn();
+      const customDetector = new StuckTaskDetector(store, { onStuck });
+      const session = createMockSession();
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      customDetector.trackTask("FN-001", session);
+      customDetector.pause();
+      vi.advanceTimersByTime(120_000);
+      customDetector.resume();
+
+      await customDetector.checkNow();
+      expect(onStuck).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(61_000);
+      await customDetector.checkNow();
+      expect(onStuck).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "FN-001", reason: "inactivity" }),
+      );
+      vi.useRealTimers();
+    });
+
+    it("does not refresh tracked timing when resume is called while already unpaused", async () => {
+      store = createMockStore({
+        getSettings: vi.fn().mockResolvedValue({ taskStuckTimeoutMs: 60000 }),
+      });
+      const onStuck = vi.fn();
+      const customDetector = new StuckTaskDetector(store, { onStuck });
+      const session = createMockSession();
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      customDetector.trackTask("FN-001", session);
+      vi.advanceTimersByTime(61_000);
+
+      customDetector.resume();
+      await customDetector.checkNow();
+
+      expect(onStuck).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: "FN-001", reason: "inactivity" }),
+      );
+      vi.useRealTimers();
+    });
+  });
+
   describe("checkNow", () => {
     it("checks stuck tasks immediately and disposes session", async () => {
       store = createMockStore({

@@ -17,7 +17,10 @@ describe("EvalStore", () => {
     const runB = store.createRun({ projectId: "p1", scope: "completed-since-last", requestedTaskIds: ["FN-2"] });
 
     const runs = store.listRuns({ projectId: "p1" });
-    expect(runs.map((run) => run.id)).toEqual([runA.id, runB.id].sort());
+    const expectedOrder = [runA, runB]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((run) => run.id);
+    expect(runs.map((run) => run.id)).toEqual(expectedOrder);
   });
 
   it("enforces active run conflict for scheduled trigger", () => {

@@ -94,6 +94,7 @@ export class StuckTaskDetector {
   private onStuck?: (event: StuckTaskEvent) => void;
   private beforeRequeue?: (taskId: string) => Promise<boolean>;
   private onLoopDetected?: (event: StuckTaskEvent) => Promise<boolean>;
+  private paused = false;
 
   constructor(
     private store: TaskStore,
@@ -407,6 +408,31 @@ export class StuckTaskDetector {
   }
 
   /**
+   * Pause stuck detection checks while the engine is in a paused lifecycle.
+   * Active tracked sessions are preserved and refreshed on resume.
+   */
+  pause(): void {
+    if (this.paused) return;
+    this.paused = true;
+  }
+
+  /**
+   * Resume stuck detection checks and refresh tracked timestamps so the paused
+   * interval does not count as inactivity/no-progress time.
+   */
+  resume(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    if (this.tracked.size === 0) return;
+    const now = Date.now();
+    for (const entry of this.tracked.values()) {
+      entry.lastActivity = now;
+      entry.lastProgressAt = now;
+      entry.activitySinceProgress = 0;
+    }
+  }
+
+  /**
    * Check for stuck tasks immediately, outside the normal polling cycle.
    * Safe to call at any time — will no-op if no tasks are tracked or timeout is disabled.
    * Logs at debug level to distinguish manual checks from polling.
@@ -429,6 +455,10 @@ export class StuckTaskDetector {
   private async checkStuckTasks(): Promise<void> {
     if (this.tracked.size === 0) return;
 
+    // Fast pause gate: if lifecycle hooks paused the detector, skip the cycle
+    // without reading settings (avoids noisy settings-read errors while paused).
+    if (this.paused) return;
+
     let settings: Settings;
     try {
       settings = await this.store.getSettings();
@@ -437,10 +467,7 @@ export class StuckTaskDetector {
       return; // Can't read settings — skip this cycle
     }
 
-    // Pause gate: when globalPause or enginePaused is on, sessions are
-    // intentionally idle (engine listeners dispose them on transition) and
-    // long pauses would otherwise look like inactivity → trigger spurious
-    // stuck-kill / requeue cycles. Skip detection while paused.
+    // Defensive fallback for pause windows where lifecycle hooks haven't run yet.
     if (settings.globalPause || settings.enginePaused) return;
 
     const timeoutMs = settings.taskStuckTimeoutMs;
