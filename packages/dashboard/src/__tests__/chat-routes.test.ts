@@ -1193,6 +1193,51 @@ describe("Chat API Routes", () => {
         expect(output).toContain('"messageId":"msg-final"');
         expect(output).toContain('"content":"Final reply"');
       });
+
+      it("uses the same generation id for subscription and sendMessage", async () => {
+        mockGetSession.mockReturnValue(sampleSession);
+
+        const chatModule = await import("../chat.js");
+        vi.mocked(chatModule.checkRateLimit).mockReturnValue(true);
+        mockBeginGeneration.mockReturnValueOnce({
+          generationId: 42,
+          abortController: new AbortController(),
+        });
+
+        mockSendMessage.mockImplementation(async (sessionId: string) => {
+          mockChatStreamManager.broadcast(sessionId, {
+            type: "done",
+            data: { messageId: "msg-final" },
+          });
+        });
+
+        const req = createSSERequest();
+        const { res } = createSSEResponse();
+
+        req.body = { content: "Hello" };
+        req.params = { id: "chat-abc123" };
+        req.query = {} as any;
+        req.headers = {} as any;
+        req.ip = "127.0.0.1";
+        req.socket = { remoteAddress: "127.0.0.1" } as any;
+
+        await invokeSSEHandler(req, res, store, mockChatStore, mockChatManager);
+
+        expect(mockBeginGeneration).toHaveBeenCalledWith("chat-abc123");
+        expect(mockChatStreamManager.subscribe).toHaveBeenCalledWith(
+          "chat-abc123",
+          expect.any(Function),
+          { generationId: 42 },
+        );
+        expect(mockSendMessage).toHaveBeenCalledWith(
+          "chat-abc123",
+          "Hello",
+          undefined,
+          undefined,
+          undefined,
+          { generationId: 42 },
+        );
+      });
     });
   });
 

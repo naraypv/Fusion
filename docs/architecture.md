@@ -152,7 +152,10 @@ Concrete references:
 - Dashboard chat UX lives in `packages/dashboard/app/components/ChatView.tsx` and hooks `useChat.ts` / `useQuickChat.ts`
 - Main `useChat` session restore/recovery must not reset the active thread during session-list refresh or `chat:session:updated` metadata churn while a response is in flight.
 - When the active session is still generating after reload/reconnect (`isGenerating: true`), `useChat` keeps recovery streaming state alive ("Connecting…") until the assistant output is observed via SSE or reloaded from messages.
-- Chat message submission uses SSE streaming responses from dashboard chat routes
+- Chat message submission uses SSE streaming responses from dashboard chat routes.
+- Main-chat optimistic user sends are reconciled against persisted SSE user echoes by content + temp-id replacement, so one user send cannot survive as a duplicate history entry after stream completion.
+- `streamChatResponse()` must flush trailing buffered SSE data on EOF even without a final newline, so terminal `done`/`error` events are not dropped at chunk boundaries.
+- Chat generation ownership is isolated by `generationId` (`ChatManager.beginGeneration` + `ChatStreamManager` subscription filters + route preallocation), preventing stale generation terminal events from leaking into a newer active request.
 
 ### Agent Companies
 

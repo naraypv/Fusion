@@ -1354,11 +1354,8 @@ describe("useChat", () => {
       });
       mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
 
-      // Track stream handlers separately from SSE handlers
-      let streamDoneHandler: ((data: { messageId: string }) => void) | undefined;
       mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
-        // Capture the onDone handler for stream completion
-        streamDoneHandler = handlers.onDone;
+        void handlers.onDone;
         return { close: vi.fn(), isConnected: () => true };
       });
 
@@ -1376,7 +1373,6 @@ describe("useChat", () => {
         expect(result.current.messages).toHaveLength(0);
       });
 
-      // Start streaming
       await act(async () => {
         await result.current.sendMessage("Hello!");
       });
@@ -1385,8 +1381,6 @@ describe("useChat", () => {
         expect(result.current.isStreaming).toBe(true);
       });
 
-      // Simulate SSE event - should not add message during streaming
-      // because isStreaming is true
       const newMessage = makeMessage({ id: "msg-002", sessionId: "session-001", role: "assistant", content: "Hi" });
       act(() => {
         subscribeHandler["chat:message:added"]?.({
@@ -1394,10 +1388,69 @@ describe("useChat", () => {
         } as MessageEvent);
       });
 
-      // Message should not be added during streaming
-      // (the SSE handler checks isStreaming and skips adding)
       await waitFor(() => {
-        expect(result.current.messages).toHaveLength(1); // Only the optimistic user message
+        expect(result.current.messages).toHaveLength(1);
+      });
+    });
+
+    it("dedupes optimistic user message when persisted user echo arrives after done", async () => {
+      mockFetchChatSessions.mockResolvedValueOnce({
+        sessions: [makeSession({ id: "session-001", agentId: "agent-001" })],
+      });
+      mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+
+      let doneHandler: ((data: { messageId: string }) => void) | undefined;
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+        doneHandler = handlers.onDone;
+        return { close: vi.fn(), isConnected: () => true };
+      });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
+
+      act(() => {
+        result.current.sendMessage("Hello!");
+      });
+
+      await waitFor(() => {
+        expect(result.current.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      });
+
+      act(() => {
+        doneHandler?.({ messageId: "msg-assistant-001" });
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(false);
+        expect(result.current.messages).toHaveLength(2);
+      });
+
+      const persistedEcho = makeMessage({
+        id: "msg-user-001",
+        sessionId: "session-001",
+        role: "user",
+        content: "Hello!",
+      });
+      act(() => {
+        subscribeHandler["chat:message:added"]?.({
+          data: JSON.stringify(persistedEcho),
+        } as MessageEvent);
+      });
+
+      await waitFor(() => {
+        const userMessages = result.current.messages.filter((message) => message.role === "user");
+        expect(userMessages).toHaveLength(1);
       });
     });
 

@@ -51,6 +51,23 @@ describe("streamChatResponse SSE parser", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("flushes terminal done event when stream ends without final newline", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(createChunkedStream(["event: done\ndata: {\"messageId\":\"msg-tail\"}"]), { status: 200 }),
+    );
+
+    const donePayloads: Array<{ messageId: string }> = [];
+
+    streamChatResponse("s-1", "hi", {
+      onDone: (data) => donePayloads.push(data),
+      onError: vi.fn(),
+    });
+
+    await vi.waitFor(() => {
+      expect(donePayloads).toEqual([{ messageId: "msg-tail" }]);
+    });
+  });
+
   it("parses done payload assistant snapshots when present", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
@@ -70,11 +87,25 @@ describe("streamChatResponse SSE parser", () => {
     });
 
     await vi.waitFor(() => {
-      expect(donePayloads).toEqual([{ messageId: "msg-1", message: { id: "msg-1", sessionId: "s-1", role: "assistant", content: "Final reply", thinkingOutput: null, metadata: null, createdAt: "2026-01-01T00:00:00.000Z" } }]);
+      expect(donePayloads).toEqual([
+        {
+          messageId: "msg-1",
+          message: {
+            id: "msg-1",
+            sessionId: "s-1",
+            role: "assistant",
+            content: "Final reply",
+            thinkingOutput: null,
+            metadata: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      ]);
     });
   });
 
-  it("handles done events that have no data payload", async () => {    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+  it("handles done events that have no data payload", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(createChunkedStream(["event: done\n\n"]), { status: 200 }),
     );
 

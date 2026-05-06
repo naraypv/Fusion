@@ -1781,4 +1781,5 @@ describe("ChatManager generation isolation", () => {
     // and not re-deleted/corrupted by sendOne's late finally.
     expect(chatManager.isGenerating("chat-001")).toBe(false);
   });
+
 });

@@ -719,8 +719,24 @@ export function useChat(
       // Use ref to get the current value (state may not be updated yet when handler runs)
       if (activeSessionRef.current?.id === message.sessionId && !isStreamingRef.current) {
         setMessages((prev) => {
-          // Avoid duplicates
+          // Avoid duplicates by persisted id first.
           if (prev.some((m) => m.id === message.id)) return prev;
+
+          // Reconcile optimistic local user messages against persisted SSE echoes.
+          // The optimistic message uses a temp id and should be replaced instead of appended.
+          if (message.role === "user") {
+            const optimisticIndex = prev.findIndex((candidate) =>
+              candidate.role === "user"
+              && candidate.id.startsWith("temp-")
+              && candidate.content.trim() === message.content.trim(),
+            );
+            if (optimisticIndex >= 0) {
+              const next = [...prev];
+              next[optimisticIndex] = message;
+              return next;
+            }
+          }
+
           return [...prev, message];
         });
       }
