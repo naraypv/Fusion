@@ -267,7 +267,7 @@ export function createFusionAuthStorage(): AuthStorage {
               providers.add(p);
             }
           }
-          return Array.from(providers);
+          return Array.from(providers).filter((p) => !loggedOutProviders.has(p));
         };
       }
 
