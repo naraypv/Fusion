@@ -207,8 +207,10 @@ export function MailboxModal({
 
   const handleOpenMessage = useCallback(async (message: Message) => {
     setSelectedMessage(message);
-    // Mark as read if unread
-    if (!message.read) {
+    // Only auto-mark as read when viewing the dashboard user's own inbox.
+    // Browsing another agent's mailbox must not consume their unread messages
+    // out from under them — the agent's heartbeat is the one that reads + acks.
+    if (!message.read && activeTab === "inbox") {
       try {
         const updated = await markMessageRead(message.id, projectId);
         // Update inbox state
@@ -233,7 +235,7 @@ export function MailboxModal({
     } catch {
       setConversationMessages([message]);
     }
-  }, [projectId]);
+  }, [projectId, activeTab]);
 
   const handleCloseMessage = useCallback(() => {
     setSelectedMessage(null);

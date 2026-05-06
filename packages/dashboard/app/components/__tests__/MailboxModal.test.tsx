@@ -285,6 +285,53 @@ describe("MailboxModal", () => {
     });
   });
 
+  it("does not mark agent inbox messages as read when the dashboard user opens them", async () => {
+    const agentInboxMessage: Message = {
+      id: "msg-agent-unread",
+      fromId: "user-001",
+      fromType: "user",
+      toId: "agent-001",
+      toType: "agent",
+      content: "Important — please reply",
+      type: "user-to-agent",
+      read: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 1,
+      messages: [agentInboxMessage],
+      inbox: [agentInboxMessage],
+      outbox: [],
+    });
+    mockFetchConversation.mockResolvedValue([agentInboxMessage]);
+
+    render(<MailboxModal {...defaultProps} />);
+    fireEvent.click(screen.getByTestId("mailbox-tab-agents"));
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-agent-select")).toBeDefined();
+    });
+    fireEvent.change(screen.getByTestId("mailbox-agent-select"), { target: { value: "agent-001" } });
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-item-msg-agent-unread")).toBeDefined();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-agent-unread"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-message-detail")).toBeDefined();
+    });
+
+    // Critical: the dashboard user browsing an agent's mailbox MUST NOT
+    // consume the agent's unread state — the agent's heartbeat is the
+    // authoritative reader.
+    expect(mockMarkMessageRead).not.toHaveBeenCalled();
+  });
+
   it("shows back button in message detail", async () => {
     render(<MailboxModal {...defaultProps} />);
     await waitFor(() => {
