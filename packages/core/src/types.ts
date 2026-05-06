@@ -2115,6 +2115,34 @@ export interface BoardConfig {
   settings?: Settings;
 }
 
+/**
+ * Outcome of restoring the developer's pre-merge autostash after the merge
+ * completes. Surfaced on MergeResult so the UI / dashboard can show whether
+ * the dev's uncommitted work was reapplied cleanly, AI-resolved, or left
+ * stashed for manual recovery.
+ *
+ * Background: when rootDir is the developer's primary checkout, the merger
+ * stashes any uncommitted edits before running its hard resets, then applies
+ * them back at the end. Historically a pop conflict would log a warning and
+ * silently leave the stash in place — developers had no way to discover this
+ * had happened. See `restoreUnrelatedRootDirChanges` in merger.ts.
+ */
+export type AutostashOutcome =
+  | { status: "no-changes" }
+  | { status: "restored"; stashSha: string }
+  | {
+      status: "ai-resolved";
+      stashSha: string;
+      conflictedFiles: string[];
+    }
+  | {
+      status: "conflict-needs-manual";
+      stashSha: string;
+      conflictedFiles: string[];
+      message: string;
+    }
+  | { status: "failed"; stashSha?: string; errorMessage: string };
+
 export interface MergeResult extends MergeDetails {
   task: Task;
   branch: string;
@@ -2126,6 +2154,9 @@ export interface MergeResult extends MergeDetails {
   pushedToRemote?: boolean;
   /** Error message if push to remote failed. Non-fatal — merge is already committed locally. */
   pushError?: string;
+  /** Outcome of restoring the developer's pre-merge autostash, when one was
+   *  created. Absent when the working tree was already clean at merge start. */
+  autostash?: AutostashOutcome;
   /** Internal flag to track if a build retry has been attempted. Not persisted. */
   _buildRetried?: boolean;
 }
