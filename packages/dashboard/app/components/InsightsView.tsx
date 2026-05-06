@@ -25,7 +25,7 @@ import {
   Settings,
 } from "lucide-react";
 import { CustomModelDropdown } from "./CustomModelDropdown";
-import type { ModelInfo } from "../api";
+import { fetchModels, type ModelInfo } from "../api";
 import { useInsights, type InsightSection } from "../hooks/useInsights";
 import type { InsightCategory } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
@@ -56,7 +56,7 @@ const CATEGORY_ICONS: Record<InsightCategory, React.ComponentType<{ size?: numbe
   other: Sparkles,
 };
 
-export function InsightsView({ projectId, addToast, onClose, onCreateTask, models = [] }: InsightsViewProps) {
+export function InsightsView({ projectId, addToast, onClose, onCreateTask, models: modelsProp }: InsightsViewProps) {
   const {
     sections,
     loading,
@@ -87,6 +87,14 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask, model
   const [selectedModel, setSelectedModel] = useState<string>(
     () => localStorage.getItem("fusion-insight-model") ?? ""
   );
+
+  // Fetch models internally if not provided via prop
+  const [fetchedModels, setFetchedModels] = useState<ModelInfo[]>([]);
+  useEffect(() => {
+    if (modelsProp) return;
+    fetchModels().then((res) => setFetchedModels(res.models)).catch(() => {});
+  }, [modelsProp]);
+  const models = modelsProp ?? fetchedModels;
 
   const handleModelChange = useCallback((value: string) => {
     setSelectedModel(value);
