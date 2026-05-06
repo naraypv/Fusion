@@ -5,15 +5,31 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 export const REQUIRED_BUILD_PACKAGES = [
-  { name: "@fusion/core", distEntry: "packages/core/dist/index.js" },
-  { name: "@fusion/plugin-sdk", distEntry: "packages/plugin-sdk/dist/index.js" },
-  { name: "@fusion-plugin-examples/hermes-runtime", distEntry: "plugins/fusion-plugin-hermes-runtime/dist/index.js" },
-  { name: "@fusion-plugin-examples/openclaw-runtime", distEntry: "plugins/fusion-plugin-openclaw-runtime/dist/index.js" },
-  { name: "@fusion-plugin-examples/paperclip-runtime", distEntry: "plugins/fusion-plugin-paperclip-runtime/dist/index.js" },
+  { name: "@fusion/core", requiredArtifacts: ["packages/core/dist/index.js"] },
+  { name: "@fusion/plugin-sdk", requiredArtifacts: ["packages/plugin-sdk/dist/index.js"] },
+  {
+    name: "@fusion-plugin-examples/hermes-runtime",
+    requiredArtifacts: [
+      "plugins/fusion-plugin-hermes-runtime/dist/index.js",
+      "plugins/fusion-plugin-hermes-runtime/dist/cli-spawn.js",
+    ],
+  },
+  {
+    name: "@fusion-plugin-examples/openclaw-runtime",
+    requiredArtifacts: [
+      "plugins/fusion-plugin-openclaw-runtime/dist/index.js",
+      "plugins/fusion-plugin-openclaw-runtime/dist/runtime-adapter.js",
+      "plugins/fusion-plugin-openclaw-runtime/dist/pi-module.js",
+      "plugins/fusion-plugin-openclaw-runtime/dist/probe.js",
+    ],
+  },
+  { name: "@fusion-plugin-examples/paperclip-runtime", requiredArtifacts: ["plugins/fusion-plugin-paperclip-runtime/dist/index.js"] },
 ];
 
 export function detectMissingArtifacts(rootDir = process.cwd(), existsFn = existsSync) {
-  return REQUIRED_BUILD_PACKAGES.filter((pkg) => !existsFn(path.join(rootDir, pkg.distEntry)));
+  return REQUIRED_BUILD_PACKAGES.filter((pkg) =>
+    pkg.requiredArtifacts.some((artifactPath) => !existsFn(path.join(rootDir, artifactPath))),
+  );
 }
 
 function run(command, args, cwd) {
