@@ -210,6 +210,18 @@ Concrete references:
 - `prompt-overrides.ts` defines prompt key catalogs and per-role override validation
 - Provides override resolution/validation helpers (`resolvePrompt`, `resolveRolePrompts`, `assertValidPromptOverrideMap`)
 
+### Plugin Prompt Contributions
+
+- Plugin prompt contributions are filtered per surface through `PluginRunner.getPromptContributionsForSurface(surface)`.
+- Prompt assembly uses `buildPluginPromptSection(surface, pluginRunner)` in `packages/engine/src/agent-instructions.ts`.
+- Supported prompt surfaces:
+  - `executor-system`
+  - `executor-task`
+  - `triage`
+  - `reviewer`
+  - `heartbeat`
+- Integration points append the built plugin section to the role-specific system/task prompt only when contributions exist, preserving existing prompts when no plugins contribute.
+
 ### Agent Permissions
 
 - `agent-permissions.ts` normalizes permissions and computes effective access state

@@ -23,7 +23,11 @@ import { reviewStep, type ReviewVerdict } from "./reviewer.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { PRIORITY_SPECIFY, type AgentSemaphore } from "./concurrency.js";
 import { AgentLogger } from "./agent-logger.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import {
+  resolveAgentInstructions,
+  buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { planLog, reviewerLog, formatError } from "./logger.js";
 import {
@@ -975,6 +979,19 @@ export class TriageProcessor {
             || (isFast ? FAST_TRIAGE_SYSTEM_PROMPT : TRIAGE_SYSTEM_PROMPT),
           triageInstructions,
         );
+        const triageContributions = this.options.pluginRunner
+          ?.getPromptContributionsForSurface("triage")
+          ?? [];
+        if (triageContributions.length > 0) {
+          planLog.log(`${task.id}: applied ${triageContributions.length} plugin prompt contributions for triage surface`);
+        }
+        const triagePluginContributions = buildPluginPromptSection(
+          "triage",
+          this.options.pluginRunner,
+        );
+        const triageSystemPromptFinal = triagePluginContributions
+          ? `${triageSystemPrompt}\n\n${triagePluginContributions}`
+          : triageSystemPrompt;
 
         // Build skill selection context (assigned agent skills take precedence over role fallback)
         const skillContext = await buildSessionSkillContext({
@@ -990,7 +1007,7 @@ export class TriageProcessor {
           runtimeHint: triageRuntimeHint,
           pluginRunner: this.options.pluginRunner,
           cwd: this.rootDir,
-          systemPrompt: triageSystemPrompt,
+          systemPrompt: triageSystemPromptFinal,
           tools: "coding",
           customTools,
           onText: agentLogger.onText,
@@ -1238,7 +1255,7 @@ export class TriageProcessor {
               runtimeHint: triageRuntimeHint,
               pluginRunner: this.options.pluginRunner,
               cwd: this.rootDir,
-              systemPrompt: triageSystemPrompt,
+              systemPrompt: triageSystemPromptFinal,
               tools: "coding",
               customTools,
               onText: agentLogger.onText,

@@ -24,7 +24,12 @@ import { Type, type Static } from "@mariozechner/pi-ai";
 import { createHash } from "node:crypto";
 import { createTaskCreateTool, createTaskLogToolWithContext, createTaskDocumentWriteTool, createTaskDocumentReadTool, createListAgentsTool, createDelegateTaskTool, createGetAgentConfigTool, createUpdateAgentConfigTool, createSendMessageTool, createReadMessagesTool, createMemoryTools, createReadEvaluationsTool, createUpdateIdentityTool, createReflectOnPerformanceTool, taskCreateParams } from "./agent-tools.js";
 import { AgentLogger } from "./agent-logger.js";
-import { resolveAgentInstructionsWithRatings, buildSystemPromptWithInstructions, resolveAgentHeartbeatProcedure } from "./agent-instructions.js";
+import {
+  resolveAgentInstructionsWithRatings,
+  buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
+  resolveAgentHeartbeatProcedure,
+} from "./agent-instructions.js";
 import { heartbeatLog, formatError } from "./logger.js";
 import { createRunAuditor, type EngineRunContext } from "./run-audit.js";
 import { promptWithFallback } from "./pi.js";
@@ -1689,6 +1694,19 @@ export class HeartbeatMonitor {
           baseHeartbeatSystemPrompt,
           [resolvedInstructionsForIdentity, memoryInstructions, selfImprovePrompt].filter((part) => part.trim()).join("\n\n"),
         );
+        const heartbeatContributions = this.pluginRunner
+          ?.getPromptContributionsForSurface("heartbeat")
+          ?? [];
+        if (heartbeatContributions.length > 0) {
+          heartbeatLog.log(`applied ${heartbeatContributions.length} plugin prompt contributions for heartbeat surface`);
+        }
+        const heartbeatPluginContributions = buildPluginPromptSection(
+          "heartbeat",
+          this.pluginRunner,
+        );
+        const systemPromptFinal = heartbeatPluginContributions
+          ? `${systemPrompt}\n\n${heartbeatPluginContributions}`
+          : systemPrompt;
 
         // fn_heartbeat_done must be the last tool in the array (stable terminal signal)
         heartbeatTools.push(heartbeatDoneTool);
@@ -1717,7 +1735,7 @@ export class HeartbeatMonitor {
           runtimeHint: extractRuntimeHint(agent.runtimeConfig),
           pluginRunner: this.pluginRunner,
           cwd: rootDir,
-          systemPrompt,
+          systemPrompt: systemPromptFinal,
           tools: "coding",
           customTools: heartbeatTools,
           ...(() => {
@@ -1956,7 +1974,7 @@ export class HeartbeatMonitor {
           try {
             const runWithPrompts: AgentHeartbeatRun = {
               ...run,
-              systemPrompt: truncatePrompt(systemPrompt, 100_000),
+              systemPrompt: truncatePrompt(systemPromptFinal, 100_000),
               executionPrompt: truncatePrompt(executionPrompt, 100_000),
               heartbeatProcedureSource: customProcedure ? "custom" : "default",
             };

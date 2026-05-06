@@ -697,6 +697,103 @@ describe("fast-mode triage", () => {
     expect(capturedSystemPrompt).toContain("## Review Level");
   });
 
+  it("includes triage plugin contributions when provided", async () => {
+    const task = createTriageTask({ id: "FN-FAST-PLUGIN-001", executionMode: "standard" });
+    const store = createMockStore({
+      getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+    });
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockImplementation((surface: string) => {
+        if (surface !== "triage") return [];
+        return [{ pluginId: "plugin-triage", contribution: { surface: "triage", content: "Use plugin triage policy." }, config: {} }];
+      }),
+      getPluginSkills: vi.fn().mockReturnValue([]),
+    };
+
+    let capturedSystemPrompt = "";
+    mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
+      capturedSystemPrompt = opts.systemPrompt;
+      return {
+        session: {
+          state: {},
+          sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          navigateTree: vi.fn(),
+        },
+      };
+    });
+
+    const processor = new TriageProcessor(store, "/tmp/root", { pluginRunner: pluginRunner as any });
+    await processor.specifyTask(task);
+
+    expect(capturedSystemPrompt).toContain("## Plugin: plugin-triage");
+    expect(capturedSystemPrompt).toContain("Use plugin triage policy.");
+  });
+
+  it("keeps triage prompt unchanged when no triage plugin contributions exist", async () => {
+    const task = createTriageTask({ id: "FN-FAST-PLUGIN-002", executionMode: "standard" });
+    const store = createMockStore({
+      getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+    });
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([]),
+      getPluginSkills: vi.fn().mockReturnValue([]),
+    };
+
+    let capturedSystemPrompt = "";
+    mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
+      capturedSystemPrompt = opts.systemPrompt;
+      return {
+        session: {
+          state: {},
+          sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          navigateTree: vi.fn(),
+        },
+      };
+    });
+
+    const processor = new TriageProcessor(store, "/tmp/root", { pluginRunner: pluginRunner as any });
+    await processor.specifyTask(task);
+
+    expect(capturedSystemPrompt).not.toContain("## Plugin:");
+  });
+
+  it("applies triage plugin contributions in fast mode too", async () => {
+    const task = createTriageTask({ id: "FN-FAST-PLUGIN-003", executionMode: "fast" });
+    const store = createMockStore({
+      getTask: vi.fn().mockResolvedValue({ ...mockTaskDetail, id: task.id, attachments: [], comments: [] }),
+    });
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([
+        { pluginId: "plugin-fast", contribution: { surface: "triage", content: "Fast mode plugin note." }, config: {} },
+      ]),
+      getPluginSkills: vi.fn().mockReturnValue([]),
+    };
+
+    let capturedSystemPrompt = "";
+    mockCreateFnAgent.mockImplementationOnce(async (opts: any) => {
+      capturedSystemPrompt = opts.systemPrompt;
+      return {
+        session: {
+          state: {},
+          sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          navigateTree: vi.fn(),
+        },
+      };
+    });
+
+    const processor = new TriageProcessor(store, "/tmp/root", { pluginRunner: pluginRunner as any });
+    await processor.specifyTask(task);
+
+    expect(capturedSystemPrompt).toContain("This task is running in **fast mode**");
+    expect(capturedSystemPrompt).toContain("## Plugin: plugin-fast");
+  });
+
   it("auto-approves fn_review_spec in fast mode without calling reviewer", async () => {
     const rootDir = await createTriageFixtureRoot("fusion-triage-fast-review-");
     try {

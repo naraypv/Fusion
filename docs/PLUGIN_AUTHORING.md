@@ -20,7 +20,7 @@ A comprehensive guide to creating Fusion plugins that extend the task board with
 14. [Example Plugins](#14-example-plugins)
 15. [Registering Skills](#15-registering-skills)
 16. [Registering Workflow Steps](#16-registering-workflow-steps)
-17. [Plugin Prompt Contributions](#17-plugin-prompt-contributions)
+17. [Contributing Prompt Modifications](#17-contributing-prompt-modifications)
 18. [Plugin Binary Setup Hooks](#18-plugin-binary-setup-hooks)
 
 ---
@@ -1240,7 +1240,7 @@ const workflowSteps: PluginWorkflowStepContribution[] = [
 
 Use `mode: "prompt" | "script"` and `toolMode: "readonly" | "coding"`.
 
-## 17. Plugin Prompt Contributions
+## 17. Contributing Prompt Modifications
 
 Prompt contributions let a plugin inject additional instructions into specific prompt surfaces.
 
@@ -1251,6 +1251,12 @@ Supported surfaces:
 - `reviewer`
 - `heartbeat`
 
+Each contribution uses the `PluginPromptContribution` shape:
+- `surface`: one of the five supported surfaces
+- `content`: prompt text to inject
+- `position?`: `"append"` (default) or `"prepend"`
+- `condition?`: optional human-readable condition note
+
 ```typescript
 import type { PluginPromptContributions } from "@fusion/plugin-sdk";
 
@@ -1258,10 +1264,10 @@ const promptContributions: PluginPromptContributions = {
   enabledByDefault: false,
   contributions: [
     {
-      surface: "reviewer",
+      surface: "executor-system",
       position: "append",
-      content: "Always call out missing tests and unsafe assumptions.",
-      condition: "Only for backend code changes",
+      content: "Always summarize browser-derived evidence with source URLs.",
+      condition: "When browser tooling is available",
     },
   ],
 };

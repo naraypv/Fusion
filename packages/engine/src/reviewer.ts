@@ -16,7 +16,11 @@ import { buildSessionSkillContext } from "./session-skill-context.js";
 import { AgentLogger } from "./agent-logger.js";
 import { reviewerLog } from "./logger.js";
 import { checkSessionError } from "./usage-limit-detector.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import {
+  resolveAgentInstructions,
+  buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { createMemoryGetTool, createMemorySearchTool } from "./agent-tools.js";
 
@@ -408,6 +412,19 @@ export async function reviewStep(
     reviewerBasePrompt + memorySection,
     reviewerInstructions,
   );
+  const reviewerContributions = options.pluginRunner
+    ?.getPromptContributionsForSurface("reviewer")
+    ?? [];
+  if (reviewerContributions.length > 0) {
+    reviewerLog.log(`applied ${reviewerContributions.length} plugin prompt contributions for reviewer surface`);
+  }
+  const reviewerPluginContributions = buildPluginPromptSection(
+    "reviewer",
+    options.pluginRunner,
+  );
+  const reviewerSystemPromptFinal = reviewerPluginContributions
+    ? `${reviewerSystemPrompt}\n\n${reviewerPluginContributions}`
+    : reviewerSystemPrompt;
 
   // Build skill selection context (assigned agent skills take precedence over role fallback)
   let skillContext = undefined;
@@ -477,7 +494,7 @@ export async function reviewStep(
       runtimeHint: extractRuntimeHint(memoryAgent?.runtimeConfig),
       pluginRunner: options.pluginRunner,
       cwd,
-      systemPrompt: reviewerSystemPrompt,
+      systemPrompt: reviewerSystemPromptFinal,
       tools: "readonly",
       customTools: memoryTools,
       onText: agentLogger ? agentLogger.onText : (delta) => options.onText?.(delta),

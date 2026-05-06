@@ -8,6 +8,7 @@ import {
   resolveAgentInstructionsWithRatings,
   buildAgentChatPrompt,
   buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
   ensureDefaultHeartbeatProcedureFile,
   resolveAgentHeartbeatProcedure,
 } from "../agent-instructions.js";
@@ -552,6 +553,38 @@ describe("buildSystemPromptWithInstructions", () => {
     expect(result).toBe(
       "Base prompt\n\n## Custom Instructions\n\nUse strict TypeScript.",
     );
+  });
+});
+
+describe("buildPluginPromptSection", () => {
+  it("returns empty string when pluginRunner is undefined", () => {
+    expect(buildPluginPromptSection("triage", undefined)).toBe("");
+  });
+
+  it("returns empty string when no contributions match", () => {
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([]),
+    };
+
+    expect(buildPluginPromptSection("triage", pluginRunner as any)).toBe("");
+  });
+
+  it("formats grouped plugin sections and prepend-before-append ordering", () => {
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([
+        { pluginId: "plugin-b", contribution: { surface: "triage", content: "append B1" }, config: {} },
+        { pluginId: "plugin-a", contribution: { surface: "triage", content: "prepend A1", position: "prepend" }, config: {} },
+        { pluginId: "plugin-a", contribution: { surface: "triage", content: "prepend A2", position: "prepend" }, config: {} },
+        { pluginId: "plugin-c", contribution: { surface: "triage", content: "append C1", position: "append" }, config: {} },
+      ]),
+    };
+
+    const result = buildPluginPromptSection("triage", pluginRunner as any);
+
+    expect(result).toContain("## Plugin: plugin-a\n\nprepend A1\n\nprepend A2");
+    expect(result).toContain("## Plugin: plugin-b\n\nappend B1");
+    expect(result).toContain("## Plugin: plugin-c\n\nappend C1");
+    expect(result.indexOf("## Plugin: plugin-a")).toBeLessThan(result.indexOf("## Plugin: plugin-b"));
   });
 });
 

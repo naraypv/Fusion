@@ -42,7 +42,11 @@ import type { StuckTaskDetector, StuckTaskEvent } from "./stuck-task-detector.js
 import type { PluginRunner } from "./plugin-runner.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { StepSessionExecutor } from "./step-session-executor.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import {
+  resolveAgentInstructions,
+  buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from "./run-audit.js";
 import { evaluateSpecStaleness, getPromptPath } from "./spec-staleness.js";
@@ -2884,6 +2888,17 @@ export class TaskExecutor {
           getExecutorSystemPrompt(settings),
           executorInstructions,
         );
+        const executorSystemContributions = this.options.pluginRunner?.getPromptContributionsForSurface("executor-system") ?? [];
+        if (executorSystemContributions.length > 0) {
+          executorLog.log(`${task.id}: applied ${executorSystemContributions.length} plugin prompt contributions for executor-system surface`);
+        }
+        const executorPluginContributions = buildPluginPromptSection(
+          "executor-system",
+          this.options.pluginRunner,
+        );
+        const executorSystemPromptFinal = executorPluginContributions
+          ? `${executorSystemPrompt}\n\n${executorPluginContributions}`
+          : executorSystemPrompt;
 
         // sessionFile must be let because it's destructured alongside session which is reassigned
         // eslint-disable-next-line prefer-const
@@ -2892,7 +2907,7 @@ export class TaskExecutor {
           runtimeHint: executorRuntimeHint,
           pluginRunner: this.options.pluginRunner,
           cwd: worktreePath,
-          systemPrompt: executorSystemPrompt,
+          systemPrompt: executorSystemPromptFinal,
           tools: "coding",
           customTools,
           onText: agentLogger.onText,
@@ -2970,7 +2985,13 @@ export class TaskExecutor {
               "Review the current state of your worktree and proceed with the next pending step.",
             ].join("\n"));
           } else {
-            const agentPrompt = buildExecutionPrompt(detail, this.rootDir, settings, worktreePath);
+            const agentPrompt = buildExecutionPrompt(
+              detail,
+              this.rootDir,
+              settings,
+              worktreePath,
+              this.options.pluginRunner,
+            );
             await promptWithFallback(session, agentPrompt);
           }
 
@@ -3196,7 +3217,7 @@ export class TaskExecutor {
                 runtimeHint: executorRuntimeHint,
                 pluginRunner: this.options.pluginRunner,
                 cwd: worktreePath,
-                systemPrompt: executorSystemPrompt,
+                systemPrompt: executorSystemPromptFinal,
                 tools: "coding",
                 customTools,
                 onText: agentLogger.onText,
@@ -3248,7 +3269,7 @@ export class TaskExecutor {
                   "Do NOT ask for permission. Do NOT write a summary. Just call a tool and keep working.",
                   "",
                   "Original task:",
-                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath),
+                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath, this.options.pluginRunner),
                 ].join("\n");
               } else {
                 retryPrompt = [
@@ -3258,7 +3279,7 @@ export class TaskExecutor {
                   "2. If there is remaining work, finish it and then call fn_task_done.",
                   "",
                   "Original task:",
-                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath),
+                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath, this.options.pluginRunner),
                 ].join("\n");
               }
 
@@ -6926,7 +6947,13 @@ function buildSourceIssueRef(sourceIssue: TaskDetail["sourceIssue"]): string {
   return `${sourceIssue.repository}#${issueNumber}`;
 }
 
-export function buildExecutionPrompt(task: TaskDetail, rootDir?: string, settings?: Settings, worktreePath?: string): string {
+export function buildExecutionPrompt(
+  task: TaskDetail,
+  rootDir?: string,
+  settings?: Settings,
+  worktreePath?: string,
+  pluginRunner?: PluginRunner,
+): string {
   const prompt = scopePromptToWorktree(task.prompt, rootDir, worktreePath);
   const reviewMatch = prompt.match(/##\s*Review Level[:\s]*(\d)/);
   const reviewLevel = reviewMatch ? parseInt(reviewMatch[1], 10) : 0;
@@ -7020,6 +7047,12 @@ git log --oneline
     steeringSection = lines.join("\n");
   }
 
+  const taskPromptContributions = pluginRunner?.getPromptContributionsForSurface("executor-task") ?? [];
+  if (taskPromptContributions.length > 0) {
+    executorLog.log(`${task.id}: applied ${taskPromptContributions.length} plugin prompt contributions for executor-task surface`);
+  }
+  const pluginTaskContributions = buildPluginPromptSection("executor-task", pluginRunner);
+
   return `Execute this task.
 
 ## Task: ${task.id}
@@ -7038,6 +7071,10 @@ ${reviewLevel >= 1 ? `Before implementing each step (except Step 0 and the final
 ${reviewLevel >= 2 ? `After implementing + committing each step, call:
 \`fn_review_step(step=N, type="code", step_name="...", baseline="<SHA from before step>")\`` : ""}
 ${reviewLevel >= 3 ? `After tests, also call fn_review_step with type="code" for test review.` : ""}
+${pluginTaskContributions ? `
+
+${pluginTaskContributions}
+` : ""}
 
 ## Worktree Boundaries
 

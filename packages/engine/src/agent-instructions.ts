@@ -6,7 +6,9 @@ import {
   type Agent,
   type AgentRatingSummary,
   type AgentStore,
+  type PluginPromptSurface,
 } from "@fusion/core";
+import type { PluginRunner } from "./plugin-runner.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("agent-instructions");
@@ -382,4 +384,39 @@ export function buildSystemPromptWithInstructions(
 ): string {
   if (!instructions.trim()) return basePrompt;
   return `${basePrompt}\n\n## Custom Instructions\n\n${instructions}`;
+}
+
+export function buildPluginPromptSection(
+  surface: PluginPromptSurface,
+  pluginRunner: PluginRunner | undefined,
+): string {
+  if (!pluginRunner) {
+    return "";
+  }
+
+  const contributions = pluginRunner.getPromptContributionsForSurface(surface);
+  if (contributions.length === 0) {
+    return "";
+  }
+
+  const prependByPlugin = new Map<string, string[]>();
+  const appendByPlugin = new Map<string, string[]>();
+
+  for (const { pluginId, contribution } of contributions) {
+    const target = contribution.position === "prepend" ? prependByPlugin : appendByPlugin;
+    const existing = target.get(pluginId) ?? [];
+    existing.push(contribution.content);
+    target.set(pluginId, existing);
+  }
+
+  const toSections = (group: Map<string, string[]>): string[] => {
+    return Array.from(group.entries()).map(([pluginId, contents]) => {
+      return `## Plugin: ${pluginId}\n\n${contents.join("\n\n")}`;
+    });
+  };
+
+  const sections = [...toSections(prependByPlugin), ...toSections(appendByPlugin)];
+
+  log.log(`Applied ${contributions.length} prompt contributions for surface '${surface}'`);
+  return sections.join("\n\n");
 }

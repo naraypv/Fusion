@@ -146,6 +146,47 @@ describe("reviewStep — spec review type", () => {
     expect(opts.systemPrompt).toContain("Mission clarity");
   });
 
+  it("appends reviewer plugin prompt contributions when provided", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
+    );
+
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([
+        { pluginId: "plugin-review", contribution: { content: "Follow plugin reviewer rubric." } },
+      ]),
+    };
+
+    await reviewStep(
+      "/tmp/worktree", "FN-050", 0, "Spec Review", "spec", "# Task: KB-050",
+      undefined,
+      { pluginRunner: pluginRunner as any },
+    );
+
+    const opts = mockedCreateFnAgent.mock.calls[0][0];
+    expect(opts.systemPrompt).toContain("## Plugin: plugin-review");
+    expect(opts.systemPrompt).toContain("Follow plugin reviewer rubric.");
+  });
+
+  it("keeps reviewer system prompt unchanged when no reviewer plugin contributions exist", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
+    );
+
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([]),
+    };
+
+    await reviewStep(
+      "/tmp/worktree", "FN-050", 0, "Spec Review", "spec", "# Task: KB-050",
+      undefined,
+      { pluginRunner: pluginRunner as any },
+    );
+
+    const opts = mockedCreateFnAgent.mock.calls[0][0];
+    expect(opts.systemPrompt).not.toContain("## Plugin:");
+  });
+
   it("injects read-only memory instructions and tools when project memory is enabled", async () => {
     mockedCreateFnAgent.mockResolvedValue(
       createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
