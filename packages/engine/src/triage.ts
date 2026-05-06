@@ -525,27 +525,7 @@ export class TriageProcessor {
     // When globalPause transitions from false → true, terminate all active triage sessions.
     store.on("settings:updated", ({ settings, previous }) => {
       if (settings.globalPause && !previous.globalPause) {
-        // Dispose every reviewer subagent first so they don't keep streaming
-        // verdicts while the main triage session is being torn down.
-        for (const taskId of [...this.activeSubagentSessions.keys()]) {
-          this.disposeSubagentsForTask(taskId, "global pause");
-        }
-        for (const [taskId, session] of this.activeSessions) {
-          planLog.log(
-            `Global pause — terminating triage session for ${taskId}`,
-          );
-          this.pauseAborted.add(taskId);
-          this.options.stuckTaskDetector?.untrackTask(taskId);
-          // abort() interrupts any in-flight LLM stream / tool call;
-          // dispose() then releases session resources.
-          const sessionWithAbort = session as { abort?: () => Promise<void>; dispose: () => void };
-          if (typeof sessionWithAbort.abort === "function") {
-            void sessionWithAbort.abort().catch((err) => {
-              planLog.warn(`Failed to abort triage session for ${taskId}: ${err}`);
-            });
-          }
-          session.dispose();
-        }
+        this.abortAndDisposeActiveSessions("global pause");
       }
     });
 
@@ -618,7 +598,40 @@ export class TriageProcessor {
       this.pollInterval = null;
       this.activePollMs = null;
     }
+    // Tear down any in-flight specify sessions and reviewer subagents so they
+    // don't keep streaming LLM tokens / tool calls past engine shutdown.
+    this.abortAndDisposeActiveSessions("engine stop");
     planLog.log("Processor stopped");
+  }
+
+  /**
+   * Abort and dispose every active specify session and reviewer subagent.
+   * Used by the global-pause handler and by `stop()`.
+   *
+   * Reviewer subagents are torn down first so they don't keep streaming
+   * verdicts while the main triage session is being disposed. abort()
+   * interrupts any in-flight LLM stream / tool call; dispose() then
+   * releases session resources.
+   */
+  private abortAndDisposeActiveSessions(reason: string): void {
+    for (const taskId of [...this.activeSubagentSessions.keys()]) {
+      this.disposeSubagentsForTask(taskId, reason);
+    }
+    for (const [taskId, session] of this.activeSessions) {
+      planLog.log(`${reason} — terminating triage session for ${taskId}`);
+      this.pauseAborted.add(taskId);
+      this.options.stuckTaskDetector?.untrackTask(taskId);
+      const sessionWithAbort = session as {
+        abort?: () => Promise<void>;
+        dispose: () => void;
+      };
+      if (typeof sessionWithAbort.abort === "function") {
+        void sessionWithAbort.abort().catch((err) => {
+          planLog.warn(`Failed to abort triage session for ${taskId}: ${err}`);
+        });
+      }
+      session.dispose();
+    }
   }
 
   /**

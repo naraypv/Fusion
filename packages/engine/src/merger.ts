@@ -785,6 +785,10 @@ Do not refactor, rename broadly, or make opportunistic improvements.
         taskTitle: taskForSkillContext?.title,
       }),
     });
+    // Register so engine.stop() can dispose this session — without this the
+    // fix agent keeps streaming past shutdown because it's not the autostash
+    // session that the engine tracks.
+    options.onSession?.(session);
 
     const runId = mergeRunContext?.runId;
     const agentId = mergeRunContext?.agentId ?? "merger";
@@ -2725,6 +2729,7 @@ async function resolveComplexRebaseConflictsWithAi(
     pluginRunner?: import("./plugin-runner.js").PluginRunner;
     signal?: AbortSignal;
     runtimeHint?: string;
+    onSession?: (session: { dispose: () => void }) => void;
   },
 ): Promise<void> {
   mergerLog.log(`${taskId}: resolving ${conflictedFiles.length} complex rebase conflict(s) with AI`);
@@ -2780,6 +2785,10 @@ You are assisting with a paused \`git pull --rebase\`.
       taskId,
     }),
   });
+  // Register so engine.stop() can dispose this session — without this, an
+  // in-progress rebase conflict resolution keeps streaming past shutdown
+  // (the engine only tracks the autostash session by default).
+  options?.onSession?.(session);
 
   const prompt = [
     `Resolve rebase conflicts for task ${taskId}.`,
@@ -2814,7 +2823,12 @@ async function resolveRebaseConflictSet(
   rootDir: string,
   taskId: string,
   settings: Settings,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<void> {
   const conflictedFiles = await getConflictedFiles(rootDir);
   if (conflictedFiles.length === 0) return;
@@ -2857,7 +2871,12 @@ async function pullWithRebaseAndResolveConflicts(
   settings: Settings,
   remote: string,
   branch: string,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<void> {
   const pullCommand = `git pull --rebase ${quoteArg(remote)} ${quoteArg(branch)}`;
   try {
@@ -2948,7 +2967,12 @@ export async function pushToRemoteAfterMerge(
   rootDir: string,
   taskId: string,
   settings: Settings,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<{ pushed: boolean; error?: string }> {
   let target: { remote: string; branch: string };
 
@@ -4412,6 +4436,7 @@ export async function aiMergeTask(
         onAgentText: options.onAgentText,
         signal: options.signal,
         runtimeHint: pushRuntimeHint,
+        onSession: options.onSession,
       });
       if (pushResult.pushed) {
         mergerLog.log(`${taskId}: pushed merged result to remote`);
