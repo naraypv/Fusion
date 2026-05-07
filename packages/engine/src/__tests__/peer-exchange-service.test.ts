@@ -49,6 +49,9 @@ describe("PeerExchangeService", () => {
   let mockReportMeshState: ReturnType<typeof vi.fn>;
   let mockGetSettingsForSync: ReturnType<typeof vi.fn>;
   let mockApplyRemoteSettings: ReturnType<typeof vi.fn>;
+  let mockGetProjectSettingsSnapshot: ReturnType<typeof vi.fn>;
+  let mockGetAuthMaterialSnapshot: ReturnType<typeof vi.fn>;
+  let mockApplyProjectSettingsSnapshot: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -61,6 +64,9 @@ describe("PeerExchangeService", () => {
     mockReportMeshState = vi.fn();
     mockGetSettingsForSync = vi.fn();
     mockApplyRemoteSettings = vi.fn();
+    mockGetProjectSettingsSnapshot = vi.fn();
+    mockGetAuthMaterialSnapshot = vi.fn();
+    mockApplyProjectSettingsSnapshot = vi.fn();
 
     mockCentralCore = {
       listNodes: mockListNodes,
@@ -69,6 +75,9 @@ describe("PeerExchangeService", () => {
       reportMeshState: mockReportMeshState,
       getSettingsForSync: mockGetSettingsForSync,
       applyRemoteSettings: mockApplyRemoteSettings,
+      getProjectSettingsSnapshot: mockGetProjectSettingsSnapshot,
+      getAuthMaterialSnapshot: mockGetAuthMaterialSnapshot,
+      applyProjectSettingsSnapshot: mockApplyProjectSettingsSnapshot,
     } as unknown as CentralCore;
 
     mockFetch = vi.fn();
@@ -386,6 +395,8 @@ describe("PeerExchangeService", () => {
       const service = new PeerExchangeService(mockCentralCore, { settingsSyncEnabled: true });
       const payload = makeSettingsPayload({ checksum: "local-checksum-123" });
       mockGetSettingsForSync.mockResolvedValue(payload);
+      mockGetProjectSettingsSnapshot.mockResolvedValue({ version: 1, exportedAt: payload.exportedAt, checksum: payload.checksum, payload: { global: {} } });
+      mockGetAuthMaterialSnapshot.mockReturnValue({ version: 1, exportedAt: payload.exportedAt, checksum: "auth-checksum", payload: { providerAuth: {} } });
       setupSuccessfulSync();
 
       await service.syncWithNode(makeNode());
@@ -395,6 +406,7 @@ describe("PeerExchangeService", () => {
       const body = JSON.parse(call[1].body);
       expect(body.settings).toBeDefined();
       expect(body.settings.checksum).toBe("local-checksum-123");
+      expect(body.sharedState?.projectSettings?.checksum).toBe("local-checksum-123");
     });
 
     it("should include settings on first sync with a node (no throttle entry)", async () => {
@@ -537,7 +549,7 @@ describe("PeerExchangeService", () => {
       const localPayload = makeSettingsPayload({ checksum: "local-checksum" });
       const remotePayload = makeSettingsPayload({ checksum: "remote-checksum" });
       mockGetSettingsForSync.mockResolvedValue(localPayload);
-      mockApplyRemoteSettings.mockResolvedValue({
+      mockApplyProjectSettingsSnapshot.mockResolvedValue({
         success: true,
         globalCount: 5,
         projectCount: 2,
@@ -554,13 +566,16 @@ describe("PeerExchangeService", () => {
           knownPeers: [],
           newPeers: [],
           timestamp: "2026-04-01T12:00:00.000Z",
-          settings: remotePayload,
+          sharedState: {
+            projectSettings: remotePayload,
+            authMaterial: { ...remotePayload, payload: { providerAuth: {} } },
+          },
         }),
       });
 
       const result = await service.syncWithNode(makeNode());
 
-      expect(mockApplyRemoteSettings).toHaveBeenCalledWith(remotePayload);
+      expect(mockApplyProjectSettingsSnapshot).toHaveBeenCalledWith(remotePayload);
       expect(result.settingsApplied).toBe(true);
       expect(result.settingsVersion).toBe("remote-checksum");
     });

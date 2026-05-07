@@ -2535,6 +2535,33 @@ export interface PeerInfo {
 }
 
 /** Request payload sent when a node initiates a peer sync. */
+export interface SnapshotBase {
+  version: number;
+  exportedAt: string;
+  checksum: string;
+}
+
+export interface SharedMeshStatePayload {
+  taskMetadata?: SnapshotBase & { payload: { tasks: Task[] } };
+  missionHierarchy?: SnapshotBase & {
+    payload: {
+      missions: import("./mission-types.js").Mission[];
+      milestones: import("./mission-types.js").Milestone[];
+      slices: import("./mission-types.js").Slice[];
+      features: import("./mission-types.js").MissionFeature[];
+      missionEvents: import("./mission-types.js").MissionEvent[];
+      assertions: import("./mission-types.js").MissionContractAssertion[];
+      featureAssertionLinks: import("./mission-types.js").FeatureAssertionLink[];
+    };
+  };
+  agents?: SnapshotBase & { payload: { agents: Agent[]; blockedStates: { agentId: string; state: BlockedStateSnapshot }[] } };
+  agentRuns?: SnapshotBase & { payload: { runs: AgentHeartbeatRun[] } };
+  activityLog?: SnapshotBase & { payload: { entries: ActivityLogEntry[] } };
+  runAudit?: SnapshotBase & { payload: { entries: RunAuditEvent[] } };
+  projectSettings?: SnapshotBase & { payload: { global: GlobalSettings; projects?: Record<string, ProjectSettings> } };
+  authMaterial?: SnapshotBase & { payload: { providerAuth?: Record<string, ProviderAuthEntry> } };
+}
+
 export interface PeerSyncRequest {
   /** Node ID of the sender. */
   senderNodeId: string;
@@ -2546,6 +2573,8 @@ export interface PeerSyncRequest {
   timestamp: string;
   /** Optional settings sync payload included in the request. */
   settings?: SettingsSyncPayload;
+  /** Optional shared-state payload included in the request. */
+  sharedState?: SharedMeshStatePayload;
 }
 
 /** Response payload returned after a peer sync exchange. */
@@ -2562,6 +2591,8 @@ export interface PeerSyncResponse {
   timestamp: string;
   /** Optional settings sync payload included in the response. */
   settings?: SettingsSyncPayload;
+  /** Optional shared-state payload included in the response. */
+  sharedState?: SharedMeshStatePayload;
 }
 
 /** A single provider's authentication credential for sync transport. */

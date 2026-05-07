@@ -485,6 +485,8 @@ export type {
   SettingsSyncPayload,
   SettingsSyncState,
   SettingsSyncResult,
+  SharedMeshStatePayload,
+  SnapshotBase,
   SystemMetrics,
   ProjectStatus,
   RegisteredProject,

@@ -1,4 +1,9 @@
-import type { CentralCore, GlobalSettings, SettingsSyncPayload } from "@fusion/core";
+import type {
+  CentralCore,
+  GlobalSettings,
+  SettingsSyncPayload,
+  SharedMeshStatePayload,
+} from "@fusion/core";
 import type { NodeConfig, PeerSyncRequest, PeerSyncResponse } from "@fusion/core";
 import { peerExchangeLog } from "./logger.js";
 
@@ -57,6 +62,8 @@ export class PeerExchangeService {
   private lastSettingsSyncByNode = new Map<string, { version: string; timestamp: number }>();
   /** Cached settings payload from the last successful getSettingsForSync call. */
   private cachedSettingsPayload: SettingsSyncPayload | null = null;
+  /** Cached shared-state settings/auth payload built from canonical snapshots. */
+  private cachedSharedStatePayload: SharedMeshStatePayload | null = null;
   /** Global settings provided via options. */
   private globalSettings?: GlobalSettings;
   /** Provider auth credentials provided via options. */
@@ -87,6 +94,7 @@ export class PeerExchangeService {
     this.globalSettings = settings;
     // Invalidate cache to ensure fresh payload on next sync
     this.cachedSettingsPayload = null;
+    this.cachedSharedStatePayload = null;
   }
 
   /**
@@ -309,6 +317,7 @@ export class PeerExchangeService {
 
           if (shouldIncludeSettings) {
             request.settings = this.cachedSettingsPayload;
+            request.sharedState = await this.getSharedStateSettingsBundle();
           }
         } catch (err) {
           // Log error but continue with peer sync
@@ -359,45 +368,46 @@ export class PeerExchangeService {
         const mergeResult = await this.centralCore.mergePeers(peerResponse.knownPeers);
 
         // ── Process remote settings if included in response ──
-        if (peerResponse.settings && this.settingsSyncEnabled) {
-          settingsVersion = peerResponse.settings.checksum;
+        if (this.settingsSyncEnabled && (peerResponse.sharedState || peerResponse.settings)) {
+          const remoteChecksum =
+            peerResponse.sharedState?.projectSettings?.checksum ??
+            peerResponse.settings?.checksum;
+          settingsVersion = remoteChecksum;
 
-          // Check if we should apply remote settings
-          // Apply if remote checksum is different from our cached checksum
           const localChecksum = this.cachedSettingsPayload?.checksum ?? "";
 
-          if (peerResponse.settings.checksum !== localChecksum) {
+          if (remoteChecksum && remoteChecksum !== localChecksum) {
             try {
-              const applyResult = await this.centralCore.applyRemoteSettings(peerResponse.settings);
+              const applyResult = await this.applyRemoteSharedState(peerResponse.sharedState, peerResponse.settings);
 
               if (applyResult.success) {
                 settingsApplied = true;
                 peerExchangeLog.log(
-                  `Applied remote settings from ${node.name} (version: ${peerResponse.settings.checksum}, ` +
-                  `global: ${applyResult.globalCount}, projects: ${applyResult.projectCount}, auth: ${applyResult.authCount})`
+                  `Applied remote settings from ${node.name} (version: ${remoteChecksum}, ` +
+                    `global: ${applyResult.globalCount}, projects: ${applyResult.projectCount}, auth: ${applyResult.authCount})`,
                 );
                 // Invalidate cache to ensure fresh data on next sync
                 this.cachedSettingsPayload = null;
+                this.cachedSharedStatePayload = null;
               } else {
-                peerExchangeLog.warn(
-                  `Failed to apply remote settings from ${node.name}: ${applyResult.error}`
-                );
+                peerExchangeLog.warn(`Failed to apply remote settings from ${node.name}: ${applyResult.error}`);
               }
             } catch (err) {
               const error = err instanceof Error ? err.message : String(err);
               peerExchangeLog.warn(`Settings sync error with ${node.name}: ${error}`);
             }
-          } else {
+          } else if (remoteChecksum) {
             peerExchangeLog.log(
-              `Remote settings from ${node.name} are up-to-date (version: ${peerResponse.settings.checksum})`
+              `Remote settings from ${node.name} are up-to-date (version: ${remoteChecksum})`,
             );
           }
 
-          // Update throttle tracking
-          this.lastSettingsSyncByNode.set(node.id, {
-            version: peerResponse.settings.checksum,
-            timestamp: Date.now(),
-          });
+          if (remoteChecksum) {
+            this.lastSettingsSyncByNode.set(node.id, {
+              version: remoteChecksum,
+              timestamp: Date.now(),
+            });
+          }
         }
 
         peerExchangeLog.log(
@@ -430,5 +440,54 @@ export class PeerExchangeService {
       }
       return { nodeId: node.id, success: false, added: 0, updated: 0, error: message };
     }
+  }
+
+  private async getSharedStateSettingsBundle(): Promise<SharedMeshStatePayload | undefined> {
+    if (this.cachedSharedStatePayload) {
+      return this.cachedSharedStatePayload;
+    }
+    const globalSettings = this.globalSettings ?? {};
+    const core = this.centralCore as CentralCore & {
+      getProjectSettingsSnapshot?: (settings: GlobalSettings) => Promise<SharedMeshStatePayload["projectSettings"]>;
+      getAuthMaterialSnapshot?: (
+        providerAuth?: Record<string, { type: "api_key" | "oauth"; key?: string; accessToken?: string; authenticated?: boolean }>,
+      ) => SharedMeshStatePayload["authMaterial"];
+    };
+    if (!core.getProjectSettingsSnapshot || !core.getAuthMaterialSnapshot) {
+      return undefined;
+    }
+    const projectSettings = await core.getProjectSettingsSnapshot(globalSettings);
+    const authMaterial = core.getAuthMaterialSnapshot(this.providerAuth);
+    this.cachedSharedStatePayload = { projectSettings, authMaterial };
+    return this.cachedSharedStatePayload;
+  }
+
+  private async applyRemoteSharedState(
+    sharedState: SharedMeshStatePayload | undefined,
+    fallbackSettings: SettingsSyncPayload | undefined,
+  ): Promise<{ success: boolean; globalCount: number; projectCount: number; authCount: number; error?: string }> {
+    const core = this.centralCore as CentralCore & {
+      applyProjectSettingsSnapshot?: (snapshot: NonNullable<SharedMeshStatePayload["projectSettings"]>) => Promise<{ success: boolean; globalCount: number; projectCount: number; authCount: number; error?: string }>;
+      applyAuthMaterialSnapshot?: (snapshot: NonNullable<SharedMeshStatePayload["authMaterial"]>) => { success?: boolean; authCount?: number; error?: string } | Record<string, unknown>;
+    };
+
+    if (sharedState?.projectSettings && core.applyProjectSettingsSnapshot) {
+      const result = await core.applyProjectSettingsSnapshot(sharedState.projectSettings);
+      if (sharedState.authMaterial && core.applyAuthMaterialSnapshot) {
+        const authResult = core.applyAuthMaterialSnapshot(sharedState.authMaterial);
+        const authCount =
+          typeof (authResult as { authCount?: number }).authCount === "number"
+            ? (authResult as { authCount: number }).authCount
+            : Object.keys(sharedState.authMaterial.payload.providerAuth ?? {}).length;
+        return { ...result, authCount: Math.max(result.authCount, authCount) };
+      }
+      return result;
+    }
+
+    if (fallbackSettings) {
+      return this.centralCore.applyRemoteSettings(fallbackSettings);
+    }
+
+    return { success: true, globalCount: 0, projectCount: 0, authCount: 0 };
   }
 }
