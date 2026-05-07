@@ -51,6 +51,7 @@ import { useAiSessionSync } from "../hooks/useAiSessionSync";
 import { useConfirm } from "../hooks/useConfirm";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { getSessionTabId } from "../utils/getSessionTabId";
+import "./MissionInterviewModal.css";
 
 // Helper functions for model selection
 function getModelSelectionValue(provider?: string, modelId?: string): string {

@@ -22,6 +22,8 @@ Use the 💡 button to open planning mode:
 - AI reasoning (thinking output) is preserved and visible throughout the session — expand the reasoning toggle to review the model's analysis before answering each question or accepting the summary
 - Produces summary + key deliverables
 - Create one task or **Break into Tasks** (multi-task generation with dependencies)
+- Summary view includes a **Priority** selector (`low`, `normal`, `high`, `urgent`) so single-task creation can set priority before task creation
+- Break-into-tasks mode includes per-subtask **Priority** selectors (`low`, `normal`, `high`, `urgent`) so each generated task can be prioritized before creation
 - Break-into-tasks descriptions are structured with subtask-specific guidance first, then a separate larger-plan context section (plus `## Planning Interview Context` when interview history exists)
 - Sessions persist when the modal is closed — resume from the sidebar list at any time; reasoning context is restored automatically
 - Back navigation rewinds the server-side planning session to the previous answered question so you can revise earlier answers and continue from the corrected turn
@@ -47,6 +49,7 @@ Use the 🌳 button:
 - Generate 2–5 candidate subtasks
 - Drag to reorder
 - Add dependencies only on earlier items
+- Set each subtask's **Priority** (`low`, `normal`, `high`, `urgent`) before create
 - Create tasks in one action
 
 ### 5) Expanded Controls

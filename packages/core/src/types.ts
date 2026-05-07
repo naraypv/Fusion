@@ -3370,6 +3370,7 @@ export interface PlanningSummary {
   title: string;
   description: string;
   suggestedSize: "S" | "M" | "L";
+  priority?: TaskPriority;
   suggestedDependencies: string[];
   keyDeliverables: string[];
 }

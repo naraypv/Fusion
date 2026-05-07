@@ -1,4 +1,11 @@
-import { resolvePlanningSettingsModel, type TaskStore, type PlanningSummary } from "@fusion/core";
+import {
+  DEFAULT_TASK_PRIORITY,
+  resolvePlanningSettingsModel,
+  TASK_PRIORITIES,
+  type PlanningSummary,
+  type TaskPriority,
+  type TaskStore,
+} from "@fusion/core";
 import { ApiError, badRequest, notFound, rateLimited } from "../api-error.js";
 import { writeSSEEvent, type SessionBufferedEvent } from "../sse-buffer.js";
 import type { AiSessionStore } from "../ai-session-store.js";
@@ -887,6 +894,9 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
     }
   });
 
+  const isTaskPriority = (value: unknown): value is TaskPriority =>
+    typeof value === "string" && (TASK_PRIORITIES as readonly string[]).includes(value);
+
   const parsePlanningSummaryOverride = (summaryInput: unknown): PlanningSummary | undefined => {
     if (summaryInput === undefined) {
       return undefined;
@@ -913,6 +923,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         summary.suggestedSize === "S" || summary.suggestedSize === "M" || summary.suggestedSize === "L"
           ? summary.suggestedSize
           : "M",
+      priority: isTaskPriority(summary.priority) ? summary.priority : DEFAULT_TASK_PRIORITY,
       suggestedDependencies: Array.isArray(summary.suggestedDependencies)
         ? summary.suggestedDependencies.filter((dep): dep is string => typeof dep === "string" && dep.trim().length > 0)
         : [],
@@ -973,6 +984,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
               title?: unknown;
               description?: unknown;
               suggestedSize?: unknown;
+              priority?: unknown;
               suggestedDependencies?: unknown;
               keyDeliverables?: unknown;
             };
@@ -992,6 +1004,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
                 parsedSummary.suggestedSize === "L"
                   ? parsedSummary.suggestedSize
                   : "M",
+              priority: isTaskPriority(parsedSummary.priority) ? parsedSummary.priority : DEFAULT_TASK_PRIORITY,
               suggestedDependencies: Array.isArray(parsedSummary.suggestedDependencies)
                 ? parsedSummary.suggestedDependencies.filter((dep): dep is string => typeof dep === "string")
                 : [],
@@ -1030,6 +1043,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         description: summary.description,
         column: "triage",
         dependencies: summary.suggestedDependencies.length > 0 ? summary.suggestedDependencies : undefined,
+        priority: isTaskPriority(summary.priority) ? summary.priority : DEFAULT_TASK_PRIORITY,
         source: { sourceType: "api" },
       });
 
@@ -1122,6 +1136,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
           title: string;
           description: string;
           suggestedSize: "S" | "M" | "L";
+          priority?: TaskPriority;
           dependsOn: string[];
         }>;
       };
@@ -1156,6 +1171,9 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         if (!item || typeof item.id !== "string" || typeof item.title !== "string" || !item.title.trim()) {
           throw badRequest("Each subtask must include id and title");
         }
+        if (item.priority !== undefined && !isTaskPriority(item.priority)) {
+          throw badRequest("Each subtask priority must be one of low, normal, high, urgent");
+        }
       }
 
       const createdTasks = [] as Awaited<ReturnType<TaskStore["createTask"]>>[];
@@ -1168,6 +1186,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
           description: typeof item.description === "string" ? item.description.trim() : item.title.trim(),
           column: "triage",
           dependencies: undefined,
+          priority: isTaskPriority(item.priority) ? item.priority : DEFAULT_TASK_PRIORITY,
           source: { sourceType: "api", sourceMetadata: { planningSessionId } },
         });
 

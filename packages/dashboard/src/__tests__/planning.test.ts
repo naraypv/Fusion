@@ -2068,6 +2068,7 @@ describe("planning module", () => {
         title: "Implementation",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: [],
       });
 
@@ -2077,6 +2078,7 @@ describe("planning module", () => {
         title: "Tests",
         description: expect.any(String),
         suggestedSize: "M",
+        priority: "normal",
         dependsOn: ["subtask-1"],
       });
 
@@ -2086,8 +2088,24 @@ describe("planning module", () => {
         title: "Documentation",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: ["subtask-2"],
       });
+    });
+
+    it("inherits summary priority for generated subtasks", async () => {
+      const mockIp = getUniqueIp();
+      const sessionId = await createCompletedSession(mockIp, "Build auth with urgent priority");
+
+      const session = getSession(sessionId);
+      if (!session?.summary) {
+        throw new Error("Expected summary to exist for completed session");
+      }
+      session.summary.priority = "urgent";
+
+      const result = generateSubtasksFromPlanning(sessionId);
+      expect(result.length).toBeGreaterThan(0);
+      expect(result.every((subtask) => subtask.priority === "urgent")).toBe(true);
     });
 
     it("generates deliverable subtasks with distinct lead guidance plus separate plan context", async () => {
@@ -2156,6 +2174,7 @@ describe("planning module", () => {
         title: "Define implementation approach",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: [],
       });
       expect(result[1]).toEqual({
@@ -2163,6 +2182,7 @@ describe("planning module", () => {
         title: "Implement core changes",
         description: expect.any(String),
         suggestedSize: "M",
+        priority: "normal",
         dependsOn: ["subtask-1"],
       });
       expect(result[2]).toEqual({
@@ -2170,6 +2190,7 @@ describe("planning module", () => {
         title: "Verify and polish",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: ["subtask-2"],
       });
       expect(result[0]?.description).toContain("Define the implementation approach for the plan");

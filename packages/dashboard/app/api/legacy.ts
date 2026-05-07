@@ -2657,6 +2657,7 @@ export interface SubtaskItem {
   title: string;
   description: string;
   suggestedSize: "S" | "M" | "L";
+  priority?: TaskPriority;
   dependsOn: string[];
 }
 
@@ -2928,6 +2929,7 @@ export function createTasksFromPlanning(
     title: string;
     description: string;
     suggestedSize: "S" | "M" | "L";
+    priority?: TaskPriority;
     dependsOn: string[];
   }>,
   projectId?: string,
