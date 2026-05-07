@@ -807,12 +807,16 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
 
   router.post("/agents/onboarding/start-streaming", async (req, res) => {
     try {
-      const { intent, context, planningModelProvider, planningModelId } = req.body as {
+      const { intent, context, mode, existingAgentConfig, planningModelProvider, planningModelId } = req.body as {
         intent?: string;
         context?: {
           existingAgents?: Array<{ id: string; name: string; role: string }>;
           templates?: Array<{ id: string; label: string; description?: string }>;
+          mode?: "create" | "edit";
+          existingAgentConfig?: Record<string, unknown>;
         };
+        mode?: "create" | "edit";
+        existingAgentConfig?: Record<string, unknown>;
         planningModelProvider?: string;
         planningModelId?: string;
       };
@@ -821,6 +825,13 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
         throw badRequest("intent is required and must be a string");
       }
 
+      const resolvedMode = mode ?? context?.mode ?? "create";
+      if (resolvedMode !== "create" && resolvedMode !== "edit") {
+        throw badRequest("mode must be 'create' or 'edit'");
+      }
+
+      const resolvedExistingAgentConfig = existingAgentConfig ?? context?.existingAgentConfig;
+
       const { store: scopedStore } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
       const ip = req.ip || req.socket.remoteAddress || "unknown";
@@ -828,9 +839,11 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
       const sessionId = await startAgentOnboardingSession(
         ip,
         {
+          mode: resolvedMode,
           intent,
           existingAgents: Array.isArray(context?.existingAgents) ? context.existingAgents : [],
           templates: Array.isArray(context?.templates) ? context.templates : [],
+          existingAgentConfig: resolvedExistingAgentConfig,
         },
         scopedStore.getRootDir(),
         planningModelProvider,

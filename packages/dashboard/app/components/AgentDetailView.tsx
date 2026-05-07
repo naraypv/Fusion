@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo, SkillContent } from "../api";
+import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo, SkillContent, AgentOnboardingSummary } from "../api";
 import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure, updateGlobalSettings, fetchSkillContent, uploadAgentAvatar, deleteAgentAvatar } from "../api";
 import type { Agent } from "../api";
 import type { AgentLogEntry, Task } from "@fusion/core";
@@ -27,6 +27,7 @@ import { useConfirm } from "../hooks/useConfirm";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { AgentAvatar } from "./AgentAvatar";
 import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
+import { ExperimentalAgentOnboardingModal } from "./ExperimentalAgentOnboardingModal";
 
 /**
  * Simple className utility - joins class names conditionally
@@ -726,6 +727,9 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               onSaved={handleSavedMutation}
               onHasChangesChange={handleConfigChangesState}
               onDelete={handleDelete}
+              onAgentDraftApplied={(updates) => {
+                setAgent((current) => (current ? { ...current, ...updates } : current));
+              }}
             />
           )}
         </div>
@@ -3007,6 +3011,7 @@ function ConfigTab({
   onSaved,
   onHasChangesChange,
   onDelete,
+  onAgentDraftApplied,
 }: {
   agent: AgentDetail;
   projectId?: string;
@@ -3014,6 +3019,7 @@ function ConfigTab({
   onSaved: () => Promise<void>;
   onHasChangesChange?: (hasChanges: boolean) => void;
   onDelete?: () => Promise<void> | void;
+  onAgentDraftApplied?: (updates: Partial<AgentDetail>) => void;
 }) {
   // Identity field state
   const [nameValue, setNameValue] = useState(agent.name);
@@ -3024,6 +3030,7 @@ function ConfigTab({
   const [managerOptions, setManagerOptions] = useState<Agent[]>([]);
   const [isLoadingManagers, setIsLoadingManagers] = useState(false);
   const [isAvatarPending, setIsAvatarPending] = useState(false);
+  const [isAiInterviewOpen, setIsAiInterviewOpen] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
 
   // Local form state initialised from agent.metadata
@@ -3103,6 +3110,89 @@ function ConfigTab({
   );
   const hasMissingManagerSelection = !!managerSelection
     && !availableManagers.some((candidate) => candidate.id === managerSelection);
+
+  const existingAgentConfig = useMemo(() => ({
+    name: nameValue,
+    role: roleValue,
+    title: titleValue || undefined,
+    instructionsText: agent.instructionsText,
+    soul: agent.soul,
+    memory: agent.memory,
+    reportsTo: reportsToValue || undefined,
+    skills: selectedSkills,
+    model: modelValue || undefined,
+    runtimeHint: runtimeMode === "runtime" ? selectedRuntimeId || undefined : undefined,
+    thinkingLevel: (formValues.thinkingLevel as "off" | "minimal" | "low" | "medium" | "high" | undefined) ?? undefined,
+    maxTurns: formValues.maxTurns ? Number(formValues.maxTurns) : undefined,
+    heartbeatIntervalMs: heartbeatValues.heartbeatIntervalMs ? Number(heartbeatValues.heartbeatIntervalMs) * 1000 : undefined,
+    heartbeatTimeoutMs: heartbeatValues.heartbeatTimeoutMs ? Number(heartbeatValues.heartbeatTimeoutMs) * 1000 : undefined,
+    maxConcurrentRuns: heartbeatValues.maxConcurrentRuns ? Number(heartbeatValues.maxConcurrentRuns) : undefined,
+    messageResponseMode: heartbeatValues.messageResponseMode as "immediate" | "on-heartbeat" | undefined,
+  }), [
+    agent.instructionsText,
+    agent.memory,
+    agent.soul,
+    formValues.maxTurns,
+    formValues.thinkingLevel,
+    heartbeatValues.heartbeatIntervalMs,
+    heartbeatValues.heartbeatTimeoutMs,
+    heartbeatValues.maxConcurrentRuns,
+    heartbeatValues.messageResponseMode,
+    modelValue,
+    nameValue,
+    reportsToValue,
+    roleValue,
+    runtimeMode,
+    selectedRuntimeId,
+    selectedSkills,
+    titleValue,
+  ]);
+
+  const applyInterviewDraft = useCallback((summary: AgentOnboardingSummary) => {
+    setNameValue(summary.name);
+    setRoleValue(summary.role);
+    setTitleValue(summary.title ?? "");
+    setIconValue(summary.icon ?? "");
+    setReportsToValue(summary.reportsTo ?? "");
+
+    if (summary.skills) {
+      setSelectedSkills(summary.skills);
+    }
+    if (summary.thinkingLevel) {
+      setFormValues((prev) => ({ ...prev, thinkingLevel: summary.thinkingLevel }));
+    }
+    if (summary.maxTurns !== undefined) {
+      setFormValues((prev) => ({ ...prev, maxTurns: String(summary.maxTurns) }));
+    }
+    if (summary.runtimeHint !== undefined) {
+      setRuntimeMode("runtime");
+      setSelectedRuntimeId(summary.runtimeHint ?? "");
+      if (summary.runtimeHint) {
+        setModelValue("");
+      }
+    } else if (summary.model !== undefined) {
+      setRuntimeMode("model");
+      setModelValue(summary.model ?? "");
+      setSelectedRuntimeId("");
+    }
+
+    const draftUpdates = Object.fromEntries(
+      Object.entries({
+        name: summary.name,
+        role: summary.role,
+        title: summary.title,
+        icon: summary.icon,
+        reportsTo: summary.reportsTo,
+        instructionsText: summary.instructionsText,
+        soul: summary.soul,
+        memory: summary.memory,
+      }).filter(([, value]) => value !== undefined),
+    ) as Partial<AgentDetail>;
+    onAgentDraftApplied?.(draftUpdates);
+
+    setIsAiInterviewOpen(false);
+    addToast("Interview draft applied. Review and save when ready.", "success");
+  }, [addToast, onAgentDraftApplied]);
 
   // Load candidate managers for reports-to dropdown
   useEffect(() => {
@@ -3709,7 +3799,12 @@ function ConfigTab({
         <p className="config-description">
           Configure agent settings and behavior.
         </p>
-        
+        <div className="config-actions-row">
+          <button type="button" className="btn btn-sm" onClick={() => setIsAiInterviewOpen(true)}>
+            AI Interview
+          </button>
+        </div>
+
         <div className="config-fields">
           <div className="config-field">
             <label htmlFor="agent-name">Name</label>
@@ -4406,6 +4501,16 @@ function ConfigTab({
           </div>
         </div>
       </div>
+
+      <ExperimentalAgentOnboardingModal
+        isOpen={isAiInterviewOpen}
+        onClose={() => setIsAiInterviewOpen(false)}
+        onUseDraft={applyInterviewDraft}
+        projectId={projectId}
+        existingAgents={managerOptions}
+        mode="edit"
+        existingAgentConfig={existingAgentConfig}
+      />
     </div>
   );
 }

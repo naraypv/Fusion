@@ -2683,6 +2683,29 @@ export interface AgentOnboardingSummary {
   templateId?: string;
   patternAgentId?: string;
   rationale?: string;
+  model?: string;
+  runtimeHint?: string;
+}
+
+export type OnboardingMode = "create" | "edit";
+
+export interface ExistingAgentOnboardingConfig {
+  name?: string;
+  role?: AgentCapability | "custom";
+  title?: string;
+  instructionsText?: string;
+  soul?: string;
+  memory?: string;
+  reportsTo?: string;
+  skills?: string[];
+  model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+  maxTurns?: number;
+  runtimeHint?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  maxConcurrentRuns?: number;
+  messageResponseMode?: "immediate" | "on-heartbeat";
 }
 
 export type AgentOnboardingStreamEvent =
@@ -2815,6 +2838,8 @@ export function startAgentOnboardingStreaming(
   context: {
     existingAgents: Array<{ id: string; name: string; role: string }>;
     templates: Array<{ id: string; label: string; description?: string }>;
+    mode?: OnboardingMode;
+    existingAgentConfig?: ExistingAgentOnboardingConfig;
   },
   projectId?: string,
   modelOverride?: { planningModelProvider?: string; planningModelId?: string },
@@ -2824,6 +2849,8 @@ export function startAgentOnboardingStreaming(
     body: JSON.stringify({
       intent,
       context,
+      mode: context.mode,
+      existingAgentConfig: context.existingAgentConfig,
       planningModelProvider: modelOverride?.planningModelProvider,
       planningModelId: modelOverride?.planningModelId,
     }),

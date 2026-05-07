@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ExperimentalAgentOnboardingModal } from "../ExperimentalAgentOnboardingModal";
+import * as apiModule from "../../api";
 
 let streamHandlers: any;
 
@@ -37,6 +38,8 @@ vi.mock("../../api", () => ({
   cancelAgentOnboarding: mockCancel,
 }));
 
+const mockStartAgentOnboardingStreaming = vi.mocked(apiModule.startAgentOnboardingStreaming);
+
 describe("ExperimentalAgentOnboardingModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -55,6 +58,14 @@ describe("ExperimentalAgentOnboardingModal", () => {
 
     fireEvent.change(screen.getByLabelText("What should this new agent own?"), { target: { value: "Review docs" } });
     fireEvent.click(screen.getByText("Start onboarding"));
+
+    await waitFor(() => {
+      expect(mockStartAgentOnboardingStreaming).toHaveBeenCalledWith(
+        "Review docs",
+        expect.objectContaining({ mode: "create" }),
+        undefined,
+      );
+    });
 
     await screen.findByText("What should this agent primarily help with?");
     fireEvent.change(screen.getByLabelText("What should this agent primarily help with?"), { target: { value: "Docs" } });
@@ -80,6 +91,44 @@ describe("ExperimentalAgentOnboardingModal", () => {
     await waitFor(() => {
       expect(onUseDraft).toHaveBeenCalledWith(expect.objectContaining({ name: "Docs Reviewer" }));
     });
+  });
+
+  it("uses edit mode copy and sends edit context", async () => {
+    render(
+      <ExperimentalAgentOnboardingModal
+        isOpen={true}
+        onClose={vi.fn()}
+        onUseDraft={vi.fn()}
+        existingAgents={[]}
+        mode="edit"
+        existingAgentConfig={{
+          name: "Editor",
+          instructionsText: "Current instructions",
+          messageResponseMode: "on-heartbeat",
+        }}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("What should this agent change or improve?"), { target: { value: "Make it clearer" } });
+    fireEvent.click(screen.getByText("Start interview"));
+
+    await waitFor(() => {
+      expect(mockStartAgentOnboardingStreaming).toHaveBeenCalledWith(
+        "Make it clearer",
+        expect.objectContaining({
+          mode: "edit",
+          existingAgentConfig: expect.objectContaining({ name: "Editor" }),
+        }),
+        undefined,
+      );
+    });
+
+    await screen.findByText("What should this agent primarily help with?");
+    fireEvent.change(screen.getByLabelText("What should this agent primarily help with?"), { target: { value: "Docs" } });
+    fireEvent.click(screen.getByText("Continue"));
+
+    await screen.findByText("Updated draft ready for review");
+    expect(screen.getByRole("button", { name: "Apply draft to settings" })).toBeTruthy();
   });
 
   it("renders stream errors and still closes cleanly", async () => {

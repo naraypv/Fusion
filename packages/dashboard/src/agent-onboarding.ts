@@ -20,6 +20,29 @@ export interface AgentOnboardingSummary {
   templateId?: string;
   patternAgentId?: string;
   rationale?: string;
+  model?: string;
+  runtimeHint?: string;
+}
+
+export type OnboardingMode = "create" | "edit";
+
+export interface ExistingAgentOnboardingConfig {
+  name?: string;
+  role?: AgentCapability | "custom";
+  title?: string;
+  instructionsText?: string;
+  soul?: string;
+  memory?: string;
+  reportsTo?: string;
+  skills?: string[];
+  model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+  maxTurns?: number;
+  runtimeHint?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  maxConcurrentRuns?: number;
+  messageResponseMode?: "immediate" | "on-heartbeat";
 }
 
 export type AgentOnboardingStreamEvent =
@@ -58,6 +81,7 @@ type OnboardingAgent = Awaited<ReturnType<typeof engineCreateFnAgent>>;
 interface Session {
   id: string;
   ip: string;
+  mode: OnboardingMode;
   contextPrompt: string;
   currentQuestion?: PlanningQuestion;
   summary?: AgentOnboardingSummary;
@@ -164,28 +188,70 @@ export function parseAgentOnboardingResponse(text: string): { type: "question"; 
 }
 
 export function createAgentOnboardingSessionPrompt(input: {
+  mode: OnboardingMode;
   intent: string;
   existingAgents: Array<{ id: string; name: string; role: string }>;
   templates: Array<{ id: string; label: string; description?: string }>;
+  existingAgentConfig?: ExistingAgentOnboardingConfig;
 }): string {
   const compactAgents = input.existingAgents.slice(0, 25).map((a) => `${a.id}:${a.name}(${a.role})`).join("\n") || "none";
   const compactTemplates = input.templates.slice(0, 25).map((t) => `${t.id}:${t.label}${t.description ? ` - ${t.description}` : ""}`).join("\n") || "none";
-  return `User intent:\n${input.intent}\n\nExisting agents:\n${compactAgents}\n\nTemplate/preset options:\n${compactTemplates}`;
+  const createContext = `User intent:\n${input.intent}\n\nExisting agents:\n${compactAgents}\n\nTemplate/preset options:\n${compactTemplates}`;
+
+  if (input.mode === "create") {
+    return createContext;
+  }
+
+  const currentConfig = input.existingAgentConfig ?? {};
+  const currentConfigLines = [
+    `name: ${currentConfig.name ?? ""}`,
+    `role: ${currentConfig.role ?? ""}`,
+    `title: ${currentConfig.title ?? ""}`,
+    `instructionsText: ${currentConfig.instructionsText ?? ""}`,
+    `soul: ${currentConfig.soul ?? ""}`,
+    `memory: ${currentConfig.memory ?? ""}`,
+    `reportsTo: ${currentConfig.reportsTo ?? ""}`,
+    `skills: ${(currentConfig.skills ?? []).join(", ")}`,
+    `model: ${currentConfig.model ?? ""}`,
+    `thinkingLevel: ${currentConfig.thinkingLevel ?? ""}`,
+    `maxTurns: ${currentConfig.maxTurns ?? ""}`,
+    `runtimeHint: ${currentConfig.runtimeHint ?? ""}`,
+    `heartbeatIntervalMs: ${currentConfig.heartbeatIntervalMs ?? ""}`,
+    `heartbeatTimeoutMs: ${currentConfig.heartbeatTimeoutMs ?? ""}`,
+    `maxConcurrentRuns: ${currentConfig.maxConcurrentRuns ?? ""}`,
+    `messageResponseMode: ${currentConfig.messageResponseMode ?? ""}`,
+  ].join("\n");
+
+  return `${createContext}\n\nCurrent agent configuration:\n${currentConfigLines}`;
 }
 
 export async function startAgentOnboardingSession(
   ip: string,
-  initialContext: { intent: string; existingAgents: Array<{ id: string; name: string; role: string }>; templates: Array<{ id: string; label: string; description?: string }> },
+  initialContext: {
+    mode?: OnboardingMode;
+    intent: string;
+    existingAgents: Array<{ id: string; name: string; role: string }>;
+    templates: Array<{ id: string; label: string; description?: string }>;
+    existingAgentConfig?: ExistingAgentOnboardingConfig;
+  },
   rootDir: string,
   modelProvider?: string,
   modelId?: string,
   promptOverrides?: PromptOverrideMap,
 ): Promise<string> {
   const id = randomUUID();
+  const mode: OnboardingMode = initialContext.mode ?? "create";
   const session: Session = {
     id,
     ip,
-    contextPrompt: createAgentOnboardingSessionPrompt(initialContext),
+    mode,
+    contextPrompt: createAgentOnboardingSessionPrompt({
+      mode,
+      intent: initialContext.intent,
+      existingAgents: initialContext.existingAgents,
+      templates: initialContext.templates,
+      existingAgentConfig: initialContext.existingAgentConfig,
+    }),
     history: [],
     thinkingOutput: "",
     createdAt: new Date(),

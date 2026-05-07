@@ -896,6 +896,7 @@ export function NewAgentDialog({
         }}
         projectId={projectId}
         existingAgents={existingAgents}
+        mode="create"
       />
     </div>,
     document.body,

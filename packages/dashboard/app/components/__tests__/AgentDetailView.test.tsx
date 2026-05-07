@@ -112,6 +112,43 @@ vi.mock("../SkillMultiselect", () => ({
   ),
 }));
 
+vi.mock("../ExperimentalAgentOnboardingModal", () => ({
+  ExperimentalAgentOnboardingModal: ({ isOpen, mode, existingAgentConfig, onUseDraft, onClose }: {
+    isOpen: boolean;
+    mode?: "create" | "edit";
+    existingAgentConfig?: Record<string, unknown>;
+    onUseDraft: (summary: any) => void;
+    onClose: () => void;
+  }) => (
+    isOpen ? (
+      <div data-testid="mock-ai-interview-modal">
+        <span data-testid="mock-ai-interview-mode">{mode}</span>
+        <button
+          type="button"
+          onClick={() => onUseDraft({
+            name: "Interviewed Agent",
+            role: "reviewer",
+            title: "Draft Title",
+            icon: "🧠",
+            reportsTo: "agent-002",
+            instructionsText: "Updated instructions",
+            soul: "Updated soul",
+            memory: "Updated memory",
+            skills: ["skill-1"],
+            thinkingLevel: "high",
+            maxTurns: 12,
+            model: "openai/gpt-4o",
+          })}
+        >
+          Apply Draft
+        </button>
+        <button type="button" onClick={onClose}>Close Modal</button>
+        <pre data-testid="mock-ai-existing-config">{JSON.stringify(existingAgentConfig ?? {})}</pre>
+      </div>
+    ) : null
+  ),
+}));
+
 vi.mock("../../sse-bus", () => ({
   subscribeSse: vi.fn(() => () => {}),
 }));
@@ -1579,6 +1616,35 @@ describe("AgentDetailView", () => {
       });
       await user.click(screen.getByText("Settings"));
     };
+
+    it("opens AI Interview in edit mode and applies draft values to local settings fields", async () => {
+      const user = userEvent.setup();
+
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />,
+      );
+
+      await navigateToSettings(user);
+      await user.click(await screen.findByRole("button", { name: "AI Interview" }));
+
+      expect(await screen.findByTestId("mock-ai-interview-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("mock-ai-interview-mode")).toHaveTextContent("edit");
+      expect(screen.getByTestId("mock-ai-existing-config").textContent).toContain("Test Agent");
+
+      await user.click(screen.getByRole("button", { name: "Apply Draft" }));
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Interviewed Agent");
+        expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Draft Title");
+        expect((screen.getByLabelText("Icon") as HTMLInputElement).value).toBe("🧠");
+        expect((screen.getByLabelText("Role") as HTMLSelectElement).value).toBe("reviewer");
+      });
+      expect(mockUpdateAgent).not.toHaveBeenCalled();
+    });
 
     it("shows settings delete control for idle and paused agents", async () => {
       const user = userEvent.setup();

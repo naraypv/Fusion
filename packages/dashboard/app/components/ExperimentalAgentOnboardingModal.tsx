@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Agent, AgentOnboardingSummary, ConversationHistoryEntry } from "../api";
+import type { Agent, AgentOnboardingSummary, ConversationHistoryEntry, ExistingAgentOnboardingConfig, OnboardingMode } from "../api";
 import {
   cancelAgentOnboarding,
   connectAgentOnboardingStream,
@@ -18,6 +18,8 @@ interface ExperimentalAgentOnboardingModalProps {
   onUseDraft: (summary: AgentOnboardingSummary) => void;
   projectId?: string;
   existingAgents: Agent[];
+  mode?: OnboardingMode;
+  existingAgentConfig?: ExistingAgentOnboardingConfig;
 }
 
 export function ExperimentalAgentOnboardingModal({
@@ -26,6 +28,8 @@ export function ExperimentalAgentOnboardingModal({
   onUseDraft,
   projectId,
   existingAgents,
+  mode = "create",
+  existingAgentConfig,
 }: ExperimentalAgentOnboardingModalProps) {
   const [viewState, setViewState] = useState<ViewState>("initial");
   const [intent, setIntent] = useState("");
@@ -36,6 +40,7 @@ export function ExperimentalAgentOnboardingModal({
   const [summary, setSummary] = useState<AgentOnboardingSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<ConversationHistoryEntry[]>([]);
+  const isEditMode = mode === "edit";
 
   const resetState = useCallback(() => {
     setViewState("initial");
@@ -113,6 +118,8 @@ export function ExperimentalAgentOnboardingModal({
       const result = await startAgentOnboardingStreaming(
         intent,
         {
+          mode,
+          existingAgentConfig,
           existingAgents: existingAgents.map((agent) => ({ id: agent.id, name: agent.name, role: agent.role })),
           templates: templateOptions,
         },
@@ -158,11 +165,11 @@ export function ExperimentalAgentOnboardingModal({
 
         {viewState === "initial" && (
           <div className="form-group">
-            <label htmlFor="agent-onboarding-intent">What should this new agent own?</label>
+            <label htmlFor="agent-onboarding-intent">{isEditMode ? "What should this agent change or improve?" : "What should this new agent own?"}</label>
             <textarea id="agent-onboarding-intent" className="input experimental-agent-onboarding-modal__textarea" value={intent} onChange={(e) => setIntent(e.target.value)} />
             <div className="modal-actions">
               <button className="btn" onClick={() => void handleClose()}>Cancel</button>
-              <button className="btn btn-primary" disabled={!intent.trim()} onClick={() => void start()}>Start onboarding</button>
+              <button className="btn btn-primary" disabled={!intent.trim()} onClick={() => void start()}>{isEditMode ? "Start interview" : "Start onboarding"}</button>
             </div>
           </div>
         )}
@@ -180,7 +187,7 @@ export function ExperimentalAgentOnboardingModal({
 
         {viewState === "summary" && summary && (
           <div className="form-group">
-            <label>Draft ready for review</label>
+            <label>{isEditMode ? "Updated draft ready for review" : "Draft ready for review"}</label>
             <div className="experimental-agent-onboarding-modal__summary card">
               <div className="experimental-agent-onboarding-modal__summary-section">
                 <h4>Profile</h4>
@@ -228,7 +235,7 @@ export function ExperimentalAgentOnboardingModal({
             </div>
             <div className="modal-actions">
               <button className="btn" onClick={() => void handleClose()}>Cancel</button>
-              <button className="btn btn-primary" onClick={() => onUseDraft(summary)}>Continue to agent form</button>
+              <button className="btn btn-primary" onClick={() => onUseDraft(summary)}>{isEditMode ? "Apply draft to settings" : "Continue to agent form"}</button>
             </div>
           </div>
         )}

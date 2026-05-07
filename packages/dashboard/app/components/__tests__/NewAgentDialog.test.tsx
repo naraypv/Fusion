@@ -28,10 +28,11 @@ vi.mock("../SkillMultiselect", () => ({
 
 // Mock AgentGenerationModal
 vi.mock("../ExperimentalAgentOnboardingModal", () => ({
-  ExperimentalAgentOnboardingModal: ({ isOpen, onClose, onUseDraft }: { isOpen: boolean; onClose: () => void; onUseDraft: (draft: any) => void }) => {
+  ExperimentalAgentOnboardingModal: ({ isOpen, onClose, onUseDraft, mode }: { isOpen: boolean; onClose: () => void; onUseDraft: (draft: any) => void; mode?: "create" | "edit" }) => {
     if (!isOpen) return null;
     return (
       <div role="dialog" aria-label="AI Interview">
+        <div data-testid="interview-mode">{mode}</div>
         <button onClick={onClose}>Close Interview</button>
         <button
           onClick={() => onUseDraft({
@@ -287,6 +288,7 @@ describe("NewAgentDialog", () => {
 
       await user.click(screen.getByRole("button", { name: "AI Interview" }));
       expect(screen.getByRole("dialog", { name: "AI Interview" })).toBeInTheDocument();
+      expect(screen.getByTestId("interview-mode")).toHaveTextContent("create");
 
       await user.click(screen.getByRole("button", { name: "Apply Interview Draft" }));
 

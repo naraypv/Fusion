@@ -396,12 +396,14 @@ The final `createAgent(...)` call always uses the latest values from these step-
 
 The **New Agent** dialog is the canonical launch point for agent creation.
 
-When **Settings → Experimental Features → Planning-style Agent Onboarding** (`experimentalFeatures.agentOnboarding`) is enabled, step 0 of the New Agent dialog includes an **AI Interview** entry point.
+When **Settings → Experimental Features → Planning-style Agent Onboarding** (`experimentalFeatures.agentOnboarding`) is enabled:
 
-- The interview flow asks clarifying questions using repo-aware context (existing agents + preset/template options).
-- It generates a **draft** agent configuration summary (name/role/instructions and optional template or pattern provenance).
-- Clicking **Continue to agent form** applies that draft back into the same `NewAgentDialog` as a prefill for human review and edits.
-- The interview flow does **not** auto-create agents directly.
+- Step 0 of the **New Agent** dialog includes an **AI Interview** entry point for create mode.
+- **Agent detail → Settings** includes an **AI Interview** action for edit mode on existing agents.
+- The interview flow asks clarifying questions using repo-aware context (existing agents + preset/template options for create mode, plus current agent configuration for edit mode).
+- It generates a **draft** configuration summary for review.
+- In create mode, **Continue to agent form** prefills `NewAgentDialog`; in edit mode, **Apply draft to settings** updates local editable fields in the settings UI.
+- The interview flow does **not** auto-create or auto-save agents directly.
 
 When `experimentalFeatures.agentOnboarding` is disabled, the New Agent dialog still opens normally but the **AI Interview** entry point is hidden.
 

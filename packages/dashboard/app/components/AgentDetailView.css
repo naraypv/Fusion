@@ -922,6 +922,13 @@
   margin: 0 0 calc(var(--space-md) + var(--space-sm)) 0;
 }
 
+.config-actions-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
 .config-fields {
   display: flex;
   flex-direction: column;
