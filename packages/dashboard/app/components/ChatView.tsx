@@ -1,6 +1,6 @@
 // ChatView.css is imported eagerly from App.tsx to avoid a flash of
 // unstyled content when the lazy chunk loads. Do not re-import here.
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -793,51 +793,18 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     }
   }, []);
 
-  const { keyboardOverlap, keyboardOpen } = useMobileKeyboard({
+  const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } = useMobileKeyboard({
     enabled: isMobile && !!activeSession,
   });
 
-  // Only structural per-open/close vars go through React state. The
-  // high-frequency --vv-height / --vv-offset-top vars are written
-  // imperatively below to avoid a one-frame lag during iOS keyboard
-  // pan that causes the composer to slide over the messages list.
   const threadKeyboardStyle: CSSProperties =
     keyboardOpen
-      ? ({ "--keyboard-overlap": `${keyboardOverlap}px` } as CSSProperties)
+      ? ({
+          "--keyboard-overlap": `${keyboardOverlap}px`,
+          "--vv-offset-top": `${viewportOffsetTop}px`,
+          ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
+        } as CSSProperties)
       : {};
-
-  const threadRef = useRef<HTMLDivElement>(null);
-
-  // Mirror visualViewport metrics onto the .chat-thread element as CSS
-  // vars synchronously, bypassing React state. iOS fires
-  // visualViewport scroll/resize events on the same frame as its own
-  // keyboard / pan animation; deferring writes through React state
-  // makes the thread (and its bottom-pinned composer) lag by one paint
-  // — visible as the composer momentarily sliding over messages while
-  // the user pans. Mirrors QuickChatFAB.tsx:1032-1052 which uses the
-  // same approach and works correctly on mobile.
-  useLayoutEffect(() => {
-    if (!keyboardOpen) return;
-    if (typeof window === "undefined" || !window.visualViewport) return;
-    const thread = threadRef.current;
-    if (!thread) return;
-
-    const vv = window.visualViewport;
-    const apply = () => {
-      thread.style.setProperty("--vv-height", `${vv.height}px`);
-      thread.style.setProperty("--vv-offset-top", `${vv.offsetTop || 0}px`);
-    };
-
-    apply();
-    vv.addEventListener("resize", apply);
-    vv.addEventListener("scroll", apply);
-    return () => {
-      vv.removeEventListener("resize", apply);
-      vv.removeEventListener("scroll", apply);
-      thread.style.removeProperty("--vv-height");
-      thread.style.removeProperty("--vv-offset-top");
-    };
-  }, [keyboardOpen]);
 
   const filteredSkills = useMemo(() => {
     const normalizedFilter = skillFilter.trim().toLowerCase();
@@ -1737,7 +1704,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       )}
 
       {/* Thread */}
-      <div className="chat-thread" ref={threadRef} style={threadKeyboardStyle}>
+      <div className="chat-thread" style={threadKeyboardStyle}>
         {/* Header - always rendered in desktop/tablet, only rendered in mobile when viewing a thread */}
         {(hasThreadInView || !isMobile) && (
           <div className="chat-thread-header">
