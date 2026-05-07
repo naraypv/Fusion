@@ -8058,6 +8058,7 @@ export function streamChatResponse(
 
   const abortController = new AbortController();
   let closedByUser = false;
+  let terminated = false;
 
   const dispatchEvent = (eventName: string, rawData: string): void => {
     if (!eventName) {
@@ -8101,6 +8102,7 @@ export function streamChatResponse(
         }
         break;
       case "done":
+        terminated = true;
         try {
           const parsed = JSON.parse(rawData) as { messageId?: unknown; message?: unknown };
           handlers.onDone?.({
@@ -8112,6 +8114,7 @@ export function streamChatResponse(
         }
         break;
       case "error":
+        terminated = true;
         try {
           const parsed = JSON.parse(rawData);
           handlers.onError?.(parsed.message || parsed);
@@ -8215,6 +8218,14 @@ export function streamChatResponse(
         }
 
         processLines(decoder.decode(value, { stream: true }));
+      }
+
+      // Server closed the stream without emitting a terminal `done` or `error`
+      // SSE event (common on flaky mobile networks, proxy idle-kill, or
+      // backgrounded tabs). Surface as an error so the client unwinds
+      // streaming state instead of getting stuck with isStreaming=true.
+      if (!terminated && !closedByUser) {
+        handlers.onError?.("Connection closed unexpectedly");
       }
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === "AbortError") {

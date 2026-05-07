@@ -492,6 +492,7 @@ export function useChat(
       if (isStreaming) {
         pendingMessageRef.current = content;
         setPendingMessage(content);
+        addToast?.("Still waiting for previous response — message queued", "warning");
         return;
       }
 
