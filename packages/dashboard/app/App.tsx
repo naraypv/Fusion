@@ -115,6 +115,7 @@ function prefetchLazyViews() {
 }
 
 const SETUP_WARNING_DISMISSED_KEY = "kb-setup-warning-dismissed";
+const ACTIVE_CHAT_SESSION_STORAGE_KEY = "kb-chat-active-session";
 
 function buildRemoteDashboardUrl(serverUrl: string, authToken?: string | null): string {
   const url = new URL(serverUrl);
@@ -345,8 +346,9 @@ function AppInner() {
   // via useMobileScrollLock — the reference-counted hook handles overlap.
   useMobileScrollLock(mobileKeyboardOpen);
 
-  // App-level mailbox unread count state (used for header/mobile nav badges)
+  // App-level mailbox/chat unread state (used for header/mobile nav badges)
   const [mailboxUnreadCount, setMailboxUnreadCount] = useState(0);
+  const [chatHasUnreadResponse, setChatHasUnreadResponse] = useState(false);
 
   const refreshMailboxUnreadCount = useCallback(() => {
     fetchUnreadCount(currentProject?.id)
@@ -377,6 +379,39 @@ function AppInner() {
       },
     });
   }, [currentProject?.id, refreshMailboxUnreadCount]);
+
+  useEffect(() => {
+    if (taskView === "chat") {
+      setChatHasUnreadResponse(false);
+    }
+  }, [taskView]);
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (currentProject?.id) {
+      params.set("projectId", currentProject.id);
+    }
+    const query = params.size > 0 ? `?${params.toString()}` : "";
+
+    return subscribeSse(`/api/events${query}`, {
+      events: {
+        "chat:message:added": (event: MessageEvent) => {
+          try {
+            const payload = JSON.parse(event.data) as { role?: string; sessionId?: string; projectId?: string | null };
+            const activeSessionId = getScopedItem(ACTIVE_CHAT_SESSION_STORAGE_KEY, currentProject?.id);
+            if (!activeSessionId) return;
+            if (payload.role !== "assistant") return;
+            if (taskView === "chat") return;
+            if (payload.sessionId !== activeSessionId) return;
+            if (payload.projectId && currentProject?.id && payload.projectId !== currentProject.id) return;
+            setChatHasUnreadResponse(true);
+          } catch {
+            // no-op
+          }
+        },
+      },
+    });
+  }, [currentProject?.id, taskView]);
 
   // Nodes management is an overlay view (not a modal), so it stays local to App.
   const [nodesOpen, setNodesOpen] = useState(false);
@@ -1193,6 +1228,7 @@ function AppInner() {
         onOpenSystemStats={openSystemStatsWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
         mailboxUnreadCount={mailboxUnreadCount}
+        chatHasUnreadResponse={chatHasUnreadResponse}
         onOpenSchedules={openSchedulesWithNav}
         onOpenGitManager={openGitManagerWithNav}
         onOpenNodes={handleOpenNodesWithNav}
@@ -1314,6 +1350,7 @@ function AppInner() {
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
         onOpenNodes={handleOpenNodesWithNav}
         mailboxUnreadCount={mailboxUnreadCount}
+        chatHasUnreadResponse={chatHasUnreadResponse}
         onOpenGitManager={openGitManagerWithNav}
         onOpenWorkflowSteps={openWorkflowStepsWithNav}
         onOpenSchedules={openSchedulesWithNav}

@@ -539,8 +539,9 @@ beforeEach(() => {
   mockNodeContextValue.clearCurrentNode.mockClear();
   // Clear node selection from localStorage to avoid cross-test leakage
   localStorage.removeItem("fusion-dashboard-current-node");
-  // Clear onboarding state from localStorage
+  // Clear onboarding/chat state from localStorage
   localStorage.removeItem("kb-onboarding-state");
+  localStorage.removeItem(scopedKey("kb-chat-active-session", "proj_123"));
   // Reset onboarding state mocks
   mockIsOnboardingResumable.mockReset();
   mockIsOnboardingResumable.mockReturnValue(false);
@@ -685,6 +686,114 @@ describe("App mailbox unread count", () => {
       expect(fetchUnreadCount).toHaveBeenCalledTimes(2);
       expect(fetchUnreadCount).toHaveBeenLastCalledWith("proj_123");
     });
+  });
+});
+
+describe("App chat unread response indicator", () => {
+  it("shows unread indicator when assistant message arrives for active session after leaving chat", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+  });
+
+  it("does not show unread indicator for non-qualifying chat events", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "user", sessionId: "sess-active" }),
+        }),
+      );
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-other" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+  });
+
+  it("clears unread indicator when returning to chat and does not mark while in chat", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId("header-chat-view-btn"));
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+    });
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
   });
 });
 

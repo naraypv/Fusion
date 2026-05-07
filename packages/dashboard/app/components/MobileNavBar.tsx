@@ -54,6 +54,7 @@ export interface MobileNavBarProps {
   onOpenSystemStats?: () => void;
   onOpenMailbox?: () => void;
   mailboxUnreadCount?: number;
+  chatHasUnreadResponse?: boolean;
   onOpenGitManager?: () => void;
   onOpenWorkflowSteps?: () => void;
   onOpenSchedules?: () => void;
@@ -116,6 +117,7 @@ export function MobileNavBar({
   onOpenSystemStats,
   onOpenMailbox,
   mailboxUnreadCount = 0,
+  chatHasUnreadResponse = false,
   onOpenGitManager,
   onOpenWorkflowSteps,
   onOpenSchedules,
@@ -303,7 +305,12 @@ export function MobileNavBar({
           aria-selected={view === "chat"}
           onClick={() => onChangeView("chat")}
         >
-          <MessageSquare />
+          <span className="mobile-nav-tab-icon-wrapper">
+            <MessageSquare />
+            {chatHasUnreadResponse && view !== "chat" && (
+              <span className="status-dot status-dot--pending mobile-nav-chat-unread-dot" aria-label="Unread chat response" />
+            )}
+          </span>
           <span className="mobile-nav-tab-label">Chat</span>
         </button>
 

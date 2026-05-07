@@ -315,6 +315,16 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-nav-tab-missions").className).not.toContain("mobile-nav-tab--active");
   });
 
+  it("shows chat unread indicator when chatHasUnreadResponse is true and chat tab is inactive", () => {
+    render(<MobileNavBar {...createDefaultProps()} view="board" chatHasUnreadResponse={true} />);
+    expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+  });
+
+  it("hides chat unread indicator when chat tab is active", () => {
+    render(<MobileNavBar {...createDefaultProps()} view="chat" chatHasUnreadResponse={true} />);
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+  });
+
   it("skills tab calls onChangeView with 'skills'", () => {
     const props = createDefaultProps();
     render(<MobileNavBar {...props} view="board" showSkillsTab={true} />);

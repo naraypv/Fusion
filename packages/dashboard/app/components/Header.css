@@ -624,6 +624,7 @@
   justify-content: center;
   width: 28px;
   height: 28px;
+  position: relative;
   background: none;
   border: none;
   border-radius: var(--radius-sm);
@@ -650,6 +651,12 @@
 .view-toggle-btn.active:hover {
   background: var(--todo);
   color: var(--bg);
+}
+
+.header-chat-unread-dot {
+  position: absolute;
+  top: calc(var(--space-xs) * -1);
+  right: calc(var(--space-xs) * -1);
 }
 
 /* === View Toggle Overflow Dropdown === */

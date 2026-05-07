@@ -83,6 +83,17 @@
   height: 22px;
 }
 
+.mobile-nav-tab-icon-wrapper {
+  position: relative;
+  display: inline-flex;
+}
+
+.mobile-nav-chat-unread-dot {
+  position: absolute;
+  top: calc(var(--space-xs) * -1);
+  right: calc(var(--space-xs) * -1);
+}
+
 .mobile-nav-tab-label {
   max-width: 100%;
   overflow: hidden;

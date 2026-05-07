@@ -181,6 +181,8 @@ export interface HeaderProps {
   onOpenMailbox?: () => void;
   /** Unread message count for badge display */
   mailboxUnreadCount?: number;
+  /** Whether chat has an unread assistant response */
+  chatHasUnreadResponse?: boolean;
   onOpenSchedules?: () => void;
   onOpenGitManager?: () => void;
   onOpenNodes?: () => void;
@@ -242,6 +244,7 @@ export function Header({
   onOpenSystemStats,
   onOpenMailbox,
   mailboxUnreadCount = 0,
+  chatHasUnreadResponse = false,
   onOpenSchedules,
   onOpenGitManager,
   onOpenNodes,
@@ -1107,8 +1110,12 @@ export function Header({
               title="Chat view"
               aria-label="Chat view"
               aria-pressed={view === "chat"}
+              data-testid="header-chat-view-btn"
             >
               <MessageSquare size={16} />
+              {chatHasUnreadResponse && view !== "chat" && (
+                <span className="status-dot status-dot--pending header-chat-unread-dot" aria-label="Unread chat response" />
+              )}
             </button>
             <button
               className={`view-toggle-btn${view === "documents" ? " active" : ""}`}

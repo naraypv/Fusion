@@ -138,6 +138,16 @@ describe("Header", () => {
       expect(onChangeView).toHaveBeenCalledWith("list");
     });
 
+    it("shows chat unread indicator when chatHasUnreadResponse is true and chat is not active", () => {
+      renderHeader({ onChangeView: noop, view: "board", chatHasUnreadResponse: true });
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+
+    it("hides chat unread indicator when chat view is active", () => {
+      renderHeader({ onChangeView: noop, view: "chat", chatHasUnreadResponse: true });
+      expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+    });
+
     it("has correct aria attributes for accessibility", () => {
       renderHeader({ onChangeView: noop, view: "board" });
       const boardBtn = screen.getByTitle("Board view");
