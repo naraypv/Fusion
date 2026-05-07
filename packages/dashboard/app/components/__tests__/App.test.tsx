@@ -3308,7 +3308,7 @@ describe("App board branch filters", () => {
     });
   });
 
-  it("supports filtering for tasks without branch values", async () => {
+  it("supports filtering for tasks without working branch values", async () => {
     mockUseTasks.mockImplementation(() => ({
       tasks: [
         makeTask("FN-1", "Unassigned Task"),
@@ -3330,11 +3330,41 @@ describe("App board branch filters", () => {
     await waitForAppShell();
 
     fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
-    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__none__" } });
+    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__fusion:no-branch__" } });
 
     await waitFor(() => {
       expect(screen.getByText("Unassigned Task")).toBeTruthy();
       expect(screen.queryByText("Assigned Task")).toBeNull();
+    });
+  });
+
+  it("supports filtering for tasks without base branch values", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-1", "No Base Branch", "feature/a"),
+        makeTask("FN-2", "Has Base Branch", "feature/a", "main"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "__fusion:no-branch__" } });
+
+    await waitFor(() => {
+      expect(screen.getByText("No Base Branch")).toBeTruthy();
+      expect(screen.queryByText("Has Base Branch")).toBeNull();
     });
   });
 

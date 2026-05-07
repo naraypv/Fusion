@@ -29,7 +29,7 @@
 
 .header-branch-filters {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-2xl) * 5), 100%), 1fr));
   gap: var(--space-sm);
   margin-top: var(--space-sm);
 }

@@ -17,7 +17,7 @@ Board view is the kanban surface for day-to-day operation.
 Features:
 
 - Drag-and-drop between lifecycle columns
-- Search/filter tasks
+- Search/filter tasks (including working-branch and base-branch dropdown filters with explicit **No working branch** / **No base branch** options)
 - Column visibility controls
 - Inline quick entry creation
 - PR/issue badges with live updates

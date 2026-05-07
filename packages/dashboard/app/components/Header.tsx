@@ -18,7 +18,7 @@ import { getPluginNavIcon } from "./pluginNavIcon";
 
 export { useViewportMode };
 
-const NO_BRANCH_FILTER_VALUE = "__none__";
+const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
 
 // Status icon config for project selector dropdown
 const PROJECT_STATUS_CONFIG: Record<ProjectStatus, { color: string }> = {
@@ -212,12 +212,12 @@ export interface HeaderProps {
   showAgentsTab?: boolean;
   searchQuery?: string;
   onSearchChange?: (query: string) => void;
-  branchFilter?: string | null;
-  baseBranchFilter?: string | null;
+  branchFilter?: string;
+  baseBranchFilter?: string;
   branchOptions?: string[];
   baseBranchOptions?: string[];
-  onBranchFilterChange?: (value: string | null) => void;
-  onBaseBranchFilterChange?: (value: string | null) => void;
+  onBranchFilterChange?: (value: string) => void;
+  onBaseBranchFilterChange?: (value: string) => void;
   /** Multi-project props */
   projects?: ProjectInfo[];
   currentProject?: ProjectInfo | null;
@@ -276,8 +276,8 @@ export function Header({
   showAgentsTab,
   searchQuery = "",
   onSearchChange,
-  branchFilter = null,
-  baseBranchFilter = null,
+  branchFilter = "",
+  baseBranchFilter = "",
   branchOptions = [],
   baseBranchOptions = [],
   onBranchFilterChange,
@@ -1902,8 +1902,8 @@ export function Header({
               <span>Working branch</span>
               <select
                 className="header-branch-filter-select"
-                value={branchFilter ?? ""}
-                onChange={(event) => onBranchFilterChange?.(event.target.value || null)}
+                value={branchFilter}
+                onChange={(event) => onBranchFilterChange?.(event.target.value)}
                 data-testid="working-branch-filter"
               >
                 <option value="">All working branches</option>
@@ -1916,15 +1916,15 @@ export function Header({
               </select>
             </label>
             <label className="header-branch-filter-label">
-              <span>Target branch</span>
+              <span>Base branch</span>
               <select
                 className="header-branch-filter-select"
-                value={baseBranchFilter ?? ""}
-                onChange={(event) => onBaseBranchFilterChange?.(event.target.value || null)}
+                value={baseBranchFilter}
+                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
                 data-testid="target-branch-filter"
               >
-                <option value="">All target branches</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>No target branch</option>
+                <option value="">All base branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No base branch</option>
                 {baseBranchOptions.map((option) => (
                   <option key={option} value={option}>
                     {option}
@@ -1968,8 +1968,8 @@ export function Header({
               <span>Working branch</span>
               <select
                 className="header-branch-filter-select"
-                value={branchFilter ?? ""}
-                onChange={(event) => onBranchFilterChange?.(event.target.value || null)}
+                value={branchFilter}
+                onChange={(event) => onBranchFilterChange?.(event.target.value)}
                 data-testid="working-branch-filter-mobile"
               >
                 <option value="">All working branches</option>
@@ -1982,15 +1982,15 @@ export function Header({
               </select>
             </label>
             <label className="header-branch-filter-label">
-              <span>Target branch</span>
+              <span>Base branch</span>
               <select
                 className="header-branch-filter-select"
-                value={baseBranchFilter ?? ""}
-                onChange={(event) => onBaseBranchFilterChange?.(event.target.value || null)}
+                value={baseBranchFilter}
+                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
                 data-testid="target-branch-filter-mobile"
               >
-                <option value="">All target branches</option>
-                <option value={NO_BRANCH_FILTER_VALUE}>No target branch</option>
+                <option value="">All base branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No base branch</option>
                 {baseBranchOptions.map((option) => (
                   <option key={option} value={option}>
                     {option}

@@ -116,7 +116,7 @@ function prefetchLazyViews() {
 
 const SETUP_WARNING_DISMISSED_KEY = "kb-setup-warning-dismissed";
 const ACTIVE_CHAT_SESSION_STORAGE_KEY = "kb-chat-active-session";
-const NO_BRANCH_FILTER_VALUE = "__none__";
+const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
 
 function buildRemoteDashboardUrl(serverUrl: string, authToken?: string | null): string {
   const url = new URL(serverUrl);
@@ -207,8 +207,8 @@ function AppInner() {
   
   // Search query state - must be defined before useTasks
   const [searchQuery, setSearchQuery] = useState("");
-  const [branchFilter, setBranchFilter] = useState<string | null>(null);
-  const [baseBranchFilter, setBaseBranchFilter] = useState<string | null>(null);
+  const [branchFilter, setBranchFilter] = useState("");
+  const [baseBranchFilter, setBaseBranchFilter] = useState("");
   
   // Remote node data and events when in remote mode (pass searchQuery for server-side filtering)
   const remoteData = useRemoteNodeData(currentNodeId, { projectId: currentProject?.id, searchQuery: searchQuery || undefined });
@@ -446,20 +446,20 @@ function AppInner() {
 
   const filteredBoardTasks = useMemo(() => {
     return boardSourceTasks.filter((task) => {
-      const taskBranch = task.branch?.trim() ?? null;
-      const taskBaseBranch = task.baseBranch?.trim() ?? null;
+      const taskBranch = task.branch?.trim() ?? "";
+      const taskBaseBranch = task.baseBranch?.trim() ?? "";
       if (branchFilter === NO_BRANCH_FILTER_VALUE) {
-        if (taskBranch) {
+        if (taskBranch.length > 0) {
           return false;
         }
-      } else if (branchFilter && taskBranch !== branchFilter) {
+      } else if (branchFilter.length > 0 && taskBranch !== branchFilter) {
         return false;
       }
       if (baseBranchFilter === NO_BRANCH_FILTER_VALUE) {
-        if (taskBaseBranch) {
+        if (taskBaseBranch.length > 0) {
           return false;
         }
-      } else if (baseBranchFilter && taskBaseBranch !== baseBranchFilter) {
+      } else if (baseBranchFilter.length > 0 && taskBaseBranch !== baseBranchFilter) {
         return false;
       }
       return true;

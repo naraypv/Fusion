@@ -1067,6 +1067,10 @@ describe("Header", () => {
       expect(screen.getByTestId("header-branch-filters-desktop")).toBeInTheDocument();
       expect(screen.getByTestId("working-branch-filter")).toBeInTheDocument();
       expect(screen.getByTestId("target-branch-filter")).toBeInTheDocument();
+      expect(screen.getByRole("option", { name: "All working branches" })).toHaveValue("");
+      expect(screen.getByRole("option", { name: "No working branch" })).toHaveValue("__fusion:no-branch__");
+      expect(screen.getByRole("option", { name: "All base branches" })).toHaveValue("");
+      expect(screen.getByRole("option", { name: "No base branch" })).toHaveValue("__fusion:no-branch__");
     });
 
     it("does not render branch filters in list view", () => {
@@ -1088,15 +1092,15 @@ describe("Header", () => {
       });
       fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
       fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "feature/a" } });
-      fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__none__" } });
+      fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__fusion:no-branch__" } });
       fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "release" } });
-      fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "__none__" } });
+      fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "__fusion:no-branch__" } });
       fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "" } });
       expect(onBranchFilterChange).toHaveBeenCalledWith("feature/a");
-      expect(onBranchFilterChange).toHaveBeenCalledWith("__none__");
-      expect(onBranchFilterChange).toHaveBeenCalledWith(null);
+      expect(onBranchFilterChange).toHaveBeenCalledWith("__fusion:no-branch__");
+      expect(onBranchFilterChange).toHaveBeenCalledWith("");
       expect(onBaseBranchFilterChange).toHaveBeenCalledWith("release");
-      expect(onBaseBranchFilterChange).toHaveBeenCalledWith("__none__");
+      expect(onBaseBranchFilterChange).toHaveBeenCalledWith("__fusion:no-branch__");
     });
 
     it("renders branch filters in mobile expanded search for board view", () => {
