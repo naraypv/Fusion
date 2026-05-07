@@ -10,8 +10,8 @@
       "import": "./src/index.ts"
     },
     "./dashboard-view": {
-      "types": "./src/DependencyGraph.tsx",
-      "import": "./src/DependencyGraph.tsx"
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
     }
   },
   "scripts": {

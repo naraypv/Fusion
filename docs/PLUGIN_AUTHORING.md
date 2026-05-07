@@ -634,6 +634,11 @@ registerPluginView(
 
 The host then renders plugin views via `PluginDashboardViewHost` using the composite ID.
 
+Runtime host context contract:
+- Registered views receive a `context` object from the dashboard host (`PluginDashboardViewContext`).
+- Context includes the active `projectId`, current visible `tasks`, optional `workflowSteps`, and `openTaskDetail` for launching the native task detail flow.
+- Keep view-specific UI behavior in the plugin; treat host context as service/data injection only.
+
 Placement guidance:
 - `primary`: top-level nav tab (host may limit count on mobile)
 - `overflow`: desktop header overflow menu

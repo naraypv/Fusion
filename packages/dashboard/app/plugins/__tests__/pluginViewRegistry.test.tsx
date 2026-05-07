@@ -57,6 +57,17 @@ describe("pluginViewRegistry", () => {
     expect(await screen.findByText("Rendered Plugin View")).toBeInTheDocument();
   });
 
+  it("forwards host context to registered components", async () => {
+    const View = lazy(async () => ({
+      default: ({ context }: { context?: { projectId?: string } }) => <div>{context?.projectId ?? "none"}</div>,
+    }));
+    registerPluginView("plugin-a", "main", View);
+
+    render(<>{PluginDashboardViewHost({ viewId: "plugin:plugin-a:main", context: { projectId: "proj-1", tasks: [], workflowSteps: [], openTaskDetail: () => {} } })}</>);
+
+    expect(await screen.findByText("proj-1")).toBeInTheDocument();
+  });
+
   it("renders unavailable fallback for unregistered views", () => {
     render(<>{PluginDashboardViewHost({ viewId: "plugin:plugin-a:missing" })}</>);
     expect(screen.getByTestId("plugin-view-unavailable")).toBeInTheDocument();

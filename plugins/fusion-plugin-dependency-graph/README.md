@@ -15,6 +15,7 @@ Plugin-provided top-level **Graph** dashboard view for Fusion.
 - **Position persistence**: dragged node positions are stored per project in browser localStorage and restored on reload
 - **Animated transitions**: fit/reset operations animate `transform` (`var(--transition-normal)`), while continuous drag/wheel/pinch stays transition-free for responsiveness
 - **Node rendering**: each graph node renders the real dashboard `TaskCard` via `GraphTaskNode` (no duplicated card markup)
+- **Task detail integration**: clicking a graph card opens the native dashboard task detail modal through host context (`openTaskDetail`), matching board/list behavior
 - **In-progress behavior**: steps are visible by default and active-task glow (`agent-active`) is preserved because node cards reuse TaskCard directly
 - **Active-state indicator bar**: active nodes render a compact top bar (`.graph-task-active-indicator`) with the current execution status label (for example `Executing`, `Planning`) and pulsing `--in-progress` emphasis
 - **Current-step highlighting**: active nodes set `data-current-step` for valid native step indices so CSS selectors highlight the currently executing `.card-step-item` and pulse its step dot

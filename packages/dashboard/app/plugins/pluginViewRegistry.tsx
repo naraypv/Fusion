@@ -1,11 +1,21 @@
+import type { Task, TaskDetail, WorkflowStep } from "@fusion/core";
 import { AlertTriangle } from "lucide-react";
 import { lazy, Suspense, type LazyExoticComponent, type ReactElement, type ReactNode } from "react";
 import { ErrorBoundary } from "../components/ErrorBoundary";
+import type { DetailTaskTab } from "../hooks/useModalManager";
 import "./pluginViewRegistry.css";
 
 export type PluginTaskView = `plugin:${string}:${string}`;
 
-type PluginViewComponent = LazyExoticComponent<() => ReactElement>;
+export interface PluginDashboardViewContext {
+  projectId?: string;
+  tasks: Task[];
+  workflowSteps: WorkflowStep[];
+  openTaskDetail: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => void;
+  renderTaskCard?: (task: Task | TaskDetail) => ReactNode;
+}
+
+type PluginViewComponent = LazyExoticComponent<({ context }: { context?: PluginDashboardViewContext }) => ReactElement>;
 
 const registry = new Map<string, PluginViewComponent>();
 
@@ -39,7 +49,21 @@ export function getPluginViewComponent(pluginId: string, viewId: string): Plugin
 /** Test helper for clearing global registry state. */
 export function __test_clearPluginViewRegistry(): void {
   registry.clear();
+  registerBundledPluginViews();
 }
+
+function registerBundledPluginViews(): void {
+  registerPluginView(
+    "fusion-plugin-dependency-graph",
+    "graph",
+    lazy(async () => {
+      const mod = await import("@fusion-plugin-examples/dependency-graph/dashboard-view");
+      return { default: mod.DependencyGraphDashboardView };
+    }),
+  );
+}
+
+registerBundledPluginViews();
 
 function PluginViewUnavailable({ viewId }: { viewId: string }): ReactNode {
   return (
@@ -55,7 +79,7 @@ function PluginViewUnavailable({ viewId }: { viewId: string }): ReactNode {
   );
 }
 
-export function PluginDashboardViewHost({ viewId }: { viewId: PluginTaskView }): ReactNode {
+export function PluginDashboardViewHost({ viewId, context }: { viewId: PluginTaskView; context?: PluginDashboardViewContext }): ReactNode {
   const parsed = parsePluginViewId(viewId);
   if (!parsed) return <PluginViewUnavailable viewId={viewId} />;
 
@@ -67,7 +91,7 @@ export function PluginDashboardViewHost({ viewId }: { viewId: PluginTaskView }):
   return (
     <ErrorBoundary fallback={<PluginViewUnavailable viewId={viewId} />}>
       <Suspense fallback={null}>
-        <ViewComponent />
+        <ViewComponent context={context} />
       </Suspense>
     </ErrorBoundary>
   );

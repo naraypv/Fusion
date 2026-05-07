@@ -117,4 +117,11 @@ describe("DependencyGraph", () => {
     fireEvent.click(screen.getByTestId("task-A"));
     expect(onOpenDetail).toHaveBeenCalledWith(expect.objectContaining({ id: "A" }));
   });
+
+  it("falls back to onOpenTaskDetail when onOpenDetail is not provided", () => {
+    const onOpenTaskDetail = vi.fn();
+    render(<DependencyGraph tasks={[createTask("A", "in-progress")]} onOpenTaskDetail={onOpenTaskDetail} />);
+    fireEvent.click(screen.getByTestId("task-A"));
+    expect(onOpenTaskDetail).toHaveBeenCalledWith("A");
+  });
 });

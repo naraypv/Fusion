@@ -40,6 +40,19 @@ afterEach(() => {
 });
 
 describe("GraphTaskNode drag", () => {
+  it("does not open detail after drag threshold is exceeded", () => {
+    const onOpenDetail = vi.fn();
+    render(<GraphTaskNode {...props({ onOpenDetail })} />);
+    const node = screen.getByTestId("graph-task-node-FN-1");
+
+    fireEvent.pointerDown(node, { pointerId: 1, clientX: 10, clientY: 10, isPrimary: true });
+    fireEvent.pointerMove(node, { pointerId: 1, clientX: 25, clientY: 25, isPrimary: true });
+    fireEvent.pointerUp(node, { pointerId: 1, clientX: 25, clientY: 25, isPrimary: true });
+    fireEvent.click(node);
+
+    expect(onOpenDetail).not.toHaveBeenCalled();
+  });
+
   it("applies dragging class only after threshold move", () => {
     const onNodePositionChange = vi.fn();
     render(<GraphTaskNode {...props({ onNodePositionChange })} />);

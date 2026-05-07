@@ -93,6 +93,7 @@ Navigation placement in this iteration:
 - **Mobile:** `MobileNavBar` More sheet
 
 `fusion-plugin-dependency-graph` registers `graph` and is host-resolved through an explicit static registry (`app/plugins/pluginViewRegistry.tsx`) for bundle-safe rendering. CLI dashboard/serve/daemon startup now auto-installs this bundled plugin when missing.
+Graph view cards now use the same host-provided `openTaskDetail` flow as board/list cards, so clicking a graph node opens the native task detail modal while preserving plugin-owned graph interactions (drag/pan/highlighting).
 
 ### Mobile Bottom Navigation
 The dashboard now includes a dedicated bottom tab navigation pattern for mobile viewports (`≤768px`) via `MobileNavBar` (`app/components/MobileNavBar.tsx`). This pattern is designed for narrow screens and Capacitor-wrapped app usage where bottom-tab navigation is the primary interaction model.

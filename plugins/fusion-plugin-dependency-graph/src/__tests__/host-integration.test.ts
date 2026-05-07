@@ -11,7 +11,7 @@ describe("dependency graph plugin host integration contract", () => {
       expect.objectContaining({
         viewId: "graph",
         label: "Graph",
-        componentPath: "./src/DependencyGraph.tsx",
+        componentPath: "./dashboard-view",
         placement: "more",
       }),
     ]);

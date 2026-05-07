@@ -275,6 +275,10 @@ vi.mock("../../components/AgentsView", () => ({
   AgentsView: () => <div className="agents-view">Agents view</div>,
 }));
 
+vi.mock("@fusion-plugin-examples/dependency-graph/dashboard-view", () => ({
+  DependencyGraphDashboardView: () => <div data-testid="dependency-graph">No active tasks to display in graph view.</div>,
+}));
+
 vi.mock("../../components/ResearchView", () => ({
   ResearchView: ({ addToast }: { addToast?: (message: string, type?: "success" | "error" | "info") => void }) => (
     <div data-testid="research-view">
@@ -1777,7 +1781,8 @@ describe("App view switching", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText("Plugin view unavailable")).toBeInTheDocument();
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
+      expect(screen.getByText("No active tasks to display in graph view.")).toBeInTheDocument();
     });
 
     localStorage.removeItem(taskViewStorageKey());
@@ -1797,7 +1802,7 @@ describe("App view switching", () => {
 
     const first = render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("Plugin view unavailable")).toBeInTheDocument();
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
     });
     first.unmount();
 
@@ -1818,7 +1823,7 @@ describe("App view switching", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText("Plugin view unavailable")).toBeInTheDocument();
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
     });
 
     localStorage.removeItem(taskViewStorageKey());
