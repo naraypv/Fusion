@@ -44,6 +44,8 @@ const mockCentralListProjects = vi.fn().mockResolvedValue([]);
 const mockCentralInit = vi.fn().mockResolvedValue(undefined);
 const mockCentralClose = vi.fn().mockResolvedValue(undefined);
 const mockCentralReconcileProjectStatuses = vi.fn().mockResolvedValue(undefined);
+const mockCentralGetLocalNode = vi.fn().mockResolvedValue({ id: "node-local" });
+const mockCentralListNodes = vi.fn().mockResolvedValue([]);
 const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile } = vi.hoisted(() => ({
   mockPerformUpdateCheck: vi.fn(),
   mockClearUpdateCheckCache: vi.fn(),
@@ -104,6 +106,8 @@ vi.mock("@fusion/core", async (importOriginal) => {
       close: mockCentralClose,
       listProjects: mockCentralListProjects,
       reconcileProjectStatuses: mockCentralReconcileProjectStatuses,
+      getLocalNode: mockCentralGetLocalNode,
+      listNodes: mockCentralListNodes,
     })),
   });
 });
@@ -175,6 +179,7 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     listTasks: vi.fn().mockResolvedValue([]),
     searchTasks: vi.fn().mockResolvedValue([]),
     createTask: vi.fn(),
+    createTaskWithReservedId: undefined,
     moveTask: vi.fn(),
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
@@ -205,6 +210,11 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updatePrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getDistributedTaskIdAllocator: vi.fn().mockReturnValue({
+      reserveDistributedTaskId: vi.fn().mockResolvedValue({ reservationId: "res-1", taskId: "FN-7001" }),
+      commitDistributedTaskIdReservation: vi.fn().mockResolvedValue({}),
+      abortDistributedTaskIdReservation: vi.fn().mockResolvedValue({}),
+    }),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -668,6 +678,98 @@ describe("POST /tasks", () => {
         settings: { autoSummarizeTitles: undefined },
       }),
     );
+  });
+
+  it("uses distributed allocator flow when reserved-id create is available", async () => {
+    const createTaskWithReservedId = vi.fn().mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-7001",
+      column: "triage",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+      nodeId: "node-target",
+    });
+    const storeWithReservedCreate = createMockStore({
+      createTaskWithReservedId,
+      getTask: vi.fn().mockResolvedValue({ ...FAKE_TASK_DETAIL, prompt: "# FN-7001\n\nBig initiative\n" }),
+    });
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(storeWithReservedCreate));
+
+    const res = await REQUEST(
+      app,
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Big initiative", nodeId: "node-target" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(createTaskWithReservedId).toHaveBeenCalledWith(
+      expect.objectContaining({ description: "Big initiative", nodeId: "node-target" }),
+      expect.objectContaining({ taskId: "FN-7001" }),
+    );
+    expect((storeWithReservedCreate.getDistributedTaskIdAllocator as ReturnType<typeof vi.fn>).mock.results[0]?.value.commitDistributedTaskIdReservation).toHaveBeenCalled();
+  });
+
+  it("returns 400 when nodeId is not a string", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Task", nodeId: 123 }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("nodeId must be a string");
+  });
+
+  it("aborts reservation and deletes local task on replication failure", async () => {
+    const reserveDistributedTaskId = vi.fn().mockResolvedValue({ reservationId: "res-1", taskId: "FN-7002" });
+    const commitDistributedTaskIdReservation = vi.fn().mockResolvedValue({});
+    const abortDistributedTaskIdReservation = vi.fn().mockResolvedValue({});
+    const createTaskWithReservedId = vi.fn().mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-7002",
+      column: "triage",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+    });
+    const deleteTask = vi.fn().mockResolvedValue(undefined);
+    const storeWithReservedCreate = createMockStore({
+      createTaskWithReservedId,
+      deleteTask,
+      getTask: vi.fn().mockResolvedValue({ ...FAKE_TASK_DETAIL, prompt: "# FN-7002\n\nBig initiative\n" }),
+      getDistributedTaskIdAllocator: vi.fn().mockReturnValue({
+        reserveDistributedTaskId,
+        commitDistributedTaskIdReservation,
+        abortDistributedTaskIdReservation,
+      }),
+    });
+    mockCentralListNodes.mockResolvedValue([{ id: "node-remote", type: "remote", url: "https://remote.example.com", apiKey: "secret" }]);
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(storeWithReservedCreate));
+
+    const res = await REQUEST(
+      app,
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Big initiative" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(abortDistributedTaskIdReservation).toHaveBeenCalledWith(expect.objectContaining({ reservationId: "res-1", reason: "failed-create" }));
+    expect(deleteTask).toHaveBeenCalledWith("FN-7002");
+    expect(commitDistributedTaskIdReservation).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+    mockCentralListNodes.mockResolvedValue([]);
   });
 
   it("forwards branch and baseBranch on create", async () => {

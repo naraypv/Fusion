@@ -28,6 +28,12 @@ import { validateNodeOverrideChange } from "./node-override-guard.js";
 import { sanitizeTitle } from "./ai-summarize.js";
 import { assertProjectRootDir } from "./project-root-guard.js";
 import { createDistributedTaskIdAllocator, type DistributedTaskIdAllocator } from "./distributed-task-id.js";
+import {
+  buildBootstrapPrompt,
+  replicationCollisionError,
+  taskMatchesReplicatedCreate,
+} from "./mesh-task-replication.js";
+import type { MeshReplicatedTaskApplyResult, MeshReplicatedTaskCreatePayload } from "./types.js";
 
 /** Database row shape for the tasks table (all columns). */
 interface TaskRow {
@@ -251,16 +257,6 @@ function compactTaskActivityLog(entries: TaskLogEntry[]): TaskLogEntry[] {
     ...entry,
     outcome: truncateTaskLogOutcome(entry.outcome),
   }));
-}
-
-/**
- * Build the exact PROMPT.md bytes that `createTask` writes for a triage task.
- * Single source of truth so the stub-detection comparison below stays in sync
- * with the bootstrap shape.
- */
-function buildBootstrapPrompt(taskId: string, title: string | undefined, description: string): string {
-  const heading = title ? `${taskId}: ${title}` : taskId;
-  return `# ${heading}\n\n${description}\n`;
 }
 
 /**
@@ -2287,6 +2283,87 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return task;
   }
 
+  async createTaskWithReservedId(
+    input: TaskCreateInput,
+    options: {
+      taskId: string;
+      createdAt?: string;
+      updatedAt?: string;
+      prompt?: string;
+      applyDefaultWorkflowSteps?: boolean;
+    },
+  ): Promise<Task> {
+    if (!input.description?.trim()) {
+      throw new Error("Description is required and cannot be empty");
+    }
+
+    const id = options.taskId.trim();
+    if (!id) {
+      throw new Error("taskId is required");
+    }
+
+    if (input.dependencies?.includes(id)) {
+      throw new Error(`Task ${id} cannot depend on itself`);
+    }
+
+    if (this.readTaskFromDb(id)) {
+      throw new Error(`Task ID already exists: ${id}`);
+    }
+
+    const title = input.title?.trim() || undefined;
+    let resolvedWorkflowSteps: string[] | undefined = input.enabledWorkflowSteps?.length
+      ? await this.resolveEnabledWorkflowSteps(input.enabledWorkflowSteps)
+      : undefined;
+
+    if (input.enabledWorkflowSteps === undefined && options.applyDefaultWorkflowSteps !== false) {
+      try {
+        const allSteps = await this.listWorkflowSteps();
+        const defaultOnSteps = allSteps
+          .filter((ws) => ws.enabled && ws.defaultOn)
+          .map((ws) => ws.id);
+        if (defaultOnSteps.length > 0) {
+          resolvedWorkflowSteps = defaultOnSteps;
+        }
+      } catch (err) {
+        storeLog.warn("Failed to auto-apply default workflow steps during reserved task creation; auto-defaulting skipped", {
+          phase: "createTaskWithReservedId:workflow-auto-default",
+          skippedAutoDefaulting: true,
+          error: err instanceof Error ? err.message : String(err),
+          descriptionLength: input.description.length,
+        });
+      }
+    } else if (Array.isArray(input.enabledWorkflowSteps) && input.enabledWorkflowSteps.length === 0) {
+      resolvedWorkflowSteps = undefined;
+    }
+
+    return this._createTaskInternal(input, title, resolvedWorkflowSteps, id, {
+      createdAt: options.createdAt,
+      updatedAt: options.updatedAt,
+      promptOverride: options.prompt,
+    });
+  }
+
+  async applyReplicatedTaskCreate(payload: MeshReplicatedTaskCreatePayload): Promise<MeshReplicatedTaskApplyResult> {
+    const existing = this.readTaskFromDb(payload.taskId);
+    if (existing) {
+      const existingDetail = await this.getTask(payload.taskId);
+      if (taskMatchesReplicatedCreate(existingDetail, payload)) {
+        return { task: existingDetail, applied: false };
+      }
+      throw replicationCollisionError(payload.taskId);
+    }
+
+    const task = await this.createTaskWithReservedId(payload.input, {
+      taskId: payload.taskId,
+      createdAt: payload.createdAt,
+      updatedAt: payload.updatedAt,
+      prompt: payload.prompt,
+      applyDefaultWorkflowSteps: false,
+    });
+
+    return { task, applied: true };
+  }
+
   /**
    * Internal helper for task creation. Used by createTask() and potentially other
    * internal methods that need to create tasks without triggering summarization.
@@ -2295,9 +2372,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     input: TaskCreateInput,
     title: string | undefined,
     resolvedWorkflowSteps: string[] | undefined,
-    id: string
+    id: string,
+    options?: {
+      createdAt?: string;
+      updatedAt?: string;
+      promptOverride?: string;
+    },
   ): Promise<Task> {
-    const now = new Date().toISOString();
+    const now = options?.createdAt ?? new Date().toISOString();
     const task: Task = {
       id,
       title,
@@ -2338,7 +2420,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       log: [{ timestamp: now, action: "Task created" }],
       columnMovedAt: now,
       createdAt: now,
-      updatedAt: now,
+      updatedAt: options?.updatedAt ?? now,
     };
 
     const dir = this.taskDir(id);
@@ -2348,9 +2430,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     // Update cache if watcher is active
     if (this.isWatching) this.taskCache.set(id, { ...task });
 
-    const prompt = task.column === "triage"
-      ? buildBootstrapPrompt(id, task.title, task.description)
-      : this.generateSpecifiedPrompt(task);
+    const prompt = options?.promptOverride
+      ?? (task.column === "triage"
+        ? buildBootstrapPrompt(id, task.title, task.description)
+        : this.generateSpecifiedPrompt(task));
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "PROMPT.md"), prompt);
 

@@ -4,12 +4,15 @@ import {
   COLUMNS,
   TASK_PRIORITIES,
   VALID_TRANSITIONS,
+  buildMeshReplicatedTaskCreatePayload,
   isTaskPriority,
   resolveTitleSummarizerSettingsModel,
+  toReplicatedCreateInput,
   validateNodeOverrideChange,
 } from "@fusion/core";
 import { planTaskWorktreePath } from "@fusion/engine";
 import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
+import { fetchFromRemoteNode } from "./register-settings-sync-helpers.js";
 import type { ApiRoutesContext } from "./types.js";
 
 interface TaskWorkflowRouteDeps {
@@ -97,6 +100,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         source,
         branch,
         baseBranch,
+        nodeId,
       } = req.body;
       if (!description || typeof description !== "string") {
         throw badRequest("description is required");
@@ -134,6 +138,10 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       // Validate priority if provided.
       if (priority !== undefined && priority !== null && !isTaskPriority(priority)) {
         throw badRequest(`priority must be one of: ${TASK_PRIORITIES.join(", ")}`);
+      }
+
+      if (nodeId !== undefined && nodeId !== null && typeof nodeId !== "string") {
+        throw badRequest("nodeId must be a string");
       }
 
       const executorModel = normalizeModelSelectionPair(validatedModelProvider, validatedModelId);
@@ -198,33 +206,97 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const normalizedBranch = validateOptionalBranchString(branch, "branch");
       const normalizedBaseBranch = validateOptionalBranchString(baseBranch, "baseBranch");
 
-      const task = await scopedStore.createTask(
-        {
-          title,
-          description,
-          column,
-          dependencies,
-          breakIntoSubtasks,
-          enabledWorkflowSteps,
-          modelPresetId: validateOptionalModelField(modelPresetId, "modelPresetId"),
-          modelProvider: executorModel.provider ?? undefined,
-          modelId: executorModel.modelId ?? undefined,
-          validatorModelProvider: validatorModel.provider ?? undefined,
-          validatorModelId: validatorModel.modelId ?? undefined,
-          planningModelProvider: planningModel.provider ?? undefined,
-          planningModelId: planningModel.modelId ?? undefined,
-          thinkingLevel: thinkingLevel || undefined,
-          summarize,
-          reviewLevel: reviewLevel ?? undefined,
-          executionMode: executionMode || undefined,
-          priority: priority ?? undefined,
-          source: normalizedSource,
-          branch: normalizedBranch,
-          baseBranch: normalizedBaseBranch,
-        },
-        { onSummarize, settings: { autoSummarizeTitles: settings.autoSummarizeTitles } }
-      );
-      res.status(201).json(task);
+      const createInput = {
+        title,
+        description,
+        column,
+        dependencies,
+        breakIntoSubtasks,
+        enabledWorkflowSteps,
+        modelPresetId: validateOptionalModelField(modelPresetId, "modelPresetId"),
+        modelProvider: executorModel.provider ?? undefined,
+        modelId: executorModel.modelId ?? undefined,
+        validatorModelProvider: validatorModel.provider ?? undefined,
+        validatorModelId: validatorModel.modelId ?? undefined,
+        planningModelProvider: planningModel.provider ?? undefined,
+        planningModelId: planningModel.modelId ?? undefined,
+        thinkingLevel: thinkingLevel || undefined,
+        summarize,
+        reviewLevel: reviewLevel ?? undefined,
+        executionMode: executionMode || undefined,
+        priority: priority ?? undefined,
+        source: normalizedSource,
+        branch: normalizedBranch,
+        baseBranch: normalizedBaseBranch,
+        ...(typeof nodeId === "string" && nodeId.trim().length > 0 ? { nodeId: nodeId.trim() } : {}),
+      };
+
+      if (typeof scopedStore.createTaskWithReservedId !== "function") {
+        const task = await scopedStore.createTask(
+          createInput,
+          { onSummarize, settings: { autoSummarizeTitles: settings.autoSummarizeTitles } },
+        );
+        res.status(201).json(task);
+        return;
+      }
+
+      const allocator = scopedStore.getDistributedTaskIdAllocator();
+      const { CentralCore } = await import("@fusion/core");
+      const central = new CentralCore();
+      await central.init();
+      const nodes = await central.listNodes();
+      const localNode = nodes.find((node) => node.type === "local");
+      const remoteNodes = nodes.filter((node) => node.type === "remote" && node.url && node.apiKey);
+      await central.close();
+
+      const reservation = await allocator.reserveDistributedTaskId({
+        prefix: "FN",
+        nodeId: localNode?.id ?? "local",
+      });
+
+      let createdTask: Task | null = null;
+      try {
+        createdTask = await scopedStore.createTaskWithReservedId(createInput, {
+          taskId: reservation.taskId,
+        });
+
+        const replicatedPayload = buildMeshReplicatedTaskCreatePayload({
+          taskId: createdTask.id,
+          reservationId: reservation.reservationId,
+          sourceNodeId: localNode?.id ?? "local",
+          createdAt: createdTask.createdAt,
+          updatedAt: createdTask.updatedAt,
+          prompt: (await scopedStore.getTask(createdTask.id)).prompt,
+          createInput: toReplicatedCreateInput(createdTask),
+        });
+
+        for (const peer of remoteNodes) {
+          await fetchFromRemoteNode(peer, "/api/mesh/tasks/create", {
+            method: "POST",
+            body: replicatedPayload,
+          });
+        }
+
+        await allocator.commitDistributedTaskIdReservation({
+          reservationId: reservation.reservationId,
+          nodeId: localNode?.id ?? "local",
+        });
+
+        res.status(201).json(createdTask);
+      } catch (err: unknown) {
+        await allocator.abortDistributedTaskIdReservation({
+          reservationId: reservation.reservationId,
+          nodeId: localNode?.id ?? "local",
+          reason: "failed-create",
+        }).catch(() => undefined);
+
+        if (createdTask) {
+          await scopedStore.deleteTask(createdTask.id).catch(() => undefined);
+        }
+
+        const message = err instanceof Error ? err.message : String(err);
+        throw new ApiError(503, `Cluster task create failed: ${message}`);
+      }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;

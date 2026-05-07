@@ -588,6 +588,37 @@ describe("createTask", () => {
     expect(body.baseBranch).toBe("main");
   });
 
+  it("serializes nodeId in create payload when execution target is specified", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      ...FAKE_CREATED_TASK,
+      nodeId: "node-exec-1",
+    }));
+
+    await createTask({
+      description: "Task with remote execution target",
+      nodeId: "node-exec-1",
+    });
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.nodeId).toBe("node-exec-1");
+  });
+
+  it("routes createTask through node proxy when transportNodeId differs from local node", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, FAKE_CREATED_TASK));
+
+    await createTask(
+      { description: "Proxy-routed task", nodeId: "node-exec-2" },
+      "proj-1",
+      { transportNodeId: "node-remote", localNodeId: "node-local" },
+    );
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    expect(call[0]).toBe("/api/proxy/node-remote/tasks?projectId=proj-1");
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.nodeId).toBe("node-exec-2");
+  });
+
   it("sends POST with multiple fields including executionMode", async () => {
     globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
       ...FAKE_CREATED_TASK,

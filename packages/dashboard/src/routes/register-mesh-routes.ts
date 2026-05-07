@@ -234,6 +234,35 @@ export const registerMeshRoutes: ApiRouteRegistrar = (ctx) => {
     }
   });
 
+  router.post("/mesh/tasks/create", async (req, res) => {
+    const payload = req.body;
+    try {
+      const senderNodeId = typeof payload?.sourceNodeId === "string" ? payload.sourceNodeId : undefined;
+      if (!(await requireMeshAuth(req, res, senderNodeId))) return;
+      if (payload?.replicationVersion !== 1) throw badRequest("replicationVersion must be 1");
+      if (typeof payload?.reservationId !== "string" || payload.reservationId.trim().length === 0) throw badRequest("reservationId is required");
+      if (typeof payload?.taskId !== "string" || payload.taskId.trim().length === 0) throw badRequest("taskId is required");
+      if (typeof payload?.sourceNodeId !== "string" || payload.sourceNodeId.trim().length === 0) throw badRequest("sourceNodeId is required");
+      if (typeof payload?.createdAt !== "string" || typeof payload?.updatedAt !== "string") throw badRequest("createdAt and updatedAt are required");
+      if (typeof payload?.prompt !== "string") throw badRequest("prompt is required");
+      if (!payload?.input || typeof payload.input !== "object") throw badRequest("input is required");
+
+      const result = await store.applyReplicatedTaskCreate(payload);
+      res.status(result.applied ? 201 : 200).json(result);
+    } catch (err: unknown) {
+      emitRemoteRouteDiagnostic({
+        route: "mesh-task-create",
+        message: "Failed to apply replicated task create",
+        nodeId: typeof payload?.sourceNodeId === "string" ? payload.sourceNodeId : undefined,
+        upstreamPath: "/api/mesh/tasks/create",
+        operationStage: "apply-replicated-create",
+        error: err,
+      });
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
+
   router.post("/mesh/sync", async (req, res) => {
     try {
       const { CentralCore } = await import("@fusion/core");

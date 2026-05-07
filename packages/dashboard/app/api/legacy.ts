@@ -247,7 +247,16 @@ export async function fetchTaskDetail(id: string, projectId?: string): Promise<T
   throw new Error("Request failed");
 }
 
-export function createTask(input: TaskCreateInput, projectId?: string): Promise<Task> {
+export interface CreateTaskRequestOptions {
+  transportNodeId?: string;
+  localNodeId?: string;
+}
+
+export function createTask(
+  input: TaskCreateInput,
+  projectId?: string,
+  options?: CreateTaskRequestOptions,
+): Promise<Task> {
   const {
     title,
     description,
@@ -269,12 +278,15 @@ export function createTask(input: TaskCreateInput, projectId?: string): Promise<
     executionMode,
     priority,
     source,
+    nodeId,
     branch,
     baseBranch,
   } = input;
 
-  return api<Task>(withProjectId("/tasks", projectId), {
+  return proxyApi<Task>(withProjectId("/tasks", projectId), {
     method: "POST",
+    nodeId: options?.transportNodeId,
+    localNodeId: options?.localNodeId,
     body: JSON.stringify({
       title,
       description,
@@ -296,6 +308,7 @@ export function createTask(input: TaskCreateInput, projectId?: string): Promise<
       executionMode,
       priority,
       source,
+      nodeId,
       branch,
       baseBranch,
     }),

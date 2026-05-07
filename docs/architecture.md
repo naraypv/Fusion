@@ -477,6 +477,11 @@ Implemented in `agent-heartbeat.ts`:
   - Default reservation TTL is `15 * 60 * 1000` ms (15 minutes). Expired/aborted reservations are **burned IDs** and are never reissued.
   - `committedClusterTaskCount` from allocator state is the only authoritative cluster-wide committed-task count. Local task-row counts and ID suffix math are not authoritative.
   - Mesh allocator write routes (`/api/mesh/task-ids/reserve|commit|abort`) return `503` when the coordinator node is unreachable; they never fall back to local-only cluster ID issuance.
+- Cluster task creation now uses a strong-write reserve → create → replicate → commit/abort sequence.
+  - `POST /api/tasks` reserves a distributed ID, creates the authoritative local task with that reserved ID, then POSTs authenticated replication payloads to peer nodes.
+  - Replica apply uses `TaskStore.applyReplicatedTaskCreate(...)`, which is idempotent by task ID: replaying the same payload returns the existing task without creating duplicates.
+  - If an incoming replicated payload conflicts with a different existing task record for the same ID, the apply path returns a deterministic collision error instead of overwriting data.
+  - Any replication/coordinator failure aborts the reservation and returns write failure (`503`), so this path does not report success for local-only partial writes.
 - Process lifecycle ownership:
   - `fn serve` / `fn dashboard` start a single process-level `PeerExchangeService` and stop it during shutdown.
   - `CentralCore.startDiscovery()` is invoked from CLI startup only after HTTP bind completes so discovery advertises the actual listening port.

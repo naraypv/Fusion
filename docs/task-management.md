@@ -382,6 +382,15 @@ At dispatch time, scheduler routing is persisted on the task as:
 - `effectiveNodeId`
 - `effectiveNodeSource` (`task-override`, `project-default`, or `local`)
 
+### Create-time routing semantics
+
+Cluster-aware task creation separates two routing decisions:
+
+- **Transport node**: which node receives the `POST /api/tasks` request (can be local or proxied remote).
+- **Execution target** (`Task.nodeId`): which node should run the task later.
+
+These are intentionally independent. Routing a create request through node A does not force execution on node A unless `Task.nodeId` also points there.
+
 ### Per-task node override
 
 You can set or clear a task override from:

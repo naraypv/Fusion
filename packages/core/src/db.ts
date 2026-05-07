@@ -938,10 +938,11 @@ export class Database {
     // and there's no other writer to coordinate with — so we skip WAL-only
     // tuning there.
     if (!inMemory) {
+      // Wait up to 5s for locks to clear before returning SQLITE_BUSY.
+      // Set this before other PRAGMAs so they also benefit from lock waiting.
+      this.db.exec("PRAGMA busy_timeout = 5000");
       // Enable WAL mode for concurrent reader/writer access
       this.db.exec("PRAGMA journal_mode = WAL");
-      // Wait up to 5s for locks to clear before returning SQLITE_BUSY
-      this.db.exec("PRAGMA busy_timeout = 5000");
       // In WAL mode NORMAL is nearly as durable as FULL with much lower fsync cost.
       this.db.exec("PRAGMA synchronous = NORMAL");
       // Checkpoint every 100 pages (~400 KB) to keep WAL small and reduce

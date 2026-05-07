@@ -28,6 +28,7 @@ const mockReserveDistributedTaskId = vi.fn();
 const mockCommitDistributedTaskIdReservation = vi.fn();
 const mockAbortDistributedTaskIdReservation = vi.fn();
 const mockGetDistributedTaskIdState = vi.fn();
+const mockApplyReplicatedTaskCreate = vi.fn();
 
 // Mock GlobalSettingsStore
 const mockGetSettings = vi.fn().mockResolvedValue({});
@@ -97,6 +98,10 @@ class MockStore extends EventEmitter {
       abortDistributedTaskIdReservation: mockAbortDistributedTaskIdReservation,
       getDistributedTaskIdState: mockGetDistributedTaskIdState,
     };
+  }
+
+  async applyReplicatedTaskCreate(payload: unknown): Promise<{ task: Task; applied: boolean }> {
+    return mockApplyReplicatedTaskCreate(payload);
   }
 
   async listTasks(): Promise<Task[]> {
@@ -724,5 +729,99 @@ describe("/api/mesh/task-ids routes", () => {
     const response = await request(app, "POST", "/api/mesh/task-ids/commit", JSON.stringify({ reservationId: "res-1", nodeId: "node-a", coordinatorNodeId: "node_remote_1" }), { "Content-Type": "application/json" });
     expect(response.status).toBe(503);
     vi.unstubAllGlobals();
+  });
+});
+
+describe("/api/mesh/tasks/create", () => {
+  let app: ReturnType<typeof createServer>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockInit.mockResolvedValue(undefined);
+    mockClose.mockResolvedValue(undefined);
+    mockGetNode.mockResolvedValue(undefined);
+    mockApplyReplicatedTaskCreate.mockResolvedValue({
+      task: {
+        id: "FN-001",
+        description: "replicated",
+        column: "triage",
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        createdAt: "2026-05-05T00:00:00.000Z",
+        updatedAt: "2026-05-05T00:00:00.000Z",
+      },
+      applied: true,
+    });
+    app = createServer(new MockStore() as unknown as TaskStore);
+  });
+
+  it("applies replicated task create payload", async () => {
+    const payload = {
+      replicationVersion: 1,
+      reservationId: "res-1",
+      taskId: "FN-001",
+      sourceNodeId: "node_remote_1",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+      prompt: "# FN-001\n\nreplicated\n",
+      input: { description: "replicated" },
+    };
+
+    const response = await request(app, "POST", "/api/mesh/tasks/create", JSON.stringify(payload), { "Content-Type": "application/json" });
+    expect(response.status).toBe(201);
+    expect(mockApplyReplicatedTaskCreate).toHaveBeenCalledWith(payload);
+  });
+
+  it("returns 200 when replicated task create is an idempotent replay", async () => {
+    mockApplyReplicatedTaskCreate.mockResolvedValue({
+      task: {
+        id: "FN-001",
+        description: "replicated",
+        column: "triage",
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        createdAt: "2026-05-05T00:00:00.000Z",
+        updatedAt: "2026-05-05T00:00:00.000Z",
+      },
+      applied: false,
+    });
+
+    const payload = {
+      replicationVersion: 1,
+      reservationId: "res-1",
+      taskId: "FN-001",
+      sourceNodeId: "node_remote_1",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+      prompt: "# FN-001\n\nreplicated\n",
+      input: { description: "replicated" },
+    };
+
+    const response = await request(app, "POST", "/api/mesh/tasks/create", JSON.stringify(payload), { "Content-Type": "application/json" });
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects unauthorized replicated create", async () => {
+    mockGetNode.mockResolvedValue(makeNodeConfig({ id: "node_remote_1", apiKey: "secret" }));
+    const payload = {
+      replicationVersion: 1,
+      reservationId: "res-1",
+      taskId: "FN-001",
+      sourceNodeId: "node_remote_1",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+      prompt: "# FN-001\n\nreplicated\n",
+      input: { description: "replicated" },
+    };
+
+    const response = await request(app, "POST", "/api/mesh/tasks/create", JSON.stringify(payload), {
+      "Content-Type": "application/json",
+      Authorization: "Bearer wrong",
+    });
+    expect(response.status).toBe(401);
   });
 });

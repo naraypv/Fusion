@@ -116,6 +116,8 @@ Within a project runtime, effective task routing resolves as:
 2. project default (`defaultNodeId`)
 3. local execution
 
+Task creation also has a separate **transport node** concept: dashboard/API clients can route the create request through a remote node proxy while still setting `Task.nodeId` for where execution should occur later. Transport-node selection controls which node receives the HTTP write; `Task.nodeId` controls execution routing after the task exists.
+
 This allows each project to maintain independent routing behavior even when managed from one central registry.
 
 ### Unavailable node policy in multi-project context

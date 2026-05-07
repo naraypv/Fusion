@@ -1154,6 +1154,22 @@ export interface TaskCreateInput {
 
 // ── Todo List Types ──────────────────────────────────────────────────────
 
+export interface MeshReplicatedTaskCreatePayload {
+  replicationVersion: 1;
+  reservationId: string;
+  taskId: string;
+  sourceNodeId: string;
+  createdAt: string;
+  updatedAt: string;
+  prompt: string;
+  input: TaskCreateInput;
+}
+
+export interface MeshReplicatedTaskApplyResult {
+  task: Task;
+  applied: boolean;
+}
+
 export interface TodoList {
   id: string;
   projectId: string;

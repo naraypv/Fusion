@@ -11356,6 +11356,91 @@ describe("RunMutationContext", () => {
       const second = store.getDistributedTaskIdAllocator();
       expect(first).toBe(second);
     });
+
+    it("createTaskWithReservedId creates using provided id", async () => {
+      const created = await store.createTaskWithReservedId(
+        { description: "replicated task", nodeId: "node-b" },
+        { taskId: "FN-9001" },
+      );
+
+      expect(created.id).toBe("FN-9001");
+      expect(created.nodeId).toBe("node-b");
+      const detail = await store.getTask("FN-9001");
+      expect(detail.prompt).toBe("# FN-9001\n\nreplicated task\n");
+    });
+
+    it("createTaskWithReservedId rejects duplicates and self-dependencies", async () => {
+      await store.createTaskWithReservedId({ description: "first" }, { taskId: "FN-9003" });
+
+      await expect(
+        store.createTaskWithReservedId({ description: "duplicate" }, { taskId: "FN-9003" }),
+      ).rejects.toThrow("Task ID already exists: FN-9003");
+
+      await expect(
+        store.createTaskWithReservedId(
+          { description: "self dep", dependencies: ["FN-9004"] },
+          { taskId: "FN-9004" },
+        ),
+      ).rejects.toThrow("Task FN-9004 cannot depend on itself");
+    });
+
+    it("applyReplicatedTaskCreate does not auto-apply default workflow steps", async () => {
+      const workflowStep = await store.createWorkflowStep({
+        name: "Default step",
+        description: "auto",
+        enabled: true,
+        defaultOn: true,
+      });
+
+      const payload = {
+        replicationVersion: 1 as const,
+        reservationId: "res-default-step",
+        taskId: "FN-9010",
+        sourceNodeId: "node-a",
+        createdAt: "2026-05-05T00:00:00.000Z",
+        updatedAt: "2026-05-05T00:00:00.000Z",
+        prompt: "# FN-9010\n\ncluster create\n",
+        input: {
+          description: "cluster create",
+          column: "triage" as const,
+        },
+      };
+
+      const result = await store.applyReplicatedTaskCreate(payload);
+      expect(result.applied).toBe(true);
+      expect(result.task.enabledWorkflowSteps).toBeUndefined();
+      expect(workflowStep.defaultOn).toBe(true);
+    });
+
+    it("applyReplicatedTaskCreate is idempotent and detects collisions", async () => {
+      const payload = {
+        replicationVersion: 1 as const,
+        reservationId: "res-1",
+        taskId: "FN-9002",
+        sourceNodeId: "node-a",
+        createdAt: "2026-05-05T00:00:00.000Z",
+        updatedAt: "2026-05-05T00:00:00.000Z",
+        prompt: "# FN-9002\n\ncluster create\n",
+        input: {
+          description: "cluster create",
+          column: "triage" as const,
+          nodeId: "node-c",
+        },
+      };
+
+      const first = await store.applyReplicatedTaskCreate(payload);
+      expect(first.applied).toBe(true);
+      const second = await store.applyReplicatedTaskCreate(payload);
+      expect(second.applied).toBe(false);
+      expect(second.task.id).toBe("FN-9002");
+
+      await expect(
+        store.applyReplicatedTaskCreate({
+          ...payload,
+          input: { ...payload.input, description: "different" },
+        }),
+      ).rejects.toThrow("Replicated task payload collision");
+    });
   });
 
   describe("FTS5 corruption recovery during upsert", () => {
