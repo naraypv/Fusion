@@ -110,10 +110,23 @@ interface UseMobileKeyboardOptions {
 export function useMobileKeyboard(
   { enabled = true }: UseMobileKeyboardOptions = {},
 ): { keyboardOverlap: number; viewportHeight: number | null; viewportOffsetTop: number; keyboardOpen: boolean } {
-  const [keyboardOverlap, setKeyboardOverlap] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState<number | null>(null);
-  const [viewportOffsetTop, setViewportOffsetTop] = useState(0);
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  // Lazy initial values: read the actual visualViewport on first render
+  // so a remount (e.g. switching tabs back with the keyboard up) doesn't
+  // start with keyboardOpen=false. That stale-state render briefly hid
+  // the .chat-thread compensation and unhid the executor status bar,
+  // which then reappeared as a blank pane covering half the composer
+  // before settling.
+  const initialMetrics = (): KeyboardMetrics => {
+    if (!enabled || typeof window === "undefined" || !isMobileDevice()) {
+      return { overlap: 0, open: false, vvHeight: null, vvOffsetTop: 0 };
+    }
+    return getKeyboardMetrics();
+  };
+  const [initial] = useState(initialMetrics);
+  const [keyboardOverlap, setKeyboardOverlap] = useState(initial.overlap);
+  const [viewportHeight, setViewportHeight] = useState<number | null>(initial.vvHeight);
+  const [viewportOffsetTop, setViewportOffsetTop] = useState(initial.vvOffsetTop);
+  const [keyboardOpen, setKeyboardOpen] = useState(initial.open);
 
   useEffect(() => {
     if (!enabled || !isMobileDevice()) {
