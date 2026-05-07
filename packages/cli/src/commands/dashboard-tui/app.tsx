@@ -956,8 +956,15 @@ function StatusModeSingle({
       ? contentRows
       : estimateSectionPanelHeight(focused, state, cols, !state.narrowLogSplitFocused);
   const candidateSplitHeight = contentRows - topNeededRows;
+  // Skip the split on the System panel — it has interactive UI (Enter to
+  // open URL, [c] to copy token, click-drag to select the token text)
+  // whose hint row only renders when the panel itself has focus. Auto-
+  // shifting focus into a bottom log strip would hide that hint and
+  // remove a clear visual path back. Logs section already shows the
+  // dedicated full-screen logs view.
+  const sectionAllowsSplit = focused !== "logs" && focused !== "system";
   const showLogSplit =
-    focused !== "logs" && candidateSplitHeight >= NARROW_SPLIT_MIN_LOG_ROWS;
+    sectionAllowsSplit && candidateSplitHeight >= NARROW_SPLIT_MIN_LOG_ROWS;
   const splitHeight = showLogSplit ? candidateSplitHeight : 0;
   // Bottom log pane has its own border + title + filter chrome (4), so the
   // visible-entries budget is splitHeight - 4.
@@ -4205,7 +4212,10 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     const narrowSplitActive = (() => {
       if (state.mode !== "status") return false;
       if (!(cols < NARROW_THRESHOLD || rows < 20)) return false;
-      if (state.activeSection === "logs") return false;
+      // System and Logs sections never get the split (see StatusModeSingle).
+      if (state.activeSection === "logs" || state.activeSection === "system") {
+        return false;
+      }
       const topNeeded = estimateSectionPanelHeight(
         state.activeSection,
         state,
