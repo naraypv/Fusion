@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import fg from "fast-glob";
+import { parse as parseYaml } from "yaml";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,29 +21,27 @@ function readJson(filePath) {
 function readWorkspacePackageDirs() {
   const workspaceFile = path.join(repoRoot, "pnpm-workspace.yaml");
   const workspaceYaml = readFileSync(workspaceFile, "utf8");
-  const patterns = [...workspaceYaml.matchAll(/^\s*-\s+"([^"]+)"\s*$/gm)].map((match) => match[1]);
-  const dirs = new Set();
+  const parsed = parseYaml(workspaceYaml);
+  const patterns = Array.isArray(parsed?.packages)
+    ? parsed.packages.filter((pattern) => typeof pattern === "string")
+    : [];
+  return fg.sync(patterns.map(workspacePatternToPackageJsonGlob), {
+    absolute: true,
+    cwd: repoRoot,
+    dot: false,
+    onlyFiles: true,
+    unique: true,
+  }).map((packageJsonPath) => path.dirname(packageJsonPath)).sort();
+}
 
-  for (const pattern of patterns) {
-    if (pattern.endsWith("/*")) {
-      const parentDir = path.join(repoRoot, pattern.slice(0, -2));
-      for (const entry of readdirSync(parentDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const packageDir = path.join(parentDir, entry.name);
-        if (existsSync(path.join(packageDir, "package.json"))) {
-          dirs.add(packageDir);
-        }
-      }
-      continue;
-    }
-
-    const packageDir = path.join(repoRoot, pattern);
-    if (existsSync(path.join(packageDir, "package.json"))) {
-      dirs.add(packageDir);
-    }
-  }
-
-  return [...dirs].sort();
+function workspacePatternToPackageJsonGlob(pattern) {
+  const trimmed = pattern.trim();
+  const isNegated = trimmed.startsWith("!");
+  const body = (isNegated ? trimmed.slice(1) : trimmed)
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  const packageJsonGlob = body.endsWith("package.json") ? body : `${body}/package.json`;
+  return isNegated ? `!${packageJsonGlob}` : packageJsonGlob;
 }
 
 function hasSharedIsolation(config) {

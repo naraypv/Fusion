@@ -8,10 +8,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildReverseDependencyMap,
   shouldForceFullSuite,
   resolveAffectedPackages,
   decideExecutionPlan,
   computePackageHash,
+  expandWithReverseDependents,
+  listWorkspacePackageInfos,
   readCache,
   writeCache,
   applyCacheToPlan,

@@ -3,7 +3,7 @@
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { readdir, readFile, rm, stat, mkdtemp } from "node:fs/promises";
+import { readFile, rm, stat, mkdtemp } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ import process from "node:process";
 
 const dashboardRoot = path.resolve(import.meta.dirname, "..");
 const appRoot = path.join(dashboardRoot, "app");
-const componentCssRoot = path.join(appRoot, "components");
+const clientDistRoot = path.join(dashboardRoot, "dist", "client");
 const requireBrowser = process.argv.includes("--require-browser") || process.env.FUSION_BROWSER_SMOKE_REQUIRE === "1";
 
 function log(message) {
@@ -23,24 +23,48 @@ function fail(message) {
 }
 
 async function loadDashboardCss() {
-  // Runtime CSS order matters for mobile layout. `main.tsx` imports `App`
-  // before `styles.css`, so component CSS is discovered first and the global
-  // stylesheet lands last in the app bundle.
-  const files = [];
-  const componentEntries = await readdir(componentCssRoot);
-  files.push(
-    ...componentEntries
-      .filter((entry) => entry.endsWith(".css"))
-      .sort()
-      .map((entry) => path.join(componentCssRoot, entry)),
-  );
-  files.push(path.join(appRoot, "styles.css"));
+  try {
+    return await readEmittedClientCss();
+  } catch {
+    await runCommand("pnpm", ["--filter", "@fusion/dashboard", "build:client"], dashboardRoot);
+    return readEmittedClientCss();
+  }
+}
+
+async function readEmittedClientCss() {
+  const indexHtml = await readFile(path.join(clientDistRoot, "index.html"), "utf8");
+  const hrefs = [...indexHtml.matchAll(/<link\b[^>]*\brel=["']stylesheet["'][^>]*\bhref=["']([^"']+)["'][^>]*>/gi)]
+    .map((match) => match[1]);
+
+  if (hrefs.length === 0) {
+    fail(`No emitted dashboard stylesheet links found in ${path.join(clientDistRoot, "index.html")}.`);
+  }
 
   const chunks = [];
-  for (const file of files) {
+  for (const href of hrefs) {
+    const file = path.join(clientDistRoot, href.replace(/^\//, ""));
     chunks.push(`\n/* ${path.relative(dashboardRoot, file)} */\n${await readFile(file, "utf8")}`);
   }
   return chunks.join("\n");
+}
+
+function runCommand(command, commandArgs, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, commandArgs, {
+      cwd,
+      stdio: "inherit",
+      shell: process.platform === "win32",
+    });
+
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`${command} ${commandArgs.join(" ")} exited with code ${code}.`));
+    });
+  });
 }
 
 function createSmokeHtml() {
@@ -292,33 +316,83 @@ async function launchBrowser(executable) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const wsUrl = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Timed out waiting for the browser DevTools endpoint."));
-    }, 15_000);
+  try {
+    const wsUrl = await new Promise((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        rejectReady(new Error("Timed out waiting for the browser DevTools endpoint."));
+      }, 15_000);
 
-    const onData = (data) => {
-      const text = data.toString();
-      const match = text.match(/DevTools listening on (ws:\/\/[^\s]+)/);
-      if (match) {
+      const cleanupListeners = () => {
         clearTimeout(timeout);
-        resolve(match[1]);
-      }
-    };
+        browser.stdout.off("data", onData);
+        browser.stderr.off("data", onData);
+        browser.off("error", rejectReady);
+        browser.off("exit", onExit);
+      };
 
-    browser.stdout.on("data", onData);
-    browser.stderr.on("data", onData);
-    browser.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
+      const resolveReady = (url) => {
+        if (settled) return;
+        settled = true;
+        cleanupListeners();
+        resolve(url);
+      };
+
+      function rejectReady(error) {
+        if (settled) return;
+        settled = true;
+        cleanupListeners();
+        reject(error);
+      }
+
+      function onData(data) {
+        const text = data.toString();
+        const match = text.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+        if (match) {
+          resolveReady(match[1]);
+        }
+      }
+
+      function onExit(code) {
+        rejectReady(new Error(`Browser exited before DevTools was ready (code ${code}).`));
+      }
+
+      browser.stdout.on("data", onData);
+      browser.stderr.on("data", onData);
+      browser.once("error", rejectReady);
+      browser.once("exit", onExit);
     });
-    browser.once("exit", (code) => {
-      clearTimeout(timeout);
-      reject(new Error(`Browser exited before DevTools was ready (code ${code}).`));
-    });
+
+    return { browser, userDataDir, wsUrl };
+  } catch (error) {
+    await stopBrowser(browser);
+    await rm(userDataDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function stopBrowser(browser) {
+  if (browser.exitCode !== null || browser.signalCode !== null) {
+    return;
+  }
+
+  const exited = new Promise((resolve) => {
+    browser.once("exit", resolve);
   });
 
-  return { browser, userDataDir, wsUrl };
+  if (!browser.killed) {
+    browser.kill();
+  }
+
+  const exitedCleanly = await Promise.race([
+    exited.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 5_000)),
+  ]);
+
+  if (!exitedCleanly && browser.exitCode === null && browser.signalCode === null) {
+    browser.kill("SIGKILL");
+    await exited;
+  }
 }
 
 function cdpConnect(wsUrl) {
@@ -542,8 +616,8 @@ async function runSmokeChecks(page, pageUrl) {
 }
 
 async function main() {
-  if (!existsSync(componentCssRoot)) {
-    fail(`Dashboard component CSS directory not found: ${componentCssRoot}`);
+  if (!existsSync(appRoot)) {
+    fail(`Dashboard app directory not found: ${appRoot}`);
   }
 
   if (typeof WebSocket === "undefined") {
@@ -559,18 +633,30 @@ async function main() {
   }
 
   log("using local browser; this fixture smoke checks real CSS layout but does not replace full dashboard E2E coverage.");
-  const fixture = await startFixtureServer();
   const launched = await launchBrowser(executable);
+  let fixture;
   let page;
   try {
+    fixture = await startFixtureServer();
     page = await createPage(launched.wsUrl);
     await runSmokeChecks(page, fixture.url);
   } finally {
     page?.close();
-    fixture.server.close();
-    launched.browser.kill();
+    if (fixture) {
+      await closeServer(fixture.server);
+    }
+    await stopBrowser(launched.browser);
     await rm(launched.userDataDir, { recursive: true, force: true });
   }
+}
+
+function closeServer(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 }
 
 main().catch((error) => {
