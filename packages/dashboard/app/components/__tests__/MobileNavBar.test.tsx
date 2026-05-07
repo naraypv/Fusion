@@ -121,7 +121,7 @@ describe("MobileNavBar", () => {
     expect(onOpenTodos).toHaveBeenCalled();
   });
 
-  it("renders dependency graph as a top-level tab and keeps additional plugin views in More", () => {
+  it("keeps dependency graph in More and routes to canonical graph task view", () => {
     const props = createDefaultProps();
     render(
       <MobileNavBar
@@ -139,14 +139,14 @@ describe("MobileNavBar", () => {
       />,
     );
 
-    const primaryTab = screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph");
-    expect(primaryTab.querySelector(".lucide-map")).toBeTruthy();
-    fireEvent.click(primaryTab);
-    expect(props.onChangeView).toHaveBeenCalledWith("plugin:fusion-plugin-dependency-graph:graph");
+    expect(screen.queryByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
 
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
-    expect(screen.queryByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
+    const graphItem = screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-graph");
+    fireEvent.click(graphItem);
+    expect(props.onChangeView).toHaveBeenCalledWith("graph");
 
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
     const overflowItem = screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-queue");
     expect(overflowItem.querySelector(".lucide-workflow")).toBeTruthy();
     fireEvent.click(overflowItem);
@@ -177,11 +177,11 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-queue")).toBeDefined();
   });
 
-  it("marks dependency graph plugin tab active when viewing its canonical plugin task-view", () => {
+  it("marks More active when current view is graph", () => {
     render(
       <MobileNavBar
         {...createDefaultProps()}
-        view="plugin:fusion-plugin-dependency-graph:graph"
+        view="graph"
         pluginDashboardViews={[
           {
             pluginId: "fusion-plugin-dependency-graph",
@@ -195,8 +195,7 @@ describe("MobileNavBar", () => {
       />,
     );
 
-    expect(screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph").className).toContain("mobile-nav-tab--active");
-    expect(screen.getByTestId("mobile-nav-tab-more").className).not.toContain("mobile-nav-tab--active");
+    expect(screen.getByTestId("mobile-nav-tab-more").className).toContain("mobile-nav-tab--active");
   });
 
   it("marks More active when current plugin view is overflow-only", () => {
@@ -218,7 +217,7 @@ describe("MobileNavBar", () => {
     );
 
     expect(screen.getByTestId("mobile-nav-tab-more").className).toContain("mobile-nav-tab--active");
-    expect(screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph").className).not.toContain("mobile-nav-tab--active");
+    expect(screen.queryByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
   });
 
   it("active tab is highlighted for mailbox", () => {

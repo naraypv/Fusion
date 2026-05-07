@@ -212,22 +212,11 @@ export function MobileNavBar({
   const showRoadmapsTopLevel = roadmapEnabled && (!skillsEnabled || view === "roadmaps");
   const showSkillsTopLevel = skillsEnabled && (!roadmapEnabled || view !== "roadmaps");
   const showSkillsInMore = skillsEnabled && !showSkillsTopLevel;
-  const isDependencyGraphView = (entry: PluginDashboardViewEntry): boolean => (
-    entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph"
-  );
   const sortedPrimaryPluginViews = pluginDashboardViews
     .filter((entry) => entry.view.placement === "primary")
     .sort((a, b) => (a.view.order ?? Number.MAX_SAFE_INTEGER) - (b.view.order ?? Number.MAX_SAFE_INTEGER));
-  const dependencyGraphPluginView = pluginDashboardViews.find(isDependencyGraphView) ?? null;
-  // Keep plugin-provided top-level tabs constrained on mobile so fixed tabs retain
-  // reasonable touch-target width. Additional primary plugin destinations overflow into More.
-  // FN-3235: Always surface the dependency graph destination as the first plugin top-level tab
-  // on mobile so task graph navigation has a clear entry point.
-  const prioritizedPrimaryPluginViews = dependencyGraphPluginView
-    ? [dependencyGraphPluginView, ...sortedPrimaryPluginViews.filter((entry) => !isDependencyGraphView(entry))]
-    : sortedPrimaryPluginViews;
   const MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS = 1;
-  const topLevelPrimaryPluginViews = prioritizedPrimaryPluginViews.slice(0, MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS);
+  const topLevelPrimaryPluginViews = sortedPrimaryPluginViews.slice(0, MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS);
   const topLevelPluginViewKeys = new Set(
     topLevelPrimaryPluginViews.map((entry) => `${entry.pluginId}:${entry.view.viewId}`),
   );
@@ -245,6 +234,7 @@ export function MobileNavBar({
     || (todosOpen && todoViewEnabled)
     || (view === "roadmaps" && !showRoadmapsTopLevel)
     || (view === "skills" && !showSkillsTopLevel)
+    || view === "graph"
     || (isPluginViewId(view) && !topLevelPrimaryPluginViews.some((entry) => buildPluginTaskViewId(entry.pluginId, entry.view.viewId) === view));
 
   return (
@@ -365,11 +355,11 @@ export function MobileNavBar({
             <button
               key={`${entry.pluginId}:${entry.view.viewId}`}
               type="button"
-              className={`mobile-nav-tab${view === pluginTaskView ? " mobile-nav-tab--active" : ""}`}
+              className={`mobile-nav-tab${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " mobile-nav-tab--active" : ""}`}
               data-testid={`mobile-nav-tab-plugin-${entry.pluginId}-${entry.view.viewId}`}
               role="tab"
-              aria-selected={view === pluginTaskView}
-              onClick={() => onChangeView(pluginTaskView)}
+              aria-selected={view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph")}
+              onClick={() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView)}
             >
               <PluginIcon />
               <span className="mobile-nav-tab-label">{entry.view.label}</span>
@@ -719,7 +709,7 @@ export function MobileNavBar({
                     type="button"
                     className="mobile-more-item"
                     data-testid={`mobile-more-item-plugin-${entry.pluginId}-${entry.view.viewId}`}
-                    onClick={() => handleMoreAction(() => onChangeView(pluginTaskView))}
+                    onClick={() => handleMoreAction(() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView))}
                   >
                     <PluginIcon />
                     <span>{entry.view.label}</span>

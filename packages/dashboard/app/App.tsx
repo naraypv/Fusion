@@ -256,6 +256,12 @@ function AppInner() {
   });
 
   const { views: pluginDashboardViews } = usePluginDashboardViews(currentProject?.id);
+  const graphPluginTaskView = useMemo(() => {
+    const graphView = pluginDashboardViews.find(
+      (entry) => entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph",
+    );
+    return graphView ? (`plugin:${graphView.pluginId}:${graphView.view.viewId}` as const) : null;
+  }, [pluginDashboardViews]);
 
   // History-aware view change handler — pushes nav entry on back-navigation stack.
   const handleTaskViewChange = useCallback((newView: TaskView) => {
@@ -536,6 +542,10 @@ function AppInner() {
   useEffect(() => {
     if (!settingsLoaded) return;
     if (isPluginViewId(taskView)) return;
+    if (taskView === "graph" && !graphPluginTaskView) {
+      handleChangeTaskView("board");
+      return;
+    }
     if (taskView === "skills" && !skillsEnabled) {
       handleChangeTaskView("board");
     }
@@ -557,7 +567,7 @@ function AppInner() {
     if (taskView === "research" && !researchEnabled) {
       handleChangeTaskView("board");
     }
-  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, roadmapEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled]);
+  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, roadmapEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled, graphPluginTaskView]);
 
   // Auto-close nodes overlay if feature flag is toggled off while overlay is open
   useEffect(() => {
@@ -975,12 +985,14 @@ function AppInner() {
       );
     }
 
+    const resolvedPluginTaskView = taskView === "graph" ? graphPluginTaskView : (isPluginViewId(taskView) ? taskView : null);
+
     // Project view
-    if (isPluginViewId(taskView)) {
+    if (resolvedPluginTaskView) {
       return (
         <PageErrorBoundary>
           <PluginDashboardViewHost
-            taskView={taskView as `plugin:${string}:${string}`}
+            taskView={resolvedPluginTaskView as `plugin:${string}:${string}`}
             context={{
               projectId: currentProject?.id,
               tasks: isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks,
@@ -993,6 +1005,7 @@ function AppInner() {
                   onOpenDetail={(value: Task | TaskDetail) => openDetailTask(value)}
                   addToast={addToast}
                   workflowStepNameLookup={workflowStepNameLookup}
+                  disableDrag={true}
                 />
               ),
             }}
@@ -1434,7 +1447,7 @@ function AppInner() {
         }}
         pluginDashboardViews={pluginDashboardViews}
       />
-      {viewMode === "project" && currentProject && taskView !== "chat" && taskView !== "mailbox" && taskView !== "insights" && taskView !== "devserver" && taskView !== "dev-server" && !isPluginViewId(taskView) && (
+      {viewMode === "project" && currentProject && taskView !== "chat" && taskView !== "mailbox" && taskView !== "insights" && taskView !== "devserver" && taskView !== "dev-server" && taskView !== "graph" && !isPluginViewId(taskView) && (
         <QuickChatFAB
           projectId={currentProject.id}
           addToast={addToast}

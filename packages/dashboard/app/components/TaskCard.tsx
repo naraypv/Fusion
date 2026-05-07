@@ -274,6 +274,8 @@ interface TaskCardProps {
   lastFetchTimeMs?: number;
   /** Lookup of workflow step IDs to display names, fetched once at board level. */
   workflowStepNameLookup?: ReadonlyMap<string, string>;
+  /** Disable card drag semantics when embedding in custom draggable containers (e.g. dependency graph). */
+  disableDrag?: boolean;
 }
 
 function areTaskBadgeInfosEqual(
@@ -415,6 +417,7 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previous.onOpenMission === next.onOpenMission &&
     previous.onMoveTask === next.onMoveTask &&
     previous.workflowStepNameLookup === next.workflowStepNameLookup &&
+    previous.disableDrag === next.disableDrag &&
     previousTask.id === nextTask.id &&
     previousTask.title === nextTask.title &&
     previousTask.description === nextTask.description &&
@@ -478,6 +481,7 @@ function TaskCardComponent({
   onMoveTask,
   lastFetchTimeMs,
   workflowStepNameLookup,
+  disableDrag,
 }: TaskCardProps) {
   const [dragging, setDragging] = useState(false);
   const [fileDragOver, setFileDragOver] = useState(false);
@@ -728,7 +732,7 @@ function TaskCardComponent({
   const isAwaitingApproval = task.column === "triage" && task.status === "awaiting-approval";
   const isArchived = task.column === "archived";
   const isAgentActive = !globalPaused && !queued && !isFailed && !isPaused && !isStuck && !isAwaitingApproval && (task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string));
-  const isDraggable = !queued && !isPaused && !isEditing && !isArchived; // Disable drag during edit or if archived
+  const isDraggable = !disableDrag && !queued && !isPaused && !isEditing && !isArchived; // Disable drag during edit/archived or host embedding
 
   // Check if this card can be edited inline
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isAgentActive && !isPaused && !queued && onUpdateTask;

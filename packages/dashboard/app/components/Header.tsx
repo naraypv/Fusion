@@ -1159,8 +1159,8 @@ export function Header({
                 return (
                   <button
                     key={`${entry.pluginId}:${entry.view.viewId}`}
-                    className={`view-toggle-btn${view === pluginTaskView ? " active" : ""}`}
-                    onClick={() => onChangeView(pluginTaskView)}
+                    className={`view-toggle-btn${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " active" : ""}`}
+                    onClick={() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView)}
                     title={`${entry.view.label} view`}
                     aria-label={`${entry.view.label} view`}
                     aria-pressed={view === pluginTaskView}
@@ -1174,7 +1174,7 @@ export function Header({
               <>
                 <button
                   ref={viewOverflowTriggerRef}
-                  className={`view-toggle-btn${["research", "skills", "roadmaps", "insights", "memory", "dev-server", "devserver"].includes(view) || (todosEnabled && todosOpen) || isPluginViewId(view) ? " active" : ""}`}
+                  className={`view-toggle-btn${["research", "skills", "roadmaps", "insights", "memory", "dev-server", "devserver", "graph"].includes(view) || (todosEnabled && todosOpen) || isPluginViewId(view) ? " active" : ""}`}
                   onClick={() => setIsViewOverflowOpen((prev) => !prev)}
                   title="More views"
                   aria-label="More views"
@@ -1298,9 +1298,9 @@ export function Header({
                         return (
                           <button
                             key={`${entry.pluginId}:${entry.view.viewId}`}
-                            className={`view-toggle-overflow-item${view === pluginTaskView ? " active" : ""}`}
+                            className={`view-toggle-overflow-item${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " active" : ""}`}
                             onClick={() => {
-                              onChangeView(pluginTaskView);
+                              onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView);
                               setIsViewOverflowOpen(false);
                             }}
                             role="menuitem"

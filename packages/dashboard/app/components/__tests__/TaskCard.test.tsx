@@ -59,6 +59,12 @@ describe("TaskCard", () => {
     expect(screen.getByText("FN-001")).toBeDefined();
   });
 
+  it("disables native card dragging when disableDrag is true", () => {
+    const { container } = render(<TaskCard task={makeTask()} onOpenDetail={noop} addToast={noop} disableDrag={true} />);
+    const card = container.querySelector(".card") as HTMLElement;
+    expect(card.getAttribute("draggable")).toBe("false");
+  });
+
   it("clicking PR badge link does not open the task detail modal", () => {
     const onOpenDetail = vi.fn();
     render(

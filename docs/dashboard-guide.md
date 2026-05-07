@@ -40,6 +40,20 @@ Features:
 
 ![List view](./screenshots/list-view.png)
 
+## Graph View
+
+Graph view visualizes task dependencies as an interactive node/edge map.
+
+Navigation:
+- Desktop: **Header → More views → Graph**
+- Mobile: **MobileNavBar → More → Graph**
+
+Behavior:
+- Shows only tasks in `triage`, `todo`, `in-progress`, and `in-review`
+- Excludes `done` and `archived`
+- Supports pan/zoom, fit-to-graph, dependency-chain highlight, and drag-to-position
+- Persists node layout per project using plugin-scoped storage key `fusion-plugin-dependency-graph:positions`
+
 ## Chat View
 
 Chat view provides project-scoped conversations with agents.

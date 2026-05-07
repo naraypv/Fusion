@@ -612,6 +612,11 @@ Placement guidance:
 - `overflow`: desktop header overflow menu
 - `more`: mobile More sheet / secondary nav surfaces
 
+Project-scoped UI state guidance:
+- Persist plugin view layout/state in browser storage using a plugin-owned base key and the shared project-scoped pattern (`kb:${projectId}:${baseKey}`).
+- For dependency graph layout, the canonical base key is `fusion-plugin-dependency-graph:positions`.
+- Do not persist plugin UI state in task metadata or server-side task records.
+
 ---
 
 ## 9. Registering Agent Runtimes

@@ -307,6 +307,28 @@ describe("useViewState", () => {
     });
   });
 
+  it("restores and persists graph taskView using scoped storage", async () => {
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "graph");
+
+    const { result } = renderHook(() =>
+      useViewState(
+        createOptions({
+          currentProject: PROJECT,
+        }),
+      ),
+    );
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("graph");
+    });
+
+    await act(async () => {
+      result.current.setTaskView("graph");
+    });
+
+    expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("graph");
+  });
+
   it("restores and persists plugin task views using the canonical composite key", async () => {
     localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "plugin:fusion-plugin-dependency-graph:graph");
 

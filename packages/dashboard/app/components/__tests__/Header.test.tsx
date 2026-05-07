@@ -167,14 +167,14 @@ describe("Header", () => {
       expect(screen.getByTestId("view-overflow-todos")).toBeInTheDocument();
     });
 
-    it("renders plugin dashboard views by placement and uses manifest icon metadata", () => {
+    it("renders dependency graph in overflow and uses canonical graph task view", () => {
       const onChangeView = vi.fn();
       renderHeader({
         onChangeView,
         pluginDashboardViews: [
           {
             pluginId: "fusion-plugin-dependency-graph",
-            view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", icon: "Map", placement: "primary" },
+            view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", icon: "Map", placement: "more" },
           },
           {
             pluginId: "fusion-plugin-dependency-graph",
@@ -183,10 +183,13 @@ describe("Header", () => {
         ],
       });
 
-      const graphPrimary = screen.getByTestId("view-toggle-plugin-fusion-plugin-dependency-graph-graph");
-      expect(graphPrimary.querySelector(".lucide-map")).toBeTruthy();
-      fireEvent.click(graphPrimary);
-      expect(onChangeView).toHaveBeenCalledWith("plugin:fusion-plugin-dependency-graph:graph");
+      expect(screen.queryByTestId("view-toggle-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      const graphItem = screen.getByTestId("view-overflow-plugin-fusion-plugin-dependency-graph-graph");
+      expect(graphItem.querySelector(".lucide-map")).toBeTruthy();
+      fireEvent.click(graphItem);
+      expect(onChangeView).toHaveBeenCalledWith("graph");
 
       fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
       const queueItem = screen.getByTestId("view-overflow-plugin-fusion-plugin-dependency-graph-queue");
