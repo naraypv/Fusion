@@ -21,6 +21,15 @@ At a high level, Fusion is split into:
 
 Native shells expose a shared host-neutral bridge at `window.fusionShell` for first-run shell onboarding, connection profile persistence, and active shell mode/profile state. The dashboard consumes `window.fusionShell` when present and degrades cleanly in plain web/PWA mode.
 
+The dashboard also has a canonical host-context bootstrap layer (`packages/dashboard/app/shell-host.ts`) that normalizes launch metadata into one discriminated union:
+- `{ kind: "browser" }`
+- `{ kind: "desktop-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+- `{ kind: "mobile-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+
+Detection priority is deterministic: explicit bootstrapped global from shell handoff → shell handoff query params → desktop fallback via `window.fusionAPI` presence → browser fallback. Shell-only query params are stripped at bootstrap via `history.replaceState`.
+
+React consumers read this through `ShellHostProvider` / `useShellHostContext` (`packages/dashboard/app/context/ShellHostContext.tsx`). Do not add ad-hoc host checks in components.
+
 ### `window.fusionShell` bridge contract
 
 Canonical dashboard-side types live in `packages/dashboard/app/types/native-shell.d.ts`.

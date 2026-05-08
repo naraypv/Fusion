@@ -15,7 +15,7 @@ import type { TaskView } from "../hooks/useViewState";
 import type { PluginDashboardViewEntry } from "../api";
 import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
-import type { ShellContext as LaunchShellContext } from "../shell-context";
+import type { ShellHostContext } from "../shell-host";
 
 export { useViewportMode };
 
@@ -225,7 +225,7 @@ export interface HeaderProps {
   onSelectProject?: (project: ProjectInfo) => void;
   onViewAllProjects?: () => void;
   projectId?: string;
-  isElectron?: boolean;
+  shellHost?: ShellHostContext;
   /** When true, the mobile bottom nav bar handles primary navigation and header nav controls are hidden. */
   mobileNavEnabled?: boolean;
   /** Available nodes for the node selector */
@@ -240,7 +240,6 @@ export interface HeaderProps {
   experimentalFeatures?: { insights?: boolean; roadmap?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean };
   pluginDashboardViews?: PluginDashboardViewEntry[];
   shellConnectionControl?: ReactNode;
-  shellContext?: LaunchShellContext | null;
 }
 
 export function Header({
@@ -289,7 +288,7 @@ export function Header({
   onSelectProject,
   onViewAllProjects,
   projectId,
-  isElectron = false,
+  shellHost = { kind: "browser" },
   mobileNavEnabled,
   availableNodes = [],
   currentNode,
@@ -298,7 +297,6 @@ export function Header({
   experimentalFeatures,
   pluginDashboardViews = [],
   shellConnectionControl,
-  shellContext,
 }: HeaderProps) {
   const mode: ViewportMode = useViewportMode();
   const isMobile = mode === "mobile";
@@ -847,9 +845,11 @@ export function Header({
     if (onSearchChange) onSearchChange("");
   }, [onSearchChange]);
 
+  const isDesktopShell = shellHost.kind === "desktop-shell";
+
   return (
     <div className="header-wrapper">
-      <header className="header" data-shell-kind={shellContext?.shellKind ?? "web"}>
+      <header className="header" data-shell-kind={shellHost.kind}>
         <div className="header-left">
           <div className="header-brand">
           <svg
@@ -1361,7 +1361,7 @@ export function Header({
         )}
 
         {/* Desktop actions */}
-        {!isCompact && !isElectron && (
+        {!isCompact && !isDesktopShell && (
           <button className="btn-icon" onClick={onOpenGitHubImport} title="Import from GitHub">
             <GitHubLogo size={16} />
           </button>
@@ -1726,7 +1726,7 @@ export function Header({
                 <span>Nodes</span>
               </button>
             )}
-            {!isElectron && (
+            {!isDesktopShell && (
               <button
                 className="mobile-overflow-item"
                 onClick={() => handleOverflowAction(onOpenGitHubImport)}

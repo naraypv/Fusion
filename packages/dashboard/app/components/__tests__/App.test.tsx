@@ -155,6 +155,34 @@ vi.mock("../../context/NodeContext", () => ({
   useNodeContext: vi.fn(() => mockNodeContextValue),
 }));
 
+const mockShellHostContextValue = {
+  host: { kind: "browser" as const },
+  isNativeShell: false,
+  kind: "browser" as const,
+};
+
+vi.mock("../../context/ShellHostContext", () => ({
+  ShellHostProvider: ({ children }: { children: React.ReactNode }) => children,
+  useShellHostContext: vi.fn(() => mockShellHostContextValue),
+}));
+
+const mockShellConnectionState = {
+  host: "web" as const,
+  desktopMode: "local" as const,
+  profiles: [],
+  activeProfileId: null,
+  localServer: null,
+};
+
+vi.mock("../../hooks/useShellConnection", () => ({
+  useShellConnection: vi.fn(() => ({
+    shellApi: null,
+    state: mockShellConnectionState,
+    ready: true,
+    openConnectionManagerSignal: 0,
+  })),
+}));
+
 // Mock model-onboarding-state
 const mockIsOnboardingResumable = vi.fn();
 const mockGetOnboardingResumeStep = vi.fn();
@@ -502,6 +530,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
 import { App } from "../../App";
 import { AUTH_TOKEN_RECOVERY_REQUIRED_EVENT } from "../../auth";
 import { fetchAuthStatus, fetchSettings, fetchGlobalSettings, fetchTaskDetail, fetchUnreadCount, updateSettings, runScript, fetchScripts, fetchModels, fetchPluginDashboardViews } from "../../api";
+import { __resetShellHostContextForTests } from "../../shell-host";
 import * as apiNodeModule from "../../hooks/useRemoteNodeData";
 
 async function waitForAppShell(): Promise<void> {
@@ -513,6 +542,7 @@ async function waitForAppShell(): Promise<void> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __resetShellHostContextForTests();
   localStorage.clear();
   mockSubscribeSse.mockReset();
   mockSubscribeSse.mockReturnValue(vi.fn());

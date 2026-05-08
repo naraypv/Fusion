@@ -63,15 +63,25 @@ describe("Header", () => {
     expect(screen.getByText("Fusion")).toBeDefined();
   });
 
-  it("applies shell context metadata on the header root", () => {
-    const { container } = renderHeader({ shellContext: { shellKind: "desktop", shellMode: "remote", capabilities: { canOpenConnectionManager: true } } });
-    expect(container.querySelector("header.header")?.getAttribute("data-shell-kind")).toBe("desktop");
+  it("applies shell host metadata on the header root", () => {
+    const { container } = renderHeader({ shellHost: { kind: "desktop-shell", mode: "remote", canOpenConnectionManager: true } });
+    expect(container.querySelector("header.header")?.getAttribute("data-shell-kind")).toBe("desktop-shell");
   });
 
   it("renders action buttons", () => {
     renderHeader();
     expect(screen.getByTitle("Import from GitHub")).toBeDefined();
     expect(screen.getByTitle("Settings")).toBeDefined();
+  });
+
+  it("hides GitHub import for desktop shell host", () => {
+    renderHeader({ shellHost: { kind: "desktop-shell" } });
+    expect(screen.queryByTitle("Import from GitHub")).toBeNull();
+  });
+
+  it("keeps GitHub import for mobile shell host", () => {
+    renderHeader({ shellHost: { kind: "mobile-shell" } });
+    expect(screen.getByTitle("Import from GitHub")).toBeDefined();
   });
 
   it("renders system stats button on desktop when handler is provided", () => {

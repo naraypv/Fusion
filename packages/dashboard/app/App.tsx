@@ -56,8 +56,8 @@ import { useRemoteNodeData } from "./hooks/useRemoteNodeData";
 import { useRemoteNodeEvents } from "./hooks/useRemoteNodeEvents";
 import { NodeProvider, useNodeContext } from "./context/NodeContext";
 import { ShellProvider } from "./context/ShellContext";
+import { ShellHostProvider, useShellHostContext } from "./context/ShellHostContext";
 import { useShellConnection } from "./hooks/useShellConnection";
-import { useShellContext as useLaunchShellContext } from "./hooks/useShellContext";
 import { NativeShellOnboardingModal } from "./components/NativeShellOnboardingModal";
 import { NativeShellConnectionManager } from "./components/NativeShellConnectionManager";
 import { NativeShellConnectionStatus } from "./components/NativeShellConnectionStatus";
@@ -154,8 +154,7 @@ export function requiresNativeShellOnboarding(
 function AppInner() {
   const { toasts, addToast, removeToast } = useToast();
   const { shellApi, state: shellState, ready: shellReady, openConnectionManagerSignal } = useShellConnection();
-  const { shellContext } = useLaunchShellContext();
-  const isElectron = shellContext?.shellKind === "desktop";
+  const shellHost = useShellHostContext();
 
   // Warm lazy view chunks during browser idle so first navigation is instant.
   useEffect(() => {
@@ -1316,8 +1315,7 @@ function AppInner() {
   return (
     <>
       <Header
-        isElectron={isElectron}
-        shellContext={shellContext}
+        shellHost={shellHost.host}
         onOpenSettings={openSettingsWithNav}
         onOpenGitHubImport={openGitHubImportWithNav}
         onOpenPlanning={openPlanningWithNav}
@@ -1547,13 +1545,15 @@ function AppInner() {
 export function App() {
   return (
     <ToastProvider>
-      <ShellProvider>
-        <NodeProvider>
-          <ConfirmDialogProvider>
-            <AppInner />
-          </ConfirmDialogProvider>
-        </NodeProvider>
-      </ShellProvider>
+      <ShellHostProvider>
+        <ShellProvider>
+          <NodeProvider>
+            <ConfirmDialogProvider>
+              <AppInner />
+            </ConfirmDialogProvider>
+          </NodeProvider>
+        </ShellProvider>
+      </ShellHostProvider>
     </ToastProvider>
   );
 }

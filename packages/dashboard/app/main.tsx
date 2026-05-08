@@ -5,6 +5,7 @@ import { App } from "./App";
 import { installAuthFetch } from "./auth";
 import { installVersionCheck } from "./versionCheck";
 import { installSwUpdate } from "./swUpdate";
+import { bootstrapShellHostContext } from "./shell-host";
 import "./styles.css";
 
 // Install the bearer-token fetch wrapper before React mounts so every API
@@ -13,6 +14,7 @@ import "./styles.css";
 // stored from a previous session.
 installAuthFetch();
 installVersionCheck();
+bootstrapShellHostContext();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

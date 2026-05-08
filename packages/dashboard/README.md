@@ -15,6 +15,23 @@ When running inside Fusion mobile or desktop shells, the dashboard uses a host-n
 
 The shared dashboard must use `window.fusionShell` for shell connectivity concerns (not direct Electron or Capacitor globals).
 
+## Canonical dashboard host-context contract
+
+Dashboard host detection is centralized in `app/shell-host.ts` and exposed to React via `ShellHostProvider` (`app/context/ShellHostContext.tsx`).
+
+Canonical contract:
+- `{ kind: "browser" }`
+- `{ kind: "desktop-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+- `{ kind: "mobile-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+
+Bootstrap priority is fixed:
+1. explicit bootstrapped global handoff (`__FUSION_SHELL_HOST_CONTEXT__` / compatibility aliases)
+2. shell handoff query params
+3. desktop fallback via `window.fusionAPI` presence
+4. browser fallback
+
+Shell launch query params are removed after bootstrap. UI components should consume `useShellHostContext()` instead of reading `window` globals directly.
+
 ## Features
 
 ### Planning Mode
