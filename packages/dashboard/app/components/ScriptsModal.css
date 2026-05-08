@@ -2999,10 +2999,12 @@
 
 .gm-pull-split-toggle {
   flex: 0 0 auto;
+  width: auto;
+  min-width: var(--space-xl);
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
   border-left: 0;
-  padding-inline: var(--space-sm);
+  padding-inline: var(--space-xs);
 }
 
 .gm-pull-menu {
@@ -3646,6 +3648,11 @@
 
   .gm-pull-split {
     flex: 1 1 100%;
+  }
+
+  .gm-pull-split-toggle {
+    min-width: 36px;
+    min-height: 36px;
   }
 
   .gm-pull-menu {
