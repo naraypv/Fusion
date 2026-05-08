@@ -1,4 +1,6 @@
 import { createReadStream } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { TaskStore, Task, TaskDetail, Column } from "@fusion/core";
 import {
   COLUMNS,
@@ -1754,6 +1756,95 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       } else {
         rethrowAsApiError(err);
       }
+    }
+  });
+
+  // Queue same-task revision pass for selected review items
+  router.post("/tasks/:id/review/revise", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const task = await scopedStore.getTask(req.params.id);
+      const itemIds = Array.isArray(req.body?.itemIds)
+        ? req.body.itemIds.filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
+        : [];
+
+      if (itemIds.length === 0) {
+        throw badRequest("itemIds must be a non-empty array of review item IDs");
+      }
+      if (!task.review) {
+        throw badRequest("Task has no review payload");
+      }
+
+      const now = new Date().toISOString();
+      const selectedSet = new Set(itemIds);
+      const selectedSummaries: string[] = [];
+      const updatedItems = task.review.items.map((item) => {
+        if (!selectedSet.has(item.id)) return item;
+        selectedSummaries.push(`- ${item.summary}`);
+        return {
+          ...item,
+          status: "queued" as const,
+          updatedAt: now,
+          failedReason: undefined,
+        };
+      });
+
+      const review = {
+        ...task.review,
+        selectedItemIds: itemIds,
+        items: updatedItems,
+      };
+
+      await scopedStore.updateTask(task.id, {
+        review,
+        status: null,
+        error: null,
+        sessionFile: null,
+      });
+
+      if (selectedSummaries.length > 0) {
+        const fusionDir = typeof scopedStore.getFusionDir === "function"
+          ? scopedStore.getFusionDir()
+          : join(scopedStore.getRootDir(), ".fusion");
+        const promptPath = join(fusionDir, "tasks", task.id, "PROMPT.md");
+        try {
+          const promptContent = await readFile(promptPath, "utf-8");
+          const sectionHeader = "## Workflow Revision Instructions";
+          const sectionContent = `${sectionHeader}\n\nAddress the following selected review feedback items in this same task run:\n\n${selectedSummaries.join("\n")}\n`;
+          const sectionRegex = new RegExp(`${sectionHeader}[\\s\\S]*?(?=\\n## |\\n# |$)`, "m");
+          const nextPrompt = promptContent.includes(sectionHeader)
+            ? promptContent.replace(sectionRegex, sectionContent)
+            : `${promptContent}\n\n${sectionContent}`;
+          await writeFile(promptPath, nextPrompt, "utf-8");
+        } catch {
+          // non-fatal: task may not have prompt yet
+        }
+      }
+
+      if (selectedSummaries.length > 0) {
+        await scopedStore.addTaskComment(
+          task.id,
+          `Review revision requested for selected items:\n\n${selectedSummaries.join("\n")}`,
+          "user",
+        );
+      }
+
+      const lastDoneStep = [...task.steps]
+        .map((step, index) => ({ step, index }))
+        .reverse()
+        .find(({ step }) => step.status === "done" || step.status === "in-progress");
+      if (lastDoneStep) {
+        await scopedStore.updateStep(task.id, lastDoneStep.index, "pending");
+      }
+
+      const moved = await scopedStore.moveTask(task.id, "todo", { preserveProgress: true });
+      await scopedStore.logEntry(task.id, "Review revision requested", `${itemIds.length} item(s) queued for same-task revision`);
+      res.json({ task: moved, review });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
     }
   });
 

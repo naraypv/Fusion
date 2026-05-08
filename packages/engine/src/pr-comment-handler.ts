@@ -86,6 +86,7 @@ export class PrCommentHandler {
 
     try {
       await this.store.addTaskComment(taskId, text, "agent");
+      await this.upsertReviewItem(taskId, prInfo, comment, "queued");
       prMonitorLog.log(`Added comment for PR review #${comment.id}`);
     } catch (err) {
       prMonitorLog.error(`Failed to add comment for ${taskId}:`, err);
@@ -179,6 +180,19 @@ export class PrCommentHandler {
       ].join("\n");
 
       await this.store.addTaskComment(taskId, feedbackText, "agent");
+      await this.upsertReviewItem(
+        taskId,
+        prInfo,
+        {
+          id: Date.now(),
+          body: reviewBody || "(no review body)",
+          user: { login: reviewerLogin },
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          html_url: prInfo.url,
+        },
+        "queued",
+      );
       await this.store.moveTask(taskId, "in-progress");
       await this.store.logEntry(
         taskId,
@@ -230,5 +244,52 @@ Please review the PR comments and address any remaining issues.`;
     } catch (err) {
       prMonitorLog.error(`Failed to create follow-up task:`, err);
     }
+  }
+
+  private async upsertReviewItem(
+    taskId: string,
+    prInfo: PrInfo,
+    comment: PrComment,
+    status: "queued" | "in-progress" | "addressed" | "failed",
+  ): Promise<void> {
+    const task = await this.store.getTask(taskId);
+    const now = new Date().toISOString();
+    const current = task.review ?? {
+      mode: "pull-request",
+      source: "github-pr",
+      decision: "pending",
+      items: [],
+      selectedItemIds: [],
+    };
+    const itemId = `gh-comment-${comment.id}`;
+    const existingIndex = current.items.findIndex((item: { id: string }) => item.id === itemId);
+    const nextItem = {
+      id: itemId,
+      source: "github-pr" as const,
+      status,
+      summary: comment.body.trim().slice(0, 160) || `Feedback from @${comment.user.login}`,
+      body: comment.body,
+      reviewer: comment.user.login,
+      commentUrl: comment.html_url,
+      createdAt: comment.created_at,
+      updatedAt: now,
+    };
+    const nextItems = [...current.items];
+    if (existingIndex >= 0) {
+      nextItems[existingIndex] = { ...nextItems[existingIndex], ...nextItem };
+    } else {
+      nextItems.push(nextItem);
+    }
+
+    await this.store.updateTask(taskId, {
+      review: {
+        ...current,
+        mode: "pull-request",
+        source: "github-pr",
+        summary: `PR #${prInfo.number} feedback items: ${nextItems.length}`,
+        latestRefreshAt: now,
+        items: nextItems,
+      },
+    });
   }
 }

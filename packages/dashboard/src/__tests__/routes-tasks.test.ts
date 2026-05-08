@@ -2137,3 +2137,59 @@ describe("POST /subtasks/*", () => {
   });
 });
 
+
+describe("POST /tasks/:id/review/revise", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = createMockStore();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("queues selected review items and moves task to todo", async () => {
+    const taskWithReview = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-001",
+      column: "in-review",
+      steps: [],
+      review: {
+        mode: "direct",
+        source: "reviewer-agent",
+        decision: "changes-requested",
+        items: [
+          {
+            id: "ri-1",
+            source: "reviewer-agent",
+            status: "failed",
+            summary: "Fix tests",
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      },
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue(taskWithReview);
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...taskWithReview, column: "todo" });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks/FN-001/review/revise",
+      JSON.stringify({ itemIds: ["ri-1"] }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith(
+      "FN-001",
+      expect.objectContaining({ review: expect.objectContaining({ selectedItemIds: ["ri-1"] }) }),
+    );
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveProgress: true });
+  });
+});

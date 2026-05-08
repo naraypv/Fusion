@@ -3116,6 +3116,65 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
   });
 
   /**
+   * POST /api/tasks/:id/review/refresh
+   * Refresh normalized review payload for task Review tab.
+   */
+  router.post("/tasks/:id/review/refresh", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const task = await scopedStore.getTask(req.params.id);
+
+      let review = task.review;
+
+      if (task.prInfo) {
+        const badgeParsed = parseBadgeUrl(task.prInfo.url);
+        const owner = badgeParsed?.owner ?? getCurrentRepo(scopedStore.getRootDir())?.owner;
+        const repo = badgeParsed?.repo ?? getCurrentRepo(scopedStore.getRootDir())?.repo;
+        if (!owner || !repo) {
+          throw badRequest("Could not determine GitHub repository for PR review refresh");
+        }
+
+        const client = new GitHubClient();
+        const snapshot = await client.getPrReviewSnapshot(owner, repo, task.prInfo.number);
+        review = {
+          mode: "pull-request",
+          source: "github-pr",
+          decision:
+            snapshot.decision === "APPROVED"
+              ? "approved"
+              : snapshot.decision === "CHANGES_REQUESTED"
+                ? "changes-requested"
+                : "pending",
+          summary: snapshot.summary,
+          latestRefreshAt: new Date().toISOString(),
+          selectedItemIds: task.review?.selectedItemIds ?? [],
+          items: snapshot.items,
+        };
+      } else {
+        const existing = task.review;
+        review = {
+          mode: existing?.mode ?? "direct",
+          source: existing?.source ?? "reviewer-agent",
+          decision: existing?.decision ?? "pending",
+          summary: existing?.summary,
+          latestRefreshAt: new Date().toISOString(),
+          selectedItemIds: existing?.selectedItemIds ?? [],
+          items: existing?.items ?? [],
+        };
+      }
+
+      await scopedStore.updateTask(task.id, { review });
+      res.json({ review, automationStatus: task.status ?? null });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw notFound(`Task ${req.params.id} not found`);
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
    * POST /api/tasks/:id/issue/refresh
    * Force refresh issue status from GitHub API.
    * Returns: Updated IssueInfo

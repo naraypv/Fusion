@@ -73,6 +73,27 @@ export interface PrCheckStatus {
   state: PrCheckState;
 }
 
+export interface PrReviewItem {
+  id: string;
+  source: "github-pr";
+  status: "queued" | "in-progress" | "addressed" | "failed";
+  summary: string;
+  body?: string;
+  filePath?: string;
+  line?: number;
+  reviewer?: string;
+  commentUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrReviewSnapshot {
+  decision: ReviewDecision;
+  checks: PrCheckStatus[];
+  items: PrReviewItem[];
+  summary?: string;
+}
+
 export interface PrMergeStatus {
   prInfo: PrInfo;
   reviewDecision: ReviewDecision;
@@ -109,6 +130,15 @@ export type BadgeBatchResponse = Record<
 >;
 
 // gh CLI JSON output types
+interface GhReviewJson {
+  id: string;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "PENDING" | string;
+  body?: string | null;
+  submittedAt?: string | null;
+  author?: { login?: string | null } | null;
+  url?: string | null;
+}
+
 interface GhPrViewJson {
   id?: string;
   number: number;
@@ -126,6 +156,7 @@ interface GhPrViewJson {
     updatedAt: string;
     url: string;
   }>;
+  reviews?: GhReviewJson[];
 }
 
 interface GhPrListJson {
@@ -519,6 +550,54 @@ export class GitHubClient {
       baseBranch: pr.base.ref,
       commentCount: pr.comments,
     });
+  }
+
+  async getPrReviewSnapshot(owner: string | undefined, repo: string | undefined, number: number): Promise<PrReviewSnapshot> {
+    const { owner: resolvedOwner, repo: resolvedRepo } = this.resolveRepo(owner, repo);
+    const pr = await runGhJsonAsync<GhPrViewJson>([
+      "pr",
+      "view",
+      String(number),
+      "--repo",
+      `${resolvedOwner}/${resolvedRepo}`,
+      "--json",
+      "reviewDecision,reviews,comments",
+    ]);
+
+    const checks = (await this.getPrMergeStatus(resolvedOwner, resolvedRepo, number)).checks;
+    const commentItems: PrReviewItem[] = (pr.comments ?? []).map((comment) => ({
+      id: `gh-comment-${comment.id}`,
+      source: "github-pr",
+      status: "queued",
+      summary: comment.body.trim().slice(0, 160) || `Comment from @${comment.author?.login ?? "reviewer"}`,
+      body: comment.body,
+      reviewer: comment.author?.login ?? undefined,
+      commentUrl: comment.url,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+    }));
+
+    const reviewItems: PrReviewItem[] = (pr.reviews ?? []).map((review) => {
+      const createdAt = review.submittedAt ?? new Date().toISOString();
+      return {
+        id: `gh-review-${review.id}`,
+        source: "github-pr",
+        status: "queued",
+        summary: (review.body ?? "").trim().slice(0, 160) || `Review ${review.state} by @${review.author?.login ?? "reviewer"}`,
+        body: review.body ?? undefined,
+        reviewer: review.author?.login ?? undefined,
+        commentUrl: review.url ?? undefined,
+        createdAt,
+        updatedAt: createdAt,
+      };
+    });
+
+    return {
+      decision: pr.reviewDecision ?? null,
+      checks,
+      items: [...reviewItems, ...commentItems],
+      summary: `PR #${number} has ${reviewItems.length} review(s) and ${commentItems.length} comment(s).`,
+    };
   }
 
   async getPrMergeStatus(owner: string | undefined, repo: string | undefined, number: number): Promise<PrMergeStatus> {

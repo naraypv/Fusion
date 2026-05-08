@@ -737,25 +737,26 @@ describe("TaskDetailModal", () => {
       );
 
       // For an in-progress task (no workflow steps, no merge commit), the
-      // top-level tabs are: Definition, Logs, Changes, Comments, Documents,
-      // Model, Workflow, Stats, Routing.
-      const tabTexts = ["Definition", "Logs", "Changes", "Comments", "Documents", "Model", "Workflow", "Stats", "Routing"];
+      // top-level tabs are: Definition, Logs, Changes, Review, Comments,
+      // Documents, Model, Workflow, Stats, Routing.
+      const tabTexts = ["Definition", "Logs", "Changes", "Review", "Comments", "Documents", "Model", "Workflow", "Stats", "Routing"];
       const tabs = screen.getAllByRole("button").filter((b) =>
         tabTexts.includes(b.textContent || "")
       );
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].textContent).toBe("Definition");
       expect(tabs[1].textContent).toBe("Logs");
       expect(tabs[2].textContent).toBe("Changes");
-      expect(tabs[3].textContent).toBe("Comments");
-      expect(tabs[4].textContent).toBe("Documents");
-      expect(tabs[5].textContent).toBe("Model");
-      expect(tabs[6].textContent).toBe("Workflow");
-      expect(tabs[7].textContent).toBe("Stats");
-      expect(tabs[8].textContent).toBe("Routing");
+      expect(tabs[3].textContent).toBe("Review");
+      expect(tabs[4].textContent).toBe("Comments");
+      expect(tabs[5].textContent).toBe("Documents");
+      expect(tabs[6].textContent).toBe("Model");
+      expect(tabs[7].textContent).toBe("Workflow");
+      expect(tabs[8].textContent).toBe("Stats");
+      expect(tabs[9].textContent).toBe("Routing");
 
       // Activity and Agent Log are NOT top-level tabs (they are subviews inside Logs)
-      expect(container.querySelectorAll(".detail-tab").length).toBe(9);
+      expect(container.querySelectorAll(".detail-tab").length).toBe(10);
       // Workflow tab should always appear even when no workflow steps are configured
       expect(screen.getByText("Workflow")).toBeInTheDocument();
       // Commits tab should NOT appear for non-done tasks

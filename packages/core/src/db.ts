@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   attachments TEXT DEFAULT '[]',
   steeringComments TEXT DEFAULT '[]',
   comments TEXT DEFAULT '[]',
+  review TEXT,
   workflowStepResults TEXT DEFAULT '[]',
   prInfo TEXT,
   issueInfo TEXT,
@@ -1189,6 +1190,7 @@ export class Database {
 
     if (this.hasTable("tasks")) {
       this.addColumnIfMissing("tasks", "executionStartBranch", "TEXT");
+      this.addColumnIfMissing("tasks", "review", "TEXT");
     }
 
     if (version >= SCHEMA_VERSION) return;

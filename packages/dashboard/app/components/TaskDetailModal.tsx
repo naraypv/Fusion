@@ -25,6 +25,7 @@ import { AgentLogViewer } from "./AgentLogViewer";
 import { ModelSelectorTab } from "./ModelSelectorTab";
 import { PrSection } from "./PrSection";
 import { TaskComments } from "./TaskComments";
+import { TaskReviewTab } from "./TaskReviewTab";
 import { MergeDetails } from "./MergeDetails";
 import { TaskChangesTab } from "./TaskChangesTab";
 import { TaskForm, type PendingImage } from "./TaskForm";
@@ -227,7 +228,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-type TabId = "definition" | "logs" | "changes" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | `plugin-${string}`;
+type TabId = "definition" | "logs" | "changes" | "review" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | `plugin-${string}`;
 
 export interface TaskDetailModalProps {
   task: Task | TaskDetail;
@@ -1988,6 +1989,12 @@ export function TaskDetailContent({
               </button>
             )}
             <button
+              className={`detail-tab${activeTab === "review" ? " detail-tab-active" : ""}`}
+              onClick={() => setActiveTab("review")}
+            >
+              Review
+            </button>
+            <button
               className={`detail-tab${activeTab === "comments" ? " detail-tab-active" : ""}`}
               onClick={() => setActiveTab("comments")}
             >
@@ -2113,6 +2120,8 @@ export function TaskDetailContent({
             </div>
           ) : activeTab === "changes" ? (
             <TaskChangesTab taskId={task.id} worktree={task.worktree} projectId={projectId} column={task.column} mergeDetails={task.mergeDetails} modifiedFiles={task.modifiedFiles} />
+          ) : activeTab === "review" ? (
+            <TaskReviewTab task={task} addToast={addToast} projectId={projectId} onTaskUpdated={onTaskUpdated} />
           ) : activeTab === "comments" ? (
             <TaskComments task={task} addToast={addToast} projectId={projectId} onTaskUpdated={onTaskUpdated} />
           ) : activeTab === "documents" ? (

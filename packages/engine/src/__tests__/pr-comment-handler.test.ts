@@ -4,7 +4,10 @@ import type { TaskStore, Task } from "@fusion/core";
 
 const mockStore = {
   addTaskComment: vi.fn<(id: string, text: string, author?: string) => Promise<Task>>(),
+  getTask: vi.fn<(id: string) => Promise<Task>>().mockResolvedValue({ id: "FN-001", review: undefined } as Task),
+  updateTask: vi.fn<(id: string, updates: Partial<Task>) => Promise<Task>>().mockResolvedValue({ id: "FN-001" } as Task),
   createTask: vi.fn<(input: Parameters<TaskStore["createTask"]>[0]) => Promise<Task>>().mockResolvedValue({ id: "FN-123" } as Task),
+  moveTask: vi.fn<(id: string, column: Task["column"]) => Promise<Task>>().mockResolvedValue({ id: "FN-001", column: "in-progress" } as Task),
 } as unknown as TaskStore;
 
 describe("PrCommentHandler", () => {
@@ -192,6 +195,27 @@ describe("PrCommentHandler", () => {
       const text = (mockStore.addTaskComment as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(text).toContain("This PR is already merged");
       expect(text).toContain("follow-up work");
+    });
+  });
+
+  describe("handleChangesRequested", () => {
+    it("persists review item feedback when changes are requested", async () => {
+      (mockStore.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "FN-001", column: "in-review", review: undefined } as Task);
+
+      await handler.handleChangesRequested("FN-001", mockPrInfo, "reviewer", "Please add tests");
+
+      expect(mockStore.updateTask).toHaveBeenCalledWith(
+        "FN-001",
+        expect.objectContaining({
+          review: expect.objectContaining({
+            mode: "pull-request",
+            items: expect.arrayContaining([
+              expect.objectContaining({ source: "github-pr", status: "queued" }),
+            ]),
+          }),
+        }),
+      );
+      expect(mockStore.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
     });
   });
 

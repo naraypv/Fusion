@@ -232,6 +232,7 @@ The task detail modal exposes multiple tabs:
 - **Log** — task event history
 - **Changes** — merge diff/change summary
 - **Workflow** — workflow step results (pass/fail/skip)
+- **Review** — actionable feedback surface (PR reviews/threads or reviewer-agent findings), refresh controls, and same-task revision actions for selected items
 - **Stats** — execution timing + token usage breakdown
   - `Total execution time` prefers durable wall-clock execution window (`executionStartedAt` → `executionCompletedAt`)
   - Fallback order for legacy tasks: `timedExecutionMs` when present, otherwise `[timing]` log sum + workflow runtime
@@ -257,9 +258,12 @@ This file is the contract for execution and review.
 ## Task Comments vs Steering Comments
 
 - **Task comments** (`fn task comment`) are general collaboration notes.
+- **Review tab feedback** is dedicated actionable review input (PR review data in pull-request mode, reviewer-agent findings in direct mode) used to request same-task revisions.
 - **Steering comments** (`fn task steer`) are execution guidance for the running agent.
 
 Steering comments can be injected mid-run into active executor sessions.
+
+When users select review items and trigger **Request revision** from the Review tab, Fusion queues those items on the same task, injects revision guidance into `PROMPT.md`, reopens the last completed step, and re-dispatches the task through `todo` for an in-place revision pass.
 
 ### User comments and triage re-consideration
 

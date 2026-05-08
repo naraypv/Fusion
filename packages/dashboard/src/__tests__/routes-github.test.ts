@@ -2027,5 +2027,71 @@ describe("GET /tasks/:id/file-diffs", () => {
   });
 });
 
+describe("POST /tasks/:id/review/refresh", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = createMockStore();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("refreshes PR-backed review payload", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      prInfo: {
+        url: "https://github.com/owner/repo/pull/42",
+        number: 42,
+        status: "open",
+        title: "PR",
+        headBranch: "fusion/fn-1",
+        baseBranch: "main",
+        commentCount: 0,
+      },
+    });
+    vi.spyOn(GitHubClient.prototype, "getPrReviewSnapshot").mockResolvedValue({
+      decision: "CHANGES_REQUESTED",
+      checks: [],
+      summary: "needs work",
+      items: [],
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect((store.updateTask as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(
+      "FN-001",
+      expect.objectContaining({ review: expect.objectContaining({ mode: "pull-request" }) }),
+    );
+  });
+
+  it("refreshes direct-mode review payload without PR", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      review: {
+        mode: "direct",
+        source: "reviewer-agent",
+        decision: "pending",
+        items: [],
+      },
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect((store.updateTask as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
+    expect(res.body.review.mode).toBe("direct");
+  });
+});
+
 // --- Git Management route tests ---
 // These are integration tests that run against the actual git repository

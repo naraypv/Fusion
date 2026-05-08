@@ -250,6 +250,20 @@ export async function fetchTaskDetail(id: string, projectId?: string): Promise<T
   throw new Error("Request failed");
 }
 
+export interface UpdateTaskReviewRequest {
+  review: TaskDetail["review"] | null;
+}
+
+export interface RefreshTaskReviewResponse {
+  review: NonNullable<TaskDetail["review"]>;
+  automationStatus: string | null;
+}
+
+export interface ReviseTaskReviewResponse {
+  task: Task;
+  review: NonNullable<TaskDetail["review"]>;
+}
+
 export interface CreateTaskRequestOptions {
   transportNodeId?: string;
   localNodeId?: string;
@@ -5081,6 +5095,21 @@ export function assignTaskToUser(taskId: string, userId: string | null, projectI
 export function acceptTaskReview(taskId: string, projectId?: string): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/accept-review`, projectId), {
     method: "POST",
+  });
+}
+
+/** Refresh normalized task review data (PR mode or direct mode) */
+export function refreshTaskReview(taskId: string, projectId?: string): Promise<RefreshTaskReviewResponse> {
+  return api<RefreshTaskReviewResponse>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review/refresh`, projectId), {
+    method: "POST",
+  });
+}
+
+/** Request an in-place revision pass for selected review items */
+export function reviseTaskReviewItems(taskId: string, itemIds: string[], projectId?: string): Promise<ReviseTaskReviewResponse> {
+  return api<ReviseTaskReviewResponse>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review/revise`, projectId), {
+    method: "POST",
+    body: JSON.stringify({ itemIds }),
   });
 }
 

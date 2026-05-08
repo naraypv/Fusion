@@ -37,7 +37,7 @@ describe("TaskDetailModal", () => {
       expect(container.querySelector(".modal-actions .modal-actions-spacer")).toBeTruthy();
       expect(container.querySelector(".detail-body")).toBeTruthy();
       const tabs = container.querySelectorAll(".detail-tab");
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].classList.contains("detail-tab-active")).toBe(true);
       expect(Array.from(tabs).slice(1).every((t) => !t.classList.contains("detail-tab-active"))).toBe(true);
       // Responsive CSS controls sizing — no inline padding/fontSize/borderBottom leaks

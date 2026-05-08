@@ -35,6 +35,8 @@ vi.mock("../../api", async (importOriginal) => {
     pauseTask: vi.fn().mockResolvedValue({}),
     unpauseTask: vi.fn().mockResolvedValue({}),
     fetchWorkflowResults: vi.fn().mockResolvedValue([]),
+    refreshTaskReview: vi.fn().mockResolvedValue({ review: undefined, automationStatus: null }),
+    reviseTaskReviewItems: vi.fn().mockResolvedValue({ task: makeTask(), review: undefined }),
   });
 });
 

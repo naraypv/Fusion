@@ -699,6 +699,37 @@ export interface TaskCommentInput {
   author: string;
 }
 
+export type TaskReviewMode = "pull-request" | "direct";
+export type TaskReviewSource = "github-pr" | "reviewer-agent";
+export type TaskReviewDecision = "approved" | "changes-requested" | "commented" | "pending";
+export type TaskReviewItemStatus = "queued" | "in-progress" | "addressed" | "failed";
+
+export interface TaskReviewItem {
+  id: string;
+  source: TaskReviewSource;
+  status: TaskReviewItemStatus;
+  summary: string;
+  body?: string;
+  filePath?: string;
+  line?: number;
+  commentUrl?: string;
+  reviewer?: string;
+  createdAt: string;
+  updatedAt: string;
+  addressedAt?: string;
+  failedReason?: string;
+}
+
+export interface TaskReview {
+  mode: TaskReviewMode;
+  source: TaskReviewSource;
+  decision: TaskReviewDecision;
+  summary?: string;
+  latestRefreshAt?: string;
+  selectedItemIds?: string[];
+  items: TaskReviewItem[];
+}
+
 export interface TaskDocument {
   /** UUID primary key */
   id: string;
@@ -918,6 +949,8 @@ export interface Task {
   attachments?: TaskAttachment[];
   steeringComments?: SteeringComment[];
   comments?: TaskComment[];
+  /** Structured review metadata shown in the Review tab. */
+  review?: TaskReview;
   /** PR information for tasks linked to GitHub pull requests */
   prInfo?: PrInfo;
   mergeDetails?: MergeDetails;
@@ -2339,6 +2372,8 @@ export interface ArchivedTaskEntry {
   attachments?: TaskAttachment[];
   /** User and agent comments remain searchable in the archive DB. */
   comments?: TaskComment[];
+  /** Structured review metadata shown in the Review tab. */
+  review?: TaskReview;
   /** Reconstructed prompt content at archive time, without attachment blobs. */
   prompt?: string;
   /** Agent log retention mode used when this archive entry was written. */

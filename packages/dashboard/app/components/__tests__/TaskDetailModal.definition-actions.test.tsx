@@ -185,7 +185,7 @@ describe("TaskDetailModal", () => {
       // In-progress tasks show exactly 9 tabs:
       // Definition, Logs, Changes, Comments, Documents, Model, Workflow, Stats, Routing
       const tabs = container.querySelectorAll(".detail-tab");
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].textContent).toBe("Definition");
       expect(tabs[1].textContent).toBe("Logs");
       expect(tabs[2].textContent).toBe("Changes");
@@ -214,7 +214,7 @@ describe("TaskDetailModal", () => {
 
       // In-progress task with workflow steps: 9 tabs (Workflow after Model, Stats then Routing)
       const tabs = container.querySelectorAll(".detail-tab");
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].textContent).toBe("Definition");
       expect(tabs[1].textContent).toBe("Logs");
       expect(tabs[2].textContent).toBe("Changes");
@@ -244,7 +244,7 @@ describe("TaskDetailModal", () => {
 
       // Done task with commit SHA: Definition, Logs, Changes, Comments, Documents, Model, Workflow, Stats, Routing (9 tabs, no Commits)
       const tabs = container.querySelectorAll(".detail-tab");
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].textContent).toBe("Definition");
       expect(tabs[1].textContent).toBe("Logs");
       expect(tabs[2].textContent).toBe("Changes");
@@ -277,7 +277,7 @@ describe("TaskDetailModal", () => {
 
       // Done task with workflow steps and commit SHA: 9 tabs (no Commits)
       const tabs = container.querySelectorAll(".detail-tab");
-      expect(tabs.length).toBe(9);
+      expect(tabs.length).toBe(10);
       expect(tabs[0].textContent).toBe("Definition");
       expect(tabs[1].textContent).toBe("Logs");
       expect(tabs[2].textContent).toBe("Changes");

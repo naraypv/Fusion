@@ -290,7 +290,7 @@ describe("TaskDetailModal", () => {
     expect(screen.queryByText("PROMPT.md")).toBeNull();
   });
 
-  it("renders Comments tab", () => {
+  it("renders Review and Comments tabs", () => {
     render(
       <TaskDetailModal
         task={makeTask()}
@@ -303,6 +303,7 @@ describe("TaskDetailModal", () => {
       />,
     );
 
+    expect(screen.getByText("Review")).toBeTruthy();
     expect(screen.getByText("Comments")).toBeTruthy();
   });
 
