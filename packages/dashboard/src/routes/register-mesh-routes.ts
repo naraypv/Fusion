@@ -379,6 +379,146 @@ export const registerMeshRoutes: ApiRouteRegistrar = (ctx) => {
         }
       }
 
+      // ── Shared state sync: apply inbound domain snapshots independently ──
+      const { AgentStore, SHARED_STATE_DEFAULT_LIMIT, validateSnapshotEnvelope } = await import("@fusion/core");
+      const sharedState = req.body?.sharedState;
+      if (sharedState && typeof sharedState === "object") {
+        const missionStore = store.getMissionStore();
+        const fusionDir = store.getFusionDir();
+        let agentStore: InstanceType<typeof AgentStore> | null = null;
+
+        const ensureAgentStore = async (): Promise<InstanceType<typeof AgentStore>> => {
+          if (agentStore) return agentStore;
+          const newStore = new AgentStore({ rootDir: fusionDir, taskStore: store });
+          await newStore.init();
+          agentStore = newStore;
+          return agentStore;
+        };
+
+        const applyDomain = async (domain: string, fn: () => Promise<void> | void): Promise<void> => {
+          try {
+            await fn();
+          } catch (err) {
+            emitRemoteRouteDiagnostic({
+              route: "mesh-sync",
+              message: `Failed to apply shared state domain: ${domain}`,
+              nodeId: senderNodeId,
+              upstreamPath: "/api/mesh/sync",
+              operationStage: `apply-shared-state-${domain}`,
+              level: "warn",
+              error: err,
+            });
+          }
+        };
+
+        await applyDomain("task-metadata", async () => {
+          if (!sharedState.taskMetadata) return;
+          validateSnapshotEnvelope(sharedState.taskMetadata);
+          await store.applyTaskMetadataSnapshot(sharedState.taskMetadata as Parameters<typeof store.applyTaskMetadataSnapshot>[0]);
+        });
+
+        await applyDomain("mission-hierarchy", async () => {
+          if (!sharedState.missionHierarchy) return;
+          validateSnapshotEnvelope(sharedState.missionHierarchy);
+          missionStore.applyMissionHierarchySnapshot(sharedState.missionHierarchy as Parameters<typeof missionStore.applyMissionHierarchySnapshot>[0]);
+        });
+
+        await applyDomain("agents", async () => {
+          if (!sharedState.agents) return;
+          validateSnapshotEnvelope(sharedState.agents);
+          const activeAgentStore = await ensureAgentStore();
+          await activeAgentStore.applyAgentSnapshot(sharedState.agents as Parameters<typeof activeAgentStore.applyAgentSnapshot>[0]);
+        });
+
+        await applyDomain("agent-runs", async () => {
+          if (!sharedState.agentRuns) return;
+          validateSnapshotEnvelope(sharedState.agentRuns);
+          const activeAgentStore = await ensureAgentStore();
+          await activeAgentStore.applyAgentRunSnapshot(sharedState.agentRuns as Parameters<typeof activeAgentStore.applyAgentRunSnapshot>[0]);
+        });
+
+        await applyDomain("activity-log", async () => {
+          if (!sharedState.activityLog) return;
+          validateSnapshotEnvelope(sharedState.activityLog);
+          store.applyActivityLogSnapshot(sharedState.activityLog as Parameters<typeof store.applyActivityLogSnapshot>[0]);
+        });
+
+        await applyDomain("run-audit", async () => {
+          if (!sharedState.runAudit) return;
+          validateSnapshotEnvelope(sharedState.runAudit);
+          store.applyRunAuditSnapshot(sharedState.runAudit as Parameters<typeof store.applyRunAuditSnapshot>[0]);
+        });
+
+        await applyDomain("project-settings", async () => {
+          if (!sharedState.projectSettings) return;
+          validateSnapshotEnvelope(sharedState.projectSettings);
+          const result = await central.applyProjectSettingsSnapshot(sharedState.projectSettings as Parameters<typeof central.applyProjectSettingsSnapshot>[0]);
+          if (!result.success) {
+            throw new Error(result.error ?? "applyProjectSettingsSnapshot failed");
+          }
+        });
+
+        if (sharedState.authMaterial) {
+          emitRemoteRouteDiagnostic({
+            route: "mesh-sync",
+            message: "Ignoring sharedState.authMaterial; use dedicated auth sync routes (/api/nodes/:id/auth/*)",
+            nodeId: senderNodeId,
+            upstreamPath: "/api/mesh/sync",
+            operationStage: "apply-shared-state-auth-material",
+            level: "info",
+          });
+        }
+
+        // Intentionally do not close this per-request AgentStore wrapper.
+        // AgentStore uses a process-wide DB cache by rootDir; closing here would
+        // invalidate shared connections used by long-lived runtime stores.
+      }
+
+      // Build shared-state response from fresh local snapshots per request.
+      const responseSharedState: Record<string, unknown> = {};
+      const collectSnapshot = async (domain: string, fn: () => Promise<unknown>): Promise<void> => {
+        try {
+          const snapshot = await fn();
+          if (!snapshot) {
+            emitRemoteRouteDiagnostic({
+              route: "mesh-sync",
+              message: `No shared state snapshot available for domain: ${domain}`,
+              nodeId: senderNodeId,
+              upstreamPath: "/api/mesh/sync",
+              operationStage: `build-shared-state-${domain}`,
+              level: "info",
+            });
+            return;
+          }
+          responseSharedState[domain] = snapshot;
+        } catch (err) {
+          emitRemoteRouteDiagnostic({
+            route: "mesh-sync",
+            message: `Failed to build shared state snapshot for domain: ${domain}`,
+            nodeId: senderNodeId,
+            upstreamPath: "/api/mesh/sync",
+            operationStage: `build-shared-state-${domain}`,
+            level: "warn",
+            error: err,
+          });
+        }
+      };
+
+      await collectSnapshot("taskMetadata", async () => store.getTaskMetadataSnapshot());
+      await collectSnapshot("missionHierarchy", async () => store.getMissionStore().getMissionHierarchySnapshot());
+      await collectSnapshot("activityLog", async () => store.getActivityLogSnapshot(SHARED_STATE_DEFAULT_LIMIT));
+      await collectSnapshot("runAudit", async () => store.getRunAuditSnapshot({ limit: SHARED_STATE_DEFAULT_LIMIT }));
+
+      const responseAgentStore = new AgentStore({ rootDir: store.getFusionDir(), taskStore: store });
+      await responseAgentStore.init();
+      await collectSnapshot("agents", async () => responseAgentStore.getAgentSnapshot());
+      await collectSnapshot("agentRuns", async () => responseAgentStore.getAgentRunSnapshot(SHARED_STATE_DEFAULT_LIMIT));
+
+      await collectSnapshot("projectSettings", async () => {
+        const localGlobal = await store.getGlobalSettingsStore().getSettings();
+        return central.getProjectSettingsSnapshot(localGlobal);
+      });
+
       await central.close();
 
       // Return sync response
@@ -393,6 +533,9 @@ export const registerMeshRoutes: ApiRouteRegistrar = (ctx) => {
       // Include settings in response if sender sent settings
       if (responseSettings) {
         response.settings = responseSettings;
+      }
+      if (Object.keys(responseSharedState).length > 0) {
+        response.sharedState = responseSharedState;
       }
 
       res.json(response);

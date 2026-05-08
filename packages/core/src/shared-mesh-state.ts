@@ -22,6 +22,8 @@ import type {
   Slice,
 } from "./mission-types.js";
 
+export const SHARED_STATE_DEFAULT_LIMIT = 10_000;
+
 export interface SharedSnapshotEnvelope<TPayload> {
   version: number;
   exportedAt: string;

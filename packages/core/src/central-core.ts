@@ -3120,11 +3120,11 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   async applyProjectSettingsSnapshot(snapshot: ProjectSettingsSnapshot): Promise<SettingsSyncResult> {
     validateSnapshotEnvelope(snapshot);
     const payloadWithoutChecksum: Omit<SettingsSyncPayload, "checksum"> = {
-      version: 1,
-      exportedAt: snapshot.exportedAt,
       global: snapshot.payload.global,
       projects: snapshot.payload.projects,
       providerAuth: undefined,
+      exportedAt: snapshot.exportedAt,
+      version: 1,
     };
     const checksum = createHash("sha256")
       .update(JSON.stringify(payloadWithoutChecksum))

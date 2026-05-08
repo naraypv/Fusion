@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentStore } from "../agent-store.js";
 import { TaskStore } from "../store.js";
+import { validateSnapshotEnvelope } from "../shared-mesh-state.js";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -2885,8 +2886,17 @@ describe("AgentStore", () => {
     const agent = await store.createAgent({ name: "Snapshot Agent", role: "executor" });
     await store.setLastBlockedState(agent.id, { taskId: "FN-1", blockedBy: "dep", recordedAt: new Date().toISOString(), contextHash: "h" });
 
+    const run1 = await store.startHeartbeatRun(agent.id);
+    await store.endHeartbeatRun(run1.id, "completed");
+    const run2 = await store.startHeartbeatRun(agent.id);
+    await store.endHeartbeatRun(run2.id, "completed");
+
     const agentSnapshot = await store.getAgentSnapshot();
     const runSnapshot = store.getAgentRunSnapshot();
+    const limitedRunSnapshot = store.getAgentRunSnapshot(1);
+
+    validateSnapshotEnvelope(agentSnapshot);
+    validateSnapshotEnvelope(runSnapshot);
 
     const applyAgent = await store.applyAgentSnapshot(agentSnapshot);
     const applyRun = await store.applyAgentRunSnapshot(runSnapshot);
@@ -2894,8 +2904,12 @@ describe("AgentStore", () => {
     const runSnapshot2 = store.getAgentRunSnapshot();
 
     expect(applyAgent.appliedAgents).toBeGreaterThan(0);
+    expect(agentSnapshot.payload.agents.length).toBeGreaterThan(0);
+    expect(agentSnapshot.payload.blockedStates.length).toBe(1);
     expect(agentSnapshot2.payload).toEqual(agentSnapshot.payload);
     expect(runSnapshot2.payload).toEqual(runSnapshot.payload);
+    expect(limitedRunSnapshot.payload.runs).toHaveLength(1);
+    expect(limitedRunSnapshot.payload.runs[0]?.id).toBe(run2.id);
     expect(applyRun.applied + applyRun.skipped).toBeGreaterThanOrEqual(0);
   });
 });

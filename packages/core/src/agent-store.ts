@@ -2189,12 +2189,19 @@ export class AgentStore extends EventEmitter {
     return { appliedAgents, appliedBlockedStates };
   }
 
-  getAgentRunSnapshot(): AgentRunSnapshot {
-    const runs = this.db.prepare("SELECT data FROM agentRuns ORDER BY startedAt ASC").all() as Array<{ data: string }>;
-    const parsed = runs
+  getAgentRunSnapshot(limit?: number): AgentRunSnapshot {
+    const normalizedLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : undefined;
+    const query = normalizedLimit
+      ? "SELECT data FROM agentRuns ORDER BY startedAt DESC LIMIT ?"
+      : "SELECT data FROM agentRuns ORDER BY startedAt ASC";
+    const rows = normalizedLimit
+      ? (this.db.prepare(query).all(normalizedLimit) as Array<{ data: string }>)
+      : (this.db.prepare(query).all() as Array<{ data: string }>);
+    const parsed = rows
       .map((row) => this.parseJson<AgentHeartbeatRun | null>(row.data, null))
       .filter((run): run is AgentHeartbeatRun => run !== null);
-    return createAgentRunSnapshot(parsed);
+    const orderedRuns = normalizedLimit ? parsed.reverse() : parsed;
+    return createAgentRunSnapshot(orderedRuns);
   }
 
   async applyAgentRunSnapshot(snapshot: AgentRunSnapshot): Promise<{ applied: number; skipped: number }> {
