@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, renameSync, mkdtempSync, rmSync, realpathSync, globSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, renameSync, mkdtempSync, rmSync, realpathSync, globSync, existsSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -696,26 +696,50 @@ const isolatedHomesToCleanup = new Set();
 // Basenames of every fusion-test-home-root-* dir this process has minted.
 // Passed to check-test-isolation.mjs via env so it allow-lists them
 // unconditionally, even if cleanup's rm silently failed.
-const knownIsolatedHomeBasenames = new Set();
+export const knownIsolatedHomeBasenames = new Set();
 
-function cleanupIsolatedHomePath(homePath, retries = 3, delayMs = 200) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      rmSync(homePath, { recursive: true, force: true });
-      break;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (attempt < retries) {
-        // EBUSY on macOS: SQLite WAL still mmap'd or orphan child holding fd.
-        // Spin briefly to give the OS time to release the handle.
-        const end = Date.now() + delayMs;
-        while (Date.now() < end) { /* busy-wait */ }
-      } else {
-        console.warn(`[test-changed] failed to remove isolated HOME ${homePath} after ${retries + 1} attempts: ${message}`);
+let cleanupRmSync = rmSync;
+
+export function __setCleanupRmSyncForTests(nextRmSync) {
+  cleanupRmSync = typeof nextRmSync === "function" ? nextRmSync : rmSync;
+}
+
+function sleepMsSync(ms) {
+  if (ms <= 0) return;
+  spawnSync("sleep", [String(ms / 1000)], { stdio: "ignore" });
+}
+
+/**
+ * Retry isolated HOME cleanup synchronously to absorb transient EBUSY races
+ * (common on macOS when Vitest workers still hold file descriptors briefly).
+ * If cleanup still fails, check-test-isolation gets an allow-list of every
+ * minted fusion-test-home-root-* basename to avoid false leak failures.
+ */
+export function cleanupIsolatedHomePath(homePath, retries = 3, delayMs = 75) {
+  try {
+    if (!existsSync(homePath)) return;
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        cleanupRmSync(homePath, { recursive: true, force: true });
+        return;
+      } catch (err) {
+        if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+          return;
+        }
+        lastError = err;
+        if (attempt < retries) {
+          sleepMsSync(delayMs);
+        }
       }
     }
+
+    const message = lastError instanceof Error ? lastError.message : String(lastError);
+    console.warn(`[test-changed] failed to remove isolated HOME ${homePath} after ${retries} attempts: ${message}`);
+  } finally {
+    isolatedHomesToCleanup.delete(homePath);
   }
-  isolatedHomesToCleanup.delete(homePath);
 }
 
 function cleanupIsolatedHomes() {

@@ -24,9 +24,12 @@ import {
   shouldRunIsolationGuard,
   defaultTestWorkerBudget,
   createIsolatedHomeEnv,
+  cleanupIsolatedHomePath,
+  knownIsolatedHomeBasenames,
+  __setCleanupRmSyncForTests,
 } from "../test-changed.mjs";
 
-import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -672,4 +675,64 @@ test("createIsolatedHomeEnv: returns temp HOME/USERPROFILE pair without mutating
   assert.match(isolatedHome, /fusion-test-home-root-/);
 
   rmSync(isolatedHome, { recursive: true, force: true });
+});
+
+test("cleanupIsolatedHomePath: removes existing isolated HOME directory", () => {
+  const homePath = mkdtempSync(path.join(tmpdir(), "fusion-test-home-root-cleanup-"));
+  assert.equal(path.basename(homePath).startsWith("fusion-test-home-root-cleanup-"), true);
+
+  cleanupIsolatedHomePath(homePath);
+
+  assert.equal(existsSync(homePath), false);
+});
+
+test("cleanupIsolatedHomePath: silently succeeds for ENOENT paths", () => {
+  const missingPath = path.join(tmpdir(), `fusion-test-home-root-missing-${Date.now()}-${Math.random()}`);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+
+  try {
+    cleanupIsolatedHomePath(missingPath);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.deepEqual(warnings, []);
+});
+
+test("cleanupIsolatedHomePath: warns once after bounded retry failures", () => {
+  const homePath = mkdtempSync(path.join(tmpdir(), "fusion-test-home-root-fail-"));
+  const warnings = [];
+  const originalWarn = console.warn;
+  const error = Object.assign(new Error("simulated EBUSY"), { code: "EBUSY" });
+  let calls = 0;
+
+  __setCleanupRmSyncForTests(() => {
+    calls += 1;
+    throw error;
+  });
+  console.warn = (msg) => warnings.push(String(msg));
+
+  try {
+    cleanupIsolatedHomePath(homePath, 3, 0);
+  } finally {
+    __setCleanupRmSyncForTests(null);
+    console.warn = originalWarn;
+    rmSync(homePath, { recursive: true, force: true });
+  }
+
+  assert.equal(calls, 3);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /failed to remove isolated HOME/);
+});
+
+test("createIsolatedHomeEnv: records raw/realpath basenames in allow-list set", () => {
+  const { isolatedHome } = createIsolatedHomeEnv({ PATH: process.env.PATH || "" });
+  const base = path.basename(isolatedHome);
+
+  assert.equal(knownIsolatedHomeBasenames.has(base), true);
+  assert.ok(knownIsolatedHomeBasenames.size >= 1);
+
+  cleanupIsolatedHomePath(isolatedHome);
 });
