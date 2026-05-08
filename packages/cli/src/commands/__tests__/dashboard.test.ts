@@ -53,7 +53,7 @@ const {
     mockSelfHealingStop: vi.fn(),
     mockCheckStuckBudget: vi.fn().mockResolvedValue(true),
     mockStuckCheckNow: vi.fn().mockResolvedValue(undefined),
-    mockResolveGlobalDir: vi.fn().mockReturnValue("/tmp/test-global"),
+    mockResolveGlobalDir: vi.fn().mockReturnValue(`/tmp/test-global-dashboard-${process.pid}`),
     mockGlobalSettingsGetSettings: vi.fn().mockResolvedValue({}),
     mockGlobalSettingsUpdateSettings: vi.fn().mockResolvedValue({}),
     mockDaemonTokenGetOrCreate: vi.fn().mockResolvedValue("fn_test_dashboard_token"),
@@ -804,7 +804,7 @@ function resetGitHubMocks() {
   });
 }
 
-const updateCacheDir = "/tmp/test-global";
+const updateCacheDir = `/tmp/test-global-dashboard-${process.pid}`;
 const updateCachePath = `${updateCacheDir}/update-check.json`;
 
 function writeUpdateCache(payload: { updateAvailable: boolean; latestVersion: string; currentVersion: string }): void {
@@ -824,7 +824,7 @@ beforeEach(() => {
   mockStuckCheckNow.mockReset();
   mockStuckCheckNow.mockResolvedValue(undefined);
   mockResolveGlobalDir.mockReset();
-  mockResolveGlobalDir.mockReturnValue("/tmp/test-global");
+  mockResolveGlobalDir.mockReturnValue(updateCacheDir);
   mockGlobalSettingsGetSettings.mockReset();
   mockGlobalSettingsGetSettings.mockResolvedValue({});
   mockGlobalSettingsUpdateSettings.mockReset();
