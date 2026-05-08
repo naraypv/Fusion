@@ -8,6 +8,7 @@ export type GlassesCardAction = {
 
 export type GlassesCard = {
   id: string;
+  kind?: "task" | "summary" | "notification";
   title: string;
   bodyLines: string[];
   accentColor: string;
@@ -25,6 +26,7 @@ const COLUMN_COLORS: Record<string, string> = {
 export function taskToCard(task: FusionTask): GlassesCard {
   return {
     id: `task-${task.id}`,
+    kind: "task",
     title: `${task.id}: ${task.title}`,
     bodyLines: [task.description, `Column: ${task.column}`],
     accentColor: COLUMN_COLORS[task.column] ?? "blue",
@@ -39,6 +41,7 @@ export function boardSummaryCard(tasksByColumn: Record<string, number>): Glasses
   const ordered = ["triage", "todo", "in-progress", "in-review", "done"];
   return {
     id: "board-summary",
+    kind: "summary",
     title: "Fusion Board Summary",
     bodyLines: ordered.map((column) => `${column}: ${tasksByColumn[column] ?? 0}`),
     accentColor: "blue",
@@ -48,6 +51,7 @@ export function boardSummaryCard(tasksByColumn: Record<string, number>): Glasses
 export function notificationCard(task: FusionTask, reason: string): GlassesCard {
   return {
     id: `notification-${task.id}-${reason}`,
+    kind: "notification",
     title: `Task update: ${task.id}`,
     bodyLines: [task.title, `Now in ${task.column}`, reason],
     accentColor: COLUMN_COLORS[task.column] ?? "blue",

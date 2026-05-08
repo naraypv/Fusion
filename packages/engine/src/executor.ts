@@ -210,7 +210,7 @@ async function runConfiguredCommand(
 // ── Tool parameter schemas (module-level for reuse in ToolDefinition generics) ──
 
 const taskUpdateParams = Type.Object({
-  step: Type.Number({ description: "Step number (0-indexed)" }),
+  step: Type.Number({ description: "Step number (1-indexed)" }),
   status: Type.Union(
     STEP_STATUSES.map((s) => Type.Literal(s)),
     { description: "New status: pending, in-progress, done, or skipped" },
@@ -3916,18 +3916,28 @@ export class TaskExecutor {
           };
         }
 
-        if (!Number.isInteger(step) || step < 0) {
+        if (!Number.isInteger(step) || step < 1) {
           return {
             content: [{
               type: "text" as const,
-              text: `Invalid step number: ${step}. Steps are 0-indexed.`,
+              text: `Invalid step number: ${step}. Steps are 1-indexed.`,
             }],
             details: {},
           };
         }
 
-        const task = await store.updateStep(taskId, step, status as StepStatus);
-        const stepInfo = task.steps[step];
+        const stepIndex = step - 1;
+        const task = await store.updateStep(taskId, stepIndex, status as StepStatus);
+        const stepInfo = task.steps[stepIndex];
+        if (!stepInfo) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Invalid step number: ${step}. This task has ${task.steps.length} step(s) (1-indexed).`,
+            }],
+            details: {},
+          };
+        }
         const persistedStatus = stepInfo.status;
         const progress = task.steps.filter((s) => s.status === "done").length;
 

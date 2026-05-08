@@ -25,6 +25,7 @@ describe("cards", () => {
           "Column: in-review",
         ],
         "id": "task-FN-1",
+        "kind": "task",
         "title": "FN-1: Ship",
       }
     `);
@@ -42,6 +43,7 @@ describe("cards", () => {
           "done: 1",
         ],
         "id": "board-summary",
+        "kind": "summary",
         "title": "Fusion Board Summary",
       }
     `);
@@ -64,6 +66,7 @@ describe("cards", () => {
           "entered notify column",
         ],
         "id": "notification-FN-2-entered notify column",
+        "kind": "notification",
         "title": "Task update: FN-2",
       }
     `);

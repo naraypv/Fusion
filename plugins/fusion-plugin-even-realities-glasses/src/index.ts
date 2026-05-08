@@ -3,14 +3,13 @@ import type { FusionPlugin, PluginContext, PluginRouteDefinition, PluginRouteRes
 import { requestReview, startWork } from "./agent-actions.js";
 import { FusionApiClient } from "./fusion-api-client.js";
 import { createNotifier } from "./notifier.js";
-import { runQuickCapture } from "./quick-capture.js";
+import { quickCaptureRoutes } from "./routes/quick-capture-routes.js";
 import {
   agentActionsEnabled,
   getFusionBaseUrl,
   getFusionToken,
   getNotifyColumns,
   getPollingIntervalMs,
-  getQuickCaptureColumn,
   settingsSchema,
 } from "./settings.js";
 import { StubGlassesTransport } from "./transport.js";
@@ -63,18 +62,6 @@ const routes: PluginRouteDefinition[] = [
   },
   {
     method: "POST",
-    path: "/quick-capture",
-    handler: async (req, ctx) => {
-      const { instance, error } = getInstanceOrResponse(ctx);
-      if (!instance) return error as PluginRouteResponse;
-      const text = typeof (req as { body?: { text?: unknown } }).body?.text === "string" ? (req as { body?: { text?: string } }).body?.text ?? "" : "";
-      if (!text.trim()) return { status: 400, body: { error: "text is required" } };
-      const result = await runQuickCapture(text, { apiClient: instance.client, defaultColumn: getQuickCaptureColumn(ctx.settings) });
-      return { status: 200, body: result };
-    },
-  },
-  {
-    method: "POST",
     path: "/actions/start-work",
     handler: async (req, ctx) => {
       const { instance, error } = getInstanceOrResponse(ctx);
@@ -121,7 +108,7 @@ const plugin: FusionPlugin = definePlugin({
     settingsSchema,
   },
   state: "installed",
-  routes,
+  routes: [...routes, ...quickCaptureRoutes],
   hooks: {
     onSchemaInit: (db) => {
       (db as PluginDb).exec(`

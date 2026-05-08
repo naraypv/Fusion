@@ -5,6 +5,7 @@ describe("even realities plugin", () => {
   it("has expected manifest and settings keys", () => {
     expect(plugin.manifest.id).toBe("fusion-plugin-even-realities-glasses");
     expect(Object.keys(plugin.manifest.settingsSchema ?? {}).sort()).toEqual([
+      "apiKey",
       "enableAgentActions",
       "fusionApiBaseUrl",
       "fusionApiToken",

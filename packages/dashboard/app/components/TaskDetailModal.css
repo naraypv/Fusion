@@ -1118,14 +1118,14 @@
 
   /* Larger touch targets for file entries on mobile */
   .changed-files-sidebar.mobile .changed-files-entry {
-    padding: 10px var(--space-md);
+    padding: calc(var(--space-sm) + var(--space-xs) / 2) var(--space-md);
     min-height: 36px;
   }
 
   /* Clearer active state on mobile */
   .changed-files-sidebar.mobile .changed-files-entry.active {
     background: var(--card-hover);
-    border-left: 3px solid var(--in-progress);
+    border-left: calc(var(--btn-border-width) * 3) solid var(--in-progress);
   }
 
   .changed-files-content.mobile {

@@ -20,6 +20,10 @@ export const settingsSchema: Record<string, PluginSettingSchema> = {
     type: "password",
     label: "Fusion API Token",
   },
+  apiKey: {
+    type: "password",
+    label: "Glasses Route API Key",
+  },
   glassesDeviceId: {
     type: "string",
     label: "Glasses Device ID",
