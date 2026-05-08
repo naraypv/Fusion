@@ -10,6 +10,7 @@ const workspaceRoot = resolve(packageRoot, "..", "..");
 const dashboardClientDir = join(workspaceRoot, "packages", "dashboard", "dist", "client");
 const desktopDistDir = join(packageRoot, "dist");
 const desktopClientDistDir = join(desktopDistDir, "client");
+const externalMainProcessPackages = ["electron", "@fusion/core", "@fusion/dashboard"];
 
 function run(command: string, args: string[], cwd: string): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -58,7 +59,7 @@ async function buildElectronEntrypoints(): Promise<void> {
       target: "node22",
       sourcemap: true,
       packages: "external",
-      external: ["electron"],
+      external: externalMainProcessPackages,
       logLevel: "info",
     }),
     build({
@@ -70,7 +71,7 @@ async function buildElectronEntrypoints(): Promise<void> {
       target: "node22",
       sourcemap: true,
       packages: "external",
-      external: ["electron"],
+      external: externalMainProcessPackages,
       logLevel: "info",
     }),
   ]);

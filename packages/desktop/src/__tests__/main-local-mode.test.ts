@@ -26,14 +26,14 @@ const mocks = vi.hoisted(() => {
   const BrowserWindow = vi.fn(() => browserWindow);
   const Tray = vi.fn(() => ({ destroy: vi.fn() }));
 
-  const localServerManager = {
-    start: vi.fn(async () => undefined),
-    stop: vi.fn(async () => undefined),
-    getState: vi.fn(() => ({ status: "idle", error: null })),
-    getPort: vi.fn(() => undefined),
+  const localRuntimeManager = {
+    startLocal: vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4041 })),
+    stopLocal: vi.fn(async () => ({ source: "none", state: "stopped" })),
+    getStatus: vi.fn(() => ({ source: "none", state: "stopped" })),
+    getServerPort: vi.fn(() => undefined),
   };
 
-  return { app, appHandlers, BrowserWindow, Tray, browserWindow, localServerManager };
+  return { app, appHandlers, BrowserWindow, Tray, browserWindow, localRuntimeManager };
 });
 
 vi.mock("electron", () => ({
@@ -49,28 +49,22 @@ vi.mock("../tray.js", () => ({ setupTray: vi.fn() }));
 vi.mock("../ipc.js", () => ({ registerIpcHandlers: vi.fn() }));
 vi.mock("../native.js", () => ({ DEFAULT_WINDOW_STATE: { width: 1000, height: 800 }, loadWindowState: vi.fn(async () => null), saveWindowState: vi.fn(), setupAutoUpdater: vi.fn() }));
 vi.mock("../deep-link.js", () => ({ registerDeepLinkProtocol: vi.fn(), setupDeepLinkHandler: vi.fn() }));
-vi.mock("../shell-settings.js", () => ({
-  readShellSettings: vi.fn(async () => ({
-    desktopMode: "local",
-    hasCompletedModeSelection: true,
-    activeProfileId: null,
-    profiles: [],
-  })),
-  getDesktopShellModeState: () => ({ isFirstRun: false, desktopMode: "local" }),
-}));
-vi.mock("../local-server.js", () => ({ DesktopLocalServerManager: vi.fn(() => mocks.localServerManager) }));
+vi.mock("../local-runtime.js", () => ({ LocalRuntimeManager: vi.fn(() => mocks.localRuntimeManager) }));
 
 describe("main local mode", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
     mocks.appHandlers.clear();
+    delete process.env.FUSION_DESKTOP_MODE;
   });
 
-  it("starts local server manager when restored desktop mode is local", async () => {
+  it("starts local runtime manager when FUSION_DESKTOP_MODE is local", async () => {
+    process.env.FUSION_DESKTOP_MODE = "local";
     const { initializeApp } = await import("../main.ts");
     await initializeApp();
 
-    expect(mocks.localServerManager.start).toHaveBeenCalled();
+    expect(mocks.localRuntimeManager.startLocal).toHaveBeenCalled();
+    delete process.env.FUSION_DESKTOP_MODE;
   });
 });

@@ -124,21 +124,25 @@ describe("ipc handlers", () => {
     expect(channels.has("shell:saveProfile")).toBe(true);
     expect(channels.has("shell:getDesktopModeState")).toBe(true);
     expect(channels.has("shell:setDesktopMode")).toBe(true);
+    expect(channels.has("desktopRuntime:getStatus")).toBe(true);
+    expect(channels.has("desktopRuntime:startLocal")).toBe(true);
+    expect(channels.has("desktopRuntime:stopLocal")).toBe(true);
     expect(channels.has("platform:get")).toBe(true);
   });
 
   it("shell:getState returns desktop shell state", async () => {
-    await registerHandlers();
+    await registerHandlers({ getRuntimeStatus: () => ({ source: "none", state: "stopped" }) });
     const handler = mocks.ipcHandlers.get("shell:getState");
     const result = await handler?.({});
 
     expect(result).toMatchObject({ host: "desktop-shell", desktopMode: "remote" });
     expect(result).toMatchObject({ desktopModeState: { isFirstRun: false, desktopMode: "remote" } });
+    expect(result).toMatchObject({ localRuntime: { source: "none", state: "stopped" } });
   });
 
   it("shell:setDesktopMode persists mode and emits state", async () => {
     const onDesktopModeChange = vi.fn(async () => undefined);
-    const { window } = await registerHandlers({ onDesktopModeChange });
+    const { window } = await registerHandlers({ onDesktopModeChange, getRuntimeStatus: () => ({ source: "none", state: "stopped" }) });
     const handler = mocks.ipcHandlers.get("shell:setDesktopMode");
     await handler?.({}, "local");
 
@@ -147,6 +151,18 @@ describe("ipc handlers", () => {
     );
     expect(onDesktopModeChange).toHaveBeenCalledWith("local");
     expect(window.webContents.send).toHaveBeenCalledWith("shell:state", expect.any(Object));
+  });
+
+  it("desktopRuntime start/stop/getStatus handlers proxy runtime manager", async () => {
+    const getRuntimeStatus = vi.fn(() => ({ source: "none", state: "stopped" }));
+    const startLocalRuntime = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4510 }));
+    const stopLocalRuntime = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 9999 }));
+
+    await registerHandlers({ getRuntimeStatus, startLocalRuntime, stopLocalRuntime });
+
+    await expect(mocks.ipcHandlers.get("desktopRuntime:getStatus")?.({})).resolves.toEqual({ source: "none", state: "stopped" });
+    await expect(mocks.ipcHandlers.get("desktopRuntime:startLocal")?.({})).resolves.toEqual({ source: "embedded-local", state: "running", port: 4510 });
+    await expect(mocks.ipcHandlers.get("desktopRuntime:stopLocal")?.({})).resolves.toEqual({ source: "embedded-local", state: "running", port: 9999 });
   });
 
   it("shell:saveProfile persists the helper-generated profile", async () => {

@@ -11,7 +11,7 @@ import {
   type DesktopShellMode,
   type ShellConnectionProfile,
 } from "./shell-settings.js";
-import type { DesktopLocalServerState } from "./local-server.js";
+import type { DesktopRuntimeStatus } from "./local-runtime.js";
 
 interface ShellConnectionProfileInput {
   id?: string;
@@ -29,19 +29,20 @@ interface ShellConnectionState {
   desktopMode?: DesktopShellMode;
   activeProfileId: string | null;
   profiles: ShellConnectionProfile[];
-  localServer?: DesktopLocalServerState;
+  localRuntime?: DesktopRuntimeStatus;
 }
 
 interface RegisterIpcOptions {
   onDesktopModeChange?: (mode: DesktopShellMode) => Promise<void>;
-  getLocalServerState?: () => DesktopLocalServerState;
+  getRuntimeStatus?: () => DesktopRuntimeStatus;
+  startLocalRuntime?: () => Promise<DesktopRuntimeStatus>;
+  stopLocalRuntime?: () => Promise<DesktopRuntimeStatus>;
   getServerPort?: () => number | undefined;
 }
 
-
 function toShellState(
   settings: Awaited<ReturnType<typeof readShellSettings>>,
-  localServerState?: DesktopLocalServerState,
+  runtimeStatus?: DesktopRuntimeStatus,
 ): ShellConnectionState {
   return {
     host: "desktop-shell",
@@ -49,15 +50,15 @@ function toShellState(
     desktopMode: settings.desktopMode ?? undefined,
     activeProfileId: settings.activeProfileId,
     profiles: settings.profiles,
-    localServer: localServerState ?? { status: "idle", error: null },
+    localRuntime: runtimeStatus ?? { source: "none", state: "stopped" },
   };
 }
 
 async function emitShellState(
   mainWindow: BrowserWindow,
-  getLocalServerState?: () => DesktopLocalServerState,
+  getRuntimeStatus?: () => DesktopRuntimeStatus,
 ): Promise<ShellConnectionState> {
-  const state = toShellState(await readShellSettings(), getLocalServerState?.());
+  const state = toShellState(await readShellSettings(), getRuntimeStatus?.());
   mainWindow.webContents.send("shell:state", state);
   return state;
 }
@@ -99,7 +100,11 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
   ipcMain.handle("native:showImportDialog", () => showImportSettingsDialog(mainWindow));
   ipcMain.handle("app:getServerPort", () => options.getServerPort?.());
 
-  ipcMain.handle("shell:getState", () => readShellSettings().then((settings) => toShellState(settings, options.getLocalServerState?.())));
+  ipcMain.handle("desktopRuntime:getStatus", async () => options.getRuntimeStatus?.() ?? { source: "none", state: "stopped" });
+  ipcMain.handle("desktopRuntime:startLocal", async () => options.startLocalRuntime?.() ?? { source: "none", state: "stopped" });
+  ipcMain.handle("desktopRuntime:stopLocal", async () => options.stopLocalRuntime?.() ?? { source: "none", state: "stopped" });
+
+  ipcMain.handle("shell:getState", () => readShellSettings().then((settings) => toShellState(settings, options.getRuntimeStatus?.())));
   ipcMain.handle("shell:listProfiles", async () => (await readShellSettings()).profiles);
 
   ipcMain.handle("shell:saveProfile", async (_event, profile: ShellConnectionProfileInput) => {
@@ -111,20 +116,20 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
       ? settings.profiles.map((item) => (item.id === existing.id ? nextProfile : item))
       : [...settings.profiles, nextProfile];
     await writeShellSettings(settings);
-    await emitShellState(mainWindow, options.getLocalServerState);
+    await emitShellState(mainWindow, options.getRuntimeStatus);
     return nextProfile;
   });
 
   ipcMain.handle("shell:deleteProfile", async (_event, profileId: string) => {
     const settings = applyDeleteProfile(await readShellSettings(), profileId);
     await writeShellSettings(settings);
-    await emitShellState(mainWindow, options.getLocalServerState);
+    await emitShellState(mainWindow, options.getRuntimeStatus);
   });
 
   ipcMain.handle("shell:setActiveProfile", async (_event, profileId: string | null) => {
     const settings = applySetActiveProfile(await readShellSettings(), profileId);
     await writeShellSettings(settings);
-    return emitShellState(mainWindow, options.getLocalServerState);
+    return emitShellState(mainWindow, options.getRuntimeStatus);
   });
 
   ipcMain.handle("shell:getDesktopModeState", async () => {
@@ -138,7 +143,7 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
     settings.hasCompletedModeSelection = true;
     await writeShellSettings(settings);
     await options.onDesktopModeChange?.(mode);
-    return emitShellState(mainWindow, options.getLocalServerState);
+    return emitShellState(mainWindow, options.getRuntimeStatus);
   });
 
   ipcMain.handle("shell:startQrScan", async () => {

@@ -101,10 +101,10 @@ vi.mock("electron", () => ({
 }));
 
 const mainDeps = vi.hoisted(() => {
-  const start = vi.fn(async () => undefined);
-  const stop = vi.fn(async () => undefined);
-  const getState = vi.fn(() => ({ status: "idle", error: null }));
-  const getPort = vi.fn(() => 0);
+  const startLocal = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4545 }));
+  const stopLocal = vi.fn(async () => ({ source: "none", state: "stopped" }));
+  const getStatus = vi.fn(() => ({ source: "none", state: "stopped" }));
+  const getServerPort = vi.fn(() => 0);
   return {
     registerIpcHandlers: vi.fn(),
     buildAppMenu: vi.fn(),
@@ -114,14 +114,8 @@ const mainDeps = vi.hoisted(() => {
     setupAutoUpdater: vi.fn(),
     loadWindowState: vi.fn(async () => null),
     saveWindowState: vi.fn(),
-    readShellSettings: vi.fn(async () => ({
-      desktopMode: null,
-      hasCompletedModeSelection: false,
-      activeProfileId: null,
-      profiles: [],
-    })),
-    DesktopLocalServerManager: vi.fn(() => ({ start, stop, getState, getPort })),
-    start,
+    LocalRuntimeManager: vi.fn(() => ({ startLocal, stopLocal, getStatus, getServerPort })),
+    startLocal,
   };
 });
 
@@ -138,15 +132,8 @@ vi.mock("../native.js", () => ({
   saveWindowState: mainDeps.saveWindowState,
   setupAutoUpdater: mainDeps.setupAutoUpdater,
 }));
-vi.mock("../shell-settings.js", () => ({
-  readShellSettings: mainDeps.readShellSettings,
-  getDesktopShellModeState: (settings: { hasCompletedModeSelection: boolean; desktopMode: "local" | "remote" | null }) => ({
-    isFirstRun: !settings.hasCompletedModeSelection || settings.desktopMode === null,
-    desktopMode: settings.desktopMode,
-  }),
-}));
-vi.mock("../local-server.js", () => ({
-  DesktopLocalServerManager: mainDeps.DesktopLocalServerManager,
+vi.mock("../local-runtime.js", () => ({
+  LocalRuntimeManager: mainDeps.LocalRuntimeManager,
 }));
 
 async function importMainModule() {
@@ -160,12 +147,7 @@ describe("main process", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.resetModules();
-    mainDeps.readShellSettings.mockResolvedValue({
-      desktopMode: null,
-      hasCompletedModeSelection: false,
-      activeProfileId: null,
-      profiles: [],
-    });
+    delete process.env.FUSION_DESKTOP_MODE;
     if (originalDashboardUrl === undefined) {
       delete process.env.FUSION_DASHBOARD_URL;
     } else {
@@ -257,26 +239,21 @@ describe("main process", () => {
     expect(typeof mainModule.initializeApp).toBe("function");
   });
 
-  it("initializeApp starts local server only when persisted mode is local and not first run", async () => {
-    mainDeps.readShellSettings.mockResolvedValueOnce({
-      desktopMode: "local",
-      hasCompletedModeSelection: true,
-      activeProfileId: null,
-      profiles: [],
-    });
+  it("initializeApp starts local runtime when FUSION_DESKTOP_MODE=local", async () => {
+    process.env.FUSION_DESKTOP_MODE = "local";
     const { initializeApp } = await importMainModule();
 
     await initializeApp();
 
-    expect(mainDeps.start).toHaveBeenCalledTimes(1);
+    expect(mainDeps.startLocal).toHaveBeenCalledTimes(1);
   });
 
-  it("initializeApp does not start local server on first run without mode selection", async () => {
+  it("initializeApp does not start local runtime when FUSION_DESKTOP_MODE is unset", async () => {
     const { initializeApp } = await importMainModule();
 
     await initializeApp();
 
-    expect(mainDeps.start).not.toHaveBeenCalled();
+    expect(mainDeps.startLocal).not.toHaveBeenCalled();
   });
 
   it("createMainWindow registers close and closed handlers", async () => {

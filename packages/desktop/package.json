@@ -28,6 +28,8 @@
     "dist": "electron-builder"
   },
   "dependencies": {
+    "@fusion/core": "workspace:*",
+    "@fusion/dashboard": "workspace:*",
     "electron-updater": "^6.6.0"
   },
   "devDependencies": {

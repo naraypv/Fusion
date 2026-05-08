@@ -89,7 +89,10 @@ Desktop boots through a shell-owned mode chooser before mounting the dashboard a
 | `window:isMaximized` | renderer → main | none | `Promise<boolean>` |
 | `app:getSystemInfo` | renderer → main | none | `Promise<{ platform; arch; electronVersion; nodeVersion; appVersion; }>` |
 | `app:checkForUpdates` | renderer → main | none | `Promise<{ status: "checking" } \| { status: "error"; error: string }>` |
-| `app:getServerPort` | renderer → main | none | `Promise<number \| undefined>` |
+| `app:getServerPort` | renderer → main | none | `Promise<number \| undefined>` (external CLI port when present; otherwise embedded local runtime port when running) |
+| `desktopRuntime:getStatus` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
+| `desktopRuntime:startLocal` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
+| `desktopRuntime:stopLocal` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
 | `tray:updateStatus` | renderer → main | `status: "running" \| "paused" \| "stopped"` | `Promise<void>` |
 | `native:showExportDialog` | renderer → main | none | `Promise<string \| null>` |
 | `native:showImportDialog` | renderer → main | none | `Promise<string \| null>` |
@@ -104,13 +107,28 @@ Desktop boots through a shell-owned mode chooser before mounting the dashboard a
 
 ## Local Bundled Runtime Lifecycle
 
-Desktop local mode uses an in-process runtime manager (`src/local-server.ts`) that mirrors the CLI desktop server pattern:
+Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) that mirrors the CLI desktop server pattern:
 
 - creates `TaskStore`, calls `init()` and `watch()`
 - creates the dashboard server with `createServer(store)`
 - listens on an ephemeral port (`0`, never `4040`)
-- reports `idle | starting | ready | error` local runtime state via `window.fusionShell`
-- starts automatically when desktop mode is `local`, stops on remote switch and app shutdown
+- reports runtime status as:
+  - `source`: `"embedded-local" | "external-cli" | "none"`
+  - `state`: `"stopped" | "starting" | "running" | "error"`
+  - optional `port`, `baseUrl`, and `error`
+- keeps shutdown idempotent and exact-once for embedded server close and store close
+
+### Runtime source rules
+
+- **external-cli**: when `FUSION_SERVER_PORT` is provided (for example by `fn desktop`), Electron treats the server as CLI-owned and does **not** start an embedded server. `desktopRuntime:stopLocal` is a no-op in this state and never kills the CLI-owned server.
+- **embedded-local**: when started inside Electron via runtime IPC or startup env activation.
+- **none**: no active runtime.
+
+### Activation rules
+
+- Desktop does **not** auto-start embedded local runtime by default.
+- Embedded local runtime starts at launch only when `FUSION_DESKTOP_MODE=local` is set.
+- Future onboarding/connection flows can start/stop embedded local runtime explicitly over IPC.
 
 ## Main Process Lifecycle
 
@@ -148,6 +166,7 @@ Desktop local mode uses an in-process runtime manager (`src/local-server.ts`) th
 - `window.electronAPI`
   - Window control: `minimize()`, `maximize()`, `close()`, `isMaximized()`
   - App/system: `getSystemInfo()`, `checkForUpdates()`, `getServerPort()`
+  - Desktop runtime: `getDesktopRuntimeStatus()`, `startDesktopLocalRuntime()`, `stopDesktopLocalRuntime()`
   - Tray: `updateTrayStatus(status)`
   - Native dialogs: `showExportDialog()`, `showImportDialog()`
   - Event subscriptions (return unsubscribe functions):
