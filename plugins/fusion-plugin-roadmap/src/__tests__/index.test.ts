@@ -14,7 +14,7 @@ import plugin, {
   normalizeRoadmapMilestoneOrder,
 } from "../index.js";
 
-describe("fusion-plugin-roadmap package surface", () => {
+describe("roadmap-planner package surface", () => {
   it("keeps manifest and plugin entry metadata aligned", () => {
     const manifest = JSON.parse(readFileSync(resolve(process.cwd(), "manifest.json"), "utf8")) as {
       id: string;
@@ -38,7 +38,7 @@ describe("fusion-plugin-roadmap package surface", () => {
   });
 
   it("exports plugin manifest with roadmap id", () => {
-    expect(plugin.manifest.id).toBe("fusion-plugin-roadmap");
+    expect(plugin.manifest.id).toBe("roadmap-planner");
   });
 
   it("re-exports roadmap domain symbols", () => {

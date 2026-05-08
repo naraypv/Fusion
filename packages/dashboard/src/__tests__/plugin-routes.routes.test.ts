@@ -7,6 +7,7 @@ import type { PluginInstallation } from "@fusion/core";
 import type { PluginStore } from "@fusion/core";
 import type { PluginLoader } from "@fusion/core";
 import { createApiRoutes } from "../routes.js";
+import { createPluginRouter } from "../plugin-routes.js";
 import { get as performGet, request as performRequest } from "../test-request.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
 
@@ -1176,6 +1177,32 @@ describe("DELETE /plugins/:id", () => {
 
     expect(res.status).toBe(204);
     expect(mockGetOrCreateProjectStore).toHaveBeenCalledWith("proj_123");
+  });
+});
+
+describe("plugin-defined route dispatch", () => {
+  it("registers PATCH routes from plugins", () => {
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        { pluginId: "roadmap-planner", route: { method: "PATCH", path: "/roadmaps/x", handler: vi.fn() } },
+      ]),
+    };
+
+    const pluginStore = createMockPluginStore();
+    const router = createPluginRouter(pluginStore, createMockPluginLoader({
+      createRouteContext: vi.fn().mockResolvedValue({
+        pluginId: "roadmap-planner",
+        taskStore: createMockTaskStore(),
+        settings: {},
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+        emitEvent: vi.fn(),
+      }),
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "roadmap-planner" } }),
+    } as any), pluginRunner as any, createMockTaskStore());
+
+    const stack = (router as any).stack as Array<{ route?: { path: string; methods: Record<string, boolean> } }>;
+    const patchRoute = stack.find((layer) => layer.route?.path === "/roadmap-planner/roadmaps/x");
+    expect(patchRoute?.route?.methods.patch).toBe(true);
   });
 });
 

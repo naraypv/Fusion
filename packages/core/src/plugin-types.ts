@@ -137,6 +137,8 @@ export interface PluginContext {
   emitEvent: (event: string, data: unknown) => void;
   /** Engine-injected AI session factory (undefined when engine is not loaded) */
   createAiSession?: CreateAiSessionFactory;
+  /** Optional host capability to resolve a project-scoped TaskStore by projectId. */
+  resolveProjectTaskStore?: (projectId: string) => Promise<TaskStore>;
 }
 
 /**

@@ -44,7 +44,7 @@ export function ensureRoadmapSchema(db: Database): void {
 
 const plugin = definePlugin({
   manifest: {
-    id: "fusion-plugin-roadmap",
+    id: "roadmap-planner",
     name: "Roadmaps",
     version: "0.1.0",
     description: "Standalone roadmap planning plugin",

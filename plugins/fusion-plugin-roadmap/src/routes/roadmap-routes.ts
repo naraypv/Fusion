@@ -2,6 +2,7 @@ import type { PluginContext, PluginRouteDefinition, PluginRouteResponse } from "
 
 interface RouteRequest {
   params: Record<string, string>;
+  query?: Record<string, string | string[] | undefined>;
   body?: unknown;
 }
 import { RoadmapStore } from "../store/roadmap-store.js";
@@ -18,8 +19,23 @@ import {
 
 const roadmapStoreCache = new WeakMap<object, RoadmapStore>();
 
-function getRoadmapStore(ctx: PluginContext): RoadmapStore {
-  const taskStoreWithRoadmaps = ctx.taskStore as PluginContext["taskStore"] & {
+function resolveProjectId(req: RouteRequest): string | undefined {
+  const queryProjectId = paramValue(req.query?.projectId);
+  if (queryProjectId.trim()) return queryProjectId.trim();
+  const bodyProjectId = req.body && typeof req.body === "object"
+    ? (req.body as { projectId?: unknown }).projectId
+    : undefined;
+  if (typeof bodyProjectId === "string" && bodyProjectId.trim()) return bodyProjectId.trim();
+  return undefined;
+}
+
+async function getRoadmapStore(req: RouteRequest, ctx: PluginContext): Promise<RoadmapStore> {
+  const projectId = resolveProjectId(req);
+  const scopedTaskStore = projectId && ctx.resolveProjectTaskStore
+    ? await ctx.resolveProjectTaskStore(projectId)
+    : ctx.taskStore;
+
+  const taskStoreWithRoadmaps = scopedTaskStore as PluginContext["taskStore"] & {
     getRoadmapStore?: () => RoadmapStore;
   };
 
@@ -27,10 +43,10 @@ function getRoadmapStore(ctx: PluginContext): RoadmapStore {
     return taskStoreWithRoadmaps.getRoadmapStore();
   }
 
-  const key = ctx.taskStore as object;
+  const key = scopedTaskStore as object;
   const cached = roadmapStoreCache.get(key);
   if (cached) return cached;
-  const store = new RoadmapStore(ctx.taskStore.getDatabase());
+  const store = new RoadmapStore(scopedTaskStore.getDatabase());
   roadmapStoreCache.set(key, store);
   return store;
 }
@@ -62,9 +78,10 @@ function noContent(): PluginRouteResponse {
 
 function routeHandler<T>(handler: (req: RouteRequest, ctx: PluginContext, roadmapStore: RoadmapStore) => Promise<T | PluginRouteResponse> | T | PluginRouteResponse) {
   return async (req: unknown, ctx: PluginContext): Promise<T | PluginRouteResponse> => {
-    const roadmapStore = getRoadmapStore(ctx);
+    const routeRequest = asRequest(req);
+    const roadmapStore = await getRoadmapStore(routeRequest, ctx);
     try {
-      return await handler(asRequest(req), ctx, roadmapStore);
+      return await handler(routeRequest, ctx, roadmapStore);
     } catch (error) {
       if (error instanceof Error && error.message.toLowerCase().includes("not found")) {
         return notFound(error.message);
