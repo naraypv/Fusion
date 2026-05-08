@@ -54,13 +54,16 @@ describe("preload", () => {
     await importPreloadModule();
     const api = getExposed<{
       getDesktopLaunchMode: () => Promise<string>;
+      getDesktopLaunchContext: () => Promise<unknown>;
       setDesktopLaunchMode: (mode: "choose" | "local" | "remote") => Promise<string>;
     }>("electronAPI");
 
     await api?.getDesktopLaunchMode();
+    await api?.getDesktopLaunchContext();
     await api?.setDesktopLaunchMode("local");
 
     expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:getMode");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:getContext");
     expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:setMode", "local");
   });
 

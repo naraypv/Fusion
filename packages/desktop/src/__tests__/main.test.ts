@@ -137,9 +137,22 @@ vi.mock("../native.js", () => ({
   saveDesktopLaunchMode: mainDeps.saveDesktopLaunchMode,
   saveWindowState: mainDeps.saveWindowState,
   setupAutoUpdater: mainDeps.setupAutoUpdater,
+  normalizeDesktopRemoteLaunch: vi.fn((settings) => {
+    const active = settings.profiles.find((profile: { id: string }) => profile.id === settings.activeProfileId);
+    return active ? { mode: "remote", profileId: active.id, serverBaseUrl: active.serverUrl.replace(/\/$/, ""), serverLabel: active.name, authToken: active.authToken ?? undefined } : null;
+  }),
+  buildRemoteShellHandoffUrl: vi.fn((launch) => `https://remote.example.com?shellKind=desktop&shellMode=remote&profileId=${launch.profileId}`),
 }));
 vi.mock("../local-runtime.js", () => ({
   LocalRuntimeManager: mainDeps.LocalRuntimeManager,
+}));
+
+vi.mock("../shell-settings.js", () => ({
+  readShellSettings: vi.fn(async () => ({
+    desktopMode: "remote",
+    activeProfileId: "profile_1",
+    profiles: [{ id: "profile_1", name: "Remote", serverUrl: "https://remote.example.com", authToken: "token" }],
+  })),
 }));
 
 async function importMainModule() {
@@ -264,13 +277,16 @@ describe("main process", () => {
     expect(mainDeps.startLocal).not.toHaveBeenCalled();
   });
 
-  it("initializeApp does not start local runtime for remembered remote mode", async () => {
+  it("initializeApp routes remembered remote mode to remote dashboard handoff URL", async () => {
     mainDeps.loadDesktopLaunchMode.mockResolvedValueOnce("remote");
     const { initializeApp, getCurrentDesktopLaunchMode } = await importMainModule();
 
     await initializeApp();
 
     expect(mainDeps.startLocal).not.toHaveBeenCalled();
+    expect(mocks.browserWindowInstance.loadURL).toHaveBeenCalledWith(
+      expect.stringContaining("shellMode=remote"),
+    );
     expect(getCurrentDesktopLaunchMode()).toBe("remote");
   });
 

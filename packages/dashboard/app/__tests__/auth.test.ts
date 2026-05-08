@@ -5,6 +5,78 @@ async function loadAuthModule() {
   return import("../auth");
 }
 
+async function loadShellContextModule() {
+  return import("../shell-context");
+}
+
+describe("shell handoff contract", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("builds and parses a valid remote launch", async () => {
+    const {
+      buildRemoteShellLaunchUrl,
+      parseRemoteShellLaunchFromUrl,
+      SHELL_TOKEN_PARAM,
+      SHELL_KIND_PARAM,
+      SHELL_MODE_PARAM,
+      SHELL_PROFILE_ID_PARAM,
+      SHELL_SERVER_BASE_URL_PARAM,
+    } = await loadShellContextModule();
+
+    const launchUrl = buildRemoteShellLaunchUrl({
+      shellKind: "desktop",
+      shellMode: "remote",
+      profileId: "profile_1",
+      serverBaseUrl: "https://remote.example.com/",
+      serverLabel: "Remote A",
+      token: "daemon-token",
+      capabilities: { canOpenConnectionManager: true },
+    });
+
+    const parsedUrl = new URL(launchUrl);
+    expect(parsedUrl.searchParams.get(SHELL_KIND_PARAM)).toBe("desktop");
+    expect(parsedUrl.searchParams.get(SHELL_MODE_PARAM)).toBe("remote");
+    expect(parsedUrl.searchParams.get(SHELL_PROFILE_ID_PARAM)).toBe("profile_1");
+    expect(parsedUrl.searchParams.get(SHELL_SERVER_BASE_URL_PARAM)).toBe("https://remote.example.com");
+    expect(parsedUrl.searchParams.get(SHELL_TOKEN_PARAM)).toBe("daemon-token");
+
+    expect(parseRemoteShellLaunchFromUrl(launchUrl)).toEqual({
+      shellKind: "desktop",
+      shellMode: "remote",
+      profileId: "profile_1",
+      serverBaseUrl: "https://remote.example.com",
+      serverLabel: "Remote A",
+      token: "daemon-token",
+      capabilities: { canOpenConnectionManager: true },
+    });
+  });
+
+  it("rejects malformed or partial remote launch data", async () => {
+    const { parseRemoteShellLaunchFromUrl } = await loadShellContextModule();
+
+    expect(
+      parseRemoteShellLaunchFromUrl(
+        "https://remote.example.com/?shellKind=desktop&shellMode=remote&profileId=abc",
+      ),
+    ).toBeNull();
+
+    expect(
+      parseRemoteShellLaunchFromUrl(
+        "https://remote.example.com/?shellKind=desktop&shellMode=remote&serverBaseUrl=https://remote.example.com",
+      ),
+    ).toBeNull();
+
+    expect(
+      parseRemoteShellLaunchFromUrl(
+        "https://remote.example.com/?shellKind=unknown&shellMode=remote&profileId=abc&serverBaseUrl=https://remote.example.com",
+      ),
+    ).toBeNull();
+  });
+});
+
 describe("auth helpers", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -12,14 +84,14 @@ describe("auth helpers", () => {
   });
 
   it("captures token from ?token= and cleans URL while preserving other params/hash", async () => {
-    window.history.replaceState({}, "", "/dashboard?token=daemon-123&view=board#focus");
+    window.history.replaceState({}, "", "/dashboard?token=daemon-123&view=board&shellKind=desktop#focus");
 
     const { getAuthToken } = await loadAuthModule();
 
     expect(getAuthToken()).toBe("daemon-123");
     expect(window.localStorage.getItem("fn.authToken")).toBe("daemon-123");
     expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(
-      "/dashboard?view=board#focus",
+      "/dashboard?view=board&shellKind=desktop#focus",
     );
   });
 

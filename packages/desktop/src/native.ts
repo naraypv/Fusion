@@ -20,6 +20,37 @@ export interface WindowState {
 
 export type DesktopLaunchMode = "choose" | "local" | "remote";
 
+export interface DesktopRemoteProfileLike {
+  id: string;
+  name: string;
+  serverUrl: string;
+  authToken?: string | null;
+}
+
+export interface DesktopShellSettingsLike {
+  desktopMode: "local" | "remote" | null;
+  activeProfileId: string | null;
+  profiles: DesktopRemoteProfileLike[];
+}
+
+export interface NormalizedDesktopRemoteLaunch {
+  mode: "remote";
+  profileId: string;
+  serverBaseUrl: string;
+  serverLabel?: string;
+  authToken?: string;
+}
+
+export const SHELL_HANDOFF_QUERY = {
+  shellKind: "shellKind",
+  shellMode: "shellMode",
+  profileId: "profileId",
+  serverBaseUrl: "serverBaseUrl",
+  serverLabel: "serverLabel",
+  token: "token",
+  canOpenConnectionManager: "shellCanOpenConnectionManager",
+} as const;
+
 export const DEFAULT_WINDOW_STATE: WindowState = {
   width: 1280,
   height: 900,
@@ -164,6 +195,58 @@ export function setupAutoUpdater(mainWindow?: BrowserWindow): void {
   } catch (error) {
     console.error("[desktop/native] Auto-updater unavailable", error);
   }
+}
+
+function normalizeServerBaseUrl(serverUrl: string): string | null {
+  try {
+    const parsed = new URL(serverUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeDesktopRemoteLaunch(settings: DesktopShellSettingsLike): NormalizedDesktopRemoteLaunch | null {
+  if (settings.desktopMode !== "remote" || !settings.activeProfileId) {
+    return null;
+  }
+
+  const activeProfile = settings.profiles.find((profile) => profile.id === settings.activeProfileId);
+  if (!activeProfile) {
+    return null;
+  }
+
+  const serverBaseUrl = normalizeServerBaseUrl(activeProfile.serverUrl);
+  if (!serverBaseUrl) {
+    return null;
+  }
+
+  return {
+    mode: "remote",
+    profileId: activeProfile.id,
+    serverBaseUrl,
+    ...(activeProfile.name ? { serverLabel: activeProfile.name } : {}),
+    ...(activeProfile.authToken ? { authToken: activeProfile.authToken } : {}),
+  };
+}
+
+export function buildRemoteShellHandoffUrl(launch: NormalizedDesktopRemoteLaunch): string {
+  const url = new URL(launch.serverBaseUrl);
+  url.searchParams.set(SHELL_HANDOFF_QUERY.shellKind, "desktop");
+  url.searchParams.set(SHELL_HANDOFF_QUERY.shellMode, "remote");
+  url.searchParams.set(SHELL_HANDOFF_QUERY.profileId, launch.profileId);
+  url.searchParams.set(SHELL_HANDOFF_QUERY.serverBaseUrl, launch.serverBaseUrl);
+  if (launch.serverLabel) {
+    url.searchParams.set(SHELL_HANDOFF_QUERY.serverLabel, launch.serverLabel);
+  }
+  if (launch.authToken) {
+    url.searchParams.set(SHELL_HANDOFF_QUERY.token, launch.authToken);
+  }
+  url.searchParams.set(SHELL_HANDOFF_QUERY.canOpenConnectionManager, "1");
+  return url.toString();
 }
 
 function isValidDesktopLaunchMode(value: unknown): value is DesktopLaunchMode {

@@ -57,6 +57,7 @@ import { useRemoteNodeEvents } from "./hooks/useRemoteNodeEvents";
 import { NodeProvider, useNodeContext } from "./context/NodeContext";
 import { ShellProvider } from "./context/ShellContext";
 import { useShellConnection } from "./hooks/useShellConnection";
+import { useShellContext as useLaunchShellContext } from "./hooks/useShellContext";
 import { NativeShellOnboardingModal } from "./components/NativeShellOnboardingModal";
 import { NativeShellConnectionManager } from "./components/NativeShellConnectionManager";
 import { NativeShellConnectionStatus } from "./components/NativeShellConnectionStatus";
@@ -153,7 +154,8 @@ export function requiresNativeShellOnboarding(
 function AppInner() {
   const { toasts, addToast, removeToast } = useToast();
   const { shellApi, state: shellState, ready: shellReady, openConnectionManagerSignal } = useShellConnection();
-  const isElectron = typeof window !== "undefined" && Boolean((window as Window & { electronAPI?: unknown }).electronAPI);
+  const { shellContext } = useLaunchShellContext();
+  const isElectron = shellContext?.shellKind === "desktop";
 
   // Warm lazy view chunks during browser idle so first navigation is instant.
   useEffect(() => {
@@ -1315,6 +1317,7 @@ function AppInner() {
     <>
       <Header
         isElectron={isElectron}
+        shellContext={shellContext}
         onOpenSettings={openSettingsWithNav}
         onOpenGitHubImport={openGitHubImportWithNav}
         onOpenPlanning={openPlanningWithNav}

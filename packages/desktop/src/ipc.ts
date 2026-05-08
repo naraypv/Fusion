@@ -1,5 +1,5 @@
 import { app, type BrowserWindow, ipcMain, type Tray } from "electron";
-import { setupAutoUpdater, showExportSettingsDialog, showImportSettingsDialog } from "./native.js";
+import { setupAutoUpdater, showExportSettingsDialog, showImportSettingsDialog, type NormalizedDesktopRemoteLaunch } from "./native.js";
 import { type EngineStatus, updateTrayStatus } from "./tray.js";
 import {
   applyDeleteProfile,
@@ -42,6 +42,7 @@ interface RegisterIpcOptions {
   stopLocalRuntime?: () => Promise<DesktopRuntimeStatus>;
   getServerPort?: () => number | undefined;
   getDesktopLaunchMode?: () => DesktopLaunchMode;
+  getDesktopLaunchContext?: () => NormalizedDesktopRemoteLaunch | null;
 }
 
 function isDesktopLaunchMode(value: unknown): value is DesktopLaunchMode {
@@ -112,6 +113,7 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
   ipcMain.handle("desktopRuntime:startLocal", async () => options.startLocalRuntime?.() ?? { source: "none", state: "stopped" });
   ipcMain.handle("desktopRuntime:stopLocal", async () => options.stopLocalRuntime?.() ?? { source: "none", state: "stopped" });
   ipcMain.handle("desktopLaunchMode:getMode", async () => options.getDesktopLaunchMode?.() ?? "choose");
+  ipcMain.handle("desktopLaunchMode:getContext", async () => options.getDesktopLaunchContext?.() ?? null);
   ipcMain.handle("desktopLaunchMode:setMode", async (_event, mode: unknown) => {
     if (!isDesktopLaunchMode(mode)) {
       throw new Error("Invalid desktop launch mode");

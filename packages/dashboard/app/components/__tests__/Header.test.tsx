@@ -63,6 +63,11 @@ describe("Header", () => {
     expect(screen.getByText("Fusion")).toBeDefined();
   });
 
+  it("applies shell context metadata on the header root", () => {
+    const { container } = renderHeader({ shellContext: { shellKind: "desktop", shellMode: "remote", capabilities: { canOpenConnectionManager: true } } });
+    expect(container.querySelector("header.header")?.getAttribute("data-shell-kind")).toBe("desktop");
+  });
+
   it("renders action buttons", () => {
     renderHeader();
     expect(screen.getByTitle("Import from GitHub")).toBeDefined();

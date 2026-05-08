@@ -25,7 +25,7 @@
  */
 
 const STORAGE_KEY = "fn.authToken";
-const URL_PARAM = "token";
+export const URL_TOKEN_PARAM = "token";
 /** Query param name used when we can't set an Authorization header (EventSource, WebSocket). */
 export const QUERY_TOKEN_PARAM = "fn_token";
 
@@ -76,13 +76,13 @@ function captureTokenFromUrl(): string | undefined {
 
   try {
     const url = new URL(window.location.href);
-    const token = url.searchParams.get(URL_PARAM);
+    const token = url.searchParams.get(URL_TOKEN_PARAM);
     if (!token) {
       return undefined;
     }
 
     writeStoredToken(token);
-    url.searchParams.delete(URL_PARAM);
+    url.searchParams.delete(URL_TOKEN_PARAM);
     const cleaned = url.pathname + (url.search ? url.search : "") + url.hash;
     window.history.replaceState(window.history.state, "", cleaned);
     return token;

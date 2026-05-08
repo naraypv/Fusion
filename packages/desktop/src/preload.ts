@@ -57,6 +57,8 @@ const electronApi = {
   getDesktopLaunchMode: (): Promise<"choose" | "local" | "remote"> => ipcRenderer.invoke("desktopLaunchMode:getMode"),
   setDesktopLaunchMode: (mode: "choose" | "local" | "remote"): Promise<"choose" | "local" | "remote"> =>
     ipcRenderer.invoke("desktopLaunchMode:setMode", mode),
+  getDesktopLaunchContext: (): Promise<{ mode: "remote"; profileId: string; serverBaseUrl: string; serverLabel?: string; authToken?: string } | null> =>
+    ipcRenderer.invoke("desktopLaunchMode:getContext"),
 
   // Tray status
   updateTrayStatus: (status: string): Promise<void> => ipcRenderer.invoke("tray:updateStatus", status),

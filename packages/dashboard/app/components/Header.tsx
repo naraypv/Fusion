@@ -15,6 +15,7 @@ import type { TaskView } from "../hooks/useViewState";
 import type { PluginDashboardViewEntry } from "../api";
 import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
+import type { ShellContext as LaunchShellContext } from "../shell-context";
 
 export { useViewportMode };
 
@@ -239,6 +240,7 @@ export interface HeaderProps {
   experimentalFeatures?: { insights?: boolean; roadmap?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean };
   pluginDashboardViews?: PluginDashboardViewEntry[];
   shellConnectionControl?: ReactNode;
+  shellContext?: LaunchShellContext | null;
 }
 
 export function Header({
@@ -296,6 +298,7 @@ export function Header({
   experimentalFeatures,
   pluginDashboardViews = [],
   shellConnectionControl,
+  shellContext,
 }: HeaderProps) {
   const mode: ViewportMode = useViewportMode();
   const isMobile = mode === "mobile";
@@ -846,7 +849,7 @@ export function Header({
 
   return (
     <div className="header-wrapper">
-      <header className="header">
+      <header className="header" data-shell-kind={shellContext?.shellKind ?? "web"}>
         <div className="header-left">
           <div className="header-brand">
           <svg

@@ -168,6 +168,11 @@ vi.mock("../native.js", () => ({
   saveWindowState: mocks.saveWindowState,
   setupAutoUpdater: mocks.setupAutoUpdater,
   DEFAULT_WINDOW_STATE: mocks.DEFAULT_WINDOW_STATE,
+  normalizeDesktopRemoteLaunch: vi.fn((settings) => {
+    const active = settings.profiles.find((profile: { id: string }) => profile.id === settings.activeProfileId);
+    return active ? { mode: "remote", profileId: active.id, serverBaseUrl: active.serverUrl.replace(/\/$/, ""), serverLabel: active.name, authToken: active.authToken ?? undefined } : null;
+  }),
+  buildRemoteShellHandoffUrl: vi.fn((launch) => `https://remote.example.com?shellMode=remote&profileId=${launch.profileId}`),
 }));
 
 vi.mock("../local-runtime.js", () => ({
@@ -180,6 +185,14 @@ vi.mock("../local-runtime.js", () => ({
 }));
 
 // Mock renderer module
+vi.mock("../shell-settings.js", () => ({
+  readShellSettings: vi.fn(async () => ({
+    desktopMode: "remote",
+    activeProfileId: "profile_1",
+    profiles: [{ id: "profile_1", name: "Remote", serverUrl: "https://remote.example.com", authToken: "token" }],
+  })),
+}));
+
 vi.mock("../renderer.js", () => ({
   isDevelopmentMode: vi.fn(() => false),
   getRendererUrl: vi.fn(() => "file:///path/to/dist/client/index.html"),
@@ -373,6 +386,17 @@ describe("main integration", () => {
     if (platformDescriptor) {
       Object.defineProperty(process, "platform", platformDescriptor);
     }
+  });
+
+  it("loads remote handoff URL when remembered mode is remote", async () => {
+    mocks.loadDesktopLaunchMode.mockResolvedValueOnce("remote");
+    const { initializeApp } = await importMainModule();
+
+    await initializeApp();
+
+    const [{ instance }] = mocks.windowInstances;
+    expect(instance.loadURL).toHaveBeenCalledWith(expect.stringContaining("shellMode=remote"));
+    expect(mocks.startLocal).not.toHaveBeenCalled();
   });
 
   it("starts local runtime when remembered mode is local", async () => {

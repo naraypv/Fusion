@@ -22,6 +22,7 @@ export type {
 } from "./plugins/push-notifications.js";
 export { ShareManager } from "./plugins/share.js";
 export { MobileNativeShellBridge } from "./plugins/native-shell.js";
+export { buildMobileShellHandoff } from "./plugins/shell-handoff.js";
 export { QrScanner, parseQrConnectionPayload } from "./plugins/qr-scanner.js";
 export {
   loadShellProfiles,
@@ -42,6 +43,8 @@ export type {
   ShellConnectionProfile,
   ShellConnectionProfileInput,
   ShellConnectionState,
+  MobileShellHandoffResult,
+  MobileRemoteShellLaunch,
 } from "./types.js";
 
 interface LifecycleManager {
