@@ -1774,6 +1774,367 @@ async function findFilesWithConflictMarkers(rootDir: string, files: string[]): P
 }
 
 /**
+ * Recovery path for the hard-fail branch of `git stash apply`: the stash
+ * couldn't even start applying (typical causes: untracked-overwrite, the
+ * stash mentions a path that no longer exists at HEAD, or an index conflict
+ * where git refuses to write any markers). The working tree has no conflict
+ * markers because nothing was applied.
+ *
+ * Layered fallback:
+ *   1. Pull the stash patch via `git stash show -p <sha>` and try
+ *      `git apply --3way` against the working tree. This is more permissive
+ *      than `stash apply` for several common failure shapes (especially
+ *      untracked overwrites: --3way can produce conflict markers we can
+ *      then resolve, where stash apply just refuses).
+ *   2. If --3way left conflict markers: route to the existing AI conflict
+ *      resolver.
+ *   3. If --3way also hard-failed and smart conflict resolution is enabled:
+ *      spawn an AI agent armed with the patch + error context, ask it to
+ *      reconstruct the developer's edits on top of HEAD by editing files
+ *      directly.
+ *
+ * Returns the appropriate AutostashOutcome. If recovery succeeds, the stash
+ * is dropped (since its content is now applied to the working tree). If
+ * recovery fails, the stash is left intact for manual recovery.
+ */
+async function tryRecoverHardFailApply(params: {
+  rootDir: string;
+  taskId: string;
+  sha: string;
+  applyErrorMsg: string;
+  applyStderr: string;
+  ctx: {
+    store: TaskStore;
+    options: MergerOptions;
+    settings: Settings;
+  };
+}): Promise<AutostashOutcome> {
+  const { rootDir, taskId, sha, applyErrorMsg, applyStderr, ctx } = params;
+  const stashFiles = [...await listStashChangedPaths(rootDir, sha)];
+  const smartConflictResolution =
+    (ctx.settings.smartConflictResolution ?? ctx.settings.autoResolveConflicts) !== false;
+
+  // Step 1: try `git apply --3way`. This pulls the diff out of the stash and
+  // applies it as a regular patch with three-way merging, which behaves
+  // better than `stash apply` in several common hard-fail shapes.
+  let threeWayConflicted: string[] = [];
+  let threeWayApplied = false;
+  try {
+    // Get the patch text from the stash.
+    const { stdout: patchOut } = await execAsync(
+      `git stash show -p --binary ${sha}`,
+      { cwd: rootDir, encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
+    );
+    const patchText = String(patchOut);
+    if (!patchText.trim()) {
+      // Nothing to apply — stash was empty or show failed.
+      mergerLog.warn(`${taskId}: autostash ${sha.slice(0, 7)} produced empty patch; cannot 3-way recover`);
+    } else {
+      // Pipe the patch into `git apply --3way` via stdin.
+      const patchPath = join(rootDir, ".git", `fusion-autostash-${sha.slice(0, 7)}.patch`);
+      writeFileSync(patchPath, patchText, "utf-8");
+      try {
+        await execAsync(`git apply --3way --whitespace=nowarn ${quoteArg(patchPath)}`, { cwd: rootDir });
+        threeWayApplied = true;
+        mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} recovered via git apply --3way`);
+      } catch (threeWayErr: unknown) {
+        const conflicted = await getConflictedFiles(rootDir);
+        if (conflicted.length > 0) {
+          threeWayConflicted = conflicted;
+          mergerLog.log(`${taskId}: 3-way produced ${conflicted.length} conflict file(s) — handing to AI resolver`);
+        } else {
+          const tweMsg = threeWayErr instanceof Error ? threeWayErr.message : String(threeWayErr);
+          mergerLog.warn(`${taskId}: 3-way apply also failed (${tweMsg}); falling through to AI patch recovery`);
+        }
+      } finally {
+        try { unlinkSync(patchPath); } catch { /* ignore */ }
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: failed to extract patch from stash ${sha.slice(0, 7)} (${msg})`);
+  }
+
+  // 3-way produced a clean working tree → drop stash and report restored.
+  if (threeWayApplied) {
+    const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash apply hit hard failure but recovered via git apply --3way (stash ${sha.slice(0, 7)})`,
+      `Original error: ${applyErrorMsg}\n${applyStderr ? `\nGit stderr:\n${applyStderr}\n` : ""}${dropResult.dropped ? "" : `\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+    ).catch(() => undefined);
+    return { status: "restored", stashSha: sha };
+  }
+
+  // 3-way produced conflict markers → existing AI conflict resolver handles it.
+  if (threeWayConflicted.length > 0) {
+    if (!smartConflictResolution) {
+      const message = `Autostash 3-way produced conflict markers in ${threeWayConflicted.length} file(s) and smartConflictResolution is disabled. Stash ${sha.slice(0, 7)} left intact.`;
+      await ctx.store.logEntry(
+        taskId,
+        `Autostash 3-way left conflict markers — manual resolution required (smart resolution disabled)`,
+        message,
+      ).catch(() => undefined);
+      return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: threeWayConflicted, message };
+    }
+
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash 3-way left conflicts in ${threeWayConflicted.length} file(s) — invoking AI to resolve`,
+      threeWayConflicted.join("\n"),
+    ).catch(() => undefined);
+
+    const aiResult = await runAiAgentForAutostashConflict({
+      store: ctx.store,
+      rootDir,
+      taskId,
+      conflictedFiles: threeWayConflicted,
+      options: ctx.options,
+      settings: ctx.settings,
+    });
+
+    const stillConflicted = aiResult.success
+      ? await findFilesWithConflictMarkers(rootDir, threeWayConflicted)
+      : threeWayConflicted;
+
+    if (aiResult.success && stillConflicted.length === 0) {
+      const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+      await ctx.store.logEntry(
+        taskId,
+        `Autostash hard-fail recovered via 3-way + AI conflict resolution (${threeWayConflicted.length} file(s))`,
+        `Resolved files:\n${threeWayConflicted.join("\n")}${dropResult.dropped ? "" : `\n\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+      ).catch(() => undefined);
+      return { status: "ai-resolved", stashSha: sha, conflictedFiles: threeWayConflicted };
+    }
+
+    const failureMsg = `3-way+AI resolution incomplete; markers remain in ${stillConflicted.join(", ") || "(unknown)"}. Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `Autostash 3-way+AI resolution failed`, failureMsg).catch(() => undefined);
+    return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: stillConflicted, message: failureMsg };
+  }
+
+  // Step 3: 3-way also hard-failed. AI patch recovery if enabled.
+  if (!smartConflictResolution || stashFiles.length === 0) {
+    const message = `Autostash apply hard-failed (${applyErrorMsg})${applyStderr ? `; git stderr: ${applyStderr}` : ""}. Stash ${sha.slice(0, 7)} left intact.`;
+    mergerLog.warn(`${taskId}: ${message}`);
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash apply failed — stash ${sha.slice(0, 7)} left intact for manual recovery`,
+      `${applyErrorMsg}${applyStderr ? `\n\nGit stderr:\n${applyStderr}` : ""}\n\nRecover with:\n  cd ${rootDir} && git stash apply ${sha}`,
+    ).catch(() => undefined);
+    return { status: "failed", stashSha: sha, errorMessage: applyErrorMsg };
+  }
+
+  await ctx.store.logEntry(
+    taskId,
+    `Autostash apply hard-failed — invoking AI patch-recovery agent (${stashFiles.length} file(s))`,
+    `${applyErrorMsg}${applyStderr ? `\n\nGit stderr:\n${applyStderr}` : ""}\n\nFiles in stash:\n${stashFiles.join("\n")}`,
+  ).catch(() => undefined);
+
+  const patchAiResult = await runAiAgentForAutostashHardFail({
+    store: ctx.store,
+    rootDir,
+    taskId,
+    stashSha: sha,
+    stashFiles,
+    applyErrorMsg,
+    applyStderr,
+    options: ctx.options,
+    settings: ctx.settings,
+  });
+
+  if (!patchAiResult.success) {
+    const failMsg = `AI patch-recovery failed (${patchAiResult.error ?? "unknown"}). Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `Autostash AI patch-recovery failed`, failMsg).catch(() => undefined);
+    return { status: "failed", stashSha: sha, errorMessage: failMsg };
+  }
+
+  // Verify any remaining conflict markers — agent may have left some.
+  const remainingMarkers = await findFilesWithConflictMarkers(rootDir, stashFiles);
+  if (remainingMarkers.length > 0) {
+    const failMsg = `AI patch-recovery left conflict markers in: ${remainingMarkers.join(", ")}. Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `AI patch-recovery incomplete — manual recovery required`, failMsg).catch(() => undefined);
+    return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: remainingMarkers, message: failMsg };
+  }
+
+  const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+  await ctx.store.logEntry(
+    taskId,
+    `Autostash hard-fail recovered by AI patch-recovery agent (${stashFiles.length} file(s))`,
+    `Recovered files:\n${stashFiles.join("\n")}${dropResult.dropped ? "" : `\n\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+  ).catch(() => undefined);
+  return { status: "ai-resolved", stashSha: sha, conflictedFiles: stashFiles };
+}
+
+/**
+ * AI agent for autostash apply HARD failures (no conflict markers, nothing
+ * applied). Receives the stash patch + git stderr and reconstructs the
+ * developer's edits on top of HEAD by editing files directly. Mirrors
+ * `runAiAgentForAutostashConflict` but with a different prompt because
+ * there are no in-tree conflict markers to resolve — the agent has to
+ * re-apply changes from the patch by hand.
+ */
+async function runAiAgentForAutostashHardFail(params: {
+  store: TaskStore;
+  rootDir: string;
+  taskId: string;
+  stashSha: string;
+  stashFiles: string[];
+  applyErrorMsg: string;
+  applyStderr: string;
+  options: MergerOptions;
+  settings: Settings;
+}): Promise<{ success: boolean; error?: string }> {
+  const { store, rootDir, taskId, stashSha, stashFiles, applyErrorMsg, applyStderr, options, settings } = params;
+
+  const agentLogger = new AgentLogger({
+    store,
+    taskId,
+    agent: "merger",
+    persistAgentToolOutput: settings.persistAgentToolOutput,
+    onAgentText: options.onAgentText
+      ? (_id: string, delta: string) => options.onAgentText!(delta)
+      : undefined,
+    onAgentTool: options.onAgentTool
+      ? (_id: string, name: string) => options.onAgentTool!(name)
+      : undefined,
+  });
+
+  let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
+  let skillContext = undefined;
+  if (options.agentStore) {
+    try {
+      taskForSkillContext = await store.getTask(taskId);
+      skillContext = await buildSessionSkillContext({
+        agentStore: options.agentStore,
+        task: taskForSkillContext,
+        sessionPurpose: "merger",
+        projectRootDir: rootDir,
+        pluginRunner: options.pluginRunner,
+      });
+    } catch {
+      // graceful fallback
+    }
+  }
+  const assignedAgentId = taskForSkillContext?.assignedAgentId?.trim();
+  const agentStoreWithGetAgent = options.agentStore && typeof (options.agentStore as { getAgent?: unknown }).getAgent === "function"
+    ? options.agentStore
+    : null;
+  const assignedAgent = assignedAgentId && agentStoreWithGetAgent
+    ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
+    : null;
+  const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
+
+  const systemPrompt = `You are an autostash hard-failure recovery agent for the Fusion merger.
+
+Before the merge ran, the developer had uncommitted local changes. We snapshotted them into a git stash, ran the merge cleanly on top, and tried to re-apply the stash. Both \`git stash apply\` and \`git apply --3way\` failed without producing conflict markers — meaning git refused to attempt the apply at all (typical causes: untracked-file overwrite, a path in the stash no longer exists at HEAD, or an index conflict that produced no in-tree markers).
+
+## Your job
+Reconstruct the developer's intended uncommitted changes on top of the current HEAD by editing files directly. The stash patch (sourced from \`git stash show -p ${stashSha}\`) is your authoritative source for what changed.
+
+## Rules
+1. Run \`git stash show -p ${stashSha}\` (or read it via your shell) to get the patch text. Read it carefully.
+2. For each file in the patch, decide how to apply the developer's intent on top of HEAD's current contents:
+   - If the file still exists at HEAD: apply the patch hunks, integrating with any merge changes that overlap.
+   - If the file was deleted at HEAD: re-create it (the developer presumably wanted it) UNLESS the patch was deleting it too — in which case do nothing.
+   - If the file is new (added by the patch): create it with the patch contents.
+3. Do NOT make git commits. Do NOT run \`git add\` or \`git stash drop\`. Just edit files in the working tree.
+4. Do NOT touch files outside the patch.
+5. If a hunk's surrounding context no longer exists at HEAD (e.g., merge changed the function signature), make a reasonable best-effort placement and add a brief \`// TODO(autostash-recovery)\` comment so the developer can review.
+6. NO conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) may remain in the working tree when you finish — those would block follow-up tooling.
+
+The orchestrator will scan the working tree for conflict markers post-run; any remaining will be treated as a failed recovery.`;
+
+  const fileList = stashFiles.map((f) => `- ${f}`).join("\n");
+  const prompt = `Recover the developer's uncommitted changes for task ${taskId}.
+
+## Original git error
+${applyErrorMsg}
+${applyStderr ? `\n## Git stderr\n\`\`\`\n${applyStderr}\n\`\`\`` : ""}
+
+## Stash SHA (source of truth for the patch)
+${stashSha}
+
+## Files mentioned in the stash
+${fileList}
+
+## Steps
+1. Run \`git stash show -p ${stashSha}\` to read the developer's intended changes
+2. For each file, integrate those changes onto the current HEAD by editing the file directly
+3. When done, NO conflict markers may remain in the working tree
+4. Do NOT commit, do NOT touch the stash, do NOT modify files outside the list above`;
+
+  mergerLog.log(`${taskId}: starting autostash hard-fail recovery agent (${stashFiles.length} file(s))`);
+
+  const { session } = await createResolvedAgentSession({
+    sessionPurpose: "merger",
+    runtimeHint: mergerRuntimeHint,
+    pluginRunner: options.pluginRunner,
+    cwd: rootDir,
+    systemPrompt,
+    tools: "coding",
+    onText: agentLogger.onText,
+    onThinking: agentLogger.onThinking,
+    onToolStart: agentLogger.onToolStart,
+    onToolEnd: agentLogger.onToolEnd,
+    defaultProvider: settings.defaultProviderOverride && settings.defaultModelIdOverride
+      ? settings.defaultProviderOverride
+      : settings.defaultProvider,
+    defaultModelId: settings.defaultProviderOverride && settings.defaultModelIdOverride
+      ? settings.defaultModelIdOverride
+      : settings.defaultModelId,
+    fallbackProvider: settings.fallbackProvider,
+    fallbackModelId: settings.fallbackModelId,
+    defaultThinkingLevel: settings.defaultThinkingLevel,
+    ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+    taskId,
+    taskTitle: taskForSkillContext?.title,
+    onFallbackModelUsed: createFallbackModelObserver({
+      agent: "merger",
+      label: "autostash hard-fail recovery agent",
+      store,
+      taskId,
+      taskTitle: taskForSkillContext?.title,
+    }),
+  });
+  options.onSession?.(session);
+
+  try {
+    await store.appendAgentLog(
+      taskId,
+      `Autostash hard-fail recovery agent started (model: ${describeModel(session)}, files: ${stashFiles.length})`,
+      "text",
+      undefined,
+      "merger",
+    );
+
+    await withRateLimitRetry(async () => {
+      throwIfAborted(options.signal, taskId);
+      await promptWithFallback(session, prompt);
+      checkSessionError(session);
+    }, {
+      onRetry: (attempt, delayMs, error) => {
+        const delaySec = Math.round(delayMs / 1000);
+        mergerLog.warn(`⏳ ${taskId} autostash hard-fail agent rate limited — retry ${attempt} in ${delaySec}s: ${error.message}`);
+      },
+      signal: options.signal,
+    });
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: autostash hard-fail agent error: ${msg}`);
+    await store.logEntry(taskId, "Autostash hard-fail recovery agent encountered an error", msg);
+    return { success: false, error: msg };
+  } finally {
+    try {
+      session.dispose();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
  * Restore the autostash created by `stashUnrelatedRootDirChanges` after a
  * merge completes. Best-effort: any failure logs a warning but does not
  * throw — by the time we reach the finally block the merge result has
@@ -1791,6 +2152,9 @@ async function findFilesWithConflictMarkers(rootDir: string, files: string[]): P
  *      the markers in place; on success drop the stash and return
  *      `ai-resolved`. Otherwise return `conflict-needs-manual` and leave
  *      the stash for the developer to recover by hand.
+ *   4. On apply HARD failure (no markers, nothing applied): try
+ *      `git apply --3way` from the patch, fall through to AI patch-recovery
+ *      if needed. See `tryRecoverHardFailApply`.
  */
 async function restoreUnrelatedRootDirChanges(
   rootDir: string,
@@ -1808,28 +2172,37 @@ async function restoreUnrelatedRootDirChanges(
   // half-popped state — apply never auto-drops, so the stash is always
   // recoverable under any failure mode.
   let applyConflicted = false;
+  let applyStderr = "";
+  let applyErrorMsg = "";
   try {
     await execAsync(`git stash apply ${sha}`, { cwd: rootDir });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const errAsRecord = err as { stderr?: string; stdout?: string; message?: string };
+    applyErrorMsg = err instanceof Error ? err.message : String(err);
+    // execAsync (util.promisify of child_process.exec) attaches stderr/stdout
+    // to the error object. Capture them so the operator can distinguish
+    // untracked-overwrite ("would be overwritten by merge") from index-conflict
+    // from missing-SHA without having to grep runtime logs.
+    applyStderr = String(errAsRecord.stderr ?? errAsRecord.stdout ?? "").trim();
     // git stash apply exits non-zero both on hard failure (e.g. SHA gone)
     // and on conflict-with-applied-changes. Distinguish by checking the
     // working tree for conflict markers.
     const conflicted = await getConflictedFiles(rootDir);
     if (conflicted.length === 0) {
-      // Hard failure — nothing applied, nothing to resolve. Stash is
-      // intact, point operator at it.
+      // Hard failure — apply put nothing in the working tree (no conflict
+      // markers). Try AI recovery before giving up.
       mergerLog.warn(
-        `${taskId}: failed to apply autostash ${sha.slice(0, 7)} (${msg}) — stash left intact; recover with: cd ${rootDir} && git stash apply ${sha}`,
+        `${taskId}: autostash ${sha.slice(0, 7)} hard-fail apply (${applyErrorMsg}); stderr=${applyStderr || "(empty)"}`,
       );
-      await ctx.store
-        .logEntry(
-          taskId,
-          `Autostash apply failed — stash ${sha.slice(0, 7)} left intact for manual recovery`,
-          `${msg}\n\nRecover with:\n  cd ${rootDir} && git stash apply ${sha}`,
-        )
-        .catch(() => undefined);
-      return { status: "failed", stashSha: sha, errorMessage: msg };
+      const hardFailOutcome = await tryRecoverHardFailApply({
+        rootDir,
+        taskId,
+        sha,
+        applyErrorMsg,
+        applyStderr,
+        ctx,
+      });
+      return hardFailOutcome;
     }
     applyConflicted = true;
     mergerLog.warn(
