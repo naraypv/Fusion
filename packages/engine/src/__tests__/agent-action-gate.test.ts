@@ -71,17 +71,71 @@ describe("agent-action-gate", () => {
 
   it("classifies explicit network and management tools", () => {
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_research_run", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("network_api");
-    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_create", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
+    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_create", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("exempt");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_add_dep", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
-    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_delegate_task", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
+    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_delegate_task", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("exempt");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_update_agent_config", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
-    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_update_identity", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
+    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_update_identity", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("exempt");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_spawn_agent", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
   });
 
   it("keeps routine task bookkeeping tools exempt", () => {
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_update", args: {}, permissionPolicy: approvalPolicy }).category).toBe("exempt");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_update", args: {}, permissionPolicy: approvalPolicy }).disposition).toBe("allow");
+  });
+
+  it.each([
+    "fn_heartbeat_done",
+    "fn_task_create",
+    "fn_delegate_task",
+    "fn_send_message",
+    "fn_memory_append",
+    "fn_update_identity",
+    "fn_reflect_on_performance",
+  ])("always allows newly exempt internal tool %s under locked-down policies", (toolName) => {
+    const lockedDownPolicy: AgentPermissionPolicy = {
+      presetId: "locked-down",
+      rules: {
+        "git_write": "block",
+        "file_write_delete": "block",
+        "command_execution": "block",
+        "network_api": "block",
+        "task_agent_mutation": "block",
+      },
+    };
+
+    const decision = evaluateAgentActionGate({ agentId: "a1", toolName, args: {}, permissionPolicy: lockedDownPolicy });
+    expect(decision.disposition).toBe("allow");
+    expect(decision.category).toBe("exempt");
+  });
+
+  it("keeps bash and write blocked under locked-down policy", () => {
+    const lockedDownPolicy: AgentPermissionPolicy = {
+      presetId: "locked-down",
+      rules: {
+        "git_write": "block",
+        "file_write_delete": "block",
+        "command_execution": "block",
+        "network_api": "block",
+        "task_agent_mutation": "block",
+      },
+    };
+
+    const bashDecision = evaluateAgentActionGate({
+      agentId: "a1",
+      toolName: "bash",
+      args: { command: "git commit -m x" },
+      permissionPolicy: lockedDownPolicy,
+    });
+    const writeDecision = evaluateAgentActionGate({
+      agentId: "a1",
+      toolName: "write",
+      args: { path: "a.ts", content: "x" },
+      permissionPolicy: lockedDownPolicy,
+    });
+
+    expect(bashDecision.disposition).toBe("block");
+    expect(writeDecision.disposition).toBe("block");
   });
 
   it("resolves disposition from policy", () => {

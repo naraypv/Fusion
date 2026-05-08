@@ -29,6 +29,8 @@ export interface AgentActionGateContext {
   findPendingApprovalByDedupeKey: (dedupeKey: string) => Promise<unknown | null>;
 }
 
+// FN-3724: Internal Fusion runtime/coordinator tools never perform external mutations.
+// They must bypass user-configurable approval/block policies so permanent-agent heartbeats cannot deadlock.
 const EXEMPT_TOOLS = new Set([
   "read",
   "find",
@@ -42,6 +44,17 @@ const EXEMPT_TOOLS = new Set([
   "fn_memory_search",
   "fn_memory_get",
   "fn_read_messages",
+  "fn_heartbeat_done",
+  "fn_task_create",
+  "fn_delegate_task",
+  "fn_list_agents",
+  "fn_agent_show",
+  "fn_agent_org_chart",
+  "fn_send_message",
+  "fn_memory_append",
+  "fn_read_evaluations",
+  "fn_update_identity",
+  "fn_reflect_on_performance",
 ]);
 
 const TASK_AGENT_MANAGEMENT_TOOLS = new Set([
@@ -196,6 +209,9 @@ export function evaluateAgentActionGate(params: {
     operation = params.toolName;
     resourceType = "file";
     resourceId = typeof args.path === "string" ? args.path : undefined;
+  } else if (EXEMPT_TOOLS.has(params.toolName)) {
+    category = "exempt";
+    operation = params.toolName;
   } else if (TASK_AGENT_MANAGEMENT_TOOLS.has(params.toolName)) {
     category = "task_agent_mutation";
     operation = params.toolName;
@@ -204,9 +220,6 @@ export function evaluateAgentActionGate(params: {
     category = "network_api";
     operation = params.toolName;
     resourceType = "research";
-  } else if (EXEMPT_TOOLS.has(params.toolName)) {
-    category = "exempt";
-    operation = params.toolName;
   }
 
   const disposition: AgentPermissionPolicyDisposition | "allow" = category === "exempt"

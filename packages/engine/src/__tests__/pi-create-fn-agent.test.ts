@@ -619,6 +619,33 @@ describe("wrapToolsWithActionGate", () => {
     expect(createApprovalRequest).toHaveBeenCalledTimes(1);
     expect(tool.execute).not.toHaveBeenCalled();
   });
+
+  it("passes through exempt internal tools under locked-down policy", async () => {
+    const execute = vi.fn().mockResolvedValue({ ok: true });
+    const tool = { name: "fn_heartbeat_done", label: "Heartbeat Done", description: "", parameters: {}, execute };
+    const { wrapToolsWithActionGate } = await import("../pi.js");
+    const wrapped = wrapToolsWithActionGate([tool as any], {
+      agentId: "agent-1",
+      agentName: "Agent",
+      isEphemeral: false,
+      taskId: "FN-1",
+      permissionPolicy: {
+        presetId: "locked-down",
+        rules: {
+          "git_write": "block",
+          "file_write_delete": "block",
+          "command_execution": "block",
+          "network_api": "block",
+          "task_agent_mutation": "block",
+        },
+      },
+      createApprovalRequest: vi.fn(),
+      findPendingApprovalByDedupeKey: vi.fn(),
+    });
+
+    await (wrapped[0] as any).execute("t1", {});
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("createFnAgent", () => {
