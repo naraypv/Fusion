@@ -1893,6 +1893,18 @@ describe("AgentStore", () => {
       expect(claimedAgent?.taskId).toBe(taskId);
     });
 
+    it("claimTaskForAgent rejects non-executor agents for implementation tasks", async () => {
+      const reviewer = await store.createAgent({ name: "Reviewer", role: "reviewer" });
+
+      const result = await store.claimTaskForAgent(reviewer.id, taskId);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toMatch(/requires an "executor"-role agent/);
+
+      const claimedTask = await taskStore.getTask(taskId);
+      expect(claimedTask?.assignedAgentId).toBeUndefined();
+    });
+
     it("claimTaskForAgent rejects paused task", async () => {
       await taskStore.updateTask(taskId, { paused: true });
 

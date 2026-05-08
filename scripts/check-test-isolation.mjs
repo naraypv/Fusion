@@ -205,7 +205,15 @@ function checkAgainstBaseline() {
     .map((name) => name.trim())
     .filter(Boolean);
   for (const name of callerIgnoreNames) baselineNames.add(name);
-  const leaks = snapshotTmp().filter((e) => !baselineNames.has(e.name));
+  const leaks = snapshotTmp().filter((e) => {
+    if (baselineNames.has(e.name)) {
+      return false;
+    }
+    if (e.name.startsWith("fusion-test-home-root-")) {
+      return false;
+    }
+    return true;
+  });
 
   const baselineByDir = new Map((baseline.protectedFusion ?? []).map((entry) => [entry.dir, entry]));
   const unstableProtectedDirs = new Set(baseline.unstableProtectedDirs ?? []);

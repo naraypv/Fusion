@@ -871,6 +871,34 @@ describe("TaskStore", () => {
 
       await expect(store.selectNextTaskForAgent("agent-without-tasks")).resolves.toBeNull();
     });
+
+    it("skips implementation todos for non-executor role agents", async () => {
+      await store.createTask({
+        description: "Assigned todo",
+        column: "todo",
+        assignedAgentId: "agent-1",
+      });
+
+      await expect(
+        store.selectNextTaskForAgent("agent-1", { id: "agent-1", role: "reviewer" }),
+      ).resolves.toBeNull();
+    });
+
+    it("returns implementation todos for executor role agents", async () => {
+      const todo = await store.createTask({
+        description: "Assigned todo",
+        column: "todo",
+        assignedAgentId: "agent-1",
+      });
+
+      const selected = await store.selectNextTaskForAgent("agent-1", {
+        id: "agent-1",
+        role: "executor",
+      });
+
+      expect(selected?.task.id).toBe(todo.id);
+      expect(selected?.priority).toBe("todo");
+    });
   });
 
   // ── Lock serialization test ──────────────────────────────────────

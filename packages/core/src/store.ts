@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, SourceType, WorkflowStepTemplate } from "./types.js";
+import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, SourceType, WorkflowStepTemplate, Agent } from "./types.js";
 import { createActivityLogSnapshot, createRunAuditSnapshot, createTaskMetadataSnapshot, toTaskMetadataRecord, validateSnapshotEnvelope, type ActivityLogSnapshot, type RunAuditSnapshot, type TaskMetadataSnapshot } from "./shared-mesh-state.js";
 import { VALID_TRANSITIONS, DEFAULT_SETTINGS, isGlobalSettingsKey, WORKFLOW_STEP_TEMPLATES, validateDocumentKey } from "./types.js";
 import { normalizeTaskPriority } from "./task-priority.js";
+import { canAgentTakeImplementationTask } from "./agent-role-policy.js";
 import { GlobalSettingsStore } from "./global-settings.js";
 import { Database, toJson, toJsonNullable, fromJson } from "./db.js";
 import { ArchiveDatabase } from "./archive-db.js";
@@ -2852,7 +2853,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return rows.map((row) => this.rowToTask(row));
   }
 
-  async selectNextTaskForAgent(agentId: string): Promise<InboxTask | null> {
+  async selectNextTaskForAgent(
+    agentId: string,
+    agent?: Pick<Agent, "id" | "role">,
+  ): Promise<InboxTask | null> {
     const tasks = await this.listTasks({ slim: true });
     if (tasks.length === 0) {
       return null;
@@ -2878,7 +2882,16 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       };
     }
 
-    const todoCandidates = assignedTasks.filter((task) => task.column === "todo" && task.paused !== true);
+    const roleCompatibleAssignedTasks = agent
+      ? assignedTasks.filter((task) => {
+          if (task.column === "in-progress") {
+            return true;
+          }
+          return canAgentTakeImplementationTask(agent, task);
+        })
+      : assignedTasks;
+
+    const todoCandidates = roleCompatibleAssignedTasks.filter((task) => task.column === "todo" && task.paused !== true);
 
     const readyTodo = todoCandidates
       .filter((task) => {

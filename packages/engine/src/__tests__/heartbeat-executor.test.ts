@@ -596,6 +596,39 @@ describe("executeHeartbeat", () => {
       expect(toolNames).toContain("fn_task_log");
     });
 
+    it("auto-claim skips implementation candidates for non-executor agents", async () => {
+      const store = createStoreWithAgentForExec({
+        taskId: undefined,
+        role: "reviewer",
+        soul: "review workflows",
+      });
+      const mockSession = createMockAgentSession();
+      mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });
+
+      mockTaskStore = createMockTaskStore({
+        listTasks: vi.fn().mockResolvedValue([
+          {
+            id: "FN-CANDIDATE",
+            description: "executor reliability follow-up",
+            title: "Executor reliability",
+            prompt: "",
+            steps: [],
+            column: "todo",
+            dependencies: [],
+            log: [],
+            attachments: [],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          } as unknown as TaskDetail,
+        ]),
+      });
+
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+
+      expect(store.claimTaskForAgent).not.toHaveBeenCalled();
+    });
+
     it("agent WITH instructionsText but no task creates session and completes successfully", async () => {
       const store = createStoreWithAgentForExec({ taskId: undefined, instructionsText: "Monitor task board and create follow-up tasks" });
       const mockSession = createMockAgentSession();
@@ -1666,7 +1699,7 @@ describe("executeHeartbeat", () => {
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
       await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
 
-      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001");
+      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001", { id: "agent-001", role: "executor" });
       expect(store.assignTask).toHaveBeenCalledWith("agent-001", "FN-INBOX", expect.objectContaining({ agentId: "agent-001" }));
       expect(mockTaskStore.getTask).toHaveBeenCalledWith("FN-INBOX");
     });
@@ -1713,7 +1746,7 @@ describe("executeHeartbeat", () => {
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
       const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
 
-      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001");
+      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001", { id: "agent-001", role: "executor" });
       expect(result.resultJson).toEqual({ reason: "no_assignment" });
     });
 
@@ -1794,7 +1827,7 @@ describe("executeHeartbeat", () => {
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
       const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
 
-      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001");
+      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001", { id: "agent-001", role: "executor" });
       expect(checkoutTask).toHaveBeenCalledWith("FN-CHECKOUT", "agent-001", expect.objectContaining({ agentId: "agent-001" }));
       expect(result.resultJson).toEqual({ reason: "no_assignment" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();

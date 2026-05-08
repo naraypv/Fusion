@@ -323,6 +323,7 @@ Create a new task and assign it to a specific agent for execution. The task goes
 | `agent_id` | `string` (required) | The agent ID to delegate work to |
 | `description` | `string` (required) | What needs to be done |
 | `dependencies` | `string[]` (optional) | Task IDs this new task depends on |
+| `override` | `boolean` (optional) | Set true to bypass executor-role assignment policy |
 
 **Example workflow — CEO agent discovers QA agent and delegates testing:**
 
@@ -344,6 +345,7 @@ delegate_task({
 **Error cases:**
 - `"ERROR: Agent {agent_id} not found"` — The agent ID does not exist
 - `"ERROR: Cannot delegate to ephemeral/runtime agent {agent_id}"` — Cannot delegate to runtime task-worker agents (use `spawn_agent` for parallel worktree tasks instead)
+- `"ERROR: Agent {agent_id} has role \"...\"; implementation task <new> requires an \"executor\"-role agent. Pass override=true to bypass."` — Non-executor target blocked unless `override: true`
 
 ### `get_agent_config` Tool
 

@@ -2054,6 +2054,7 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
   let tempDir: string;
   let fusionDir: string;
   let agentId: string;
+  let reviewerAgentId: string;
   let store: TaskStore;
 
   // Agent store init + createAgent is ~50ms per call; hoisted to beforeAll
@@ -2070,13 +2071,19 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
       name: "Assignment test agent",
       role: "executor",
     });
+    const reviewer = await agentStore.createAgent({
+      name: "Assignment reviewer agent",
+      role: "reviewer",
+    });
     agentId = agent.id;
+    reviewerAgentId = reviewer.id;
   }, 30_000);
 
   beforeEach(() => {
     store = createMockStore({
       getFusionDir: vi.fn().mockReturnValue(fusionDir),
       updateTask: vi.fn(),
+      getTask: vi.fn().mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-200", column: "todo" }),
       listTasks: vi.fn().mockResolvedValue([]),
       selectNextTaskForAgent: vi.fn().mockResolvedValue(null),
     } as any);
@@ -2107,6 +2114,39 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
     expect(res.status).toBe(200);
     expect(store.updateTask).toHaveBeenCalledWith("FN-200", { assignedAgentId: agentId });
     expect(res.body.assignedAgentId).toBe(agentId);
+  }, 20000);
+
+  it("returns 409 when assigning implementation task to non-executor without override", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-200/assign",
+      JSON.stringify({ agentId: reviewerAgentId }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("requires an \"executor\"-role agent");
+    expect(store.updateTask).not.toHaveBeenCalled();
+  }, 20000);
+
+  it("allows non-executor assignment when override is true", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-200",
+      assignedAgentId: reviewerAgentId,
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-200/assign",
+      JSON.stringify({ agentId: reviewerAgentId, override: true }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-200", { assignedAgentId: reviewerAgentId });
   }, 20000);
 
   it("returns 404 when assigning to a non-existent agent", async () => {

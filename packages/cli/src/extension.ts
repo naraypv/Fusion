@@ -16,6 +16,8 @@ import {
   RESEARCH_RUN_STATUSES,
   isResearchExperimentalEnabled,
   resolveResearchSettings,
+  canAgentTakeImplementationTask,
+  formatRoleMismatchReason,
 } from "@fusion/core";
 import {
   getGhErrorMessage,
@@ -89,6 +91,8 @@ function getFusionDir(cwd: string): string {
 async function validateAssignableAgentId(
   cwd: string,
   agentId: string,
+  task?: Pick<Task, "id" | "column"> | null,
+  override = false,
 ): Promise<string | null> {
   const { AgentStore, isEphemeralAgent } = await import("@fusion/core");
   const agentStore = new AgentStore({ rootDir: getFusionDir(cwd) });
@@ -99,6 +103,9 @@ async function validateAssignableAgentId(
   }
   if (isEphemeralAgent(agent)) {
     return `Cannot assign task to ephemeral/runtime agent ${agentId}`;
+  }
+  if (task && !override && !canAgentTakeImplementationTask(agent, task)) {
+    return formatRoleMismatchReason(agent, task);
   }
   return null;
 }
@@ -387,7 +394,8 @@ export default function kbExtension(pi: ExtensionAPI) {
       const store = await getStore(ctx.cwd);
 
       if (params.agentId !== undefined) {
-        const error = await validateAssignableAgentId(ctx.cwd, params.agentId);
+        const candidateTask: Pick<Task, "id" | "column"> = { id: "<new>", column: "triage" };
+        const error = await validateAssignableAgentId(ctx.cwd, params.agentId, candidateTask);
         if (error) {
           return {
             content: [{ type: "text", text: error }],
@@ -505,7 +513,7 @@ export default function kbExtension(pi: ExtensionAPI) {
       }
       if (params.agentId !== undefined) {
         if (params.agentId !== null) {
-          const error = await validateAssignableAgentId(ctx.cwd, params.agentId);
+          const error = await validateAssignableAgentId(ctx.cwd, params.agentId, task);
           if (error) {
             return {
               content: [{ type: "text", text: error }],
@@ -2516,6 +2524,7 @@ export default function kbExtension(pi: ExtensionAPI) {
       "Use fn_list_agents first to find available agents and their capabilities",
       "The task is created in 'todo' and assigned to the target agent",
       "Cannot delegate to ephemeral/runtime agents",
+      "Implementation tasks require an executor-role agent unless override=true",
       "Optionally specify dependencies on other tasks",
     ],
     parameters: Type.Object({
@@ -2524,11 +2533,15 @@ export default function kbExtension(pi: ExtensionAPI) {
       dependencies: Type.Optional(
         Type.Array(Type.String(), { description: "Task IDs this new task depends on (e.g. [\"KB-001\"]" }),
       ),
+      override: Type.Optional(
+        Type.Boolean({ description: "Set true to bypass executor-role assignment policy" }),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       // Validate target agent exists and is not ephemeral
-      const agentError = await validateAssignableAgentId(ctx.cwd, params.agent_id);
+      const delegateTask: Pick<Task, "id" | "column"> = { id: "<new>", column: "todo" };
+      const agentError = await validateAssignableAgentId(ctx.cwd, params.agent_id, delegateTask, params.override === true);
       if (agentError) {
         return {
           content: [{ type: "text", text: `ERROR: ${agentError}` }],

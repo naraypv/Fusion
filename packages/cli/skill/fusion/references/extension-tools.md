@@ -282,6 +282,7 @@ Create a new task and assign it to a specific agent for execution. The task goes
 | `agent_id` | string | ✓ | The agent ID to delegate work to |
 | `description` | string | ✓ | What needs to be done |
 | `dependencies` | array | — | Task IDs this new task depends on (e.g. [\"KB-001\"] |
+| `override` | boolean | — | Set true to bypass executor-role assignment policy |
 
 ### fn_agent_show
 

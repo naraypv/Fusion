@@ -769,6 +769,14 @@ Executor and heartbeat agents can discover and delegate work to other agents usi
 
 Delegation is designed for cross-agent handoff (e.g., an executor handing off to a QA agent). For parallel worktree-based parallelization, use `spawn_agent` instead.
 
+### Role-based assignment policy
+
+Implementation tasks require an agent with `role: "executor"`.
+
+- Heartbeat inbox and auto-claim paths filter out role-incompatible implementation tasks.
+- `PATCH /api/tasks/:id/assign` returns `409` for non-executor assignment attempts unless `override: true` is provided in the request body.
+- `fn_delegate_task` enforces the same policy and supports `override: true` when intentional.
+
 ## Heartbeat Monitoring and Trigger Scheduling
 
 Fusion's `HeartbeatTriggerScheduler` supports five trigger types:

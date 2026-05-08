@@ -1342,6 +1342,46 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     expect(result.content[0].text).toContain(ephemeralId);
   });
 
+  it("fn_task_create rejects non-executor assignment for implementation tasks", async () => {
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    await agentStore.init();
+    const reviewer = await agentStore.createAgent({ name: "reviewer-create", role: "reviewer" });
+
+    const createTool = api.tools.get("fn_task_create")!;
+    const result = await createTool.execute(
+      "create-role-check",
+      { description: "create with reviewer", agentId: reviewer.id },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+  });
+
+  it("fn_task_update rejects non-executor assignment for implementation tasks", async () => {
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    await agentStore.init();
+    const reviewer = await agentStore.createAgent({ name: "reviewer", role: "reviewer" });
+
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    const task = await store.createTask({ description: "needs owner", column: "todo" });
+
+    const updateTool = api.tools.get("fn_task_update")!;
+    const result = await updateTool.execute(
+      "update-role-check",
+      { id: task.id, agentId: reviewer.id },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+  });
+
   describe("fn_list_agents", () => {
     it("returns agent list", async () => {
       await seedAgent(tmpDir, { name: "alpha-agent" });
@@ -1513,6 +1553,42 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("ephemeral/runtime agent");
+    });
+
+    it("rejects non-executor delegate target without override", async () => {
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      await agentStore.init();
+      const reviewer = await agentStore.createAgent({ name: "delegate-reviewer", role: "reviewer" });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-role-1",
+        { agent_id: reviewer.id, description: "Will fail role policy" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+    });
+
+    it("allows non-executor delegate target with override", async () => {
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      await agentStore.init();
+      const reviewer = await agentStore.createAgent({ name: "delegate-reviewer-override", role: "reviewer" });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-role-2",
+        { agent_id: reviewer.id, description: "Intentional override", override: true },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(result.details.agentId).toBe(reviewer.id);
     });
 
     it("wires dependencies correctly", async () => {

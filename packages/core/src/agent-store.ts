@@ -55,6 +55,7 @@ import {
 import type { RunMutationContext } from "./types.js";
 import type { TaskStore } from "./store.js";
 import { computeAccessState } from "./agent-permissions.js";
+import { canAgentTakeImplementationTask, formatRoleMismatchReason } from "./agent-role-policy.js";
 import { resolveEffectiveAgentPermissionPolicy } from "./agent-permission-policy.js";
 import { Database } from "./db.js";
 import { createAgentRunSnapshot, createAgentSnapshot, validateSnapshotEnvelope, type AgentRunSnapshot, type AgentSnapshot } from "./shared-mesh-state.js";
@@ -1318,6 +1319,10 @@ export class AgentStore extends EventEmitter {
 
     if (task.paused) {
       return { ok: false, reason: "paused", task };
+    }
+
+    if (!canAgentTakeImplementationTask(agent, task)) {
+      return { ok: false, reason: formatRoleMismatchReason(agent, task), task };
     }
 
     if (task.column === "done" || task.column === "archived") {

@@ -11,6 +11,8 @@ import {
   resolveTitleSummarizerSettingsModel,
   toReplicatedCreateInput,
   validateNodeOverrideChange,
+  canAgentTakeImplementationTask,
+  formatRoleMismatchReason,
 } from "@fusion/core";
 import { planTaskWorktreePath } from "@fusion/engine";
 import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
@@ -1662,7 +1664,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   // Assign or unassign a task to an explicit agent
   router.patch("/tasks/:id/assign", async (req, res) => {
     try {
-      const { agentId } = req.body as { agentId?: string | null };
+      const { agentId, override } = req.body as { agentId?: string | null; override?: boolean };
       if (agentId !== null && typeof agentId !== "string") {
         throw badRequest("agentId must be a string or null");
       }
@@ -1679,6 +1681,15 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         const agent = await agentStore.getAgent(agentId);
         if (!agent) {
           throw notFound("Agent not found");
+        }
+
+        const targetTask = await scopedStore.getTask(req.params.id);
+        if (!targetTask) {
+          throw notFound("Task not found");
+        }
+
+        if (override !== true && !canAgentTakeImplementationTask(agent, targetTask)) {
+          throw new ApiError(409, formatRoleMismatchReason(agent, targetTask));
         }
       }
 

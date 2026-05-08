@@ -18,7 +18,7 @@
  */
 
 import type { AgentStore, AgentHeartbeatRun, HeartbeatInvocationSource, AgentHeartbeatConfig, AgentBudgetStatus, Message, MessageStore, TaskStore, TaskDetail, AgentRole, Agent, InboxTask, RunMutationContext, Settings, AgentConfigRevision, ReflectionStore } from "@fusion/core";
-import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy } from "@fusion/core";
+import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy, canAgentTakeImplementationTask } from "@fusion/core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import { createHash } from "node:crypto";
@@ -1458,7 +1458,13 @@ export class HeartbeatMonitor {
         let inboxSelection: InboxTask | null = null;
 
         if (!taskId) {
-          inboxSelection = await taskStore.selectNextTaskForAgent(agentId);
+          inboxSelection = await taskStore.selectNextTaskForAgent(agentId, { id: agent.id, role: agent.role });
+          if (inboxSelection && !canAgentTakeImplementationTask(agent, inboxSelection.task)) {
+            heartbeatLog.log(
+              `Agent ${agentId} (role=${agent.role}) skipped inbox-selected task ${inboxSelection.task.id} due to executor-role assignment policy`,
+            );
+            inboxSelection = null;
+          }
           if (inboxSelection) {
             taskId = inboxSelection.task.id;
             heartbeatLog.log(`Inbox selected task ${taskId} (priority: ${inboxSelection.priority}) for agent ${agentId}`);
@@ -1529,8 +1535,16 @@ export class HeartbeatMonitor {
                 })
                 .slice(0, 10);
 
-              autoClaimCandidates = openCandidates;
-              const ranked = openCandidates
+              const roleCompatibleCandidates = openCandidates.filter((candidate) => canAgentTakeImplementationTask(agent, candidate));
+              const skippedIncompatibleCount = openCandidates.length - roleCompatibleCandidates.length;
+              if (skippedIncompatibleCount > 0) {
+                heartbeatLog.log(
+                  `Agent ${agentId} (role=${agent.role}) skipped auto-claim of ${skippedIncompatibleCount} implementation task(s) — only executor agents may claim implementation work`,
+                );
+              }
+
+              autoClaimCandidates = roleCompatibleCandidates;
+              const ranked = roleCompatibleCandidates
                 .map((candidate) => ({ candidate, score: taskRelevanceScore(agent, candidate as TaskDetail) }))
                 .filter((entry) => entry.score > 0)
                 .sort((a, b) => b.score - a.score || (a.candidate.columnMovedAt ?? a.candidate.createdAt).localeCompare(b.candidate.columnMovedAt ?? b.candidate.createdAt));

@@ -58,6 +58,12 @@ export {
 export type { BuiltInAgentPermissionPolicyPreset } from "./agent-permission-policy.js";
 export { AgentStore, DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS } from "./agent-store.js";
 export type { AgentStoreEvents } from "./agent-store.js";
+export {
+  isImplementationTask,
+  isExecutorRoleAgent,
+  canAgentTakeImplementationTask,
+  formatRoleMismatchReason,
+} from "./agent-role-policy.js";
 export { ReflectionStore } from "./reflection-store.js";
 export type { ReflectionStoreEvents } from "./reflection-store.js";
 export { MessageStore } from "./message-store.js";
