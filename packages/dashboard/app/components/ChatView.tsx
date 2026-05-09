@@ -33,6 +33,7 @@ import { CustomModelDropdown } from "./CustomModelDropdown";
 import { ProviderIcon } from "./ProviderIcon";
 import { AgentMentionPopup } from "./AgentMentionPopup";
 import { FileMentionPopup } from "./FileMentionPopup";
+import { CreateRoomModal, type RoomDraft } from "./CreateRoomModal";
 import { useFileMention } from "../hooks/useFileMention";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
@@ -740,6 +741,10 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
    * add room data models, APIs, and routing.
    */
   const [chatScope, setChatScope] = useState<"direct" | "rooms">("direct");
+  const [createRoomOpen, setCreateRoomOpen] = useState(false);
+  // FN-3807: replace draftRooms with backend-backed state.
+  const [draftRooms, setDraftRooms] = useState<RoomDraft[]>([]);
+  const [activeDraftRoomName, setActiveDraftRoomName] = useState<string | null>(null);
   const [agentsMap, setAgentsMap] = useState<Map<string, Agent>>(new Map());
   const [discoveredSkills, setDiscoveredSkills] = useState<DiscoveredSkill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(true);
@@ -1722,7 +1727,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
         {chatScope === "direct" ? (
           <>
             {/* Search section */}
-            <div className="chat-sidebar-search">
+            <div className="chat-sidebar-search-section">
               <div className="chat-sidebar-search-wrapper">
                 <Search size={14} className="chat-sidebar-search-icon" />
                 <input
@@ -1792,8 +1797,47 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
             </div>
           </>
         ) : (
-          <div className="chat-sidebar-rooms-empty" data-testid="chat-sidebar-rooms-empty">
-            No rooms yet — room creation lands in a follow-up task.
+          <div className="chat-sidebar-rooms" data-testid="chat-sidebar-rooms">
+            <div className="chat-sidebar-rooms-header">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                data-testid="chat-create-room-btn"
+                onClick={() => setCreateRoomOpen(true)}
+              >
+                <Plus size={14} />
+                Create room
+              </button>
+            </div>
+            {draftRooms.length === 0 ? (
+              <div className="chat-sidebar-rooms-empty" data-testid="chat-sidebar-rooms-empty">
+                No rooms yet.
+              </div>
+            ) : (
+              <div className="chat-session-list chat-sidebar-list">
+                {draftRooms.map((room) => {
+                  const memberCount = room.memberAgentIds.length;
+                  const isActive = activeDraftRoomName === room.name;
+                  return (
+                    <button
+                      key={room.name}
+                      type="button"
+                      className={`chat-room-item${isActive ? " chat-room-item--active" : ""}`}
+                      data-testid={`chat-room-item-${room.name}`}
+                      onClick={() => {
+                        setActiveDraftRoomName(room.name);
+                        if (isMobile) {
+                          setSidebarVisible(false);
+                        }
+                      }}
+                    >
+                      <span className="chat-room-item-name">{room.displayName}</span>
+                      <span className="chat-room-item-meta">{memberCount} member{memberCount === 1 ? "" : "s"}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
         {/* Mobile footer with New Chat action */}
@@ -1875,6 +1919,16 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       )}
 
       {/* Thread */}
+      {chatScope === "rooms" ? (
+        <div className="chat-thread chat-thread--rooms-placeholder" data-testid="chat-rooms-placeholder-pane">
+          <div className="chat-rooms-placeholder-title">
+            {activeDraftRoomName ? `#${activeDraftRoomName}` : "Select a room"}
+          </div>
+          <div className="chat-rooms-placeholder-copy">
+            Coming soon — room messaging is being wired up (FN-3807).
+          </div>
+        </div>
+      ) : (
       <div
         className={`chat-thread${keyboardOpen && hasKeyboardViewportDisplacement ? " chat-thread--keyboard-active" : ""}`}
         style={threadKeyboardStyle}
@@ -2201,6 +2255,19 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
           </div>
         )}
       </div>
+      )}
+
+      <CreateRoomModal
+        isOpen={createRoomOpen}
+        onClose={() => setCreateRoomOpen(false)}
+        projectId={projectId}
+        existingRoomNames={draftRooms.map((room) => room.name)}
+        onCreate={(draft) => {
+          setDraftRooms((prev) => [...prev, draft]);
+          setActiveDraftRoomName(draft.name);
+          setCreateRoomOpen(false);
+        }}
+      />
 
       {/* New Chat Dialog (rendered at root level) */}
       {showNewDialog && (
