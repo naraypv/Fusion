@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, ChatSession } from "@fusion/core";
+import type { ChatMessage, EnrichedChatSession } from "@fusion/core";
 import {
   fetchResumeChatSession,
   fetchChatSessions,
@@ -36,8 +36,8 @@ interface SessionTarget {
 
 export interface UseQuickChatReturn {
   // Session state
-  activeSession: ChatSession | null;
-  sessions: ChatSession[];
+  activeSession: EnrichedChatSession | null;
+  sessions: EnrichedChatSession[];
   sessionsLoading: boolean;
 
   // Message state
@@ -54,7 +54,7 @@ export interface UseQuickChatReturn {
   stopStreaming: () => void;
   clearPendingMessage: () => void;
   switchSession: (agentId: string, modelProvider?: string, modelId?: string) => Promise<void>;
-  selectSession: (session: ChatSession) => Promise<void>;
+  selectSession: (session: EnrichedChatSession) => Promise<void>;
   startModelChat: (modelProvider: string, modelId: string) => Promise<void>;
   startFreshSession: (agentId?: string, modelProvider?: string, modelId?: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
@@ -192,8 +192,8 @@ export function useQuickChat(
   addToast?: (msg: string, type?: "success" | "error" | "warning") => void,
 ): UseQuickChatReturn {
   // Session state
-  const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSession, setActiveSession] = useState<EnrichedChatSession | null>(null);
+  const [sessions, setSessions] = useState<EnrichedChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
 
   // Message state
@@ -223,7 +223,7 @@ export function useQuickChat(
   // closure causes switchSession to get a new identity every time
   // activeSession changes — which then re-triggers the consuming
   // component's useEffect that depends on switchSession.
-  const activeSessionRef = useRef<ChatSession | null>(activeSession);
+  const activeSessionRef = useRef<EnrichedChatSession | null>(activeSession);
   activeSessionRef.current = activeSession;
 
   // Max retries for session init to prevent infinite toast loops
@@ -253,7 +253,7 @@ export function useQuickChat(
   }, [projectId]);
 
   const createSessionForTarget = useCallback(
-    async (target: SessionTarget): Promise<ChatSession> => {
+    async (target: SessionTarget): Promise<EnrichedChatSession> => {
       const newSessionInput: { agentId: string; modelProvider?: string; modelId?: string } = {
         agentId: target.agentId,
       };
@@ -509,7 +509,7 @@ export function useQuickChat(
     [initializeSession, reloadMessages, resetTransientComposerState],
   );
 
-  const selectSession = useCallback(async (session: ChatSession) => {
+  const selectSession = useCallback(async (session: EnrichedChatSession) => {
     const target = resolveSessionTarget(session.agentId, session.modelProvider ?? undefined, session.modelId ?? undefined);
     if (!target) return;
 

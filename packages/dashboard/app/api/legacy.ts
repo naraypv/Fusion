@@ -8653,9 +8653,9 @@ export function attachChatStream(
 
   (async () => {
     try {
-      const requestHeaders = withTokenHeader();
+      const requestHeaders = new Headers(withTokenHeader() as HeadersInit);
       if (typeof options?.lastEventId === "number") {
-        requestHeaders["Last-Event-ID"] = String(options.lastEventId);
+        requestHeaders.set("Last-Event-ID", String(options.lastEventId));
       }
 
       const res = await fetch(url, {
