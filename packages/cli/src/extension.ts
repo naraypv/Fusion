@@ -25,6 +25,7 @@ import {
   isGhAvailable,
   runGhJsonAsync,
 } from "@fusion/core/gh-cli";
+import { fetchWebContent } from "@fusion/engine";
 import { resolve, basename, extname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -1359,6 +1360,54 @@ export default function kbExtension(pi: ExtensionAPI) {
           },
         ],
         details: { taskId, logs },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "fn_web_fetch",
+    label: "fn: Web Fetch",
+    description: "Lightweight URL fetch (no JS rendering). Use agent-browser skill for JS-heavy pages.",
+    parameters: Type.Object({
+      url: Type.String({ description: "URL to fetch (http/https)" }),
+      prompt: Type.Optional(Type.String({ description: "Optional extraction hint for downstream summarization" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Timeout in milliseconds (default: 30000)" })),
+      maxBytes: Type.Optional(Type.Number({ description: "Max bytes to return (default: 512000)" })),
+    }),
+    promptSnippet: "Fetch and extract readable text from a webpage URL",
+    promptGuidelines: [
+      "Use for lightweight GET requests where JS rendering is not required.",
+      "For JS-rendered pages or complex browsing flows, use agent-browser skill instead.",
+    ],
+    async execute(_toolCallId, params) {
+      const result = await fetchWebContent(params.url, {
+        timeoutMs: params.timeoutMs,
+        maxBytes: params.maxBytes,
+      });
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `URL: ${result.finalUrl}`,
+            `Status: ${result.status}`,
+            `Content-Type: ${result.contentType}`,
+            params.prompt ? `Prompt: ${params.prompt}` : undefined,
+            result.title ? `Title: ${result.title}` : undefined,
+            "",
+            result.content,
+            result.truncated ? "\n[truncated to maxBytes]" : "",
+          ].filter(Boolean).join("\n"),
+        }],
+        details: {
+          finalUrl: result.finalUrl,
+          status: result.status,
+          contentType: result.contentType,
+          title: result.title,
+          truncated: result.truncated,
+          bytesRead: result.bytesRead,
+          promptSnippet: params.prompt ? params.prompt.slice(0, 200) : undefined,
+          promptGuidelines: "Lightweight fetch only; for JS-rendered pages, use agent-browser skill.",
+        },
       };
     },
   });

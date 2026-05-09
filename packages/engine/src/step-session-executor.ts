@@ -39,6 +39,7 @@ import {
   createDelegateTaskTool,
   createListAgentsTool,
   createMemoryTools,
+  createWebFetchTool,
   createReadMessagesTool,
   createSendMessageTool,
   createTaskCreateTool,
@@ -901,6 +902,7 @@ export class StepSessionExecutor {
                 createTaskDocumentReadTool(this.options.store, taskDetail.id),
               ]
             : [];
+          const webFetchTool = createWebFetchTool();
           const memoryTools = createMemoryTools(this.options.rootDir, settings);
 
           // Task log and create tools — task context for step sessions.
@@ -965,6 +967,7 @@ Follow instructions precisely and avoid unrelated changes.`,
             customTools: [
               ...pluginTools,
               ...documentTools,
+              webFetchTool,
               ...memoryTools,
               ...taskLogTool,
               ...taskCreateTool,

@@ -61,6 +61,7 @@ import {
   createGetAgentConfigTool,
   createListAgentsTool,
   createMemoryTools,
+  createWebFetchTool,
   createReadMessagesTool,
   createReflectOnPerformanceTool,
   createUpdateAgentConfigTool,
@@ -2936,6 +2937,7 @@ export class TaskExecutor {
             getSettings: async () => this.store.getSettings(),
           })
           : []),
+        createWebFetchTool(),
         ...createMemoryTools(this.rootDir, settings, assignedAgent ? {
           agentMemory: {
             agentId: assignedAgent.id,

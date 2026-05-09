@@ -254,6 +254,15 @@ The pi extension provides tools and a `/fn` command for interacting with fn from
 
 The extension has no skills — tool descriptions give the LLM everything it needs.
 
+### WebFetch tool (`fn_web_fetch`)
+
+Use `fn_web_fetch` for lightweight URL reads from agent/chat sessions. It performs an HTTP GET, follows redirects, extracts readable text (including HTML→text and JSON pretty-print), and returns bounded content.
+
+- Default limits: `timeoutMs=30000` and `maxBytes=512000` (500 KB)
+- Security: blocks private/loopback/link-local hosts (including DNS-resolved private addresses) unless explicitly overridden in internal/test contexts
+- Scope: read-only fetch (no JS rendering, no auth flows, no POST/cookie workflows)
+- Use `agent-browser` skill when pages require JavaScript execution, interactive navigation, or richer browser behavior
+
 ## Agent Spawning (`spawn_agent` tool)
 
 The executor agent can spawn child agents that run in parallel. Each spawned agent:

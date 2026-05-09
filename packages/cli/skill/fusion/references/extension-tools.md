@@ -364,6 +364,17 @@ Show a single insight-generation run by ID.
 
 ## Other Tools
 
+### fn_web_fetch
+
+Lightweight URL fetch (no JS rendering). Use agent-browser skill for JS-heavy pages. URL to fetch (http/https) Optional extraction hint for downstream summarization Timeout in milliseconds (default: 30000) Max bytes to return (default: 512000)
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | string | ✓ | URL to fetch (http/https) |
+| `prompt` | string | — | Optional extraction hint for downstream summarization |
+| `timeoutMs` | number | — | Timeout in milliseconds (default: 30000) |
+| `maxBytes` | number | — | Max bytes to return (default: 512000) |
+
 ### fn_research_run
 
 Start a bounded research run and optionally wait for findings.

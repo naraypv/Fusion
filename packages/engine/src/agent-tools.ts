@@ -20,6 +20,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createLogger } from "./logger.js";
+import { fetchWebContent, WebFetchError } from "./web-fetch.js";
 
 // ── Tool parameter schemas (canonical definitions) ────────────────────────
 
@@ -128,6 +129,13 @@ export const memoryGetParams = Type.Object({
   path: Type.String({ description: "Memory path from fn_memory_search, e.g. .fusion/memory/MEMORY.md or .fusion/memory/YYYY-MM-DD.md" }),
   startLine: Type.Optional(Type.Number({ description: "1-based start line (default: 1)" })),
   lineCount: Type.Optional(Type.Number({ description: "Number of lines to read (default: 120, max: 400)" })),
+});
+
+export const webFetchParams = Type.Object({
+  url: Type.String({ description: "URL to fetch (http/https only)" }),
+  prompt: Type.Optional(Type.String({ description: "Optional extraction hint for downstream summarization" })),
+  timeoutMs: Type.Optional(Type.Number({ description: "Request timeout in milliseconds" })),
+  maxBytes: Type.Optional(Type.Number({ description: "Maximum content bytes to return" })),
 });
 
 export const researchRunParams = Type.Object({
@@ -917,6 +925,60 @@ export function createMemoryAppendTool(rootDir: string, settings?: MemoryToolSet
         content: [{ type: "text" as const, text: `Appended to ${params.layer} memory.` }],
         details: { scope, layer: params.layer },
       };
+    },
+  };
+}
+
+export function createWebFetchTool(options?: { allowPrivateHosts?: boolean }): ToolDefinition {
+  return {
+    name: "fn_web_fetch",
+    label: "WebFetch",
+    description: "Fetch and extract readable text from a URL (lightweight HTTP fetch, no JS rendering).",
+    parameters: webFetchParams,
+    execute: async (_id: string, params: Static<typeof webFetchParams>) => {
+      try {
+        const result = await fetchWebContent(params.url, {
+          timeoutMs: params.timeoutMs,
+          maxBytes: params.maxBytes,
+          allowPrivateHosts: options?.allowPrivateHosts ?? false,
+        });
+        const sections = [
+          `URL: ${result.finalUrl}`,
+          `Status: ${result.status}`,
+          `Content-Type: ${result.contentType}`,
+          params.prompt ? `Prompt: ${params.prompt}` : undefined,
+          result.title ? `Title: ${result.title}` : undefined,
+          "",
+          result.content,
+          result.truncated ? "\n[truncated to maxBytes]" : "",
+        ].filter(Boolean);
+        return {
+          content: [{ type: "text" as const, text: sections.join("\n") }],
+          details: {
+            finalUrl: result.finalUrl,
+            status: result.status,
+            contentType: result.contentType,
+            title: result.title,
+            truncated: result.truncated,
+            bytesRead: result.bytesRead,
+            prompt: params.prompt,
+          },
+        };
+      } catch (error) {
+        if (error instanceof WebFetchError) {
+          return {
+            content: [{ type: "text" as const, text: `ERROR [${error.code}]: ${error.message}` }],
+            details: { code: error.code, message: error.message },
+            isError: true,
+          };
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `ERROR [network-error]: ${message}` }],
+          details: { code: "network-error", message },
+          isError: true,
+        };
+      }
     },
   };
 }
