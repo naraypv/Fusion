@@ -20,6 +20,7 @@ No Meta Cloud app, webhook URL, verify token, or Graph API credentials are requi
 - `allowedSenders`: allowed WhatsApp JIDs or E.164 digits.
 - `agentSystemPrompt`: system prompt for replies.
 - `historyTurnLimit`: persisted turn window (default `40`).
+- `dedupeRetentionDays`: replay-protection retention window for inbound message IDs (default `7` days). Rows older than this are pruned lazily whenever a new inbound message is processed.
 
 ## Routes
 

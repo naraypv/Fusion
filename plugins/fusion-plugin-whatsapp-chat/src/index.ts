@@ -4,6 +4,7 @@ import { WhatsAppConnection } from "./connection.js";
 import { generateReply } from "./reply.js";
 
 const DEFAULT_HISTORY_TURN_LIMIT = 40;
+const DEFAULT_DEDUPE_RETENTION_DAYS = 7;
 
 export type ChatTurn = { role: "user" | "assistant"; text: string; createdAt: string };
 
@@ -39,6 +40,12 @@ const settingsSchema: Record<string, PluginSettingSchema> = {
     label: "History Turn Limit",
     defaultValue: DEFAULT_HISTORY_TURN_LIMIT,
   },
+  dedupeRetentionDays: {
+    type: "number",
+    label: "Dedupe Retention (days)",
+    description: "How long inbound message IDs are kept for replay protection. Older rows are pruned on each inbound message.",
+    defaultValue: DEFAULT_DEDUPE_RETENTION_DAYS,
+  },
 };
 
 const connections = new Map<string, WhatsAppConnection>();
@@ -58,6 +65,14 @@ export function getHistoryTurnLimit(settings: Record<string, unknown>): number {
   const value = settings.historyTurnLimit;
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_HISTORY_TURN_LIMIT;
+  }
+  return Math.floor(value);
+}
+
+export function getDedupeRetentionDays(settings: Record<string, unknown>): number {
+  const value = settings.dedupeRetentionDays;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_DEDUPE_RETENTION_DAYS;
   }
   return Math.floor(value);
 }
@@ -121,8 +136,16 @@ export function wasProcessed(db: PluginDb, messageId: string): boolean {
   return Boolean(row?.found);
 }
 
-export function markProcessed(db: PluginDb, messageId: string, sender: string): void {
-  db.prepare("INSERT INTO whatsapp_chat_dedupe(messageId, sender, receivedAt) VALUES(?, ?, ?)").run(messageId, sender, new Date().toISOString());
+export function markProcessed(
+  db: PluginDb,
+  messageId: string,
+  sender: string,
+  retentionDays: number = DEFAULT_DEDUPE_RETENTION_DAYS,
+): void {
+  const now = new Date().toISOString();
+  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+  db.prepare("DELETE FROM whatsapp_chat_dedupe WHERE receivedAt < ?").run(cutoff);
+  db.prepare("INSERT INTO whatsapp_chat_dedupe(messageId, sender, receivedAt) VALUES(?, ?, ?)").run(messageId, sender, now);
 }
 
 

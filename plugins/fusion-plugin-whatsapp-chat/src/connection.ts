@@ -3,7 +3,17 @@ import type { PluginContext } from "@fusion/plugin-sdk";
 import pino from "pino";
 import qrcode from "qrcode";
 import { clearAuthState, createPluginDbAuthState } from "./auth-state.js";
-import { getAllowedSenders, getHistoryTurnLimit, loadHistory, markProcessed, saveHistory, wasProcessed, type ChatTurn, type PluginDb } from "./index.js";
+import {
+  getAllowedSenders,
+  getDedupeRetentionDays,
+  getHistoryTurnLimit,
+  loadHistory,
+  markProcessed,
+  saveHistory,
+  wasProcessed,
+  type ChatTurn,
+  type PluginDb,
+} from "./index.js";
 
 export type ConnectionStatus = {
   state: "starting" | "awaiting-qr" | "awaiting-code" | "connected" | "disconnected" | "error";
@@ -181,7 +191,7 @@ export class WhatsAppConnection {
       if (allowedSenders.size === 0 || (!allowedSenders.has(sender) && !allowedSenders.has(jid))) continue;
       if (wasProcessed(this.db, messageId)) continue;
 
-      markProcessed(this.db, messageId, sender);
+      markProcessed(this.db, messageId, sender, getDedupeRetentionDays(this.ctx.settings));
 
       try {
         const history = loadHistory(this.db, sender);
