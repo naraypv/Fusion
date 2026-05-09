@@ -1,5 +1,11 @@
 # @fusion-plugin-examples/notification
 
+## 0.2.32
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.24.0
+
 ## 0.2.31
 
 ### Patch Changes
