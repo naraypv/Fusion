@@ -1191,6 +1191,52 @@ describe("schema migrations", () => {
     db.close();
   });
 
+  it("backfills missing checkout lease columns when schemaVersion is already current", () => {
+    tmpDir = makeTmpDir();
+    const fusionDir = join(tmpDir, ".fusion");
+    const legacyDb = new Database(fusionDir);
+
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS __meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        nextId INTEGER DEFAULT 1,
+        nextWorkflowStepId INTEGER DEFAULT 1,
+        settings TEXT DEFAULT '{}',
+        workflowSteps TEXT DEFAULT '[]',
+        updatedAt TEXT
+      );
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        "column" TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+    `);
+    legacyDb.exec("INSERT INTO __meta (key, value) VALUES ('schemaVersion', '70')");
+    legacyDb.exec("INSERT INTO __meta (key, value) VALUES ('lastModified', '1000')");
+    legacyDb.exec(`INSERT INTO tasks (id, description, "column", createdAt, updatedAt) VALUES ('FN-lease', 'legacy', 'triage', '2026-01-01', '2026-01-01')`);
+    legacyDb.close();
+
+    const db = new Database(fusionDir);
+    db.init();
+
+    const columns = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    const columnNames = columns.map((column) => column.name);
+    expect(columnNames).toContain("checkedOutBy");
+    expect(columnNames).toContain("checkedOutAt");
+    expect(columnNames).toContain("checkoutNodeId");
+    expect(columnNames).toContain("checkoutRunId");
+    expect(columnNames).toContain("checkoutLeaseRenewedAt");
+    expect(columnNames).toContain("checkoutLeaseEpoch");
+
+    const task = db.prepare("SELECT checkoutLeaseEpoch FROM tasks WHERE id = 'FN-lease'").get() as { checkoutLeaseEpoch: number | null };
+    expect(task.checkoutLeaseEpoch).toBe(0);
+
+    db.close();
+  });
+
   it("backfills legacy routines table missing agentId with safe defaults", () => {
     tmpDir = makeTmpDir();
     const fusionDir = join(tmpDir, ".fusion");

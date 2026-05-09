@@ -1064,6 +1064,7 @@ export class Database {
     this.migrate();
 
     // Compatibility backfills that must run even when schemaVersion is current.
+    this.ensureTasksSchemaCompatibility();
     this.ensureRoutinesSchemaCompatibility();
     this.ensureInsightRunsSchemaCompatibility();
     this.ensureEvalTaskResultsSchemaCompatibility();
@@ -1086,6 +1087,29 @@ export class Database {
    * Column additions use `hasColumn()` so they are idempotent — safe to
    * re-run even if a previous migration partially applied.
    */
+  /**
+   * Applies idempotent compatibility fixes for legacy tasks checkout lease columns.
+   *
+   * FN-3879 documented a self-heal for missing checkout lease columns, but the
+   * original column adds lived only in the `version < 20` migration block. Some
+   * legacy/mesh-synced databases report `schemaVersion >= 20` despite never
+   * receiving those columns, so task listing queries can fail with `no such
+   * column: checkoutNodeId`. Running this unconditionally on init guarantees the
+   * canonical lease columns exist.
+   */
+  private ensureTasksSchemaCompatibility(): void {
+    if (!this.hasTable("tasks")) {
+      return;
+    }
+
+    this.addColumnIfMissing("tasks", "checkedOutBy", "TEXT");
+    this.addColumnIfMissing("tasks", "checkedOutAt", "TEXT");
+    this.addColumnIfMissing("tasks", "checkoutNodeId", "TEXT");
+    this.addColumnIfMissing("tasks", "checkoutRunId", "TEXT");
+    this.addColumnIfMissing("tasks", "checkoutLeaseRenewedAt", "TEXT");
+    this.addColumnIfMissing("tasks", "checkoutLeaseEpoch", "INTEGER DEFAULT 0");
+  }
+
   /**
    * Applies idempotent compatibility fixes for legacy routines table shapes.
    *
