@@ -862,6 +862,43 @@ describe("CentralCore", () => {
       );
     });
 
+    it("resolves working directories strictly from exact project/node mappings", async () => {
+      const projectPath = join(tempDir, "mapping-resolver-project");
+      mkdirSync(projectPath);
+      projectPaths.push(projectPath);
+
+      const project = await central.registerProject({
+        name: "Mapping Resolver",
+        path: projectPath,
+      });
+      const remoteNode = await central.registerNode({ name: "mapping-resolver-remote", type: "remote", url: "http://remote.example" });
+      const otherNode = await central.registerNode({ name: "mapping-resolver-other", type: "remote", url: "http://other.example" });
+
+      const localNode = (await central.listNodes()).find((node) => node.type === "local");
+      expect(localNode).toBeDefined();
+
+      await expect(central.resolveLocalProjectWorkingDirectory(project.id)).resolves.toBe(projectPath);
+
+      await central.upsertProjectNodePathMapping({
+        projectId: project.id,
+        nodeId: remoteNode.id,
+        path: "/remote/project/root",
+      });
+
+      await expect(central.resolveProjectWorkingDirectory(project.id, remoteNode.id)).resolves.toBe(
+        "/remote/project/root",
+      );
+      await expect(central.resolveProjectWorkingDirectory("proj_missing", remoteNode.id)).rejects.toThrow(
+        "Project not found: proj_missing",
+      );
+      await expect(central.resolveProjectWorkingDirectory(project.id, "node_missing")).rejects.toThrow(
+        "Node not found: node_missing",
+      );
+      await expect(central.resolveProjectWorkingDirectory(project.id, otherNode.id)).rejects.toThrow(
+        `Project/node path mapping not found for projectId=${project.id} nodeId=${otherNode.id}`,
+      );
+    });
+
     it("should check local node health and emit node:health:changed", async () => {
       const node = await central.registerNode({ name: "local-health", type: "local" });
 

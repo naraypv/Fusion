@@ -375,7 +375,7 @@ export class ProjectEngineManager {
       throw new Error(`Project ${projectId} is paused`);
     }
 
-    const runtimeConfig = this.buildRuntimeConfig(project);
+    const runtimeConfig = await this.buildRuntimeConfig(project);
     const engineOptions = this.buildEngineOptions(project, overrides);
 
     const engine = new ProjectEngine(
@@ -395,14 +395,14 @@ export class ProjectEngineManager {
     return engine;
   }
 
-  private buildRuntimeConfig(project: RegisteredProject): ProjectRuntimeConfig {
+  private async buildRuntimeConfig(project: RegisteredProject): Promise<ProjectRuntimeConfig> {
     const settings = project.settings as
       | Record<string, unknown>
       | undefined;
 
     return {
       projectId: project.id,
-      workingDirectory: project.path,
+      workingDirectory: await this.centralCore.resolveLocalProjectWorkingDirectory(project.id),
       isolationMode:
         (project.isolationMode as "in-process" | "child-process") ??
         "in-process",

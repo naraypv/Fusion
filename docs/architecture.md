@@ -1014,6 +1014,7 @@ Multi-project orchestration spans core + engine.
 ### Engine orchestration
 - `HybridExecutor` (`packages/engine/src/hybrid-executor.ts`) is the top-level orchestrator
 - `ProjectManager` instantiates per-project runtimes and forwards events with project attribution
+- Runtime startup/update resolves `ProjectRuntimeConfig.workingDirectory` through `CentralCore.resolveLocalProjectWorkingDirectory()` / `resolveProjectWorkingDirectory(projectId,nodeId)` using exact `projectNodePathMappings` rows for the active node; missing mappings are hard failures (no fallback to `RegisteredProject.path`).
 
 ### Runtime abstraction
 Defined in `project-runtime.ts`:

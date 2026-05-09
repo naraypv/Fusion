@@ -149,6 +149,8 @@ So node onboarding records where a given node can access a project on disk, with
 - `isolationMode: "in-process"` + remote `projects.nodeId` → `RemoteNodeRuntime`
 - `isolationMode: "in-process"` + local/unset/missing node assignment → `InProcessRuntime`
 
+Runtime startup now resolves `ProjectRuntimeConfig.workingDirectory` from the exact routed/current node mapping (`projectNodePathMappings` for `{projectId,nodeId}`) via `CentralCore` resolver APIs. It does **not** fall back to `projects.path` when that node mapping is missing; startup/update fails with a clear mapping error.
+
 So `projects.nodeId` is a **project host-node assignment**, not a per-task override, and not the node-specific working-directory source of truth (that lives in `projectNodePathMappings`).
 
 ### Task routing defaults (`defaultNodeId` + `Task.nodeId`)

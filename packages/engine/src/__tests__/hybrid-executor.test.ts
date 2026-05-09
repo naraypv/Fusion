@@ -138,6 +138,9 @@ describe("HybridExecutor", () => {
       logActivity: vi.fn().mockResolvedValue(undefined),
       acquireGlobalSlot: vi.fn().mockResolvedValue(true),
       releaseGlobalSlot: vi.fn().mockResolvedValue(undefined),
+      resolveLocalProjectWorkingDirectory: vi
+        .fn()
+        .mockResolvedValue("/mapped/local/project-root"),
       removeAllListeners: vi.fn(),
       on: vi.fn().mockReturnThis(),
     } as unknown as CentralCore;
@@ -188,11 +191,14 @@ describe("HybridExecutor", () => {
       await executor.initialize();
 
       const manager = mockProjectManagerInstances[0];
+      expect(mockCentralCore.resolveLocalProjectWorkingDirectory).toHaveBeenCalledWith(
+        "proj_remote_1",
+      );
       expect(manager?.addProject).toHaveBeenCalledWith(
         expect.objectContaining({
           projectId: "proj_remote_1",
           isolationMode: "in-process",
-          workingDirectory: "/tmp/test-project",
+          workingDirectory: "/mapped/local/project-root",
         })
       );
     });
@@ -434,19 +440,34 @@ describe("HybridExecutor", () => {
       ).rejects.toThrow("Runtime not found");
     });
 
-    it("reuses the registered project path when isolation mode changes without an explicit working directory", async () => {
+    it("resolves working directory from local-node mapping when isolation mode changes without an explicit working directory", async () => {
       const manager = mockProjectManagerInstances[0];
       manager?.addProject.mockClear();
 
       await executor.updateProject("proj_test123", { isolationMode: "child-process" });
 
       expect(mockCentralCore.getProject).toHaveBeenCalledWith("proj_test123");
+      expect(mockCentralCore.resolveLocalProjectWorkingDirectory).toHaveBeenCalledWith(
+        "proj_test123",
+      );
       expect(manager?.removeProject).toHaveBeenCalledWith("proj_test123");
       expect(manager?.addProject).toHaveBeenCalledWith(expect.objectContaining({
         projectId: "proj_test123",
-        workingDirectory: "/tmp/test-project",
+        workingDirectory: "/mapped/local/project-root",
         isolationMode: "child-process",
       }));
+    });
+
+    it("fails isolation-mode runtime recreation when no local-node mapping exists", async () => {
+      (mockCentralCore.resolveLocalProjectWorkingDirectory as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error("Project/node path mapping not found for projectId=proj_test123 nodeId=node_local"),
+      );
+
+      await expect(
+        executor.updateProject("proj_test123", { isolationMode: "child-process" }),
+      ).rejects.toThrow(
+        "Project/node path mapping not found for projectId=proj_test123 nodeId=node_local",
+      );
     });
   });
 });

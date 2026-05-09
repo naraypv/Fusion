@@ -1779,6 +1779,40 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     return row?.path;
   }
 
+  async resolveProjectWorkingDirectory(projectId: string, nodeId: string): Promise<string> {
+    this.ensureInitialized();
+
+    const project = await this.getProject(projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`);
+    }
+
+    const node = await this.getNode(nodeId);
+    if (!node) {
+      throw new Error(`Node not found: ${nodeId}`);
+    }
+
+    const mappedPath = await this.getProjectNodePath(projectId, nodeId);
+    if (!mappedPath) {
+      throw new Error(
+        `Project/node path mapping not found for projectId=${projectId} nodeId=${nodeId}`,
+      );
+    }
+
+    return mappedPath;
+  }
+
+  async resolveLocalProjectWorkingDirectory(projectId: string): Promise<string> {
+    this.ensureInitialized();
+
+    const localNode = await this.getLocalNode();
+    if (!localNode) {
+      throw new Error("Local node not found");
+    }
+
+    return this.resolveProjectWorkingDirectory(projectId, localNode.id);
+  }
+
   async listProjectNodePathMappings(filters?: {
     projectId?: string;
     nodeId?: string;
