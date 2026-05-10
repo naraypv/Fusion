@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { REPO_OVERRIDE_RE, isValidRepoSlug, parseRepoSlug, resolveTaskGithubTracking } from "../github-tracking.js";
+import { isValidRepoSlug, parseRepoSlug, resolveTaskGithubTracking } from "../github-tracking.js";
+import { REPO_OVERRIDE_RE } from "../types.js";
 
 describe("REPO_OVERRIDE_RE", () => {
-  it("matches valid owner/repo overrides", () => {
+  it("matches owner/repo slugs and rejects malformed values", () => {
     expect(REPO_OVERRIDE_RE.test("owner/repo")).toBe(true);
     expect(REPO_OVERRIDE_RE.test("org.name/repo_name-1")).toBe(true);
     expect(REPO_OVERRIDE_RE.test("owner")).toBe(false);
+    expect(REPO_OVERRIDE_RE.test("owner/repo/extra")).toBe(false);
+    expect(REPO_OVERRIDE_RE.test("owner repo/repo")).toBe(false);
+    expect(REPO_OVERRIDE_RE.test(" owner/repo ")).toBe(false);
   });
 });
 

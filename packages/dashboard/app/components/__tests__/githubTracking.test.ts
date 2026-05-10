@@ -1,13 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
-
-vi.mock("@fusion/core", () => ({
-  REPO_OVERRIDE_RE: /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/,
-}));
-
-import { REPO_OVERRIDE_RE } from "@fusion/core";
-import { resolveEffectiveGithubRepoDefault } from "../githubTracking";
+import { REPO_OVERRIDE_RE as CORE_REPO_OVERRIDE_RE } from "@fusion/core";
+import { describe, expect, it } from "vitest";
+import { REPO_OVERRIDE_RE, resolveEffectiveGithubRepoDefault } from "../githubTracking";
 
 describe("githubTracking helper", () => {
+  it("reuses the shared core regex export", () => {
+    expect(REPO_OVERRIDE_RE).toBe(CORE_REPO_OVERRIDE_RE);
+  });
+
   it("accepts valid owner/repo values and rejects malformed values", () => {
     expect(REPO_OVERRIDE_RE.test("owner/repo")).toBe(true);
     expect(REPO_OVERRIDE_RE.test("org.name/repo_name-1")).toBe(true);

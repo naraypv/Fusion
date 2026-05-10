@@ -961,6 +961,9 @@ export interface TaskDocumentWithTask extends TaskDocument {
 
 export const DOCUMENT_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
+/** Shared GitHub owner/repo slug validation for repo override inputs. */
+export const REPO_OVERRIDE_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
 export function validateDocumentKey(key: string): void {
   if (!DOCUMENT_KEY_RE.test(key)) {
     throw new Error(
