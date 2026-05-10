@@ -1238,6 +1238,8 @@ Git dashboard routes are registered in `register-git-github.ts`.
 
 When a task is created, Fusion only attempts GitHub issue creation if per-task tracking is explicitly enabled (`task.githubTracking.enabled === true`). The lifecycle then resolves the repo in priority order: task override (`repoOverride`) → project `githubTrackingDefaultRepo` → global `githubTrackingDefaultRepo`. If no repo resolves, task creation still succeeds and an activity entry records the skip reason. GitHub API/CLI failures are best-effort only (swallowed with warning), so task creation is never blocked by GitHub availability.
 
+When Fusion does create a tracking issue, it formats the title as `[FN-XXXX] Task title` and sends a short plain-text body prefixed with `Fusion task: FN-XXXX`. The body is a bounded summary snippet (not full task prompt content), and Fusion does not include any hyperlink back to the local dashboard.
+
 ### Worktree model
 - Each active task runs in isolated worktree under `.worktrees/*`
 - Executor creates branches like `fusion/{task-id}` (`executor.ts`)

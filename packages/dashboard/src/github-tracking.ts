@@ -2,6 +2,69 @@ import type { GlobalSettings, ProjectSettings, Task, TaskStore } from "@fusion/c
 import type { CreatedIssue } from "./github.js";
 import type { GitHubClient } from "./github.js";
 
+const TRACKING_ISSUE_TITLE_LIMIT = 240;
+const TRACKING_ISSUE_BODY_SUMMARY_LIMIT = 500;
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function firstNonEmptyParagraph(value: string | undefined): string | null {
+  if (!value) return null;
+  const paragraph = value
+    .split(/\n\s*\n/g)
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+  return paragraph && paragraph.length > 0 ? paragraph : null;
+}
+
+function sanitizeSummaryText(value: string): string {
+  const cleaned = value
+    .split(/\r?\n/)
+    .filter((line) => !/^```/.test(line.trim()))
+    .map((line) => line.replace(/^\s*#{1,6}\s+/, "").replace(/^\s*(?:[-*+]\s+|\d+\.\s+)/, ""))
+    .join(" ");
+
+  const withoutFusionUrls = cleaned
+    .replace(/https?:\/\/localhost(?::\d+)?\/[^\s)]*/gi, " ")
+    .replace(/https?:\/\/[^\s)]*\/tasks\/FN-\d+[^\s)]*/gi, " ");
+
+  return collapseWhitespace(withoutFusionUrls);
+}
+
+export function formatTrackingIssueTitle(task: Pick<Task, "id" | "title">): string {
+  const prefix = `[${task.id}] `;
+  const baseTitle = collapseWhitespace(task.title ?? "") || "Untitled task";
+  const maxTitleLength = Math.max(1, TRACKING_ISSUE_TITLE_LIMIT - prefix.length);
+
+  if (baseTitle.length <= maxTitleLength) {
+    return `${prefix}${baseTitle}`;
+  }
+
+  const truncated = `${baseTitle.slice(0, Math.max(0, maxTitleLength - 1)).trimEnd()}…`;
+  return `${prefix}${truncated}`;
+}
+
+export function formatTrackingIssueBody(task: {
+  id: string;
+  title?: string;
+  description?: string;
+  summary?: string;
+  prompt?: string;
+}): string {
+  const source = firstNonEmptyParagraph(task.description)
+    ?? firstNonEmptyParagraph(task.prompt)
+    ?? task.summary?.trim()
+    ?? "No summary available.";
+
+  const sanitized = sanitizeSummaryText(source) || "No summary available.";
+  const summary = sanitized.length > TRACKING_ISSUE_BODY_SUMMARY_LIMIT
+    ? `${sanitized.slice(0, TRACKING_ISSUE_BODY_SUMMARY_LIMIT - 1).trimEnd()}…`
+    : sanitized;
+
+  return `Fusion task: ${task.id}\n\n${summary}`;
+}
+
 export interface MaybeCreateTrackingIssueDeps {
   taskStore: TaskStore;
   githubClient: GitHubClient;
@@ -52,8 +115,8 @@ export async function maybeCreateTrackingIssue(
     return { created: false, reason: "no_repo_configured" };
   }
 
-  const title = `[${task.id}] ${task.title ?? task.description.slice(0, 80)}`;
-  const body = `Tracking issue for ${task.id}.\n\n_Summary placeholder — populated by FN-3871._`;
+  const title = formatTrackingIssueTitle(task);
+  const body = formatTrackingIssueBody(task);
 
   try {
     const issue = await deps.githubClient.createIssue({ owner: repo.owner, repo: repo.repo, title, body });
