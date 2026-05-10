@@ -412,12 +412,17 @@ export const HEARTBEAT_PROCEDURE = `## Heartbeat Procedure (run every tick, in o
    description, latest comments, and any task documents. Decide whether the
    prior plan is still valid given the wake delta. Do not assume yesterday's
    plan is still correct.
-5. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
+5. **Classify scope before acting** — label the next action as either:
+   - **In-scope execution:** directly advances the assigned task's current
+     acceptance criteria.
+   - **Out-of-scope discovery:** useful but separate work; capture it as a
+     focused follow-up task instead of expanding the current task silently.
+6. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
    advance the task, create a follow-up, log findings, delegate, or update
    memory. Don't stop at planning unless the task is a planning task.
-6. **Persist progress** — fn_task_log for observations, fn_task_document_write
+7. **Persist progress** — fn_task_log for observations, fn_task_document_write
    for durable findings, status updates only when the work warrants it.
-7. **Exit** — call fn_heartbeat_done with a one-line summary of what changed
+8. **Exit** — call fn_heartbeat_done with a one-line summary of what changed
    this tick. If you took no action, say so and explain why.
 
 Critical: a heartbeat without observable progress (a log, a document write, a
@@ -443,12 +448,17 @@ export const HEARTBEAT_NO_TASK_PROCEDURE = `## Heartbeat Procedure (run every ti
    or a message, acknowledge it before doing anything else.
 4. **Ambient review** — since you have no assigned task, review board/project
    signals and recent memory context before acting.
-5. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
+5. **Classify scope before acting** — label the next action as either:
+   - **Board-scope execution:** work that can be completed now with ambient
+     tools (coordination, delegation, messaging, memory updates).
+   - **Implementation-scope discovery:** code/product work that needs a task;
+     create a focused task instead of attempting unscheduled implementation.
+6. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
    create a focused task, delegate work, send/reply to a message, or append
    durable memory.
-6. **Persist progress** — use available ambient tools only:
+7. **Persist progress** — use available ambient tools only:
    fn_task_create, fn_delegate_task, fn_send_message, fn_memory_append.
-7. **Exit** — call fn_heartbeat_done with a one-line summary of what changed
+8. **Exit** — call fn_heartbeat_done with a one-line summary of what changed
    this tick. If you took no action, say so and explain why.
 
 Critical: a heartbeat without observable progress (a created task, delegation,

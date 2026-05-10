@@ -1938,6 +1938,13 @@ describe("executeHeartbeat", () => {
       expect(HEARTBEAT_NO_TASK_PROCEDURE.indexOf("**Inbox**")).toBeLessThan(HEARTBEAT_NO_TASK_PROCEDURE.indexOf("**Wake delta**"));
     });
 
+    it("both heartbeat procedures include scope-classification guidance", () => {
+      expect(HEARTBEAT_PROCEDURE).toContain("Classify scope before acting");
+      expect(HEARTBEAT_PROCEDURE).toContain("Out-of-scope discovery");
+      expect(HEARTBEAT_NO_TASK_PROCEDURE).toContain("Classify scope before acting");
+      expect(HEARTBEAT_NO_TASK_PROCEDURE).toContain("Implementation-scope discovery");
+    });
+
     it("no-task system prompt processing messages section does not reference fn_task_log", () => {
       const processingMessagesSection = HEARTBEAT_NO_TASK_SYSTEM_PROMPT.split("## Processing Messages")[1] ?? "";
       expect(processingMessagesSection).not.toContain("fn_task_log");
