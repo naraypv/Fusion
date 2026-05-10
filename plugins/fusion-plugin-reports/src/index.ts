@@ -3,10 +3,12 @@ import { definePlugin } from "@fusion/plugin-sdk";
 import { runReviewPanel } from "./review-panel.js";
 import { ensureReportSchema } from "./report-schema.js";
 import { createReportExportRoutes } from "./routes/report-export-routes.js";
+import { createReportListRoutes } from "./routes/report-list-routes.js";
 import type { CombinedReview, ReviewPanelMember, RunReviewPanelInput } from "./review-types.js";
 import type { ReportCadence, ReportCreateInput } from "./store/report-types.js";
 import { ReportStore } from "./store/report-store.js";
 import { settingsSchema } from "./settings.js";
+export { ReportsDashboardView } from "./dashboard-view.js";
 
 const plugin = definePlugin({
   manifest: {
@@ -22,7 +24,17 @@ const plugin = definePlugin({
   hooks: {
     onSchemaInit: ensureReportSchema,
   },
-  routes: createReportExportRoutes(),
+  routes: [...createReportListRoutes(), ...createReportExportRoutes()],
+  dashboardViews: [
+    {
+      viewId: "reports",
+      label: "Reports",
+      componentPath: "./dashboard-view",
+      icon: "FileText",
+      placement: "primary",
+      order: 35,
+    },
+  ],
 });
 
 export interface RunGeneratedReportReviewInput {

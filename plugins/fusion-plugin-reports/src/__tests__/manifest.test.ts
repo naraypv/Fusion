@@ -42,6 +42,20 @@ describe("reports plugin manifest", () => {
     expect(plugin.manifest.fusionVersion).toBe(manifest.fusionVersion);
   });
 
+  it("registers dashboard view", () => {
+    expect(plugin.dashboardViews).toEqual([
+      {
+        viewId: "reports",
+        label: "Reports",
+        componentPath: "./dashboard-view",
+        icon: "FileText",
+        placement: "primary",
+        order: 35,
+      },
+    ]);
+    expect(manifest.dashboardViews).toEqual(plugin.dashboardViews);
+  });
+
   it("includes full settings schema", () => {
     expect(plugin.manifest.settingsSchema).toBeDefined();
     for (const key of expectedKeys) {

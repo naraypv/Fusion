@@ -136,3 +136,14 @@ Emitted events:
 - `report:deleted`
 
 This archive is the source of truth for downstream report HTML rendering (FN-3785) and dashboard report list/detail flows (FN-3786).
+
+## Dashboard view
+
+The plugin registers a primary dashboard view (`Reports`) via `dashboardViews` with `componentPath: "./dashboard-view"`.
+
+The view provides:
+- History list of reports with filters (cadence, status, period date range, title search, agent filter)
+- Embedded detail preview using sandboxed iframe + preview HTML endpoint
+- Section quick-jump navigation by stable `data-section` markers
+- Side-by-side comparison drawer for two reports with section-level diff summary
+- Standalone HTML download action wired to the export endpoint

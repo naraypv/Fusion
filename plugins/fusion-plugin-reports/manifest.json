@@ -5,6 +5,16 @@
   "description": "Generates beautiful HTML system-activity reports with multi-agent review.",
   "author": "Fusion Team",
   "fusionVersion": ">=0.1.0",
+  "dashboardViews": [
+    {
+      "viewId": "reports",
+      "label": "Reports",
+      "componentPath": "./dashboard-view",
+      "icon": "FileText",
+      "placement": "primary",
+      "order": 35
+    }
+  ],
   "settingsSchema": {
     "dailyEnabled": { "type": "boolean", "label": "Enable Daily Reports", "description": "Generate daily reports on schedule.", "group": "Schedules", "defaultValue": true },
     "dailyCron": { "type": "string", "label": "Daily Schedule (cron)", "description": "Cron expression for daily report generation.", "group": "Schedules", "required": true, "defaultValue": "0 8 * * *" },
