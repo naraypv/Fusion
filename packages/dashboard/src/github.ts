@@ -1348,6 +1348,55 @@ export class GitHubClient {
     }
   }
 
+  async setIssueState(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    state: "open" | "closed",
+    stateReason?: "completed" | "not_planned" | "reopened",
+  ): Promise<void> {
+    if (this.hasGhAuth()) {
+      try {
+        const command = state === "closed" ? "close" : "reopen";
+        const args = ["issue", command, String(issueNumber), "--repo", `${owner}/${repo}`];
+        if (state === "closed" && (stateReason === "completed" || stateReason === "not_planned")) {
+          args.push("--reason", stateReason);
+        }
+        runGh(args);
+        return;
+      } catch (err) {
+        if (!this.token) {
+          throw new Error(getGhErrorMessage(err));
+        }
+      }
+    }
+
+    if (!this.token) {
+      throw new Error("GitHub CLI (gh) is not available or not authenticated, and no GITHUB_TOKEN provided.");
+    }
+
+    const url = `${this.baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}`;
+    const payload: { state: "open" | "closed"; state_reason?: "completed" | "not_planned" | "reopened" } = { state };
+    if (stateReason !== undefined) {
+      payload.state_reason = stateReason;
+    }
+
+    const result = await this.fetchThrottled<{ id: number; state: string }>(
+      url,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+
+    if (!result.success) {
+      throw new Error(result.error ?? "Failed to update GitHub issue state");
+    }
+  }
+
   /**
    * Fetch current issue status using gh CLI if available, otherwise REST API.
    * Returns null if the issue is not found or is a pull request.

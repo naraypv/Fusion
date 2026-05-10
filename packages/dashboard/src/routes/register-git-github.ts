@@ -22,6 +22,7 @@ import {
 import { GitHubClient, parseBadgeUrl } from "../github.js";
 import { GitHubIssueCommentService } from "../github-issue-comment.js";
 import { GitHubTrackingCommentService } from "../github-tracking-comments.js";
+import { GitHubTrackingStateService } from "../github-tracking-state.js";
 import { githubRateLimiter } from "../github-poll.js";
 import {
   classifyWebhookEvent,
@@ -1112,6 +1113,13 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     );
     githubTrackingCommentService.start();
     ctx.registerDispose(() => githubTrackingCommentService.stop());
+
+    const githubTrackingStateService = new GitHubTrackingStateService(
+      store,
+      () => ctx.options?.githubToken ?? process.env.GITHUB_TOKEN,
+    );
+    githubTrackingStateService.start();
+    ctx.registerDispose(() => githubTrackingStateService.stop());
   }
 
   /**

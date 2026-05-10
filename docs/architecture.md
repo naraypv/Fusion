@@ -1244,6 +1244,8 @@ When Fusion does create a tracking issue, it formats the title as `[FN-XXXX] Tas
 
 When a tracked task later moves to `in-progress` or `done`, Fusion posts one short lifecycle comment on the linked tracking issue. These comments include the Fusion task ID as plain text (`Fusion task: FN-XXXX`) and never link back to the Fusion app. No comment is posted for any other transition.
 
+When a tracked task transitions into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`. When a task transitions out of `done` into any active column (`triage`, `todo`, `in-progress`, `in-review`), Fusion reopens it with `state_reason: reopened`. Moves from `done` to `archived` leave the issue closed. Tasks without `githubTracking.enabled` or without a linked issue are unaffected, and GitHub failures are logged to task activity without blocking the move.
+
 ### Worktree model
 - Each active task runs in isolated worktree under `.worktrees/*`
 - Executor creates branches like `fusion/{task-id}` (`executor.ts`)
