@@ -42,14 +42,18 @@ export function buildPromptLayers(input: PromptLayerInput): SystemPromptLayers {
 
   const dynamicParts: string[] = [];
 
-  const trimmedInstructions = agentInstructions?.trim() ?? "";
-  if (trimmedInstructions) {
-    dynamicParts.push(`## Custom Instructions\n\n${trimmedInstructions}`);
-  }
-
+  // Memory section comes before instructions to preserve the relative
+  // ordering from the legacy buildSystemPromptWithInstructions approach,
+  // where memory was concatenated onto basePrompt before instructions
+  // were appended.
   const trimmedMemory = memorySection?.trim() ?? "";
   if (trimmedMemory) {
     dynamicParts.push(trimmedMemory);
+  }
+
+  const trimmedInstructions = agentInstructions?.trim() ?? "";
+  if (trimmedInstructions) {
+    dynamicParts.push(`## Custom Instructions\n\n${trimmedInstructions}`);
   }
 
   const trimmedPlugins = pluginContributions?.trim() ?? "";

@@ -83,15 +83,19 @@ describe("prompt layers backward compatibility", () => {
   });
 
   describe("reviewer assembly pattern", () => {
-    it("produces the expected reviewer prompt with memory in dynamic layer", () => {
+    it("preserves memory-before-instructions ordering in dynamic layer", () => {
       const basePrompt = "You are an independent code and plan reviewer.";
-      const memoryInstructions = "\n## Memory\n\nUse fn_memory_search.";
+      const memoryInstructions = "## Memory\n\nUse fn_memory_search.";
       const agentInstructions = "Focus on security.";
       const plugins = "## Plugin: lint\n\nCheck eslint.";
 
-      // New reviewer pattern: memory goes in dynamic layer (not stable) so
-      // the stable prefix is byte-identical across sessions even when memory
-      // changes mid-task.
+      // The old reviewer pattern was:
+      //   buildSystemPromptWithInstructions(base + memory, instructions) + plugins
+      // which produced: base + memory → instructions → plugins
+      //
+      // The new pattern moves memory from stable to dynamic (so stable prefix
+      // is byte-identical even if memory changes mid-task), but preserves the
+      // relative ordering: memory → instructions → plugins in the dynamic layer.
       const layers = buildPromptLayers({
         basePrompt,
         agentInstructions,
@@ -100,12 +104,16 @@ describe("prompt layers backward compatibility", () => {
       });
       const result = collapsePromptLayers(layers);
 
-      // Base prompt is the stable layer
+      // Base prompt is the stable layer (no memory)
       expect(layers.stable).toBe(basePrompt);
-      // Dynamic layer contains instructions, memory, and plugins
-      expect(result).toContain(agentInstructions);
-      expect(result).toContain("Memory");
-      expect(result).toContain(plugins);
+
+      // Dynamic layer preserves: memory → instructions → plugins ordering
+      const memoryIdx = result.indexOf("## Memory");
+      const instructionsIdx = result.indexOf("## Custom Instructions");
+      const pluginsIdx = result.indexOf("## Plugin:");
+      expect(memoryIdx).toBeGreaterThan(0);
+      expect(instructionsIdx).toBeGreaterThan(memoryIdx);
+      expect(pluginsIdx).toBeGreaterThan(instructionsIdx);
     });
   });
 

@@ -64,7 +64,7 @@ describe("buildPromptLayers", () => {
     });
 
     expect(layers.dynamic).toBe(
-      "## Custom Instructions\n\nInstructions.\n\nMemory.\n\nPlugins."
+      "Memory.\n\n## Custom Instructions\n\nInstructions.\n\nPlugins."
     );
   });
 
