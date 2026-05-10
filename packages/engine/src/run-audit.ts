@@ -91,7 +91,13 @@ export type DatabaseMutationType =
   | "task:unpause"
   | "task:dependency:add"
   | "document:write"
-  | "workflow-step:result";
+  | "workflow-step:result"
+  | "agent:create:requested"
+  | "agent:create:approved"
+  | "agent:create:denied"
+  | "agent:delete:requested"
+  | "agent:delete:approved"
+  | "agent:delete:denied";
 
 // ── Filesystem mutation types ─────────────────────────────────────────────────
 

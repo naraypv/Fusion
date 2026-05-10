@@ -5,8 +5,12 @@ export const READONLY_BUILTIN_TOOLS: ReadonlySet<string> = new Set(["read", "fin
 export const FILE_WRITE_BUILTIN_TOOLS: ReadonlySet<string> = new Set(["write", "edit"]);
 
 const SHARED_TASK_AGENT_TOOLS = ["fn_task_add_dep", "fn_spawn_agent", "fn_update_agent_config", "fn_agent_create", "fn_agent_delete"] as const;
+const PROVISIONING_TOOLS = ["fn_agent_create", "fn_agent_delete"] as const;
 
 const ACTION_GATE_TASK_AGENT_ONLY_TOOLS = ["fn_task_create", "fn_delegate_task", "fn_update_identity"] as const;
+const ACTION_GATE_SHARED_TASK_AGENT_TOOLS = SHARED_TASK_AGENT_TOOLS.filter(
+  (tool) => !(PROVISIONING_TOOLS as readonly string[]).includes(tool),
+);
 const PERMANENT_TASK_AGENT_ONLY_TOOLS = [
   "fn_task_pause",
   "fn_task_unpause",
@@ -36,8 +40,10 @@ export const TASK_AGENT_MUTATION_TOOLS: ReadonlySet<string> = new Set([
   ...PERMANENT_TASK_AGENT_ONLY_TOOLS,
 ]);
 
+// FN-3953: provisioning tools are gated by dedicated agent_provisioning policy;
+// keep them out of action-gate task_agent_mutation to avoid double approval rows.
 export const ACTION_GATE_TASK_AGENT_MANAGEMENT_TOOLS: ReadonlySet<string> = new Set([
-  ...SHARED_TASK_AGENT_TOOLS,
+  ...ACTION_GATE_SHARED_TASK_AGENT_TOOLS,
   ...ACTION_GATE_TASK_AGENT_ONLY_TOOLS,
 ]);
 

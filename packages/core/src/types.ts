@@ -2169,6 +2169,13 @@ export interface ProjectSettings {
    *  remain in triage with status "awaiting-approval" until a user approves
    *  or rejects the plan. Default: false. */
   requirePlanApproval?: boolean;
+  /** Approval policy for agent provisioning tools (fn_agent_create/fn_agent_delete). */
+  agentProvisioning?: {
+    approvalMode?: AgentProvisioningApprovalMode;
+    trustedRoles?: string[];
+    trustedAgentIds?: string[];
+    alwaysApproveDelete?: boolean;
+  };
   /** When true, enforces that task specifications (PROMPT.md) are refreshed if they
    *  become stale. Stale specs are detected based on specStalenessMaxAgeMs.
    *  Default: false. */
@@ -4019,8 +4026,12 @@ export const AGENT_PERMISSION_POLICY_ACTION_CATEGORIES: readonly PermanentAgentS
   "task_agent_mutation",
 ] as const;
 
+export const AGENT_PROVISIONING_APPROVAL_MODES = ["always", "trusted-only", "never"] as const;
+export type AgentProvisioningApprovalMode = (typeof AGENT_PROVISIONING_APPROVAL_MODES)[number];
+
 /** A single runtime action category governed by permission policy. */
 export type AgentPermissionPolicyActionCategory = PermanentAgentSensitiveActionCategory;
+export type ApprovalRequestActionCategory = AgentPermissionPolicyActionCategory | "agent_provisioning";
 
 /** How a runtime action category is handled by permission policy. */
 export type AgentPermissionPolicyDisposition = "allow" | "block" | "require-approval";
@@ -4100,13 +4111,13 @@ export type LegacyAgentPermissionPolicyActionCategory =
 
 /** Canonical + compatibility action-category input accepted at boundaries. */
 export type ApprovalRequestActionCategoryInput =
-  | AgentPermissionPolicyActionCategory
+  | ApprovalRequestActionCategory
   | LegacyAgentPermissionPolicyActionCategory;
 
 /** Normalize legacy action-category aliases to canonical v1 categories. */
 export function normalizeApprovalRequestActionCategory(
   category: ApprovalRequestActionCategoryInput,
-): AgentPermissionPolicyActionCategory {
+): ApprovalRequestActionCategory {
   switch (category) {
     case "file_write":
     case "file_delete":
@@ -4118,6 +4129,8 @@ export function normalizeApprovalRequestActionCategory(
     case "task_mutation":
     case "agent_mutation":
       return "task_agent_mutation";
+    case "agent_provisioning":
+      return "agent_provisioning";
     default:
       return category;
   }
@@ -4125,7 +4138,7 @@ export function normalizeApprovalRequestActionCategory(
 
 /** Action payload gated by an approval request. */
 export interface ApprovalRequestTargetAction {
-  category: AgentPermissionPolicyActionCategory;
+  category: ApprovalRequestActionCategory;
   action: string;
   summary: string;
   resourceType: string;

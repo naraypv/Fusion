@@ -11,8 +11,8 @@ import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/p
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
-import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore } from "@fusion/core";
-import { DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
+import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings } from "@fusion/core";
+import { DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, extractAgentProvisioningRequest, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
 import { ResearchStepRunner } from "./research-step-runner.js";
@@ -21,6 +21,7 @@ import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createLogger } from "./logger.js";
 import { fetchWebContent, WebFetchError } from "./web-fetch.js";
+import type { RunAuditor } from "./run-audit.js";
 
 // ── Tool parameter schemas (canonical definitions) ────────────────────────
 
@@ -1463,10 +1464,17 @@ export function createUpdateAgentConfigTool(agentStore: AgentStore, callingAgent
  * @param taskStore - TaskStore for task creation
  * @returns ToolDefinition for the `fn_delegate_task` tool
  */
+type AgentProvisioningToolOptions = {
+  hireApprovalEnabled?: boolean;
+  approvalRequestStore?: ApprovalRequestStore;
+  settingsProvider?: () => Promise<ProjectSettings | undefined>;
+  runAuditor?: RunAuditor;
+};
+
 export function createAgentCreateTool(
   agentStore: AgentStore,
   callingAgentId: string,
-  options?: { hireApprovalEnabled?: boolean },
+  options?: AgentProvisioningToolOptions,
 ): ToolDefinition {
   return {
     name: "fn_agent_create",
@@ -1482,6 +1490,52 @@ export function createAgentCreateTool(
         return {
           content: [{ type: "text" as const, text: "ERROR: You can only create agents that report to you" }],
           details: {},
+        };
+      }
+
+      const settings = await options?.settingsProvider?.();
+      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
+        ? { agentProvisioning: { approvalMode: "never" as const } }
+        : settings;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_create",
+        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
+        settings: fallbackSettings,
+      });
+      await options?.runAuditor?.database({ type: "agent:create:requested", target: callingAgentId, metadata: { policy } });
+
+      if (policy.decision === "require-approval") {
+        if (!options?.approvalRequestStore) {
+          await options?.runAuditor?.database({ type: "agent:create:denied", target: callingAgentId, metadata: { policy, reason: "approval-store-missing" } });
+          return {
+            content: [{ type: "text" as const, text: `DENIED: agent provisioning requires approval but approval storage is unavailable (${policy.matchedRule})` }],
+            details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
+          };
+        }
+
+        const request = options.approvalRequestStore.create({
+          requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
+          targetAction: {
+            category: "agent_provisioning",
+            action: "create",
+            summary: `Create agent ${params.name} (${params.role})`,
+            resourceType: "agent",
+            resourceId: "",
+            context: { tool: "fn_agent_create", params },
+          },
+        });
+
+        return {
+          content: [{ type: "text" as const, text: `Approval required to create agent ${params.name}. Request ${request.id} created.` }],
+          details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
+        };
+      }
+
+      if (policy.decision === "deny") {
+        await options?.runAuditor?.database({ type: "agent:create:denied", target: callingAgentId, metadata: { policy } });
+        return {
+          content: [{ type: "text" as const, text: `DENIED: agent provisioning blocked by policy (${policy.matchedRule})` }],
+          details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
         };
       }
 
@@ -1509,15 +1563,20 @@ export function createAgentCreateTool(
         });
       }
 
+      await options?.runAuditor?.database({ type: "agent:create:approved", target: created.id, metadata: { policy, autoApproved: true } });
       return {
         content: [{ type: "text" as const, text: `Created agent ${created.name} (${created.id})${options?.hireApprovalEnabled ? " in pending_approval" : ""}` }],
-        details: { agent: created, pendingApproval: options?.hireApprovalEnabled === true },
+        details: { outcome: "created", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agent: created, agentId: created.id, pendingApproval: options?.hireApprovalEnabled === true },
       };
     },
   };
 }
 
-export function createAgentDeleteTool(agentStore: AgentStore, callingAgentId: string): ToolDefinition {
+export function createAgentDeleteTool(
+  agentStore: AgentStore,
+  callingAgentId: string,
+  options?: AgentProvisioningToolOptions,
+): ToolDefinition {
   return {
     name: "fn_agent_delete",
     label: "Delete Agent",
@@ -1527,7 +1586,10 @@ export function createAgentDeleteTool(agentStore: AgentStore, callingAgentId: st
       const caller = await agentStore.getAgent(callingAgentId);
       const target = await agentStore.getAgent(params.agent_id);
       if (!target) {
-        return { content: [{ type: "text" as const, text: `ERROR: Agent ${params.agent_id} not found` }], details: {} };
+        return {
+          content: [{ type: "text" as const, text: `ERROR: Agent ${params.agent_id} not found` }],
+          details: { outcome: "denied", matchedRule: "missing-target", effectiveMode: "trusted-only", agentId: params.agent_id },
+        };
       }
 
       const privileged = isCallerPrivileged(caller);
@@ -1542,6 +1604,52 @@ export function createAgentDeleteTool(agentStore: AgentStore, callingAgentId: st
         return { content: [{ type: "text" as const, text: `ERROR: Cannot delete ephemeral/runtime agent ${params.agent_id}` }], details: {} };
       }
 
+      const settings = await options?.settingsProvider?.();
+      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
+        ? { agentProvisioning: { approvalMode: "never" as const } }
+        : settings;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_delete",
+        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
+        settings: fallbackSettings,
+      });
+      await options?.runAuditor?.database({ type: "agent:delete:requested", target: target.id, metadata: { policy } });
+
+      if (policy.decision === "require-approval") {
+        if (!options?.approvalRequestStore) {
+          await options?.runAuditor?.database({ type: "agent:delete:denied", target: target.id, metadata: { policy, reason: "approval-store-missing" } });
+          return {
+            content: [{ type: "text" as const, text: `DENIED: agent delete requires approval but approval storage is unavailable (${policy.matchedRule})` }],
+            details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+          };
+        }
+
+        const request = options.approvalRequestStore.create({
+          requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
+          targetAction: {
+            category: "agent_provisioning",
+            action: "delete",
+            summary: `Delete agent ${target.name} (${target.id})`,
+            resourceType: "agent",
+            resourceId: target.id,
+            context: { tool: "fn_agent_delete", params },
+          },
+        });
+
+        return {
+          content: [{ type: "text" as const, text: `Approval required to delete agent ${target.name}. Request ${request.id} created.` }],
+          details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+        };
+      }
+
+      if (policy.decision === "deny") {
+        await options?.runAuditor?.database({ type: "agent:delete:denied", target: target.id, metadata: { policy } });
+        return {
+          content: [{ type: "text" as const, text: `DENIED: agent delete blocked by policy (${policy.matchedRule})` }],
+          details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+        };
+      }
+
       try {
         await agentStore.deleteAgent(params.agent_id, { force: params.force === true, reassignTo: params.reassign_to });
       } catch (error) {
@@ -1549,12 +1657,48 @@ export function createAgentDeleteTool(agentStore: AgentStore, callingAgentId: st
         return { content: [{ type: "text" as const, text: `ERROR: ${message}` }], details: {} };
       }
 
+      await options?.runAuditor?.database({ type: "agent:delete:approved", target: target.id, metadata: { policy, autoApproved: true } });
       return {
         content: [{ type: "text" as const, text: `Deleted agent ${target.name} (${target.id})` }],
-        details: { agentId: target.id },
+        details: { outcome: "deleted", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
       };
     },
   };
+}
+
+export async function executeApprovedAgentProvisioning(
+  approvalRequest: { id: string; status: string; targetAction: { resourceId: string } } & Parameters<typeof extractAgentProvisioningRequest>[0],
+  deps: { agentStore: AgentStore },
+): Promise<{ deletedId: string } | Awaited<ReturnType<AgentStore["createAgent"]>>> {
+  if (approvalRequest.status !== "approved") {
+    throw new Error(`Approval request ${approvalRequest.id} must be approved before provisioning execution`);
+  }
+
+  const { tool, params } = extractAgentProvisioningRequest(approvalRequest);
+  if (tool === "fn_agent_create") {
+    const runtimeConfig: Record<string, unknown> = {
+      ...(typeof params.heartbeat_interval_ms === "number" ? { heartbeatIntervalMs: params.heartbeat_interval_ms } : {}),
+      ...(typeof params.heartbeat_timeout_ms === "number" ? { heartbeatTimeoutMs: params.heartbeat_timeout_ms } : {}),
+      ...(typeof params.max_concurrent_runs === "number" ? { maxConcurrentRuns: params.max_concurrent_runs } : {}),
+      ...(typeof params.message_response_mode === "string" ? { messageResponseMode: params.message_response_mode } : {}),
+    };
+
+    return deps.agentStore.createAgent({
+      name: String(params.name),
+      role: String(params.role) as never,
+      ...(typeof params.soul === "string" ? { soul: params.soul } : {}),
+      ...(typeof params.instructions_text === "string" ? { instructionsText: params.instructions_text } : {}),
+      ...(typeof params.instructions_path === "string" ? { instructionsPath: params.instructions_path } : {}),
+      reportsTo: typeof params.reportsTo === "string" ? params.reportsTo : undefined,
+      ...(Object.keys(runtimeConfig).length > 0 ? { runtimeConfig } : {}),
+    });
+  }
+
+  await deps.agentStore.deleteAgent(approvalRequest.targetAction.resourceId, {
+    force: params.force === true,
+    reassignTo: typeof params.reassign_to === "string" ? params.reassign_to : undefined,
+  });
+  return { deletedId: approvalRequest.targetAction.resourceId };
 }
 
 export function createDelegateTaskTool(

@@ -18,6 +18,7 @@ import {
   resolveResearchSettings,
   canAgentTakeImplementationTask,
   formatRoleMismatchReason,
+  resolveAgentProvisioningPolicy,
 } from "@fusion/core";
 import {
   getGhErrorMessage,
@@ -2525,9 +2526,24 @@ export default function kbExtension(pi: ExtensionAPI) {
       message_response_mode: Type.Optional(Type.Union([Type.Literal("immediate"), Type.Literal("on-heartbeat")])),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { AgentStore } = await import("@fusion/core");
+      const { AgentStore, ApprovalRequestStore } = await import("@fusion/core");
       const agentStore = new AgentStore({ rootDir: getFusionDir(ctx.cwd) });
       await agentStore.init();
+      const store = await getStore(ctx.cwd);
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_create",
+        caller: { id: "user", role: "user", isPrivileged: true },
+        settings: await store.getSettings(),
+      });
+
+      if (policy.decision === "require-approval") {
+        const approvalStore = new ApprovalRequestStore((store as unknown as { db: unknown }).db as never);
+        const request = approvalStore.create({
+          requester: { actorId: "user", actorType: "user", actorName: "CLI User" },
+          targetAction: { category: "agent_provisioning", action: "create", summary: `Create agent ${params.name} (${params.role})`, resourceType: "agent", resourceId: "", context: { tool: "fn_agent_create", params } },
+        });
+        return { content: [{ type: "text" as const, text: `Approval required. Request ${request.id} created.` }], details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode } };
+      }
 
       const runtimeConfig: Record<string, unknown> = {
         ...(params.heartbeat_interval_ms !== undefined ? { heartbeatIntervalMs: params.heartbeat_interval_ms } : {}),
@@ -2535,7 +2551,6 @@ export default function kbExtension(pi: ExtensionAPI) {
         ...(params.max_concurrent_runs !== undefined ? { maxConcurrentRuns: params.max_concurrent_runs } : {}),
         ...(params.message_response_mode !== undefined ? { messageResponseMode: params.message_response_mode } : {}),
       };
-
       const created = await agentStore.createAgent({
         name: params.name,
         role: params.role as never,
@@ -2548,7 +2563,7 @@ export default function kbExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text" as const, text: `Created agent ${created.name} (${created.id})` }],
-        details: { agent: created },
+        details: { outcome: "created", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agent: created, agentId: created.id },
       };
     },
   });
@@ -2565,11 +2580,30 @@ export default function kbExtension(pi: ExtensionAPI) {
       reassign_to: Type.Optional(Type.String({ description: "Optional replacement agent for assigned tasks" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { AgentStore } = await import("@fusion/core");
+      const { AgentStore, ApprovalRequestStore } = await import("@fusion/core");
       const agentStore = new AgentStore({ rootDir: getFusionDir(ctx.cwd) });
       await agentStore.init();
+      const store = await getStore(ctx.cwd);
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_delete",
+        caller: { id: "user", role: "user", isPrivileged: true },
+        settings: await store.getSettings(),
+      });
+
+      if (policy.decision === "require-approval") {
+        const approvalStore = new ApprovalRequestStore((store as unknown as { db: unknown }).db as never);
+        const request = approvalStore.create({
+          requester: { actorId: "user", actorType: "user", actorName: "CLI User" },
+          targetAction: { category: "agent_provisioning", action: "delete", summary: `Delete agent ${params.id}`, resourceType: "agent", resourceId: params.id, context: { tool: "fn_agent_delete", params } },
+        });
+        return { content: [{ type: "text" as const, text: `Approval required. Request ${request.id} created.` }], details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: params.id } };
+      }
+
       await agentStore.deleteAgent(params.id, { force: params.force === true, reassignTo: params.reassign_to });
-      return { content: [{ type: "text" as const, text: `Deleted ${params.id}` }], details: { agentId: params.id } };
+      return {
+        content: [{ type: "text" as const, text: `Deleted ${params.id}` }],
+        details: { outcome: "deleted", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: params.id },
+      };
     },
   });
 
