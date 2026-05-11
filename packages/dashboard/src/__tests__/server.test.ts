@@ -68,6 +68,11 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
       exec: vi.fn(),
       prepare: vi.fn().mockReturnValue({ run: vi.fn().mockReturnValue({ changes: 0 }), get: vi.fn(), all: vi.fn().mockReturnValue([]) }),
     }),
+    getDatabaseHealth: vi.fn().mockReturnValue({
+      corruptionDetected: false,
+      integrityCheckPending: false,
+      integrityCheckLastRunAt: null,
+    }),
     getMissionStore: vi.fn().mockReturnValue({
       listMissions: vi.fn().mockReturnValue([]),
       createMission: vi.fn(),
@@ -307,6 +312,36 @@ describe("createServer health and headless mode", () => {
       status: "ok",
       version: CLI_PACKAGE_VERSION,
       uptime: expect.any(Number),
+      database: {
+        corruptionDetected: false,
+        integrityCheckPending: false,
+        integrityCheckLastRunAt: null,
+      },
+    });
+  });
+
+  it("reports degraded status when database corruption is detected", async () => {
+    const store = createMockStore({
+      getDatabaseHealth: vi.fn().mockReturnValue({
+        corruptionDetected: true,
+        integrityCheckPending: false,
+        integrityCheckLastRunAt: "2026-05-11T10:00:00.000Z",
+      }),
+    });
+    const app = createServer(store);
+
+    const res = await GET(app, "/api/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      status: "degraded",
+      version: CLI_PACKAGE_VERSION,
+      uptime: expect.any(Number),
+      database: {
+        corruptionDetected: true,
+        integrityCheckPending: false,
+        integrityCheckLastRunAt: "2026-05-11T10:00:00.000Z",
+      },
     });
   });
 

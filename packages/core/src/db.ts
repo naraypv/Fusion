@@ -1081,9 +1081,13 @@ export class Database {
   /** Returns the database file path (or ":memory:" for in-memory databases). */
   get path(): string { return this.dbPath; }
   corruptionDetected = false;
+  integrityCheckPending = false;
+  integrityCheckLastRunAt: string | null = null;
   /** Tracks transaction nesting depth for savepoint-based nested transactions. */
   private transactionDepth = 0;
   private readonly _fts5Available: boolean;
+  private backgroundIntegrityTimer: ReturnType<typeof setTimeout> | null = null;
+  private integrityCheckScheduled = false;
 
 
   constructor(fusionDir: string, options?: { inMemory?: boolean }) {
@@ -1291,48 +1295,9 @@ export class Database {
    * and seed meta values.
    */
   init(): void {
-    // Startup integrity check — run BEFORE any writes to avoid
-    // compounding corruption. Attempts WAL checkpoint recovery on failure.
-    const integrity = this.integrityCheck();
-    if (!integrity.ok) {
-      this.corruptionDetected = true;
-      console.warn(`[fusion:db] Database integrity check FAILED for ${this.dbPath} — corruption detected`);
-      // Attempt WAL checkpoint recovery
-      try {
-        this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-        const recheck = this.integrityCheck();
-        if (recheck.ok) {
-          this.corruptionDetected = false;
-          console.warn(`[fusion:db] Database recovered via WAL checkpoint: ${this.dbPath}`);
-        } else {
-          const recheckMsg = ("errors" in recheck && Array.isArray(recheck.errors))
-            ? recheck.errors.slice(0, 3).join(" | ")
-            : "unknown";
-          console.error(
-            `[fusion:db] Database is corrupted and could not be auto-recovered. ` +
-            `Run: sqlite3 ${this.dbPath} ".recover" | sqlite3 ${this.dbPath}.recovered`,
-          );
-          throw new Error(
-            `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Integrity errors: ${recheckMsg}`,
-          );
-        }
-      } catch (err) {
-        // Re-throw our own abort error; wrap others
-        if (err instanceof Error && err.message.startsWith("[fusion:db] Refusing")) {
-          throw err;
-        }
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[fusion:db] Database corruption detected for ${this.dbPath} and checkpoint recovery failed: ${errMsg}. ` +
-          "Manual recovery required.",
-        );
-        throw new Error(
-          `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Recovery error: ${errMsg}`,
-        );
-      }
-    }
-
     this.db.exec(SCHEMA_SQL);
+
+    this.scheduleBackgroundIntegrityCheck();
 
     // Seed schemaVersion and lastModified idempotently
     this.db.exec(
@@ -3123,10 +3088,41 @@ export class Database {
     return { busy: row?.busy ?? 0, log: row?.log ?? 0, checkpointed: row?.checkpointed ?? 0 };
   }
 
+  private scheduleBackgroundIntegrityCheck(): void {
+    if (this.inMemory || this.integrityCheckScheduled) {
+      return;
+    }
+
+    this.integrityCheckScheduled = true;
+    this.integrityCheckPending = true;
+    this.backgroundIntegrityTimer = setTimeout(() => {
+      this.backgroundIntegrityTimer = null;
+      const integrity = this.integrityCheck();
+      this.integrityCheckPending = false;
+      this.integrityCheckLastRunAt = new Date().toISOString();
+
+      if (integrity.ok) {
+        this.corruptionDetected = false;
+        return;
+      }
+
+      this.corruptionDetected = true;
+      const errorSummary = integrity.errors.slice(0, 3).join(" | ");
+      console.error(
+        `[fusion:db] Background integrity check detected corruption for ${this.dbPath}: ${errorSummary}`,
+      );
+    }, 3000);
+  }
+
   /**
    * Close the database connection.
    */
   close(): void {
+    if (this.backgroundIntegrityTimer) {
+      clearTimeout(this.backgroundIntegrityTimer);
+      this.backgroundIntegrityTimer = null;
+      this.integrityCheckPending = false;
+    }
     this.db.close();
   }
 

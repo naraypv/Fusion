@@ -844,7 +844,8 @@ A `prefetchLazyViews()` function runs once on mount via `requestIdleCallback` to
 ### Health and monitoring endpoints
 - **Health check**: `GET /api/health`
   - Returns liveness status for load balancers and monitoring
-  - Response: `{ status: "ok", version: string, uptime: number }`
+  - Response: `{ status: "ok" | "degraded", version: string, uptime: number, database: { corruptionDetected: boolean, integrityCheckPending: boolean, integrityCheckLastRunAt: string | null } }`
+  - Startup does not block on full `PRAGMA integrity_check(100)`; Fusion schedules it in the background shortly after boot and surfaces progress/results via `database.*` fields
   - No authentication required
 
 ### Custom Provider endpoints

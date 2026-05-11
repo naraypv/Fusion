@@ -1052,10 +1052,12 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   app.get("/api/health", (_req, res) => {
+    const database = store.getDatabaseHealth();
     res.json({
-      status: "ok",
+      status: database.corruptionDetected ? "degraded" : "ok",
       version: cliPackageVersion,
       uptime: Math.floor(process.uptime()),
+      database,
     });
   });
 

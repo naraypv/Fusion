@@ -6948,6 +6948,18 @@ ${stepsSection}`;
     return this.db;
   }
 
+  getDatabaseHealth(): {
+    corruptionDetected: boolean;
+    integrityCheckPending: boolean;
+    integrityCheckLastRunAt: string | null;
+  } {
+    return {
+      corruptionDetected: this.db.corruptionDetected,
+      integrityCheckPending: this.db.integrityCheckPending,
+      integrityCheckLastRunAt: this.db.integrityCheckLastRunAt,
+    };
+  }
+
   getDistributedTaskIdAllocator(): DistributedTaskIdAllocator {
     if (!this.distributedTaskIdAllocator) {
       this.distributedTaskIdAllocator = createDistributedTaskIdAllocator(this.db);

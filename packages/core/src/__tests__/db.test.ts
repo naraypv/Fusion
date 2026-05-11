@@ -269,23 +269,52 @@ describe("Database", () => {
   });
 
   describe("startup integrity check", () => {
-    it("passes silently on a healthy database", () => {
-      // db was already init'd in beforeEach — no warning means pass
-      const result = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
-      expect(result.integrity_check).toBe("ok");
-    });
+    it("schedules full integrity check after init instead of blocking startup", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck");
 
-    it("init completes without throwing even on a fresh database", () => {
       const freshDir = makeTmpDir();
       const freshFusionDir = join(freshDir, ".fusion");
       const freshDb = new Database(freshFusionDir);
 
       try {
-        // init includes the integrity check — should not throw
         expect(() => freshDb.init()).not.toThrow();
+        expect(freshDb.integrityCheckPending).toBe(true);
+        expect(integritySpy).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+        expect(freshDb.integrityCheckPending).toBe(false);
+        expect(freshDb.integrityCheckLastRunAt).toBeTruthy();
       } finally {
         freshDb.close();
         rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not schedule duplicate background integrity checks across repeated init calls", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck");
+      const freshDir = makeTmpDir();
+      const freshFusionDir = join(freshDir, ".fusion");
+      const freshDb = new Database(freshFusionDir);
+
+      try {
+        freshDb.init();
+        expect(freshDb.integrityCheckPending).toBe(true);
+
+        freshDb.init();
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+      } finally {
+        freshDb.close();
+        rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
       }
     });
   });
@@ -656,14 +685,17 @@ describe("Database", () => {
       const diskDb = new Database(fusionDir);
       diskDb.init();
       expect(diskDb.corruptionDetected).toBe(false);
+      expect(diskDb.integrityCheckPending).toBe(true);
       diskDb.close();
     });
 
-    it("skips integrity check side effects for in-memory databases", () => {
+    it("skips background integrity check scheduling for in-memory databases", () => {
       const memDb = new Database(fusionDir, { inMemory: true });
       memDb.init();
       expect(memDb.integrityCheck()).toEqual({ ok: true });
       expect(memDb.corruptionDetected).toBe(false);
+      expect(memDb.integrityCheckPending).toBe(false);
+      expect(memDb.integrityCheckLastRunAt).toBeNull();
       memDb.close();
     });
   });
