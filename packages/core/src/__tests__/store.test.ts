@@ -963,6 +963,23 @@ describe("TaskStore", () => {
       expect(selected?.task.id).toBe(todo.id);
       expect(selected?.priority).toBe("todo");
     });
+
+    it("allows non-executor role agents to pick assigned todos when override metadata is set", async () => {
+      const delegated = await store.createTask({
+        description: "Assigned todo override",
+        column: "todo",
+        assignedAgentId: "agent-1",
+        source: { sourceType: "api", sourceMetadata: { executorRoleOverride: true } },
+      });
+
+      const selected = await store.selectNextTaskForAgent("agent-1", {
+        id: "agent-1",
+        role: "reviewer",
+      });
+
+      expect(selected?.task.id).toBe(delegated.id);
+      expect(selected?.priority).toBe("todo");
+    });
   });
 
   // ── Lock serialization test ──────────────────────────────────────

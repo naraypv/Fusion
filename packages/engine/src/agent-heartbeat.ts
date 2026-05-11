@@ -1491,10 +1491,13 @@ export class HeartbeatMonitor {
         if (!taskId) {
           inboxSelection = await taskStore.selectNextTaskForAgent(agentId, { id: agent.id, role: agent.role });
           if (inboxSelection && !canAgentTakeImplementationTask(agent, inboxSelection.task)) {
-            heartbeatLog.log(
-              `Agent ${agentId} (role=${agent.role}) skipped inbox-selected task ${inboxSelection.task.id} due to executor-role assignment policy`,
-            );
-            inboxSelection = null;
+            const hasRoleOverride = inboxSelection.task.sourceMetadata?.executorRoleOverride === true;
+            if (!hasRoleOverride) {
+              heartbeatLog.log(
+                `Agent ${agentId} (role=${agent.role}) skipped inbox-selected task ${inboxSelection.task.id} due to executor-role assignment policy`,
+              );
+              inboxSelection = null;
+            }
           }
           if (inboxSelection) {
             taskId = inboxSelection.task.id;

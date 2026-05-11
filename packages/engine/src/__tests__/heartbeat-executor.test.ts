@@ -1707,7 +1707,11 @@ describe("executeHeartbeat", () => {
   });
 
   describe("executeHeartbeat - inbox selection", () => {
-    const makeInboxSelection = (taskId: string, priority: "in_progress" | "todo" | "blocked" = "todo") => {
+    const makeInboxSelection = (
+      taskId: string,
+      priority: "in_progress" | "todo" | "blocked" = "todo",
+      sourceMetadata?: Record<string, unknown>,
+    ) => {
       const now = new Date().toISOString();
       return {
         task: {
@@ -1720,6 +1724,7 @@ describe("executeHeartbeat", () => {
           log: [],
           createdAt: now,
           updatedAt: now,
+          ...(sourceMetadata ? { sourceMetadata } : {}),
         },
         priority,
         reason: `selected:${priority}`,
@@ -1789,6 +1794,40 @@ describe("executeHeartbeat", () => {
 
       expect(selectNextTaskForAgent).not.toHaveBeenCalled();
       expect(mockTaskStore.getTask).toHaveBeenCalledWith("FN-EXISTING");
+    });
+
+    it("allows non-executor inbox selection when override metadata is present", async () => {
+      const store = createStoreWithAgentForExec({ taskId: undefined, role: "reviewer" });
+      const selectNextTaskForAgent = vi.fn().mockResolvedValue(
+        makeInboxSelection("FN-INBOX", "todo", { executorRoleOverride: true }),
+      );
+      mockTaskStore = createMockTaskStore({
+        selectNextTaskForAgent,
+        getTask: vi.fn().mockResolvedValue({
+          id: "FN-INBOX",
+          title: "Inbox Task",
+          description: "Inbox-selected task",
+          prompt: "",
+          steps: [],
+          column: "todo",
+          dependencies: [],
+          log: [],
+          attachments: [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          sourceMetadata: { executorRoleOverride: true },
+        } as unknown as TaskDetail),
+      });
+
+      const mockSession = createMockAgentSession();
+      mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });
+
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
+
+      expect(selectNextTaskForAgent).toHaveBeenCalledWith("agent-001", { id: "agent-001", role: "reviewer" });
+      expect(store.assignTask).toHaveBeenCalledWith("agent-001", "FN-INBOX", expect.objectContaining({ agentId: "agent-001" }));
+      expect(result.resultJson).toEqual(expect.objectContaining({ reason: "inbox_selected", taskId: "FN-INBOX" }));
     });
 
     it("when inbox returns null, heartbeat completes with no_assignment", async () => {

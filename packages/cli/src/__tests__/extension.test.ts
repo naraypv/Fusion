@@ -2007,6 +2007,14 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.isError).not.toBe(true);
       expect(result.details.agentId).toBe(reviewer.id);
+
+      const store = new TaskStore(tmpDir);
+      await store.init();
+      const task = await store.getTask(result.details.taskId);
+      expect(task.sourceMetadata).toMatchObject({ executorRoleOverride: true });
+
+      const selected = await store.selectNextTaskForAgent(reviewer.id, { id: reviewer.id, role: reviewer.role });
+      expect(selected?.task.id).toBe(task.id);
     });
 
     it("wires dependencies correctly", async () => {

@@ -256,6 +256,49 @@ describe("createDelegateTaskTool", () => {
     expect(taskStore.createTask).not.toHaveBeenCalled();
   });
 
+  it("rejects non-executor target without override", async () => {
+    const reviewer = createAgent({ id: "agent-002", name: "Rita", role: "reviewer" });
+    vi.mocked(agentStore.getAgent).mockResolvedValue(reviewer);
+
+    const tool = createDelegateTaskTool(agentStore, taskStore);
+    const result = await tool.execute("session-1", {
+      agent_id: "agent-002",
+      description: "Do something",
+    }, undefined as any, undefined as any, undefined as any);
+
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("ERROR: Agent agent-002 has role \"reviewer\"");
+    expect(text).toContain("Pass override=true to bypass");
+    expect(taskStore.createTask).not.toHaveBeenCalled();
+  });
+
+  it("allows non-executor target with override", async () => {
+    const reviewer = createAgent({ id: "agent-002", name: "Rita", role: "reviewer" });
+    vi.mocked(agentStore.getAgent).mockResolvedValue(reviewer);
+    vi.mocked(taskStore.createTask).mockResolvedValue({
+      id: "FN-054",
+      description: "Do something",
+      dependencies: [],
+      column: "todo" as const,
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const tool = createDelegateTaskTool(agentStore, taskStore);
+    await tool.execute("session-1", {
+      agent_id: "agent-002",
+      description: "Do something",
+      override: true,
+    }, undefined as any, undefined as any, undefined as any);
+
+    expect(taskStore.createTask).toHaveBeenCalledWith(expect.objectContaining({
+      source: { sourceType: "api", sourceMetadata: { executorRoleOverride: true } },
+    }), expect.objectContaining({ settings: { autoSummarizeTitles: false } }));
+  });
+
   it("passes dependencies through to task creation", async () => {
     const agent = createAgent({ id: "agent-001", name: "Bob" });
     vi.mocked(agentStore.getAgent).mockResolvedValue(agent);

@@ -12,7 +12,7 @@ import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, relative, resolve } from "node:path";
 import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings } from "@fusion/core";
-import { DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, extractAgentProvisioningRequest, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
+import { DASHBOARD_USER_ID, canAgentTakeImplementationTask, dailyMemoryPath, ensureOpenClawMemoryFiles, extractAgentProvisioningRequest, formatRoleMismatchReason, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
 import { ResearchStepRunner } from "./research-step-runner.js";
@@ -83,6 +83,7 @@ export const delegateTaskParams = Type.Object({
   dependencies: Type.Optional(
     Type.Array(Type.String(), { description: "Task IDs this new task depends on (e.g. [\"KB-001\"])" }),
   ),
+  override: Type.Optional(Type.Boolean({ description: "Set true to bypass executor-role assignment policy" })),
 });
 
 export const getAgentConfigParams = Type.Object({
@@ -1732,13 +1733,25 @@ export function createDelegateTaskTool(
         };
       }
 
+      const override = params.override === true;
+      const newTaskRef = { id: "<new>", column: "todo" } as const;
+      if (!override && !canAgentTakeImplementationTask(agent, { column: newTaskRef.column })) {
+        return {
+          content: [{ type: "text" as const, text: `ERROR: ${formatRoleMismatchReason(agent, newTaskRef)}` }],
+          details: {},
+        };
+      }
+
       // Create task assigned to the target agent
       const task = await createAgentTask(taskStore, {
         description: params.description,
         dependencies: params.dependencies,
         column: "todo",
         assignedAgentId: params.agent_id,
-        source: { sourceType: "api" },
+        source: {
+          sourceType: "api",
+          ...(override ? { sourceMetadata: { executorRoleOverride: true } } : {}),
+        },
       }, options);
 
       const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";

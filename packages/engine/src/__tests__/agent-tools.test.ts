@@ -164,6 +164,23 @@ describe("createDelegateTaskTool", () => {
     }));
   });
 
+  it("forwards override=true marker in source metadata", async () => {
+    const agentStore = {
+      getAgent: vi.fn().mockResolvedValue({ id: "agent-2", name: "Planner", role: "triage", state: "idle" }),
+    };
+    const taskStore = {
+      getSettings: vi.fn().mockResolvedValue({ autoSummarizeTitles: false }),
+      createTask: vi.fn().mockResolvedValue({ id: "FN-102", dependencies: [], description: "Delegated" }),
+    };
+
+    const tool = createDelegateTaskTool(agentStore as any, taskStore as any);
+    await tool.execute("call-1", { agent_id: "agent-2", description: "Delegated", override: true } as any, undefined, undefined, {} as any);
+
+    expect(taskStore.createTask).toHaveBeenCalledWith(expect.objectContaining({
+      source: { sourceType: "api", sourceMetadata: { executorRoleOverride: true } },
+    }), expect.any(Object));
+  });
+
   it("wires title summarization callback when rootDir is provided", async () => {
     const summarizeSpy = vi.spyOn(core, "summarizeTitle").mockResolvedValue("Short title");
     const agentStore = {

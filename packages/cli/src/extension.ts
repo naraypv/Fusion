@@ -2747,7 +2747,10 @@ export default function kbExtension(pi: ExtensionAPI) {
         dependencies: params.dependencies,
         column: "todo",
         assignedAgentId: params.agent_id,
-        source: { sourceType: "api" },
+        source: {
+          sourceType: "api",
+          ...(params.override === true ? { sourceMetadata: { executorRoleOverride: true } } : {}),
+        },
       });
 
       const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";

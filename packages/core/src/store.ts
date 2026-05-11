@@ -3029,6 +3029,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     agentId: string,
     agent?: Pick<Agent, "id" | "role">,
   ): Promise<InboxTask | null> {
+    const hasExecutorRoleOverride = (task: Task): boolean => task.sourceMetadata?.executorRoleOverride === true;
     const tasks = await this.listTasks({ slim: true });
     if (tasks.length === 0) {
       return null;
@@ -3056,7 +3057,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
     const roleCompatibleAssignedTasks = agent
       ? assignedTasks.filter((task) => {
-          if (task.column === "in-progress") {
+          if (task.column === "in-progress" || hasExecutorRoleOverride(task)) {
             return true;
           }
           return canAgentTakeImplementationTask(agent, task);
