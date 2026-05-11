@@ -700,6 +700,20 @@ Heartbeat runs are composed from multiple prompt layers so each wake has full id
 
 This structure ensures every run re-anchors on identity, wake reason, and current context before taking action.
 
+### Default Procedure: Bound-Task Scope Discipline
+
+The shipped default `HEARTBEAT_PROCEDURE` (in `packages/engine/src/agent-heartbeat.ts`) now requires bound-task classification on each tick: `executor-class`, `blocked`, or `coordination-class`.
+
+- `executor-class` = implementation work (code/tests/docs prose/build-lint-typecheck)
+- `blocked` = blockedBy/dependency/peer/external wait state
+- `coordination-class` = planning/triage/routing/decision/review work
+
+When the bound task is `executor-class` or `blocked`, the default procedure directs the run to pivot toward coordination levers (in-progress risk scan, stale in-review queue, idle direct reports, strategic memory themes) rather than trying to advance implementation from heartbeat. When the task is `coordination-class`, the heartbeat can engage directly with the bound task.
+
+This behavior is inherited by new non-ephemeral agents because agent creation seeds a per-agent `HEARTBEAT.md` file from the built-in default. If an agent sets `heartbeatProcedurePath`, that markdown file fully replaces the built-in default at runtime.
+
+For pre-existing agents, use `POST /api/agents/:id/upgrade-heartbeat-procedure` (also exposed as **Upgrade to Default Heartbeat Procedure** in the agent detail Config tab) to re-seed from the current built-in constant. When the built-in default changes, running this upgrade propagates the new default to existing agents; direct operator edits to an agent’s existing procedure file are preserved unless this upgrade is run (the upgrade overwrites the per-agent file).
+
 ### Manual / On-Demand Runs Are Autonomous Heartbeats
 
 `POST /api/agents/:id/runs` with `source: "on_demand"` executes the same autonomous heartbeat flow as timer/assignment triggers. It is **not** a mailbox-only poll.

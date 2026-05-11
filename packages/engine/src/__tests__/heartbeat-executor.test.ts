@@ -1257,6 +1257,7 @@ describe("executeHeartbeat", () => {
       expect(executionPrompt).toContain("wake reason: message_received");
       expect(executionPrompt).toContain("autonomous heartbeat run");
       expect(executionPrompt).toContain(HEARTBEAT_PROCEDURE);
+      expect(executionPrompt).toContain("do not re-read PROMPT.md to advance it");
     });
 
     it("substitutes per-agent heartbeatProcedurePath content for the default procedure", async () => {
@@ -1977,11 +1978,26 @@ describe("executeHeartbeat", () => {
       expect(HEARTBEAT_NO_TASK_PROCEDURE.indexOf("**Inbox**")).toBeLessThan(HEARTBEAT_NO_TASK_PROCEDURE.indexOf("**Wake delta**"));
     });
 
-    it("both heartbeat procedures include scope-classification guidance", () => {
-      expect(HEARTBEAT_PROCEDURE).toContain("Classify scope before acting");
-      expect(HEARTBEAT_PROCEDURE).toContain("Out-of-scope discovery");
-      expect(HEARTBEAT_NO_TASK_PROCEDURE).toContain("Classify scope before acting");
-      expect(HEARTBEAT_NO_TASK_PROCEDURE).toContain("Implementation-scope discovery");
+    it("heartbeat procedures include scope-discipline guidance", () => {
+      expect(HEARTBEAT_PROCEDURE).toContain("executor-class");
+      expect(HEARTBEAT_PROCEDURE).toContain("blocked");
+      expect(HEARTBEAT_PROCEDURE).toContain("coordination-class");
+      expect(HEARTBEAT_PROCEDURE).toContain("do not re-read PROMPT.md to advance it");
+      expect(HEARTBEAT_PROCEDURE).toContain("avoid re-planning it");
+
+      const inboxIndex = HEARTBEAT_PROCEDURE.indexOf("**Inbox**");
+      const wakeDeltaIndex = HEARTBEAT_PROCEDURE.indexOf("**Wake delta**");
+      const classifyIndex = HEARTBEAT_PROCEDURE.indexOf("**Classify the bound task**");
+      const selfCheckIndex = HEARTBEAT_PROCEDURE.indexOf("**Per-tick self-check**");
+      const exitIndex = HEARTBEAT_PROCEDURE.indexOf("fn_heartbeat_done");
+      expect(classifyIndex).toBeGreaterThan(inboxIndex);
+      expect(classifyIndex).toBeGreaterThan(wakeDeltaIndex);
+      expect(selfCheckIndex).toBeGreaterThan(classifyIndex);
+      expect(selfCheckIndex).toBeLessThan(exitIndex);
+
+      expect(HEARTBEAT_NO_TASK_PROCEDURE).toContain("coordination-class");
+      expect(HEARTBEAT_NO_TASK_PROCEDURE).not.toContain("executor-class");
+      expect(HEARTBEAT_NO_TASK_PROCEDURE).not.toContain("do not re-read PROMPT.md to advance it");
     });
 
     it("no-task system prompt processing messages section does not reference fn_task_log", () => {

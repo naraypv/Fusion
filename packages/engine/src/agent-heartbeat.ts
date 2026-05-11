@@ -408,20 +408,31 @@ export const HEARTBEAT_PROCEDURE = `## Heartbeat Procedure (run every tick, in o
 3. **Wake delta** — read the Wake Delta block above. The wake reason is the
    highest-priority change for this heartbeat. If you were woken by a comment
    or a message, acknowledge it before doing anything else.
-4. **Assignment review** — if you have an assigned task, re-read its current
-   description, latest comments, and any task documents. Decide whether the
-   prior plan is still valid given the wake delta. Do not assume yesterday's
-   plan is still correct.
-5. **Classify scope before acting** — label the next action as either:
-   - **In-scope execution:** directly advances the assigned task's current
-     acceptance criteria.
-   - **Out-of-scope discovery:** useful but separate work; capture it as a
-     focused follow-up task instead of expanding the current task silently.
-6. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
+4. **Classify the bound task** — if you have an assigned task, classify it as
+   exactly one of:
+   - **executor-class** — implementation work: writing code, tests,
+     documentation prose, or running build/lint/typecheck.
+   - **blocked** — task has blockedBy set, or is waiting on a peer / dependency
+     / external input.
+   - **coordination-class** — planning, triage, routing, decision-making, or
+     review.
+   Then branch:
+   - If the bound task is **executor-class** or **blocked**, skim it once for
+     blocker risk, do not re-read PROMPT.md to advance it, and pivot this
+     heartbeat to broader board signals (in-progress risk scan, stale in-review
+     queue, idle direct reports, and strategic themes in memory). Inbox is
+     already handled in step 2.
+   - If the bound task is **coordination-class**, engage directly with the
+     bound task.
+5. **Pick the next concrete action** — exactly ONE useful action this heartbeat:
    advance the task, create a follow-up, log findings, delegate, or update
    memory. Don't stop at planning unless the task is a planning task.
-7. **Persist progress** — fn_task_log for observations, fn_task_document_write
+6. **Persist progress** — fn_task_log for observations, fn_task_document_write
    for durable findings, status updates only when the work warrants it.
+7. **Per-tick self-check** — before exiting, verify all three:
+   - Was the inbox processed?
+   - Is the chosen action on a coordination-shaped lever?
+   - If the bound task was executor-class, did I avoid re-planning it?
 8. **Exit** — call fn_heartbeat_done with a one-line summary of what changed
    this tick. If you took no action, say so and explain why.
 
@@ -447,7 +458,8 @@ export const HEARTBEAT_NO_TASK_PROCEDURE = `## Heartbeat Procedure (run every ti
    highest-priority change for this heartbeat. If you were woken by a comment
    or a message, acknowledge it before doing anything else.
 4. **Ambient review** — since you have no assigned task, review board/project
-   signals and recent memory context before acting.
+   signals and recent memory context before acting. No-task heartbeat runs are
+   inherently coordination-class because no bound task exists to classify.
 5. **Classify scope before acting** — label the next action as either:
    - **Board-scope execution:** work that can be completed now with ambient
      tools (coordination, delegation, messaging, memory updates).
