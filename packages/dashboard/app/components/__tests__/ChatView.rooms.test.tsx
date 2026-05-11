@@ -190,6 +190,29 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
     await waitFor(() => {
       expect(sendRoomMessage).toHaveBeenCalledWith("Hello room");
     });
+    await waitFor(() => {
+      expect((textarea as HTMLTextAreaElement).value).toBe("");
+    });
+  });
+
+  it("keeps room composer text and toasts once when room send fails", async () => {
+    const addToast = vi.fn();
+    const sendRoomMessage = vi.fn().mockRejectedValue(new Error("Room backend failed"));
+    setup({}, { sendRoomMessage, activeRoom: roomA });
+
+    render(<ChatView projectId="proj-123" addToast={addToast} experimentalFeatures={{ chatRooms: true }} />);
+
+    const textarea = screen.getByTestId("chat-input");
+    await userEvent.type(textarea, "Will retry{enter}");
+
+    await waitFor(() => {
+      expect(sendRoomMessage).toHaveBeenCalledWith("Will retry");
+    });
+    await waitFor(() => {
+      expect((textarea as HTMLTextAreaElement).value).toBe("Will retry");
+    });
+    expect(addToast).toHaveBeenCalledTimes(1);
+    expect(addToast).toHaveBeenCalledWith("Room backend failed", "error");
   });
 
   it("supports delete-room confirm/cancel and rerenders messages from hook state", async () => {
@@ -328,16 +351,18 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
 
   it("keeps direct mode behavior unchanged when rooms are enabled", async () => {
     localStorage.setItem("fusion:chat-scope", "direct");
+    const addToast = vi.fn();
     const sendMessage = vi.fn();
-    const sendRoomMessage = vi.fn();
+    const sendRoomMessage = vi.fn().mockRejectedValue(new Error("Room backend failed"));
     setup({ sendMessage }, { sendRoomMessage, activeRoom: roomA });
 
-    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+    render(<ChatView projectId="proj-123" addToast={addToast} experimentalFeatures={{ chatRooms: true }} />);
 
     const textarea = screen.getByTestId("chat-input");
     await userEvent.type(textarea, "Direct hello{enter}");
 
     expect(sendMessage).toHaveBeenCalledWith("Direct hello", []);
     expect(sendRoomMessage).not.toHaveBeenCalled();
+    expect(addToast).not.toHaveBeenCalled();
   });
 });

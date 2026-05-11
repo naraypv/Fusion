@@ -66,8 +66,6 @@ For a full walkthrough (installation, onboarding, first task, and daily workflow
 | [Reports Plugin](./plugins/reports.md) | Reports plugin rendering, export, standalone HTML generation, and section configuration |
 | [Even Realities Plugin API](./even-realities-plugin-api.md) | Even Realities plugin API endpoint reference and test coverage matrix |
 | [Memory Plugin Contract](./memory-plugin-contract.md) | Pluggable memory backend architecture, interface contract, and migration strategy |
-| [CLI Printing Press Design](./design/cli-printing-press-plugin.md) | Fusion integration architecture for the CLI printing press plugin (FN-3762) |
-| [CLI Printing Press Research](./research/cli-printing-press.md) | Upstream architecture and integration research for the CLI printing press generator (FN-3761) |
 
 ### Audit Reports
 | Report | Description |

@@ -1314,13 +1314,21 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
       if (!rooms.activeRoom) {
         return;
       }
-      await rooms.sendRoomMessage(trimmed);
-      clearComposerState();
+
+      try {
+        await rooms.sendRoomMessage(trimmed);
+        clearComposerState();
+      } catch (error) {
+        const message = error instanceof Error && error.message.trim()
+          ? error.message
+          : "Failed to send room message";
+        addToast(message, "error");
+      }
       return;
     }
 
     handleSend();
-  }, [messageInput, chatRoomsEnabled, chatScope, rooms, handleSend]);
+  }, [messageInput, chatRoomsEnabled, chatScope, rooms, clearComposerState, addToast, handleSend]);
 
   const handleSkillSelect = useCallback(
     (skill: DiscoveredSkill) => {

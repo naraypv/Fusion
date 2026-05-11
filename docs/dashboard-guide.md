@@ -113,14 +113,15 @@ Chat Rooms are project-scoped group conversations for multiple agents. They are 
 - Each room row includes a trash action (`aria-label="Delete room {name}"`, `data-testid="chat-room-delete-{slug}"`) that opens a **Delete Room?** confirmation dialog with **Cancel** and **Delete** actions.
 - Confirming delete calls `rooms.deleteRoom(roomId)` and permanently removes the room and its messages ("This action cannot be undone. This room and all its messages will be permanently deleted."); failures surface a `Failed to delete room` toast.
 - Selecting a room opens the room thread pane with loading and empty states, then renders room messages from `rooms.messages` as `ChatMessageInfo` entries in the same thread UI used for direct Chat.
-- Submitting the room composer calls `rooms.sendRoomMessage(...)`, which posts the user message to `POST /api/chat/rooms/:id/messages`.
-- After a successful room send, the room composer is cleared (matching direct-chat composer behavior) so stale text is not left in the input.
+- Submitting the room composer calls `rooms.sendRoomMessage(...)`, which immediately inserts a temporary local user message and then posts to `POST /api/chat/rooms/:id/messages`.
+- On successful room send, the optimistic message is reconciled with persisted server data, the transcript is refreshed to authoritative history, and the composer clears (matching direct-chat clear-on-success behavior).
 - On mobile, room threads use the same keyboard-aware thread anchoring as direct chat, keeping the composer pinned above the soft keyboard while typing.
 - The dashboard backend now orchestrates room responders on that POST: mentioned members are routed as direct responders, additional ambient members may reply (up to the room ambient responder cap), and each assistant reply is persisted with `senderAgentId` via `chatStore.addRoomMessage(...)`.
 - If room replies cannot be generated (for example no resolvable responders or all responders fail), the POST fails with an API error (HTTP 502) instead of silently returning only the user message.
 - If room responders cannot be resolved or all room-reply generations fail, the POST now returns an error instead of silently succeeding with only the user message, so failures are surfaced deterministically.
 - Room responder prompt construction now includes a bounded recent room transcript (role, sender label, timestamp, content) plus an explicit latest-user-message marker, so replies stay thread-aware without unbounded prompt growth.
-- The UI still avoids optimistic room echo; after `POST /api/chat/rooms/:id/messages`, it immediately re-fetches authoritative room messages to surface persisted user/assistant replies even if SSE delivery is delayed, and it continues to apply `chat:room:message:*` SSE updates for live fan-out.
+- On send failure, `useChatRooms` rolls back/reconciles optimistic state and rethrows; `ChatView` catches once, preserves composer text for retry/edit, and surfaces a single error toast (no duplicate hook+view notifications).
+- After each send attempt, the room transcript still re-fetches authoritative messages so persisted user/assistant replies remain visible even when SSE delivery is delayed, and `chat:room:message:*` SSE updates continue live fan-out.
 - Relationship summary: direct Chat runs one target (agent or model) per session; rooms are shared threads with multiple agent members and now use the same message contract as direct Chat; Quick Chat stays a floating single-target panel and does not host rooms.
 - For backend details, see the [Chat Room REST API reference](./architecture.md#real-time-channels) and the [chat room storage schema (`chat_rooms`, `chat_room_members`, `chat_room_messages`)](./storage.md#chat-rooms-migration-70).
 

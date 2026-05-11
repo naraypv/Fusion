@@ -182,7 +182,7 @@ describe("useChatRooms", () => {
     expect(result.current.activeRoom).toBeNull();
   });
 
-  it("sendRoomMessage resyncs room messages from server after post", async () => {
+  it("sendRoomMessage inserts optimistic temp message and reconciles to server transcript", async () => {
     const active = room("room-1", "one", "2026-05-09T01:00:00.000Z");
     mockFetchChatRooms.mockResolvedValueOnce({ rooms: [active] });
     const { result } = renderHook(() => useChatRooms("proj-1"));
@@ -193,6 +193,12 @@ describe("useChatRooms", () => {
     act(() => result.current.selectRoom("room-1"));
     await waitFor(() => expect(result.current.activeRoom?.id).toBe("room-1"));
 
+    let resolvePost: ((value: { message: ChatRoomMessage }) => void) | undefined;
+    const postPromise = new Promise<{ message: ChatRoomMessage }>((resolve) => {
+      resolvePost = resolve;
+    });
+    mockPostChatRoomMessage.mockReturnValueOnce(postPromise);
+
     mockFetchChatRoomMessages.mockResolvedValueOnce({
       messages: [
         roomMessage("msg-user", "room-1", "hello"),
@@ -200,13 +206,45 @@ describe("useChatRooms", () => {
       ],
     });
 
+    let sendPromise!: Promise<void>;
     await act(async () => {
-      await result.current.sendRoomMessage("hello");
+      sendPromise = result.current.sendRoomMessage("hello");
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0]?.id.startsWith("temp-")).toBe(true);
+    expect(result.current.messages[0]?.content).toBe("hello");
+
+    resolvePost?.({ message: roomMessage("msg-user", "room-1", "hello") });
+
+    await act(async () => {
+      await sendPromise;
     });
 
     expect(mockPostChatRoomMessage).toHaveBeenCalledWith("room-1", { content: "hello" }, "proj-1");
     expect(mockFetchChatRoomMessages).toHaveBeenLastCalledWith("room-1", { limit: 100 }, "proj-1");
     expect(result.current.messages.map((message) => message.id)).toEqual(["msg-user", "msg-assistant"]);
+  });
+
+  it("rolls back optimistic temp message when post fails and transcript refresh fails", async () => {
+    const active = room("room-1", "one", "2026-05-09T01:00:00.000Z");
+    mockFetchChatRooms.mockResolvedValueOnce({ rooms: [active] });
+    const { result } = renderHook(() => useChatRooms("proj-1"));
+    await waitFor(() => expect(result.current.rooms.length).toBe(1));
+
+    mockFetchChatRoomMembers.mockResolvedValueOnce({ members: [] });
+    mockFetchChatRoomMessages.mockResolvedValueOnce({ messages: [] });
+    act(() => result.current.selectRoom("room-1"));
+    await waitFor(() => expect(result.current.activeRoom?.id).toBe("room-1"));
+
+    mockPostChatRoomMessage.mockRejectedValueOnce(new Error("POST failed"));
+    mockFetchChatRoomMessages.mockRejectedValueOnce(new Error("refresh failed"));
+
+    await act(async () => {
+      await expect(result.current.sendRoomMessage("hello")).rejects.toThrow("POST failed");
+    });
+
+    expect(result.current.messages).toEqual([]);
   });
 
   it("refreshes persisted room messages even when room reply generation fails", async () => {

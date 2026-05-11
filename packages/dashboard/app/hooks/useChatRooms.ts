@@ -48,6 +48,20 @@ function parseSsePayload<T>(event: MessageEvent): T | null {
   }
 }
 
+function createOptimisticRoomMessage(roomId: string, content: string): ChatRoomMessage {
+  return {
+    id: `temp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    roomId,
+    role: "user",
+    content,
+    thinkingOutput: null,
+    metadata: null,
+    senderAgentId: null,
+    mentions: [],
+    createdAt: new Date().toISOString(),
+  };
+}
+
 export function useChatRooms(
   projectId?: string,
   addToast?: (msg: string, type?: "success" | "error" | "warning") => void,
@@ -174,6 +188,11 @@ export function useChatRooms(
       throw new Error("Select a room before sending a message");
     }
 
+    const optimisticMessage = createOptimisticRoomMessage(roomId, content);
+    if (activeRoomRef.current?.id === roomId) {
+      setMessages((previous) => [...previous, optimisticMessage]);
+    }
+
     try {
       const postResult = await postChatRoomMessage(roomId, {
         content,
@@ -182,6 +201,11 @@ export function useChatRooms(
 
       if (postResult.message?.createdAt && activeRoomSnapshot) {
         setRooms((previous) => upsertRoom(previous, { ...activeRoomSnapshot, updatedAt: postResult.message.createdAt }));
+      }
+
+      if (activeRoomRef.current?.id === roomId) {
+        setMessages((previous) => previous.map((message) =>
+          message.id === optimisticMessage.id ? postResult.message : message));
       }
 
       const latestMessages = await fetchChatRoomMessages(roomId, { limit: 100 }, projectId);
@@ -196,7 +220,9 @@ export function useChatRooms(
           setMessages(latestMessages.messages);
         }
       } catch {
-        // Ignore refresh failures and preserve the original error.
+        if (activeRoomRef.current?.id === roomId) {
+          setMessages((previous) => previous.filter((message) => message.id !== optimisticMessage.id));
+        }
       }
       throw error;
     }
@@ -275,6 +301,19 @@ export function useChatRooms(
             if (previous.some((candidate) => candidate.id === message.id)) {
               return previous;
             }
+
+            if (message.role === "user") {
+              const optimisticIndex = previous.findIndex((candidate) =>
+                candidate.role === "user"
+                && candidate.id.startsWith("temp-")
+                && candidate.content.trim() === message.content.trim());
+              if (optimisticIndex >= 0) {
+                const next = [...previous];
+                next[optimisticIndex] = message;
+                return next;
+              }
+            }
+
             return [...previous, message];
           });
         },
