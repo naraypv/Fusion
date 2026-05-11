@@ -32,10 +32,15 @@ describe("TaskStore.listTasksModifiedSince", () => {
     }
   });
 
-  async function createTaskWithUpdatedAt(id: string, updatedAt: string, column: "todo" | "archived" = "todo") {
+  async function createTaskWithUpdatedAt(
+    id: string,
+    updatedAt: string,
+    column: "todo" | "archived" = "todo",
+    applyDefaultWorkflowSteps = false,
+  ) {
     return store.createTaskWithReservedId(
       { description: `Task ${id}`, column },
-      { taskId: id, createdAt: updatedAt, updatedAt },
+      { taskId: id, createdAt: updatedAt, updatedAt, applyDefaultWorkflowSteps },
     );
   }
 
@@ -72,19 +77,36 @@ describe("TaskStore.listTasksModifiedSince", () => {
     expect(exact.hasMore).toBe(false);
   });
 
-  it("uses default limit 50 and clamps above max to 200", { timeout: 30_000 }, async () => {
-    for (let i = 1; i <= 220; i += 1) {
-      const padded = i.toString().padStart(3, "0");
-      await createTaskWithUpdatedAt(`FN-${i}`, `2026-01-01T00:00:00.${padded}Z`);
-    }
+  describe("limit defaults and clamping", () => {
+    beforeEach(() => {
+      const db = (store as unknown as {
+        db: {
+          prepare: (sql: string) => { run: (...params: unknown[]) => unknown };
+          transaction: <TReturn>(fn: () => TReturn) => TReturn;
+        };
+      }).db;
+      const insertTask = db.prepare(
+        'INSERT INTO tasks (id, description, "column", createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)',
+      );
+      db.transaction(() => {
+        for (let i = 1; i <= 220; i += 1) {
+          const padded = i.toString().padStart(3, "0");
+          const id = `FN-${i}`;
+          const updatedAt = `2026-01-01T00:00:00.${padded}Z`;
+          insertTask.run(id, `Task ${id}`, "todo", updatedAt, updatedAt);
+        }
+      });
+    });
 
-    const defaultLimited = await store.listTasksModifiedSince("2026-01-01T00:00:00.000Z", Number.NaN);
-    expect(defaultLimited.tasks).toHaveLength(50);
-    expect(defaultLimited.hasMore).toBe(true);
+    it("uses default limit 50 and clamps above max to 200", async () => {
+      const defaultLimited = await store.listTasksModifiedSince("2026-01-01T00:00:00.000Z", Number.NaN);
+      expect(defaultLimited.tasks).toHaveLength(50);
+      expect(defaultLimited.hasMore).toBe(true);
 
-    const maxLimited = await store.listTasksModifiedSince("2026-01-01T00:00:00.000Z", 1000);
-    expect(maxLimited.tasks).toHaveLength(200);
-    expect(maxLimited.hasMore).toBe(true);
+      const maxLimited = await store.listTasksModifiedSince("2026-01-01T00:00:00.000Z", 1000);
+      expect(maxLimited.tasks).toHaveLength(200);
+      expect(maxLimited.hasMore).toBe(true);
+    });
   });
 
   it.each([0, -5])("clamps limit below 1 to 1 (limit=%s)", async (limit) => {
