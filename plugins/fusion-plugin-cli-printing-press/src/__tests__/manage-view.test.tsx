@@ -10,6 +10,9 @@ vi.mock("lucide-react", () => ({
   Pencil: () => null,
   RefreshCw: () => null,
   Trash2: () => null,
+  Play: () => null,
+  CheckCircle2: () => null,
+  AlertTriangle: () => null,
 }));
 
 function makeDraft(id: string, name = "Demo"): ServiceDraft {
@@ -58,7 +61,8 @@ describe("CliPrintingPressManageView", () => {
       if (method === "GET" && url.endsWith(`/drafts/${draft2.id}`)) return { ok: true, json: async () => draft2 };
       if (method === "PUT" && url.endsWith(`/drafts/${draft1.id}`)) return { ok: true, json: async () => updated };
       if (method === "POST" && url.endsWith(`/drafts/${draft1.id}/regenerate`)) {
-        return { ok: true, json: async () => ({ draft: { ...updated, regeneratedAt: new Date().toISOString() }, stub: true, message: "Regenerate stub — full generation lands in FN-3765/FN-3767" }) };
+        const generatedAt = new Date().toISOString();
+        return { ok: true, json: async () => ({ draft: { ...updated, regeneratedAt: generatedAt, generatedAt, artifactPath: "/tmp/demo.mjs" }, artifact: { draftId: draft1.id, slug: draft1.slug, binPath: "/tmp/demo.mjs", entrypoint: "node", generatedAt } }) };
       }
       if (method === "DELETE" && url.endsWith(`/drafts/${draft1.id}`)) return { ok: true, status: 204, json: async () => ({}) };
       return { ok: false, status: 404, json: async () => ({ error: "Not found" }) };
@@ -85,8 +89,8 @@ describe("CliPrintingPressManageView", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining(`/drafts/${draft1.id}`), expect.objectContaining({ method: "PUT" })));
 
-    await user.click(screen.getByRole("button", { name: /Regenerate/i }));
-    expect(await screen.findByText(/Regenerate stub/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /^Regenerate$/i }));
+    expect(await screen.findByText(/Regenerated at/i)).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /Delete/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining(`/drafts/${draft1.id}`), expect.objectContaining({ method: "DELETE" })));

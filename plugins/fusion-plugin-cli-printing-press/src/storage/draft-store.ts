@@ -24,6 +24,10 @@ function mergeDraft(existing: ServiceDraft, patch: Partial<ServiceDraft>): Servi
   };
 }
 
+export function getArtifactDir(id: string, projectRoot: string): string {
+  return join(projectRoot, ".fusion", "plugins", "cli-printing-press", "generated", id);
+}
+
 export function createDraftStore({ rootDir }: { rootDir: string }) {
   const draftsDir = join(rootDir, ".fusion", "plugins", "cli-printing-press", "drafts");
 

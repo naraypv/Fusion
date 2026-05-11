@@ -26,6 +26,8 @@ export interface ServiceDraft {
   createdAt: string;
   updatedAt: string;
   regeneratedAt?: string;
+  generatedAt?: string;
+  artifactPath?: string;
 }
 
 export type WizardStep = "basics" | "transport" | "endpoints" | "credentials" | "review";

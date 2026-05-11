@@ -47,7 +47,7 @@ describe("wizard routes", () => {
 
     const regenRes = await route("POST", "/drafts/:id/regenerate").handler({ params: { id } }, ctx);
     expect(regenRes.status).toBe(200);
-    expect((regenRes.body as { stub: boolean }).stub).toBe(true);
+    expect((regenRes.body as { artifact?: { binPath: string } }).artifact?.binPath).toBeTruthy();
 
     const missingRegenRes = await route("POST", "/drafts/:id/regenerate").handler({ params: { id: "missing" } }, ctx);
     expect(missingRegenRes.status).toBe(404);

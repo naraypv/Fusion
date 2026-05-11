@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import type { GeneratedCliArtifact } from "../generation/types.js";
 import type { ServiceDraft } from "../wizard/types.js";
 
 export interface DraftListItem {
@@ -57,10 +58,10 @@ export function useDrafts() {
     return await response.json() as ServiceDraft;
   }, []);
 
-  const regenerateDraft = useCallback(async (id: string): Promise<{ draft: ServiceDraft; stub: boolean; message: string }> => {
+  const regenerateDraft = useCallback(async (id: string): Promise<{ draft: ServiceDraft; artifact: GeneratedCliArtifact }> => {
     const response = await fetch(`${BASE_PATH}/${id}/regenerate`, { method: "POST" });
     if (!response.ok) throw new Error(await parseError(response, "Failed to regenerate draft"));
-    return await response.json() as { draft: ServiceDraft; stub: boolean; message: string };
+    return await response.json() as { draft: ServiceDraft; artifact: GeneratedCliArtifact };
   }, []);
 
   const deleteDraft = useCallback(async (id: string): Promise<void> => {

@@ -34,3 +34,4 @@ const plugin = definePlugin({
 export default plugin;
 export { CliPrintingPressWizardView } from "./dashboard-view.js";
 export { CliPrintingPressManageView } from "./manage-view.js";
+export { CliPrintingPressTestRunner } from "./run/TestRunnerPanel.js";

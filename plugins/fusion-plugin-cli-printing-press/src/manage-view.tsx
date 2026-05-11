@@ -3,6 +3,7 @@ import { List, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { EditDraftModal } from "./manage/EditDraftModal.js";
 import { useDrafts } from "./manage/useDrafts.js";
+import { CliPrintingPressTestRunner } from "./run/TestRunnerPanel.js";
 import type { ServiceDraft } from "./wizard/types.js";
 import "./manage-view.css";
 
@@ -45,7 +46,7 @@ export function CliPrintingPressManageView({ context: _context }: { context?: Pl
     try {
       const response = await regenerateDraft(selectedId);
       setSelectedDraft(response.draft);
-      setStatusMessage(response.message);
+      setStatusMessage(`Regenerated at ${new Date(response.artifact.generatedAt).toLocaleString()}`);
       await refresh();
     } catch (err) {
       setStatusMessage(err instanceof Error ? err.message : "Failed to regenerate draft");
@@ -107,6 +108,7 @@ export function CliPrintingPressManageView({ context: _context }: { context?: Pl
                   <button className="btn" onClick={() => void onRegenerate()}><RefreshCw /> Regenerate</button>
                   <button className="btn btn-danger" onClick={() => void onDelete()}><Trash2 /> Delete</button>
                 </div>
+                <CliPrintingPressTestRunner draftId={selectedDraft.id} draft={selectedDraft} />
               </>
             ) : <p>Select a draft to inspect details.</p>}
           </div>
