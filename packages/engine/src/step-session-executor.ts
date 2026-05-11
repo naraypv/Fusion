@@ -115,6 +115,8 @@ export interface StepSessionExecutorOptions {
   actionGateContext?: AgentActionGateContext;
   /** Optional permanent-agent action gating context. */
   permanentAgentGating?: PermanentAgentGatingContext;
+  /** Task-scoped environment injected into non-git subprocesses. */
+  taskEnv?: NodeJS.ProcessEnv;
 }
 
 // ── File Scope Extraction ─────────────────────────────────────────────
@@ -1283,7 +1285,7 @@ Follow instructions precisely and avoid unrelated changes.`,
       // Remove any partial directory left behind so the invariant holds:
       // "if .worktrees/<slug> exists on disk, it is a fully registered git worktree."
       try {
-        await execAsync(`rm -rf "${worktreePath}"`, { cwd: rootDir });
+        await execAsync(`rm -rf "${worktreePath}"`, { cwd: rootDir, env: this.options.taskEnv });
       } catch {
         // best-effort cleanup; log but don't mask the original error
         stepExecLog.log(`Warning: failed to remove partial worktree directory after creation failure: ${worktreePath}`);

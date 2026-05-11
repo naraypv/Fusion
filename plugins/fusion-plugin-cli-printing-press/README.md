@@ -54,3 +54,19 @@ Generated artifacts are expected under:
 ### Deletions and filesystem cleanup
 
 `deleteService`, `deleteSpec`, and `deleteArtifact` remove DB records. v1 intentionally does **not** remove artifact files from disk; cleanup is deferred to **FN-3767**.
+
+## Executor Runtime Exposure
+
+When the plugin contributes `executorRuntimeEnv`, executor-spawned task commands receive extra runtime wiring:
+
+- Generated CLI artifact directories for each service's latest `generated` spec are prepended to task `PATH` (deduped, absolute paths only).
+- Credentials with `kind: "env_var"` are decoded and injected as environment variables for task subprocesses.
+- Non-env credential kinds (`header`, `query_param`, `basic_auth`, `bearer_token`, `api_key`) are intentionally excluded from env injection and remain request-time concerns.
+
+Security model:
+
+- Runtime env is merged per task (`process.env` base, plugin env overlay, PATH prepend), without mutating global engine `process.env`.
+- Secrets are never logged; executor diagnostics only report counts of injected keys/paths.
+- OAuth credentials are rejected defensively if encountered.
+
+To opt out for a service, remove generated artifacts or env-var credentials in the FN-3766-backed service configuration model.

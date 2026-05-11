@@ -1226,6 +1226,7 @@ describe("Executor verification gate (FN-3345)", () => {
       undefined,
       expect.anything(),
       "executor",
+      expect.any(Object),
     );
     // Task should move to in-review
     expect(store.moveTask).toHaveBeenCalledWith("FN-3345", "in-review");
@@ -1402,6 +1403,7 @@ describe("Executor verification gate (FN-3345)", () => {
       undefined,
       expect.anything(),
       "executor",
+      expect.any(Object),
     );
     // Third call should be build
     expect(mockedVerification).toHaveBeenNthCalledWith(
@@ -1414,6 +1416,7 @@ describe("Executor verification gate (FN-3345)", () => {
       undefined,
       expect.anything(),
       "executor",
+      expect.any(Object),
     );
     // Task should move to in-review
     expect(store.moveTask).toHaveBeenCalledWith("FN-3345", "in-review");

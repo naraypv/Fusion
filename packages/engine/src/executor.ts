@@ -2,7 +2,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
-import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent } from "@fusion/core";
@@ -172,6 +172,7 @@ async function runConfiguredCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<RunCommandResult> {
   try {
     const { stdout, stderr } = await execAsync(command, {
@@ -179,6 +180,7 @@ async function runConfiguredCommand(
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
       encoding: "utf-8",
+      ...(extraEnv !== undefined && { env: extraEnv }),
     });
 
     return {
@@ -1914,7 +1916,7 @@ export class TaskExecutor {
           if (await this.shouldDeferCompletionForGlobalPause(task.id, "before workflow steps during completed-task recovery")) {
             return false;
           }
-          const workflowResult = await this.runWorkflowSteps(task, task.worktree, settings);
+          const workflowResult = await this.runWorkflowSteps(task, task.worktree, settings, undefined);
           if (workflowResult === "deferred-paused") {
             if (this.pausedAborted.has(task.id)) {
               this.pausedAborted.delete(task.id);
@@ -2296,6 +2298,7 @@ export class TaskExecutor {
     let stuckRequeue: boolean | null = null;
     let taskDone = false;
     let reviewAddressingActivated = false;
+    let taskEnv: NodeJS.ProcessEnv | undefined;
 
     try {
       await this.transitionReviewAddressing(task.id, ["queued"], "in-progress");
@@ -2415,7 +2418,7 @@ export class TaskExecutor {
           if (settings.worktreeInitCommand) {
             const initStartedAt = Date.now();
             try {
-              const initResult = await runConfiguredCommand(settings.worktreeInitCommand, worktreePath, 300_000);
+              const initResult = await runConfiguredCommand(settings.worktreeInitCommand, worktreePath, 300_000, taskEnv);
               if (initResult.spawnError || initResult.timedOut || initResult.exitCode !== 0) {
                 throw new Error(configuredCommandErrorMessage(initResult));
               }
@@ -2442,7 +2445,7 @@ export class TaskExecutor {
             if (scriptCommand) {
               const setupStartedAt = Date.now();
               try {
-                const setupResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000);
+                const setupResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000, taskEnv);
                 if (setupResult.spawnError || setupResult.timedOut || setupResult.exitCode !== 0) {
                   throw new Error(configuredCommandErrorMessage(setupResult));
                 }
@@ -2495,6 +2498,26 @@ export class TaskExecutor {
 
       this.activeWorktrees.set(task.id, worktreePath);
       executorLog.log(`${task.id}: worktree ready at ${worktreePath}`);
+
+      const runtimeEnvContribution = await this.options.pluginRunner?.collectExecutorRuntimeEnv({
+        taskId: task.id,
+        worktreePath,
+        rootDir: this.rootDir,
+        branch: task.branch ?? undefined,
+      });
+      const pathPrepend = runtimeEnvContribution?.pathPrepend ?? [];
+      const injectedEnv = runtimeEnvContribution?.env ?? {};
+      // We intentionally do NOT mutate process.env globally. Agent session subprocesses
+      // currently inherit the engine process env only; piping taskEnv into AgentRuntimeOptions
+      // is tracked as follow-up work.
+      taskEnv = {
+        ...process.env,
+        ...injectedEnv,
+        PATH: [...pathPrepend, process.env.PATH ?? ""].filter(Boolean).join(delimiter),
+      };
+      executorLog.log(
+        `${task.id}: executor runtime env injected (${pathPrepend.length} PATH entries, ${Object.keys(injectedEnv).length} env keys)`,
+      );
 
       this.options.onStart?.(task, worktreePath);
 
@@ -2559,6 +2582,7 @@ export class TaskExecutor {
           // Pass agentStore and messageStore for delegation and messaging tools
           agentStore: this.options.agentStore,
           messageStore: this.options.messageStore,
+          taskEnv,
           onStepStart: (stepIndex) => {
             this.options.stuckTaskDetector?.recordProgress(task.id);
             try {
@@ -2650,7 +2674,7 @@ export class TaskExecutor {
             // and when no verification commands are configured.
             if (executionMode !== "fast") {
               if (settings.testCommand?.trim() || settings.buildCommand?.trim()) {
-                const verificationResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings);
+                const verificationResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings, taskEnv);
 
                 if (!verificationResult.allPassed) {
                   const failedType = verificationResult.failedCommand === "testCommand" ? "test" : "build";
@@ -2695,6 +2719,7 @@ export class TaskExecutor {
                       settings,
                       attempt,
                       maxFixRetries,
+                      taskEnv,
                     );
                     if (fixed) {
                       fixSucceeded = true;
@@ -2734,7 +2759,7 @@ export class TaskExecutor {
 
             // Run workflow steps before moving to in-review — skip in fast mode
             if (executionMode !== "fast") {
-              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
               if (workflowResult === "deferred-paused") {
                 if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                   this.pausedAborted.delete(task.id);
@@ -3348,7 +3373,7 @@ export class TaskExecutor {
 
             // Run workflow steps before moving to in-review — skip in fast mode
             if (executionMode !== "fast") {
-              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
               if (workflowResult === "deferred-paused") {
                 if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                   this.pausedAborted.delete(task.id);
@@ -3537,7 +3562,7 @@ export class TaskExecutor {
 
               // Run workflow steps before moving to in-review — skip in fast mode
               if (executionMode !== "fast") {
-                const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+                const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
                 if (workflowResult === "deferred-paused") {
                   if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                     this.pausedAborted.delete(task.id);
@@ -4754,6 +4779,7 @@ ${feedback}
     task: Task,
     worktreePath: string,
     settings: Settings,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<VerificationResult> {
     const testCommand = settings.testCommand?.trim();
     const buildCommand = settings.buildCommand?.trim();
@@ -4779,7 +4805,7 @@ ${feedback}
     // Run test command first if configured
     if (testCommand) {
       const testResult = await runVerificationCommand(
-        this.store, worktreePath, task.id, testCommand, "test", undefined, executorLog, "executor",
+        this.store, worktreePath, task.id, testCommand, "test", undefined, executorLog, "executor", extraEnv,
       );
       result.testResult = testResult;
 
@@ -4794,7 +4820,7 @@ ${feedback}
     // Run build command second if configured
     if (buildCommand) {
       const buildResult = await runVerificationCommand(
-        this.store, worktreePath, task.id, buildCommand, "build", undefined, executorLog, "executor",
+        this.store, worktreePath, task.id, buildCommand, "build", undefined, executorLog, "executor", extraEnv,
       );
       result.buildResult = buildResult;
 
@@ -4833,6 +4859,7 @@ ${feedback}
     settings: Settings,
     retryNumber: number,
     maxRetries: number,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<boolean> {
     try {
       executorLog.log(`${task.id}: spawning executor verification fix agent (attempt ${retryNumber}/${maxRetries})`);
@@ -4961,7 +4988,7 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
           undefined,
           "executor",
         );
-        const reRunResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings);
+        const reRunResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings, extraEnv);
 
         return reRunResult.allPassed;
       } finally {
@@ -5254,6 +5281,7 @@ ${failureFeedback}
     task: Task,
     worktreePath: string,
     settings: Settings,
+    taskEnv?: NodeJS.ProcessEnv,
   ): Promise<WorkflowStepResult | "deferred-paused"> {
     // Check if task has enabled workflow steps
     const currentTask = await this.store.getTask(task.id);
@@ -5340,7 +5368,7 @@ ${failureFeedback}
 
       try {
         const result: WorkflowStepOutcome = stepMode === "script"
-          ? await this.executeScriptWorkflowStep(task, ws, worktreePath, settings)
+          ? await this.executeScriptWorkflowStep(task, ws, worktreePath, settings, taskEnv)
           : await this.executeWorkflowStep(task, ws, worktreePath, settings);
         if (await this.shouldDeferWorkflowStepCompletion(task.id, `workflow step '${ws.name}'`)) {
           return "deferred-paused";
@@ -5459,6 +5487,7 @@ ${failureFeedback}
     workflowStep: WorkflowStep,
     worktreePath: string,
     settings: Settings,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<{ success: boolean; output?: string; error?: string }> {
     const scriptName = workflowStep.scriptName!.trim();
     const scriptCommand = settings.scripts?.[scriptName];
@@ -5474,7 +5503,7 @@ ${failureFeedback}
     await this.store.logEntry(task.id, `Workflow step '${workflowStep.name}' executing script '${scriptName}': ${scriptCommand}`);
 
     try {
-      const scriptResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000);
+      const scriptResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000, extraEnv);
       if (scriptResult.spawnError || scriptResult.timedOut || scriptResult.exitCode !== 0) {
         return { success: false, error: configuredCommandErrorMessage(scriptResult) };
       }

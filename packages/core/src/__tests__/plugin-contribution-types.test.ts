@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import type {
   FusionPlugin,
   PluginPromptContributions,
   PluginPromptSurface,
   PluginSetupCheckResult,
+  ExecutorRuntimeEnvContribution,
+  ExecutorRuntimeTaskContext,
   PluginSetupHooks,
   PluginSetupManifest,
   PluginSkillContribution,
@@ -127,6 +129,28 @@ describe("plugin contribution type constraints", () => {
     };
 
     expect(byPlugin["fusion-plugin-agent-browser"]?.contributions).toHaveLength(5);
+  });
+
+  it("accepts executor runtime env contribution shape and hook typing", () => {
+    const contribution: ExecutorRuntimeEnvContribution = {
+      pathPrepend: ["/tmp/bin"],
+      env: { SERVICE_TOKEN: "redacted" },
+      description: "runtime contribution",
+    };
+
+    const plugin: FusionPlugin = {
+      manifest: { id: "plugin-runtime-env", name: "Runtime Env", version: "1.0.0" },
+      state: "installed",
+      hooks: {},
+      executorRuntimeEnv: (taskCtx: ExecutorRuntimeTaskContext) => ({
+        pathPrepend: [taskCtx.worktreePath],
+        env: { TASK_ID: taskCtx.taskId },
+      }),
+    };
+
+    expect(contribution.pathPrepend?.[0]).toBe("/tmp/bin");
+    expectTypeOf(contribution.env).toEqualTypeOf<Record<string, string> | undefined>();
+    expectTypeOf(plugin.executorRuntimeEnv).toBeFunction();
   });
 
   it("compile-time rejects invalid prompt surfaces", () => {

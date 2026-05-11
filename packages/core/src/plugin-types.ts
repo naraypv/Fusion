@@ -581,6 +581,24 @@ export interface PluginPromptContributions {
   enabledByDefault?: boolean;
 }
 
+export interface ExecutorRuntimeTaskContext {
+  taskId: string;
+  worktreePath: string;
+  rootDir: string;
+  branch?: string;
+}
+
+export interface ExecutorRuntimeEnvContribution {
+  pathPrepend?: string[];
+  env?: Record<string, string>;
+  description?: string;
+}
+
+export type PluginExecutorRuntimeEnvHook = (
+  taskCtx: ExecutorRuntimeTaskContext,
+  ctx: PluginContext,
+) => Promise<ExecutorRuntimeEnvContribution> | ExecutorRuntimeEnvContribution;
+
 export type PluginSetupStatus = "not-installed" | "installing" | "installed" | "error";
 
 export interface PluginSetupCheckResult {
@@ -678,6 +696,8 @@ export interface FusionPlugin {
     manifest: PluginSetupManifest;
     hooks: PluginSetupHooks;
   };
+  /** Plugin-contributed executor runtime env for task-scoped subprocesses. */
+  executorRuntimeEnv?: PluginExecutorRuntimeEnvHook;
 }
 
 // ── Plugin Installation ───────────────────────────────────────────────

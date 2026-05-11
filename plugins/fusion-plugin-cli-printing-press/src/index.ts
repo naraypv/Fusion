@@ -1,6 +1,18 @@
 import { definePlugin } from "@fusion/plugin-sdk";
 import { createCliPrintingPressRoutes } from "./routes/wizard-routes.js";
-import { ensureCliPressSchema } from "./store/cli-press-store.js";
+import { buildExecutorRuntimeEnv } from "./runtime/executor-runtime-env.js";
+import { createCliPressStore, ensureCliPressSchema } from "./store/cli-press-store.js";
+
+const storeByDb = new WeakMap<object, ReturnType<typeof createCliPressStore>>();
+
+function getStore(taskStore: { getDatabase: () => object }) {
+  const db = taskStore.getDatabase();
+  const existing = storeByDb.get(db);
+  if (existing) return existing;
+  const next = createCliPressStore(db as never);
+  storeByDb.set(db, next);
+  return next;
+}
 
 const plugin = definePlugin({
   manifest: {
@@ -14,6 +26,10 @@ const plugin = definePlugin({
     onSchemaInit: ensureCliPressSchema,
   },
   routes: createCliPrintingPressRoutes(),
+  executorRuntimeEnv: (taskCtx, ctx) => {
+    const store = getStore(ctx.taskStore as { getDatabase: () => object });
+    return buildExecutorRuntimeEnv(store, taskCtx, ctx);
+  },
   dashboardViews: [
     {
       viewId: "wizard",

@@ -27,9 +27,11 @@ import type {
   PluginSetupManifest,
   PluginSetupHooks,
   PluginSetupCheckResult,
+  ExecutorRuntimeTaskContext,
 } from "@fusion/core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
+import { isAbsolute } from "node:path";
 import { createLogger, executorLog } from "./logger.js";
 
 // Type for the task store's event data
@@ -438,6 +440,78 @@ export class PluginRunner {
         status: await this.checkPluginSetup(pluginId),
       })),
     );
+  }
+
+  async collectExecutorRuntimeEnv(taskCtx: ExecutorRuntimeTaskContext): Promise<{
+    env: Record<string, string>;
+    pathPrepend: string[];
+    perPluginErrors: Array<{ pluginId: string; error: Error }>;
+  }> {
+    const loadedPlugins = this.options.pluginLoader.getLoadedPlugins();
+    const pluginResults: Array<{ pluginId: string; env: Record<string, string>; pathPrepend: string[] }> = [];
+    const perPluginErrors: Array<{ pluginId: string; error: Error }> = [];
+
+    for (const plugin of loadedPlugins) {
+      if (!plugin.executorRuntimeEnv) {
+        continue;
+      }
+
+      const pluginId = plugin.manifest.id;
+      try {
+        const settings = await this.getPluginSettings(pluginId);
+        const context: PluginContext = {
+          pluginId,
+          taskStore: this.options.taskStore,
+          settings,
+          logger: this.createPluginLogger(pluginId),
+          emitEvent: (event: string, data: unknown) => {
+            this.log.log(`[plugin:${pluginId}] Event: ${event}`, data);
+          },
+        };
+
+        const contribution = await plugin.executorRuntimeEnv(taskCtx, context);
+        const env = contribution.env ?? {};
+        const pathPrepend = contribution.pathPrepend ?? [];
+
+        if (!Array.isArray(pathPrepend) || pathPrepend.some((entry) => typeof entry !== "string" || !isAbsolute(entry))) {
+          throw new Error("executorRuntimeEnv.pathPrepend must be an array of absolute path strings");
+        }
+
+        for (const [key, value] of Object.entries(env)) {
+          if (key === "PATH") {
+            throw new Error("executorRuntimeEnv.env must not contain PATH; use pathPrepend instead");
+          }
+          if (typeof value !== "string") {
+            throw new Error(`executorRuntimeEnv.env.${key} must be a string`);
+          }
+        }
+
+        pluginResults.push({ pluginId, env, pathPrepend });
+      } catch (error) {
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        perPluginErrors.push({ pluginId, error: normalizedError });
+        this.log.warn(`executorRuntimeEnv failed for plugin ${pluginId}: ${normalizedError.message}`);
+      }
+    }
+
+    const mergedEnv: Record<string, string> = {};
+    const mergedPathPrepend: string[] = [];
+
+    for (const result of pluginResults) {
+      for (const [key, value] of Object.entries(result.env)) {
+        if (Object.prototype.hasOwnProperty.call(mergedEnv, key)) {
+          this.log.warn(`executorRuntimeEnv key override: ${key} overwritten by plugin ${result.pluginId}`);
+        }
+        mergedEnv[key] = value;
+      }
+      mergedPathPrepend.unshift(...result.pathPrepend);
+    }
+
+    return {
+      env: mergedEnv,
+      pathPrepend: mergedPathPrepend,
+      perPluginErrors,
+    };
   }
 
   getPromptContributionsForSurface(surface: PluginPromptSurface): Array<{
