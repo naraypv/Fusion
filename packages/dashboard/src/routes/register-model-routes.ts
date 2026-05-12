@@ -1,71 +1,69 @@
-import { resolvePlanningSettingsModel, type AccountCredentialSummary } from "@fusion/core";
+import { access, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { resolvePlanningSettingsModel } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import type { ApiRouteRegistrar } from "./types.js";
 
+/**
+ * Read provider names from Fusion's own auth stores (primary + legacy .pi).
+ * These represent providers the user has explicitly configured in Fusion,
+ * as opposed to supplemental credentials inherited from Codex CLI,
+ * Claude Code, or environment variables.
+ */
+async function getConfiguredProviderNames(): Promise<Set<string>> {
+  const home = process.env.HOME || process.env.USERPROFILE || homedir();
+  const providers = new Set<string>();
+
+  // Fusion primary + legacy .pi auth files
+  const authPaths = [
+    join(home, ".fusion", "agent", "auth.json"),
+    join(home, ".pi", "agent", "auth.json"),
+    join(home, ".pi", "auth.json"),
+  ];
+
+  for (const authPath of authPaths) {
+    try {
+      await access(authPath);
+      const parsed = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, unknown>;
+      for (const key of Object.keys(parsed)) {
+        providers.add(key);
+      }
+    } catch {
+      // Ignore missing or invalid auth files
+    }
+  }
+
+  // Check models.json for providers with inline API keys
+  const modelsPaths = [
+    join(home, ".fusion", "agent", "models.json"),
+    join(home, ".pi", "agent", "models.json"),
+    join(home, ".pi", "models.json"),
+  ];
+  for (const modelsPath of modelsPaths) {
+    try {
+      await access(modelsPath);
+      const parsed = JSON.parse(await readFile(modelsPath, "utf-8")) as {
+        providers?: Record<string, { apiKey?: string }>;
+      };
+      const provs = parsed?.providers;
+      if (provs) {
+        for (const [providerId, config] of Object.entries(provs)) {
+          if (config.apiKey) {
+            providers.add(providerId);
+          }
+        }
+      }
+    } catch {
+      // Ignore missing or invalid models.json
+    }
+  }
+
+  return providers;
+}
+
 export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, options, store, runtimeLogger } = ctx;
-
-  type ModelResponseEntry = {
-    provider: string;
-    id: string;
-    name: string;
-    reasoning: boolean;
-    contextWindow: number;
-    accountId?: string;
-    accountProvider?: string;
-    accountLabel?: string;
-    accountDisplayHint?: string;
-  };
-
-  function accountProviderForModelProvider(provider: string): string | undefined {
-    if (provider === "pi-claude-cli") return "claude-cli";
-    if (
-      provider === "openai-codex" ||
-      provider === "anthropic" ||
-      provider === "claude-cli" ||
-      provider === "cursor" ||
-      provider === "minimax" ||
-      provider === "google-gemini-cli"
-    ) {
-      return provider;
-    }
-    return undefined;
-  }
-
-  function appendAccountSpecificModels(models: ModelResponseEntry[]): ModelResponseEntry[] {
-    if (!options?.authStorage?.listAccounts) {
-      return models;
-    }
-
-    const accountsByProvider = new Map<string, AccountCredentialSummary[]>();
-    const accountsFor = (provider: string): AccountCredentialSummary[] => {
-      const cached = accountsByProvider.get(provider);
-      if (cached) return cached;
-      const accounts = options.authStorage!.listAccounts!(provider).filter((account) => account.status !== "disabled");
-      accountsByProvider.set(provider, accounts);
-      return accounts;
-    };
-
-    const expanded: ModelResponseEntry[] = [];
-    for (const model of models) {
-      expanded.push(model);
-      const accountProvider = accountProviderForModelProvider(model.provider);
-      if (!accountProvider) {
-        continue;
-      }
-      for (const account of accountsFor(accountProvider)) {
-        expanded.push({
-          ...model,
-          name: `${model.name} — ${account.label}`,
-          accountId: account.id,
-          accountProvider,
-          accountLabel: account.label,
-          ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
-        });
-      }
-    }
-    return expanded;
-  }
 
   router.get("/models", async (_req, res) => {
     // Get favoriteProviders/favoriteModels and default model from global settings.
@@ -76,6 +74,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     let useClaudeCli = false;
     let useDroidCli = false;
     let useLlamaCpp = false;
+    let useCursorCli = false;
     let resolvedPlanningProvider: string | undefined;
     let resolvedPlanningModelId: string | undefined;
     if (store) {
@@ -89,6 +88,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         useClaudeCli = globalSettings.useClaudeCli === true;
         useDroidCli = globalSettings.useDroidCli === true;
         useLlamaCpp = globalSettings.useLlamaCpp === true;
+        useCursorCli = (globalSettings as Record<string, unknown>).useCursorCli === true;
 
         const mergedSettings = await store.getSettingsFast();
         const resolvedPlanningModel = resolvePlanningSettingsModel(mergedSettings);
@@ -126,7 +126,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
 
     try {
       options.modelRegistry.refresh();
-      let models: ModelResponseEntry[] = options.modelRegistry.getAvailable().map((m) => ({
+      let models = options.modelRegistry.getAvailable().map((m) => ({
         provider: m.provider,
         id: m.id,
         name: m.name,
@@ -149,7 +149,21 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       if (!useLlamaCpp) {
         models = models.filter((m) => m.provider !== "llama-server");
       }
-      models = appendAccountSpecificModels(models);
+      if (!useCursorCli) {
+        models = models.filter((m) => m.provider !== "cursor-cli");
+      }
+
+      // Filter to only providers the user has explicitly configured in Fusion.
+      // getAvailable() checks supplemental credential stores (Codex CLI,
+      // Claude Code, env vars) which surface providers the user may not
+      // have set up in Fusion. We restrict to providers with credentials
+      // in Fusion's own auth stores (primary + legacy .pi + models.json),
+      // plus any providers enabled via settings toggles (Claude CLI, etc.).
+      const configuredProviders = await getConfiguredProviderNames();
+      if (useClaudeCli) configuredProviders.add("pi-claude-cli");
+      if (useDroidCli) configuredProviders.add("droid-cli");
+      if (useLlamaCpp) configuredProviders.add("llama-server");
+      models = models.filter((m) => configuredProviders.has(m.provider));
 
       res.json({
         models,

@@ -6,12 +6,28 @@ export const cliRoot = join(__dirname, "..", "..");
 export const workspaceRoot = join(cliRoot, "..", "..");
 export const bundlePath = join(cliRoot, "dist", "bin.js");
 export const clientIndexPath = join(cliRoot, "dist", "client", "index.html");
+const cursorPluginManifestPath = join(cliRoot, "dist", "plugins", "fusion-plugin-cursor-runtime", "manifest.json");
+const roadmapPluginBundledPath = join(cliRoot, "dist", "plugins", "fusion-plugin-roadmap", "bundled.js");
+export const openclawMcpSchemaServerPath = join(
+  cliRoot,
+  "dist",
+  "plugins",
+  "fusion-plugin-openclaw-runtime",
+  "mcp-schema-server.cjs",
+);
+export const droidPluginMcpServerPath = join(
+  cliRoot,
+  "dist",
+  "plugins",
+  "fusion-plugin-droid-runtime",
+  "mcp-schema-server.cjs",
+);
 
 export const dashboardClientStubMarker = "Dashboard assets not built";
 
 function runBuildCommand(command: string, cwd: string) {
   const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath) {
+  if (npmExecPath && existsSync(npmExecPath)) {
     execFileSync(process.execPath, [npmExecPath, ...command.split(" ")], {
       cwd,
       stdio: "pipe",
@@ -27,8 +43,15 @@ function runBuildCommand(command: string, cwd: string) {
   });
 }
 
-function hasBuiltDashboardAssets(): boolean {
-  if (!existsSync(bundlePath) || !existsSync(clientIndexPath)) {
+export function hasBuiltDashboardAssets(): boolean {
+  if (
+    !existsSync(bundlePath) ||
+    !existsSync(clientIndexPath) ||
+    !existsSync(cursorPluginManifestPath) ||
+    !existsSync(roadmapPluginBundledPath) ||
+    !existsSync(openclawMcpSchemaServerPath) ||
+    !existsSync(droidPluginMcpServerPath)
+  ) {
     return false;
   }
 
@@ -44,7 +67,17 @@ export function buildCliWithRealDashboardAssets() {
     return;
   }
 
+  runBuildCommand(`node ${join(workspaceRoot, "scripts", "ensure-test-artifacts.mjs")}`, workspaceRoot);
   runBuildCommand("pnpm --filter @fusion/dashboard build:client", workspaceRoot);
+  runBuildCommand("pnpm build", cliRoot);
+
+  if (hasBuiltDashboardAssets()) {
+    return;
+  }
+
+  // Fallback for environments where build:client alone does not refresh the
+  // dashboard dist/client bundle consumed by the CLI copy step.
+  runBuildCommand("pnpm --filter @fusion/dashboard build", workspaceRoot);
   runBuildCommand("pnpm build", cliRoot);
 }
 

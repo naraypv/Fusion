@@ -1,6 +1,6 @@
 import React, { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { DesktopWrapper } from "./components/DesktopWrapper";
+import { DesktopShellBootstrap } from "./components/DesktopShellBootstrap";
 
 const dashboardStylesModulePath = "../../../../dashboard/app/styles.css";
 const dashboardAppModulePath = "../../../../dashboard/app/App";
@@ -35,11 +35,7 @@ function RendererApp() {
     return null;
   }
 
-  return (
-    <DesktopWrapper>
-      <AppComponent />
-    </DesktopWrapper>
-  );
+  return <DesktopShellBootstrap DashboardApp={AppComponent} />;
 }
 
 const rootElement = document.getElementById("root");

@@ -16,9 +16,13 @@ import { buildSessionSkillContext } from "./session-skill-context.js";
 import { AgentLogger } from "./agent-logger.js";
 import { reviewerLog } from "./logger.js";
 import { checkSessionError } from "./usage-limit-detector.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import {
+  resolveAgentInstructions,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
+import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
-import { createMemoryGetTool, createMemorySearchTool } from "./agent-tools.js";
+import { createMemoryGetTool, createMemorySearchTool, createWebFetchTool } from "./agent-tools.js";
 
 export const REVIEWER_SYSTEM_PROMPT = `You are an independent code and plan reviewer.
 
@@ -351,6 +355,7 @@ export async function reviewStep(
           ? (_id, delta) => options.onText!(delta)
           : undefined,
         persistAgentToolOutput: liveSettings?.persistAgentToolOutput,
+        persistAgentThinkingLog: liveSettings?.persistAgentThinkingLog,
       })
     : null;
 
@@ -407,13 +412,36 @@ export async function reviewStep(
     }
   }
   const reviewerBasePrompt = resolveAgentPrompt("reviewer", options.agentPrompts) || REVIEWER_SYSTEM_PROMPT;
+  // Memory goes in the dynamic layer (not concatenated onto basePrompt) so the
+  // stable prefix is byte-identical across sessions even if memory changes.
+  // The leading "\n" separator is no longer needed — buildPromptLayers handles
+  // section joining with "\n\n".
   const memorySection = options.rootDir && options.settings?.memoryEnabled !== false
-    ? "\n" + buildReviewerMemoryInstructions(options.rootDir, options.settings)
+    ? buildReviewerMemoryInstructions(options.rootDir, options.settings)
     : "";
-  const reviewerSystemPrompt = buildSystemPromptWithInstructions(
-    reviewerBasePrompt + memorySection,
-    reviewerInstructions,
+
+  // Build structured layers for cross-session prompt caching.
+  // The stable layer (base prompt only) is byte-identical across all
+  // reviewer sessions in this task, enabling cache hits. Memory goes
+  // into the dynamic layer because it can change between sessions.
+  const reviewerPluginContributions = buildPluginPromptSection(
+    "reviewer",
+    options.pluginRunner,
   );
+  if (reviewerPluginContributions) {
+    reviewerLog.log(`applied plugin prompt contributions for reviewer surface`);
+  }
+
+  const layers = buildPromptLayers({
+    basePrompt: reviewerBasePrompt,
+    agentInstructions: reviewerInstructions,
+    memorySection,
+    pluginContributions: reviewerPluginContributions,
+  });
+
+  // Collapsed string for backward compatibility with runtimes that don't
+  // support layers (plugin runtimes, older pi versions).
+  const reviewerSystemPromptFinal = collapsePromptLayers(layers);
 
   // Build skill selection context (assigned agent skills take precedence over role fallback)
   let skillContext = undefined;
@@ -483,9 +511,10 @@ export async function reviewStep(
       runtimeHint: extractRuntimeHint(memoryAgent?.runtimeConfig),
       pluginRunner: options.pluginRunner,
       cwd,
-      systemPrompt: reviewerSystemPrompt,
+      systemPrompt: reviewerSystemPromptFinal,
+      systemPromptLayers: layers,
       tools: "readonly",
-      customTools: memoryTools,
+      customTools: [createWebFetchTool(), ...(memoryTools ?? [])],
       onText: agentLogger ? agentLogger.onText : (delta) => options.onText?.(delta),
       onThinking: agentLogger?.onThinking,
       onToolStart: agentLogger?.onToolStart,
@@ -544,9 +573,12 @@ export async function reviewStep(
     throw err;
   }
 
-  reviewerLog.log(`${taskId}: reviewer using model ${describeModel(session)}`);
+  const reviewerModelDesc = describeModel(session);
+  const reviewerModelMarker = `Reviewer using model: ${reviewerModelDesc}`;
+  reviewerLog.log(`${taskId}: reviewer using model ${reviewerModelDesc}`);
   if (options.store && options.taskId) {
-    await options.store.logEntry(options.taskId, `Reviewer using model: ${describeModel(session)}`);
+    await options.store.logEntry(options.taskId, reviewerModelMarker);
+    await options.store.appendAgentLog(options.taskId, reviewerModelMarker, "text", undefined, "reviewer").catch(() => undefined);
   }
 
   // Notify the caller so it can track this session in a per-task subagent map.

@@ -307,8 +307,8 @@ function getSharedGitTestRepo(): GitTestRepo {
   const repoDir = join(root, "repo");
 
   mkdirSync(repoDir, { recursive: true });
-  execFileSync("git", ["init", "--bare", remoteDir], { stdio: "pipe" });
-  execFileSync("git", ["init", repoDir], { stdio: "pipe" });
+  execFileSync("git", ["init", "--bare", "--initial-branch=main", remoteDir], { stdio: "pipe" });
+  execFileSync("git", ["init", "--initial-branch=main", repoDir], { stdio: "pipe" });
   execFileSync("git", ["-C", repoDir, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
   execFileSync("git", ["-C", repoDir, "config", "user.name", "KB Tests"], { stdio: "pipe" });
   writeFileSync(join(repoDir, "README.md"), "# Test Repo\n");
@@ -387,6 +387,9 @@ describe("Git Management endpoints", () => {
         expect(res.body[0]).toHaveProperty("message");
         expect(res.body[0]).toHaveProperty("author");
         expect(res.body[0]).toHaveProperty("date");
+        if ("body" in res.body[0] && res.body[0].body !== undefined) {
+          expect(typeof res.body[0].body).toBe("string");
+        }
       }
     });
 
@@ -434,6 +437,53 @@ describe("Git Management endpoints", () => {
         expect(res.body).toHaveProperty("stat");
         expect(res.body).toHaveProperty("patch");
       }
+    });
+  });
+
+  describe("GET /git/stashes/:index/diff", () => {
+    const resetGitRepo = () => {
+      const { headSha } = getSharedGitTestRepo();
+      execFileSync("git", ["-C", gitRepoDir, "reset", "--hard", headSha], { stdio: "pipe" });
+      execFileSync("git", ["-C", gitRepoDir, "clean", "-fd"], { stdio: "pipe" });
+      execFileSync("git", ["-C", gitRepoDir, "stash", "clear"], { stdio: "pipe" });
+    };
+
+    beforeEach(() => {
+      resetGitRepo();
+    });
+
+    afterEach(() => {
+      resetGitRepo();
+    });
+
+    it("returns 400 for invalid stash index", async () => {
+      const res = await GET(buildApp(), "/api/git/stashes/not-a-number/diff");
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("Invalid stash index");
+    });
+
+    it("returns 404 for missing stash entry", async () => {
+      const res = await GET(buildApp(), "/api/git/stashes/0/diff");
+
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain("Stash not found");
+    });
+
+    it("returns stash diff for an existing stash", async () => {
+      const readmePath = join(gitRepoDir, "README.md");
+      const original = readFileSync(readmePath, "utf-8");
+      const marker = `\nstash-diff-${Date.now()}\n`;
+      writeFileSync(readmePath, `${original}${marker}`);
+      execFileSync("git", ["-C", gitRepoDir, "stash", "push", "-m", "test stash diff"], { stdio: "pipe" });
+
+      const res = await GET(buildApp(), "/api/git/stashes/0/diff");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty("stat");
+      expect(res.body).toHaveProperty("patch");
+      expect(res.body.patch).toContain("diff --git a/README.md b/README.md");
+      expect(res.body.patch).toContain(marker.trim());
     });
   });
 
@@ -550,6 +600,9 @@ describe("Git Management endpoints", () => {
         expect(commit).toHaveProperty("author");
         expect(commit).toHaveProperty("date");
         expect(commit).toHaveProperty("parents");
+        if ("body" in commit && commit.body !== undefined) {
+          expect(typeof commit.body).toBe("string");
+        }
       }
     });
 
@@ -593,6 +646,9 @@ describe("Git Management endpoints", () => {
           expect(commit).toHaveProperty("author");
           expect(commit).toHaveProperty("date");
           expect(commit).toHaveProperty("parents");
+          if ("body" in commit && commit.body !== undefined) {
+            expect(typeof commit.body).toBe("string");
+          }
         }
       }
     });
@@ -1429,4 +1485,3 @@ describe("Workspace File Routes", () => {
     });
   });
 });
-

@@ -17,13 +17,15 @@ const execAsync = promisify(exec);
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import { resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy, type AgentStore, type MessageStore, type TaskDetail, type Settings, type TaskStore } from "@fusion/core";
+import type { AgentStore, MessageStore, PermanentAgentGatingContext, TaskDetail, Settings, TaskStore } from "@fusion/core";
 
 import {
   createResolvedAgentSession,
   describeAgentModel,
   promptWithAutoRetry,
+  resolveExecutorSessionModel,
 } from "./agent-session-helpers.js";
+import type { AgentActionGateContext } from "./agent-action-gate.js";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import { generateWorktreeName } from "./worktree-names.js";
 import { AgentSemaphore } from "./concurrency.js";
@@ -37,6 +39,7 @@ import {
   createDelegateTaskTool,
   createListAgentsTool,
   createMemoryTools,
+  createWebFetchTool,
   createReadMessagesTool,
   createSendMessageTool,
   createTaskCreateTool,
@@ -96,6 +99,8 @@ export interface StepSessionExecutorOptions {
   pluginRunner?: import("./plugin-runner.js").PluginRunner;
   /** Optional runtime hint resolved from assigned agent runtimeConfig. */
   runtimeHint?: string;
+  /** Optional assigned-agent runtime config for model override precedence. */
+  assignedAgentRuntimeConfig?: Record<string, unknown>;
   /** Callback invoked when a step starts executing. */
   onStepStart?: (stepIndex: number) => void;
   /** Callback invoked when a step completes (success or failure). */
@@ -106,6 +111,12 @@ export interface StepSessionExecutorOptions {
   agentStore?: AgentStore;
   /** Optional message store for messaging tools. */
   messageStore?: MessageStore;
+  /** Optional action-gate context for permanent assigned agents. */
+  actionGateContext?: AgentActionGateContext;
+  /** Optional permanent-agent action gating context. */
+  permanentAgentGating?: PermanentAgentGatingContext;
+  /** Task-scoped environment injected into non-git subprocesses. */
+  taskEnv?: NodeJS.ProcessEnv;
 }
 
 // ── File Scope Extraction ─────────────────────────────────────────────
@@ -564,40 +575,6 @@ interface SessionHandle {
   abortBash: () => void;
 }
 
-function resolveExecutorModelPair(
-  taskModelProvider: string | undefined,
-  taskModelId: string | undefined,
-  settings: Partial<Settings> | undefined,
-): { provider: string | undefined; modelId: string | undefined } {
-  if (taskModelProvider && taskModelId) {
-    return { provider: taskModelProvider, modelId: taskModelId };
-  }
-  if (settings?.executionProvider && settings?.executionModelId) {
-    return {
-      provider: settings.executionProvider,
-      modelId: settings.executionModelId,
-    };
-  }
-  if (settings?.executionGlobalProvider && settings?.executionGlobalModelId) {
-    return {
-      provider: settings.executionGlobalProvider,
-      modelId: settings.executionGlobalModelId,
-    };
-  }
-  if (settings?.defaultProviderOverride && settings?.defaultModelIdOverride) {
-    return {
-      provider: settings.defaultProviderOverride,
-      modelId: settings.defaultModelIdOverride,
-    };
-  }
-  if (settings?.defaultProvider && settings?.defaultModelId) {
-    return {
-      provider: settings.defaultProvider,
-      modelId: settings.defaultModelId,
-    };
-  }
-  return { provider: undefined, modelId: undefined };
-}
 
 /** Fallback store used when step logging persistence is not configured. */
 const NOOP_TASK_STORE: Pick<TaskStore, "appendAgentLog"> = {
@@ -913,6 +890,7 @@ export class StepSessionExecutor {
           taskId: taskDetail.id,
           agent: "executor",
           persistAgentToolOutput: settings.persistAgentToolOutput,
+          persistAgentThinkingLog: settings.persistAgentThinkingLog,
         });
         let session: AgentSession | null = null;
 
@@ -927,6 +905,7 @@ export class StepSessionExecutor {
                 createTaskDocumentReadTool(this.options.store, taskDetail.id),
               ]
             : [];
+          const webFetchTool = createWebFetchTool();
           const memoryTools = createMemoryTools(this.options.rootDir, settings);
 
           // Task log and create tools — task context for step sessions.
@@ -961,10 +940,11 @@ export class StepSessionExecutor {
           // 3. Global execution lane pair (settings.executionGlobalProvider + settings.executionGlobalModelId)
           // 4. Project default override pair (settings.defaultProviderOverride + settings.defaultModelIdOverride)
           // 5. Global default pair (settings.defaultProvider + settings.defaultModelId)
-          const { provider: executorProvider, modelId: executorModelId } = resolveExecutorModelPair(
+          const { provider: executorProvider, modelId: executorModelId } = resolveExecutorSessionModel(
             taskDetail.modelProvider,
             taskDetail.modelId,
             settings,
+            this.options.assignedAgentRuntimeConfig,
           );
 
           const createResult = await createResolvedAgentSession({
@@ -986,12 +966,11 @@ Follow instructions precisely and avoid unrelated changes.`,
             defaultModelId: executorModelId,
             fallbackProvider: settings.fallbackProvider,
             fallbackModelId: settings.fallbackModelId,
-            modelFallbackChain: resolveModelFallbackChain(settings),
-            routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
             defaultThinkingLevel: taskDetail.thinkingLevel ?? settings.defaultThinkingLevel,
             customTools: [
               ...pluginTools,
               ...documentTools,
+              webFetchTool,
               ...memoryTools,
               ...taskLogTool,
               ...taskCreateTool,
@@ -1015,6 +994,8 @@ Follow instructions precisely and avoid unrelated changes.`,
             },
             // Skill selection from step-session executor options
             ...(this.options.skillSelection ? { skillSelection: this.options.skillSelection } : {}),
+            actionGateContext: this.options.actionGateContext,
+            permanentAgentGating: this.options.permanentAgentGating,
             taskId: taskDetail.id,
             taskTitle: taskDetail.title,
             onFallbackModelUsed: createFallbackModelObserver({
@@ -1024,6 +1005,7 @@ Follow instructions precisely and avoid unrelated changes.`,
               taskId: taskDetail.id,
               taskTitle: taskDetail.title,
             }),
+            taskEnv: this.options.taskEnv,
           });
           session = createResult.session;
 
@@ -1305,7 +1287,7 @@ Follow instructions precisely and avoid unrelated changes.`,
       // Remove any partial directory left behind so the invariant holds:
       // "if .worktrees/<slug> exists on disk, it is a fully registered git worktree."
       try {
-        await execAsync(`rm -rf "${worktreePath}"`, { cwd: rootDir });
+        await execAsync(`rm -rf "${worktreePath}"`, { cwd: rootDir, env: this.options.taskEnv });
       } catch {
         // best-effort cleanup; log but don't mask the original error
         stepExecLog.log(`Warning: failed to remove partial worktree directory after creation failure: ${worktreePath}`);

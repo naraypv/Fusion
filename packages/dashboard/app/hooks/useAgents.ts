@@ -75,9 +75,16 @@ export function useAgents(projectId?: string, options?: UseAgentsOptions) {
         "agent:updated": refresh,
         "agent:deleted": refresh,
         "agent:stateChanged": refresh,
+        "approval:requested": refresh,
+        "approval:updated": refresh,
+        "approval:decided": refresh,
       },
     });
   }, [projectId, loadAgents, loadStats]);
+
+  const refreshAgents = useCallback(async () => {
+    await Promise.all([loadAgents(), loadStats()]);
+  }, [loadAgents, loadStats]);
 
   const showSystemAgents = options?.showSystemAgents ?? false;
   const activeAgents = agents.filter((agent) => {
@@ -87,5 +94,5 @@ export function useAgents(projectId?: string, options?: UseAgentsOptions) {
     return showSystemAgents || !isEphemeralAgent(agent);
   });
 
-  return { agents, activeAgents, stats, isLoading, loadAgents, loadStats };
+  return { agents, activeAgents, stats, isLoading, loadAgents, loadStats, refreshAgents };
 }

@@ -58,6 +58,16 @@ describe("ProviderIcon", () => {
     expect(svg.parentElement).toHaveStyle({ color: "var(--provider-openai)" });
   });
 
+  it("renders cursor-cli icon with provider token color", () => {
+    render(<ProviderIcon provider="cursor-cli" />);
+    const svg = screen.getByTestId("cursor-cli-icon");
+    expect(svg).toBeInTheDocument();
+    expect(screen.getByLabelText("Cursor — via Cursor CLI")).toBeInTheDocument();
+    const badgeGlyph = svg.querySelector('path[stroke="var(--provider-icon-contrast)"]');
+    expect(badgeGlyph).toBeInTheDocument();
+    expect(svg.parentElement).toHaveStyle({ color: "var(--provider-cursor-cli)" });
+  });
+
   it("normalizes PI-Claude-CLI provider name to lowercase alias", () => {
     render(<ProviderIcon provider="PI-Claude-CLI" />);
     const svg = screen.getByTestId("claude-cli-icon");
@@ -631,5 +641,25 @@ describe("ProviderIcon", () => {
   it("aliases opencode-go to the Opencode icon", () => {
     render(<ProviderIcon provider="opencode-go" />);
     expect(screen.getByTestId("opencode-icon")).toBeInTheDocument();
+  });
+
+  it("renders DeepSeek icon for deepseek aliases", () => {
+    for (const provider of ["deepseek", "deepseek-ai", "deep-seek"]) {
+      const { unmount } = render(<ProviderIcon provider={provider} />);
+      expect(screen.getByTestId("deepseek-icon")).toBeInTheDocument();
+      expect(screen.getByLabelText("DeepSeek")).toBeInTheDocument();
+      expect(screen.getByTestId("deepseek-icon").parentElement).toHaveStyle({ color: "var(--provider-deepseek)" });
+      unmount();
+    }
+  });
+
+  it("renders Cloudflare icon for cloudflare aliases", () => {
+    for (const provider of ["cloudflare", "cloudflared"]) {
+      const { unmount } = render(<ProviderIcon provider={provider} />);
+      expect(screen.getByTestId("cloudflare-icon")).toBeInTheDocument();
+      expect(screen.getByLabelText("Cloudflare")).toBeInTheDocument();
+      expect(screen.getByTestId("cloudflare-icon").parentElement).toHaveStyle({ color: "var(--provider-cloudflare)" });
+      unmount();
+    }
   });
 });

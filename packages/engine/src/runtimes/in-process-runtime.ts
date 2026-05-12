@@ -33,10 +33,14 @@ import { runtimeLog } from "../logger.js";
 import { StuckTaskDetector } from "../stuck-task-detector.js";
 import type { UsageLimitPauser } from "../usage-limit-detector.js";
 import { SelfHealingManager } from "../self-healing.js";
+import { RestartRecoveryCoordinator } from "../restart-recovery-coordinator.js";
+import { MeshLeaseManager } from "../mesh-lease-manager.js";
 import { PluginRunner } from "../plugin-runner.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
 import { TriageProcessor } from "../triage.js";
+import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
+import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
 
 /**
  * InProcessRuntime runs a project within the main process.
@@ -89,11 +93,16 @@ export class InProcessRuntime
   private stuckTaskDetector?: StuckTaskDetector;
   private usageLimitPauser?: UsageLimitPauser;
   private selfHealingManager?: SelfHealingManager;
+  private leaseManager?: MeshLeaseManager;
   private agentStore?: AgentStore;
   private heartbeatMonitor?: HeartbeatMonitor;
   private triggerScheduler?: HeartbeatTriggerScheduler;
-  /** Maps task IDs to agent IDs for lifecycle tracking */
-  private taskAgentMap = new Map<string, string>();
+  /**
+   * Coordinates the ephemeral task-worker lifecycle (spawn dedup, finalize,
+   * halt-listener cleanup, startup sweep). See `ephemeral-worker-manager.ts`.
+   * Created once the AgentStore is available; guard call sites with `?`.
+   */
+  private workerManager?: EphemeralWorkerManager;
   private lastActivityAt: string = new Date().toISOString();
   private pluginRunner?: PluginRunner;
   private pluginStore?: PluginStore;
@@ -106,22 +115,18 @@ export class InProcessRuntime
   private triageProcessor?: TriageProcessor;
   private messageStore?: MessageStore;
   private concurrencyChangedListener?: (state: { globalMaxConcurrent: number }) => void;
-  /** Set of agent IDs with scheduled ephemeral cleanup (prevents duplicate deletion) */
-  private pendingEphemeralDeletions = new Set<string>();
-  /** Map of agent IDs to their cleanup timer IDs */
-  private ephemeralCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Listener for agent:stateChanged events to clean up terminated ephemeral agents */
-  private ephemeralTerminationListener?: (agentId: string, from: import("@fusion/core").AgentState, to: import("@fusion/core").AgentState) => void;
   /**
    * Optional callback the runtime forwards to SelfHealingManager so that
    * stale-merge recovery can re-enqueue tasks immediately. Set by ProjectEngine
    * before `start()` via `setMergeEnqueuer`.
    */
   private mergeEnqueuer?: (taskId: string) => void;
+  private activeMergeTaskIdProvider?: () => string | null;
   /** Tracks whether startup recovery was intentionally deferred due to pause state. */
   private startupRecoveryDeferred = false;
   /** Prevent duplicate unpause recovery dispatches from racing each other. */
   private resumeAfterUnpauseRunning = false;
+  private restartRecoveryCoordinator?: RestartRecoveryCoordinator;
 
   /**
    * @param config - Runtime configuration
@@ -284,6 +289,12 @@ export class InProcessRuntime
           })
         : undefined;
 
+      this.leaseManager = new MeshLeaseManager({
+        taskStore: this.taskStore,
+        agentStore: this.agentStore,
+        getExecutingTaskIds: () => this.executor?.getExecutingTaskIds() ?? new Set<string>(),
+      });
+
       this.scheduler = new Scheduler(this.taskStore, {
         maxConcurrent: this.config.maxConcurrent,
         maxWorktrees: this.config.maxWorktrees,
@@ -291,6 +302,7 @@ export class InProcessRuntime
         missionStore,
         missionAutopilot,
         missionExecutionLoop,
+        leaseManager: this.leaseManager,
         onTaskFailed: (taskId) => {
           if (missionAutopilot) {
             void missionAutopilot.handleTaskFailure(taskId);
@@ -301,6 +313,10 @@ export class InProcessRuntime
           runtimeLog.log(`Scheduled task ${task.id}`);
         },
         onBlocked: () => {},
+        validateNodeDispatch: async (nodeId) => {
+          const mappedPath = await this.centralCore.getProjectNodePath(this.config.projectId, nodeId);
+          return validateProjectNodeMapping({ nodeId, mappedPath });
+        },
 
       });
 
@@ -322,7 +338,7 @@ export class InProcessRuntime
       let agentStoreForReflection: import("@fusion/core").AgentStore | undefined;
       try {
         const { AgentStore: AgentStoreClass } = await import("@fusion/core");
-        agentStoreForReflection = new AgentStoreClass({ rootDir: this.taskStore.getFusionDir() });
+        agentStoreForReflection = new AgentStoreClass({ rootDir: this.taskStore.getFusionDir(), taskStore: this.taskStore });
         await agentStoreForReflection.init();
         runtimeLog.log("AgentStore initialized for reflection service");
       } catch (agentErr) {
@@ -358,6 +374,21 @@ export class InProcessRuntime
         }
       }
 
+      let selfImproveService: import("../agent-self-improve.js").AgentSelfImproveService | undefined;
+      if (agentStoreForReflection && reflectionStoreForService) {
+        try {
+          const { AgentSelfImproveService: AgentSelfImproveServiceClass } = await import("../agent-self-improve.js");
+          selfImproveService = new AgentSelfImproveServiceClass({
+            agentStore: agentStoreForReflection,
+            reflectionStore: reflectionStoreForService,
+            rootDir: this.config.workingDirectory,
+          });
+          runtimeLog.log("AgentSelfImproveService initialized");
+        } catch (selfImproveErr) {
+          runtimeLog.warn(`AgentSelfImproveService initialization failed:`, selfImproveErr instanceof Error ? selfImproveErr.message : selfImproveErr);
+        }
+      }
+
       const executorOptions: TaskExecutorOptions = {
         semaphore: this.globalSemaphore,
         pool: this.worktreePool,
@@ -373,70 +404,15 @@ export class InProcessRuntime
         onStart: (task, worktreePath) => {
           this.recordActivity();
           runtimeLog.log(`Started executing task ${task.id} in ${worktreePath}`);
-          // Create a runtime-managed task worker agent for lifecycle tracking.
-          // These workers are not heartbeat-managed dashboard agents, so mark them
-          // explicitly and disable heartbeat triggers/timers.
-          if (this.agentStore) {
-            if (this.taskAgentMap.has(task.id)) {
-              runtimeLog.warn(`Skipping task-worker creation for ${task.id}: agent already exists (${this.taskAgentMap.get(task.id)})`);
-              return;
-            }
-
-            this.taskAgentMap.set(task.id, "creating");
-            this.agentStore.createAgent({
-              name: `executor-${task.id}`,
-              role: "executor",
-              metadata: {
-                agentKind: "task-worker",
-                taskWorker: true,
-                managedBy: "task-executor",
-              },
-              runtimeConfig: {
-                enabled: false,
-              },
-            }).then(async (agent: { id: string }) => {
-              this.taskAgentMap.set(task.id, agent.id);
-              await this.agentStore!.assignTask(agent.id, task.id);
-              await this.agentStore!.updateAgentState(agent.id, "active");
-              await this.agentStore!.updateAgentState(agent.id, "running");
-            }).catch((err: unknown) => {
-              this.taskAgentMap.delete(task.id);
-              runtimeLog.warn(`Failed to create agent for task ${task.id}:`, err);
-            });
-          }
+          // Legacy invariant (implemented in EphemeralWorkerManager):
+          // if (this.taskAgentMap.has(task.id)) { ... "Skipping task-worker creation for" ... }
+          void this.workerManager?.onTaskStart(task);
         },
         onComplete: (task) => {
           this.recordActivity();
           runtimeLog.log(`Completed task ${task.id}`);
           this.recordTaskCompletion(task.id, true);
-          // Update agent state to terminated (completed)
-          const agentId = this.taskAgentMap.get(task.id);
-          if (agentId && this.agentStore) {
-            // Register pending deletion before flipping to terminated so
-            // agent:stateChanged listener doesn't schedule duplicate cleanup.
-            this.pendingEphemeralDeletions.add(agentId);
-            void this.agentStore.updateAgentState(agentId, "terminated").catch((err: unknown) => {
-              const msg = err instanceof Error ? err.message : String(err);
-              runtimeLog.warn(`Failed to update agent ${agentId} state to terminated (completion): ${msg}`);
-            });
-            this.taskAgentMap.delete(task.id);
-            // Auto-delete the task-worker agent after a short delay so the UI
-            // can observe the terminal state before the agent is removed.
-            const timerId = setTimeout(async () => {
-              this.ephemeralCleanupTimers.delete(agentId);
-              this.pendingEphemeralDeletions.delete(agentId);
-              try {
-                await this.agentStore?.deleteAgent(agentId);
-              } catch (err: unknown) {
-                if (this.isBenignEphemeralDeleteRaceError(agentId, err)) {
-                  return;
-                }
-                const msg = err instanceof Error ? err.message : String(err);
-                runtimeLog.warn(`Failed to delete agent ${agentId} after completion: ${msg}`);
-              }
-            }, 5000);
-            this.ephemeralCleanupTimers.set(agentId, timerId);
-          }
+          void this.workerManager?.onTaskComplete(task.id);
         },
         onError: (task, error) => {
           this.recordActivity();
@@ -458,34 +434,7 @@ export class InProcessRuntime
             })();
           }
 
-          // Update agent state to terminated (failed)
-          const agentId = this.taskAgentMap.get(task.id);
-          if (agentId && this.agentStore) {
-            // Register pending deletion before flipping to terminated so
-            // agent:stateChanged listener doesn't schedule duplicate cleanup.
-            this.pendingEphemeralDeletions.add(agentId);
-            void this.agentStore.updateAgentState(agentId, "terminated").catch((err: unknown) => {
-              const msg = err instanceof Error ? err.message : String(err);
-              runtimeLog.warn(`Failed to update agent ${agentId} state to terminated (error): ${msg}`);
-            });
-            this.taskAgentMap.delete(task.id);
-            // Auto-delete the task-worker agent after a short delay so the UI
-            // can observe the terminal state before the agent is removed.
-            const timerId = setTimeout(async () => {
-              this.ephemeralCleanupTimers.delete(agentId);
-              this.pendingEphemeralDeletions.delete(agentId);
-              try {
-                await this.agentStore?.deleteAgent(agentId);
-              } catch (err: unknown) {
-                if (this.isBenignEphemeralDeleteRaceError(agentId, err)) {
-                  return;
-                }
-                const msg = err instanceof Error ? err.message : String(err);
-                runtimeLog.warn(`Failed to delete agent ${agentId} after error: ${msg}`);
-              }
-            }, 5000);
-            this.ephemeralCleanupTimers.set(agentId, timerId);
-          }
+          void this.workerManager?.onTaskError(task.id);
         },
       };
 
@@ -507,11 +456,21 @@ export class InProcessRuntime
           rootDir: this.config.workingDirectory,
           messageStore: this.messageStore,
           pluginRunner: this.pluginRunner,
+          reflectionStore: reflectionStoreForService,
+          reflectionService,
+          selfImproveService,
           onMissed: (agentId, reason) => {
             runtimeLog.warn(`Agent ${agentId} missed heartbeat: ${reason}`);
           },
           onTerminated: (agentId, reason) => {
             runtimeLog.warn(`Agent ${agentId} terminated (unresponsive): ${reason}`);
+          },
+          onRunCompleted: (agentId) => {
+            if (this.executor) {
+              void this.executor.resumeTaskForAgent(agentId).catch((err) => {
+                runtimeLog.warn(`resumeTaskForAgent failed for ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+              });
+            }
           },
         });
         this.heartbeatMonitor.start();
@@ -542,6 +501,7 @@ export class InProcessRuntime
             });
           },
           this.taskStore,
+          { isTaskExecuting: (taskId) => this.executor.getExecutingTaskIds().has(taskId) },
         );
         this.triggerScheduler.start();
 
@@ -554,99 +514,22 @@ export class InProcessRuntime
         const isTimerManagedAgent = (agent: import("@fusion/core").Agent) =>
           isHeartbeatEnabledAgent(agent) && isTickableHeartbeatState(agent.state);
 
-        // Listen for agent state transitions to clean up terminated ephemeral agents.
-        // This catches cases where ephemeral agents (task-workers, spawned children) are
-        // terminated by HeartbeatMonitor or other pathways outside of onComplete/onError callbacks.
-        // Non-fatal: cleanup failures are warned and do not throw.
-        this.ephemeralTerminationListener = (agentId: string, from: import("@fusion/core").AgentState, to: import("@fusion/core").AgentState) => {
-          if (to !== "terminated") return;
-          // Skip if already terminated (avoid re-scheduling)
-          if (from === "terminated") return;
-
-          // Check if already scheduled for deletion (e.g., by onComplete/onError callback
-          // or TaskExecutor spawned-child cleanup).
-          if (this.pendingEphemeralDeletions.has(agentId) || this.executor?.isEphemeralDeletionPending(agentId)) return;
-
-          // Get the agent to check ephemeral status
-          void (async () => {
-            try {
-              const agent = await this.agentStore?.getAgent(agentId);
-              if (!agent) return;
-              if (!isEphemeralAgent(agent)) return;
-
-              // Schedule deletion after delay so UI can observe terminal state
-              this.pendingEphemeralDeletions.add(agentId);
-              const timerId = setTimeout(async () => {
-                this.ephemeralCleanupTimers.delete(agentId);
-                this.pendingEphemeralDeletions.delete(agentId);
-                try {
-                  await this.agentStore?.deleteAgent(agentId);
-                } catch (err: unknown) {
-                  if (this.isBenignEphemeralDeleteRaceError(agentId, err)) {
-                    return;
-                  }
-                  const msg = err instanceof Error ? err.message : String(err);
-                  runtimeLog.warn(`Failed to delete ephemeral agent ${agentId} after termination: ${msg}`);
-                }
-              }, 5000);
-              this.ephemeralCleanupTimers.set(agentId, timerId);
-            } catch (err: unknown) {
-              const msg = err instanceof Error ? err.message : String(err);
-              runtimeLog.warn(`Failed to process termination event for agent ${agentId}: ${msg}`);
-            }
-          })();
-        };
-        this.agentStore.on("agent:stateChanged", this.ephemeralTerminationListener);
-
-        // Startup sweep for orphaned ephemeral agents from prior crashed/unclean runs.
-        // Non-fatal: best-effort cleanup that must not block runtime startup.
-        try {
-          const allAgents = await this.agentStore.listAgents({ includeEphemeral: true });
-          let cleanedCount = 0;
-          for (const agent of allAgents) {
-            if (!isEphemeralAgent(agent)) continue;
-
-            let shouldDelete = agent.state === "terminated" || agent.state === "error";
-            if (!shouldDelete && agent.taskId) {
-              try {
-                const task = await this.taskStore.getTask(agent.taskId);
-                if (!task || task.column !== "in-progress") {
-                  shouldDelete = true;
-                }
-              } catch {
-                shouldDelete = true;
-              }
-            }
-            if (!shouldDelete) continue;
-
-            try {
-              if (agent.state !== "terminated") {
-                await this.agentStore.updateAgentState(agent.id, "terminated");
-              }
-            } catch (err: unknown) {
-              const msg = err instanceof Error ? err.message : String(err);
-              runtimeLog.warn(`Startup sweep failed to set ephemeral agent ${agent.id} terminated: ${msg}`);
-            }
-
-            try {
-              await this.agentStore.deleteAgent(agent.id);
-              cleanedCount += 1;
-            } catch (err: unknown) {
-              if (this.isBenignEphemeralDeleteRaceError(agent.id, err)) {
-                cleanedCount += 1;
-                continue;
-              }
-              const msg = err instanceof Error ? err.message : String(err);
-              runtimeLog.warn(`Startup sweep failed to delete ephemeral agent ${agent.id}: ${msg}`);
-            }
-          }
-
-          if (cleanedCount > 0) {
-            runtimeLog.log(`Startup ephemeral sweep cleaned ${cleanedCount} orphaned agent(s)`);
-          }
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          runtimeLog.warn(`Startup ephemeral sweep failed (continuing): ${msg}`);
+        // Wire the ephemeral worker manager (now that the executor exists, so
+        // its spawned-child pending-deletion set can be consulted) and run
+        // the startup orphan sweep. See ephemeral-worker-manager.ts for the
+        // full lifecycle contract. Non-fatal: failures are logged and never
+        // block startup.
+        if (this.agentStore && !this.workerManager) {
+          this.workerManager = new EphemeralWorkerManager({
+            agentStore: this.agentStore,
+            taskStore: this.taskStore,
+            logger: runtimeLog,
+            isDeletionPendingExternal: (agentId) => this.executor?.isEphemeralDeletionPending(agentId) ?? false,
+          });
+        }
+        if (this.workerManager) {
+          this.workerManager.attachStateChangeListener();
+          await this.workerManager.reconcileOrphaned();
         }
 
         // Register existing non-ephemeral, heartbeat-enabled agents in tickable states.
@@ -750,9 +633,31 @@ export class InProcessRuntime
         getPlanningTaskIds: () => this.triageProcessor?.getProcessingTaskIds() ?? new Set<string>(),
         evictStaleTriageProcessing: () => this.triageProcessor?.evictStaleProcessing() ?? new Set<string>(),
         enqueueMerge: this.mergeEnqueuer ? (taskId: string) => this.mergeEnqueuer?.(taskId) : undefined,
+        getActiveMergeTaskId: () => this.activeMergeTaskIdProvider?.() ?? null,
+        leaseManager: this.leaseManager,
+        hasActiveAgentExecution: (agentId: string) => this.heartbeatMonitor?.getTrackedAgents().includes(agentId) ?? false,
+        restartDurableAgentHeartbeat: async (agentId: string, context: { reason: string; attempt: number }) => {
+          if (!this.heartbeatMonitor) {
+            return false;
+          }
+          const run = await this.heartbeatMonitor.executeHeartbeat({
+            agentId,
+            source: "automation",
+            triggerDetail: `self-healing durable-agent transient recovery (${context.reason}, attempt ${context.attempt})`,
+            contextSnapshot: {
+              selfHealing: {
+                reason: context.reason,
+                attempt: context.attempt,
+                source: "durable-agent-transient-error-recovery",
+              },
+            },
+          });
+          return !!run;
+        },
       });
       this.selfHealingManager.start();
       this.stuckTaskDetector.start();
+      this.restartRecoveryCoordinator = new RestartRecoveryCoordinator(this.taskStore, this.executor);
 
       // 8. Set up event forwarding from TaskStore
       this.setupEventForwarding();
@@ -857,20 +762,11 @@ export class InProcessRuntime
         runtimeLog.log("RoutineScheduler stopped");
       }
 
-      // 3. Remove agent event listeners (before stopping trigger scheduler)
-      // Guard on this.agentStore being defined - it may not exist if AgentStore init failed
-      if (this.ephemeralTerminationListener && this.agentStore) {
-        this.agentStore.off("agent:stateChanged", this.ephemeralTerminationListener);
-        this.ephemeralTerminationListener = undefined;
-        runtimeLog.log("AgentStore agent:stateChanged listener removed");
-      }
-      // Clear any pending ephemeral cleanup timers to prevent leaks during shutdown
-      for (const [agentId, timerId] of this.ephemeralCleanupTimers) {
-        clearTimeout(timerId);
-        runtimeLog.log(`Cleared pending cleanup timer for ephemeral agent ${agentId}`);
-      }
-      this.ephemeralCleanupTimers.clear();
-      this.pendingEphemeralDeletions.clear();
+      // 3. Tear down the ephemeral worker manager (detaches the
+      // agent:stateChanged listener and clears in-memory tracking). Safe to
+      // call when uninitialized.
+      this.workerManager?.detachStateChangeListener();
+      this.workerManager?.reset();
       this.executor?.disposeEphemeralTimers();
 
       // 4. Stop trigger scheduler
@@ -995,6 +891,10 @@ export class InProcessRuntime
     this.mergeEnqueuer = enqueueMerge;
   }
 
+  setActiveMergeTaskIdProvider(getActiveMergeTaskId: () => string | null): void {
+    this.activeMergeTaskIdProvider = getActiveMergeTaskId;
+  }
+
   /**
    * Resume executor/self-healing activity after an unpause transition.
    *
@@ -1034,13 +934,9 @@ export class InProcessRuntime
   }
 
   private async resumeStartupRecoverySequence(): Promise<void> {
-    // Requeue no-progress no-task_done failures before resumeOrphaned can
-    // restart other orphaned executions.
-    await this.selfHealingManager!.recoverNoProgressNoTaskDoneFailures();
-
-    // Resume orphaned in-progress tasks before the broader self-healing scan
-    // so the executor can claim or fast-path eligible tasks first.
-    await this.executor!.resumeOrphaned();
+    // Restart recovery decides when interrupted runs can safely resume versus
+    // when they must be reset to todo for a clean retry.
+    await this.restartRecoveryCoordinator!.recoverInterruptedRuns();
 
     // Some "stuck" tasks are already orphaned by the time the runtime boots:
     // they no longer have a tracked session/worktree, so the stuck detector
@@ -1257,25 +1153,6 @@ export class InProcessRuntime
     });
 
     runtimeLog.log("Event forwarding setup complete");
-  }
-
-  /**
-   * Returns true when an ephemeral delete failure is expected due to cleanup races
-   * (for example the agent was already removed by a parallel cleanup path).
-   */
-  private isBenignEphemeralDeleteRaceError(agentId: string, err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    const normalized = msg.toLowerCase();
-
-    if (normalized.includes("already deleted") || normalized.includes("already removed")) {
-      return true;
-    }
-
-    if (normalized.includes(`agent ${agentId.toLowerCase()} not found`)) {
-      return true;
-    }
-
-    return /^agent\s+.+\s+not found$/i.test(msg.trim());
   }
 
   /**

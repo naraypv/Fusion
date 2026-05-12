@@ -30,9 +30,9 @@ import * as subtaskBreakdownModule from "../subtask-breakdown.js";
 import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
-import * as cliAccountAuthModule from "../cli-account-auth.js";
 import * as droidCliProbeModule from "../droid-cli-probe.js";
 import * as llamaCppProbeModule from "../llama-cpp-probe.js";
+import * as runtimeProviderProbesModule from "../runtime-provider-probes.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
 import * as terminalServiceModule from "../terminal-service.js";
 import { get as performGet, request as performRequest } from "../test-request.js";
@@ -314,10 +314,10 @@ describe("GET /models", () => {
     store = createMockStore();
   });
 
-  function buildApp(modelRegistry?: ModelRegistryLike, authStorage?: AuthStorageLike) {
+  function buildApp(modelRegistry?: ModelRegistryLike) {
     const app = express();
     app.use(express.json());
-    app.use("/api", createApiRoutes(store, { modelRegistry, authStorage }));
+    app.use("/api", createApiRoutes(store, { modelRegistry }));
     return app;
   }
 
@@ -331,47 +331,6 @@ describe("GET /models", () => {
       { provider: "openai", id: "gpt-4o", name: "GPT-4o", reasoning: false, contextWindow: 128000 },
     ]);
     expect(modelRegistry.refresh).toHaveBeenCalled();
-  });
-
-  it("adds account-specific model rows for multi-account fallback selection", async () => {
-    const modelRegistry = createMockModelRegistry({
-      getAvailable: vi.fn().mockReturnValue([
-        { id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5 (CLI)", provider: "pi-claude-cli", reasoning: true, contextWindow: 200000 },
-      ]),
-    });
-    const authStorage = createMockAuthStorage({
-      listAccounts: vi.fn((provider?: string) => provider === "claude-cli"
-        ? [{
-            id: "claude-cli-account-1",
-            providerId: "claude-cli",
-            label: "Claude account 1",
-            credentialKind: "cli_oauth_home",
-            accountDisplayHint: "user@example.com",
-            priority: 100,
-            status: "active",
-            createdAt: "2026-05-05T00:00:00.000Z",
-            updatedAt: "2026-05-05T00:00:00.000Z",
-          }]
-        : []),
-    } as Partial<AuthStorageLike>);
-    const globalStore = createMockGlobalSettingsStore();
-    (globalStore.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ useClaudeCli: true });
-    (store.getGlobalSettingsStore as ReturnType<typeof vi.fn>).mockReturnValue(globalStore);
-
-    const res = await GET(buildApp(modelRegistry, authStorage), "/api/models");
-
-    expect(res.status).toBe(200);
-    expect(res.body.models).toContainEqual({
-      provider: "pi-claude-cli",
-      id: "claude-sonnet-4-5",
-      name: "Claude Sonnet 4.5 (CLI) — Claude account 1",
-      reasoning: true,
-      contextWindow: 200000,
-      accountId: "claude-cli-account-1",
-      accountProvider: "claude-cli",
-      accountLabel: "Claude account 1",
-      accountDisplayHint: "user@example.com",
-    });
   });
 
   it("returns empty array when no model registry is provided", async () => {
@@ -605,38 +564,57 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     // Filter out synthetic CLI providers — they have dedicated route tests.
     // Structural assertions here are about OAuth + API-key paths only.
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "google-gemini-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
     ]);
     expect(authStorage.reload).toHaveBeenCalled();
   });
 
+  it("includes GitHub Copilot as oauth when auth storage reports it", async () => {
+    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: "github-copilot", name: "GitHub Copilot" },
+    ]);
+    (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "github-copilot");
+
+    const res = await GET(buildApp(), "/api/auth/status");
+
+    expect(res.status).toBe(200);
+    const githubCopilot = res.body.providers.find((p: any) => p.id === "github-copilot");
+    expect(githubCopilot).toEqual({
+      id: "github-copilot",
+      name: "GitHub Copilot",
+      authenticated: true,
+      type: "oauth",
+      loginInProgress: false,
+    });
+  });
+
   it("includes oauth and model-registry-derived API key providers in one response", async () => {
     (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
-      { id: "openai-codex", name: "OpenAI Codex" },
       { id: "github-copilot", name: "GitHub Copilot" },
+      { id: "openai-codex", name: "OpenAI Codex" },
     ]);
     (authStorage.getApiKeyProviders as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "openrouter", name: "OpenRouter" },
       { id: "kimi-coding", name: "Kimi" },
       { id: "acme-extension", name: "Acme Extension" },
     ]);
-    (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "openai-codex");
+    (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "github-copilot");
     (authStorage.hasApiKey as ReturnType<typeof vi.fn>).mockImplementation((provider: string) => provider === "acme-extension");
 
     const res = await GET(buildApp(), "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "cursor" && p.id !== "google-gemini-cli" && p.id !== "droid-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "llama-cpp");
     expect(providers).toEqual([
-      { id: "openai-codex", name: "OpenAI Codex", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
-      { id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false },
+      { id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: false },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
+      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key" },
     ]);
   });
 
@@ -831,6 +809,19 @@ describe("GET /providers/claude-cli/status", () => {
 describe("Droid CLI auth routes", () => {
   let store: TaskStore;
 
+  function setDroidPluginSettings(settings: Record<string, unknown>) {
+    (store as TaskStore & {
+      getPluginStore: () => { getPlugin: (id: string) => Promise<{ settings: Record<string, unknown> }> };
+    }).getPluginStore = vi.fn().mockReturnValue({
+      getPlugin: vi.fn().mockImplementation(async (id: string) => {
+        if (id !== "fusion-plugin-droid-runtime") {
+          throw new Error("not found");
+        }
+        return { settings };
+      }),
+    });
+  }
+
   beforeEach(() => {
     store = createMockStore({
       updateGlobalSettings: vi.fn().mockResolvedValue({ useDroidCli: true }),
@@ -849,6 +840,7 @@ describe("Droid CLI auth routes", () => {
   }
 
   it("enables Droid CLI when binary is available", async () => {
+    setDroidPluginSettings({ droidBinaryPath: "/opt/custom-droid" });
     const probeSpy = vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
       available: true,
       version: "droid 1.0.0",
@@ -862,6 +854,7 @@ describe("Droid CLI auth routes", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ enabled: true, restartRequired: false });
     expect(store.updateGlobalSettings).toHaveBeenCalledWith({ useDroidCli: true });
+    expect(probeSpy).toHaveBeenCalledWith({ settings: { droidBinaryPath: "/opt/custom-droid" } });
     probeSpy.mockRestore();
   });
 
@@ -922,7 +915,8 @@ describe("Droid CLI auth routes", () => {
   });
 
   it("returns binary + toggle + extension diagnostics and computed readiness", async () => {
-    vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
+    setDroidPluginSettings({ droidBinaryPath: "/opt/custom-droid" });
+    const probeSpy = vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
       available: true,
       version: "droid 1.0.0",
       probeDurationMs: 10,
@@ -944,6 +938,7 @@ describe("Droid CLI auth routes", () => {
     expect(res.body.ready).toBe(true);
     expect(res.body.binary).toMatchObject({ available: true, version: "droid 1.0.0" });
     expect(res.body.extension).toMatchObject({ status: "ok" });
+    expect(probeSpy).toHaveBeenCalledWith({ settings: { droidBinaryPath: "/opt/custom-droid" } });
   });
 
   it("returns ready false when binary unavailable", async () => {
@@ -975,7 +970,8 @@ describe("Droid CLI auth routes", () => {
   });
 
   it("GET /auth/status includes droid-cli provider with cli type", async () => {
-    vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
+    setDroidPluginSettings({ droidBinaryPath: "/opt/custom-droid" });
+    const probeSpy = vi.spyOn(droidCliProbeModule, "probeDroidCli").mockResolvedValue({
       available: true,
       version: "droid 1.0.0",
       probeDurationMs: 10,
@@ -997,6 +993,7 @@ describe("Droid CLI auth routes", () => {
         }),
       ]),
     );
+    expect(probeSpy).toHaveBeenCalledWith({ settings: { droidBinaryPath: "/opt/custom-droid" } });
   });
 
   it("GET /auth/status marks droid-cli unauthenticated when extension status is not ok", async () => {
@@ -1027,6 +1024,85 @@ describe("Droid CLI auth routes", () => {
         }),
       ]),
     );
+  });
+
+  it("POST /auth/cursor-cli enables when cursor binary is available", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider").mockResolvedValue({
+      available: true,
+      version: "cursor-agent 1.0.0",
+      probeDurationMs: 8,
+    });
+    store.updateGlobalSettings = vi.fn().mockResolvedValue({ useCursorCli: true });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/cursor-cli", JSON.stringify({ enabled: true }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ enabled: true, restartRequired: false });
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ useCursorCli: true });
+  });
+
+  it("POST /auth/cursor-cli returns 400 when enabling without binary", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider").mockResolvedValue({
+      available: false,
+      reason: "cursor-agent not found",
+      probeDurationMs: 8,
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/cursor-cli", JSON.stringify({ enabled: true }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Cannot enable Cursor CLI routing");
+  });
+
+  it("POST /auth/cursor-cli disables without probing binary", async () => {
+    const probeSpy = vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider");
+    store.updateGlobalSettings = vi.fn().mockResolvedValue({ useCursorCli: false });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/cursor-cli", JSON.stringify({ enabled: false }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ enabled: false, restartRequired: false });
+    expect(probeSpy).not.toHaveBeenCalled();
+  });
+
+  it("GET /providers/cursor-cli/status returns readiness from toggle and binary", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider").mockResolvedValue({
+      available: true,
+      version: "cursor-agent 1.0.0",
+      probeDurationMs: 8,
+    });
+    store.getGlobalSettingsStore = vi.fn().mockReturnValue({
+      ...createMockGlobalSettingsStore(),
+      getSettings: vi.fn().mockResolvedValue({ useCursorCli: true }),
+    });
+
+    const res = await GET(buildApp(), "/api/providers/cursor-cli/status");
+    expect(res.status).toBe(200);
+    expect(res.body.ready).toBe(true);
+    expect(res.body.enabled).toBe(true);
+    expect(res.body.binary.available).toBe(true);
+  });
+
+  it("GET /providers/cursor-cli/status returns ready false when binary unavailable", async () => {
+    vi.spyOn(runtimeProviderProbesModule, "probeCursorCliProvider").mockResolvedValue({
+      available: false,
+      reason: "missing",
+      probeDurationMs: 8,
+    });
+    store.getGlobalSettingsStore = vi.fn().mockReturnValue({
+      ...createMockGlobalSettingsStore(),
+      getSettings: vi.fn().mockResolvedValue({ useCursorCli: true }),
+    });
+
+    const res = await GET(buildApp(), "/api/providers/cursor-cli/status");
+    expect(res.status).toBe(200);
+    expect(res.body.ready).toBe(false);
   });
 
   it("PUT /settings/global with useDroidCli fires onUseDroidCliToggled", async () => {
@@ -1168,36 +1244,35 @@ describe("POST /auth/login", () => {
     });
   });
 
-  it("returns an Anthropic manual-code prompt for OAuth code login", async () => {
+  it("returns manual-code flow for anthropic and skips callback rewrite on remote hosts", async () => {
+    const unchangedUrl =
+      "https://claude.ai/oauth/authorize?state=anthropic-state&redirect_uri=http%3A%2F%2Flocalhost%3A3210%2Fauth%2Fcallback";
+
     (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
       { id: "anthropic", name: "Anthropic" },
     ]);
     (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation((_provider: string, callbacks: any) => {
-      callbacks.onAuth({
-        url: "https://claude.com/cai/oauth/authorize?code=true&state=test-state",
-        instructions: "Open in browser",
-      });
-      return new Promise(() => {});
+      callbacks.onAuth({ url: unchangedUrl, instructions: "Sign in with Claude" });
+      return Promise.resolve();
     });
 
     const res = await REQUEST(
       buildApp(),
       "POST",
       "/api/auth/login",
-      JSON.stringify({ provider: "anthropic", origin: "http://localhost:4040" }),
+      JSON.stringify({ provider: "anthropic", origin: "https://my-host.example.com" }),
       { "Content-Type": "application/json" },
     );
 
     expect(res.status).toBe(200);
-    expect(res.body.url).toBe("https://claude.com/cai/oauth/authorize?code=true&state=test-state");
-    expect(res.body.instructions).toContain("copy the one-time authorization code");
+    expect(res.body.url).toBe(unchangedUrl);
+    expect(res.body.instructions).toContain("After Claude sign-in");
     expect(res.body.manualCode).toEqual({
-      prompt: "Paste the Anthropic authorization code",
-      placeholder: "code...",
-      helpText: "After Anthropic sign-in, copy the one-time authorization code from the browser and submit it here so Fusion can finish adding this account.",
+      prompt: "Paste the final redirect URL or authorization code",
+      placeholder: "http://localhost:*/callback?code=...&state=... or just the code",
+      helpText: "After Claude sign-in, copy the full browser URL (or just the code) and paste it here to finish login from this dashboard host.",
     });
   });
-
   it("returns 400 when provider is missing", async () => {
     const res = await REQUEST(buildApp(), "POST", "/api/auth/login", JSON.stringify({}), {
       "Content-Type": "application/json",
@@ -1330,92 +1405,6 @@ describe("POST /auth/cancel", () => {
   });
 });
 
-describe("POST /auth/cli-account", () => {
-  let store: TaskStore;
-  let authStorage: AuthStorageLike;
-
-  beforeEach(() => {
-    store = createMockStore();
-    authStorage = createMockAuthStorage();
-  });
-
-  function buildApp() {
-    const app = express();
-    app.use(express.json());
-    app.use("/api", createApiRoutes(store, { authStorage }));
-    return app;
-  }
-
-  it("starts CLI OAuth without blocking and returns the provider URL for the dashboard browser", async () => {
-    const submitManualCode = vi.fn().mockReturnValue(true);
-    const cancel = vi.fn();
-    const probeSpy = vi.spyOn(claudeCliProbeModule, "probeClaudeCli").mockResolvedValue({
-      available: true,
-      version: "claude 1.0.0",
-      probeDurationMs: 10,
-    });
-    vi.spyOn(cliAccountAuthModule, "startCliAccountLogin").mockResolvedValueOnce({
-      providerId: "claude-cli",
-      url: "https://claude.ai/oauth/authorize?state=test",
-      instructions: "Open from the dashboard browser",
-      manualCode: {
-        prompt: "Paste the Claude authorization code",
-        placeholder: "code...",
-      },
-      completion: new Promise(() => {}),
-      submitManualCode,
-      cancel,
-    });
-
-    const app = buildApp();
-    const res = await REQUEST(app, "POST", "/api/auth/cli-account", JSON.stringify({ provider: "claude-cli" }), {
-      "Content-Type": "application/json",
-    });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
-      success: true,
-      provider: "claude-cli",
-      url: "https://claude.ai/oauth/authorize?state=test",
-      instructions: "Open from the dashboard browser",
-      manualCode: {
-        prompt: "Paste the Claude authorization code",
-        placeholder: "code...",
-      },
-    });
-
-    const statusRes = await GET(app, "/api/auth/status");
-    const claudeProvider = statusRes.body.providers.find((p: any) => p.id === "claude-cli");
-    expect(claudeProvider).toMatchObject({
-      id: "claude-cli",
-      loginInProgress: true,
-      loginInstructions: "Open from the dashboard browser",
-      manualCode: {
-        prompt: "Paste the Claude authorization code",
-        placeholder: "code...",
-      },
-    });
-
-    const codeRes = await REQUEST(app, "POST", "/api/auth/manual-code", JSON.stringify({
-      provider: "claude-cli",
-      code: "test-code",
-    }), {
-      "Content-Type": "application/json",
-    });
-    expect(codeRes.status).toBe(200);
-    expect(codeRes.body).toEqual({ success: true, submitted: true });
-    expect(submitManualCode).toHaveBeenCalledWith("test-code");
-
-    const cancelRes = await REQUEST(app, "POST", "/api/auth/cancel", JSON.stringify({ provider: "claude-cli" }), {
-      "Content-Type": "application/json",
-    });
-    expect(cancelRes.status).toBe(200);
-    expect(cancelRes.body).toEqual({ success: true, cancelled: true });
-    expect(cancel).toHaveBeenCalled();
-    probeSpy.mockRestore();
-  });
-});
-
 describe("POST /auth/manual-code", () => {
   let store: TaskStore;
   let authStorage: AuthStorageLike;
@@ -1423,7 +1412,10 @@ describe("POST /auth/manual-code", () => {
   beforeEach(() => {
     store = createMockStore();
     authStorage = createMockAuthStorage({
-      getOAuthProviders: vi.fn().mockReturnValue([{ id: "openai-codex", name: "OpenAI Codex" }]),
+      getOAuthProviders: vi.fn().mockReturnValue([
+        { id: "openai-codex", name: "OpenAI Codex" },
+        { id: "anthropic", name: "Anthropic" },
+      ]),
     });
   });
 
@@ -1479,18 +1471,15 @@ describe("POST /auth/manual-code", () => {
     });
   });
 
-  it("submits pasted Anthropic authorization code into an active OAuth login", async () => {
+  it("submits pasted manual code for anthropic login", async () => {
     let submittedCode: string | undefined;
-    (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
-      { id: "anthropic", name: "Anthropic" },
-    ]);
     (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation(
       async (_provider: string, callbacks: {
         onAuth: (info: { url: string; instructions?: string }) => void;
         onPrompt?: () => Promise<string>;
       }) => {
         callbacks.onAuth({
-          url: "https://claude.com/cai/oauth/authorize?code=true&state=test-state",
+          url: "https://claude.ai/oauth/authorize?state=anthropic-state&redirect_uri=http%3A%2F%2Flocalhost%3A3210%2Fauth%2Fcallback",
         });
         submittedCode = await callbacks.onPrompt?.();
       },
@@ -1501,24 +1490,24 @@ describe("POST /auth/manual-code", () => {
       app,
       "POST",
       "/api/auth/login",
-      JSON.stringify({ provider: "anthropic", origin: "http://localhost:4040" }),
+      JSON.stringify({ provider: "anthropic", origin: "https://remote.example.com" }),
       { "Content-Type": "application/json" },
     );
+
     expect(loginRes.status).toBe(200);
-    expect(loginRes.body.manualCode?.prompt).toBe("Paste the Anthropic authorization code");
 
     const submitRes = await REQUEST(
       app,
       "POST",
       "/api/auth/manual-code",
-      JSON.stringify({ provider: "anthropic", code: "claude-test-code" }),
+      JSON.stringify({ provider: "anthropic", code: "anthropic-manual-code" }),
       { "Content-Type": "application/json" },
     );
 
     expect(submitRes.status).toBe(200);
     expect(submitRes.body).toEqual({ success: true, submitted: true });
     await vi.waitFor(() => {
-      expect(submittedCode).toBe("claude-test-code");
+      expect(submittedCode).toBe("anthropic-manual-code");
     });
   });
 

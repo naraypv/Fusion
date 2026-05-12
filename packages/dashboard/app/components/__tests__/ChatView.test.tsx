@@ -16,14 +16,19 @@ import * as useChatModule from "../../hooks/useChat";
 import type { UseChatReturn, ChatSessionInfo, ChatMessageInfo, ToolCallInfo } from "../../hooks/useChat";
 import * as apiModule from "../../api";
 import { _resetInitialViewportHeight } from "../../hooks/useMobileKeyboard";
+import * as useChatRoomsModule from "../../hooks/useChatRooms";
+import type { UseChatRoomsResult } from "../../hooks/useChatRooms";
 
 // Mock the hooks
 vi.mock("../../hooks/useChat");
+vi.mock("../../hooks/useChatRooms");
 
 const mockUseChat = vi.mocked(useChatModule.useChat);
+const mockUseChatRooms = vi.mocked(useChatRoomsModule.useChatRooms);
 const mockFetchDiscoveredSkills = vi.mocked(apiModule.fetchDiscoveredSkills);
 const mockCreateObjectURL = vi.fn();
 const mockRevokeObjectURL = vi.fn();
+const mockClipboardWriteText = vi.fn();
 
 // Mock lucide-react icons - spread actual module and override specific icons
 vi.mock("lucide-react", async (importOriginal) => {
@@ -45,6 +50,8 @@ vi.mock("lucide-react", async (importOriginal) => {
     EyeOff: ({ "data-testid": testId, ...props }: any) => <svg data-testid={testId || "icon-eye-off"} {...props} />,
     Paperclip: ({ "data-testid": testId, ...props }: any) => <svg data-testid={testId || "icon-paperclip"} {...props} />,
     File: ({ "data-testid": testId, ...props }: any) => <svg data-testid={testId || "icon-file"} {...props} />,
+    Copy: ({ "data-testid": testId, ...props }: any) => <svg data-testid={testId || "icon-copy"} {...props} />,
+    Check: ({ "data-testid": testId, ...props }: any) => <svg data-testid={testId || "icon-check"} {...props} />,
   };
 });
 
@@ -117,6 +124,21 @@ const defaultChatState: UseChatReturn = {
   agentsMap: new Map(),
 };
 
+const defaultRoomsState: UseChatRoomsResult = {
+  rooms: [],
+  roomsLoading: false,
+  roomsError: null,
+  activeRoom: null,
+  activeRoomMembers: [],
+  messages: [],
+  messagesLoading: false,
+  selectRoom: vi.fn(),
+  createRoom: vi.fn(),
+  deleteRoom: vi.fn(),
+  sendRoomMessage: vi.fn(),
+  refreshRooms: vi.fn(),
+};
+
 const activeSessionFixture: ChatSessionInfo = {
   id: "session-001",
   agentId: "agent-001",
@@ -147,6 +169,11 @@ function setupMockChat(overrides: Partial<UseChatReturn> = {}) {
   mockUseChat.mockReturnValue(state);
 }
 
+function setupMockRooms(overrides: Partial<UseChatRoomsResult> = {}) {
+  const state: UseChatRoomsResult = { ...defaultRoomsState, ...overrides };
+  mockUseChatRooms.mockReturnValue(state);
+}
+
 function ensureMatchMedia() {
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {
@@ -174,14 +201,21 @@ function mockViewportMode(mode: "mobile" | "desktop") {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setupMockRooms();
   mockFetchDiscoveredSkills.mockResolvedValue([]);
   mockCreateObjectURL.mockImplementation((file: File) => `blob:${file.name}`);
   Object.defineProperty(URL, "createObjectURL", { value: mockCreateObjectURL, writable: true });
   Object.defineProperty(URL, "revokeObjectURL", { value: mockRevokeObjectURL, writable: true });
+  mockClipboardWriteText.mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText: mockClipboardWriteText },
+    configurable: true,
+  });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  localStorage.removeItem("fusion:chat-scope");
 });
 
 describe("ChatView", () => {
@@ -445,7 +479,7 @@ describe("ChatView", () => {
     expect(screen.queryByTestId("chat-render-mode-plain")).not.toBeInTheDocument();
   });
 
-  it("renders per-message eye toggles for assistant bubbles on desktop and isolates toggles by message", async () => {
+  it("thread-header toggle flips every assistant bubble between rendered Markdown and plain text", async () => {
     setupMockChat({
       activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
       messages: [
@@ -458,24 +492,27 @@ describe("ChatView", () => {
 
     const firstBubble = screen.getByTestId("chat-message-msg-001");
     const secondBubble = screen.getByTestId("chat-message-msg-002");
-    const [firstToggle, secondToggle] = screen.getAllByTestId("chat-message-render-toggle");
+    const headerToggle = screen.getByTestId("chat-thread-render-toggle");
 
-    expect(firstToggle).toBeInTheDocument();
-    expect(secondToggle).toBeInTheDocument();
+    // Per-message toggles were intentionally removed; only the single
+    // thread-level toggle should exist.
+    expect(screen.queryAllByTestId("chat-message-render-toggle")).toHaveLength(0);
     expect(within(firstBubble).getByText("First", { selector: "strong" })).toBeInTheDocument();
     expect(within(secondBubble).getByText("Second", { selector: "strong" })).toBeInTheDocument();
 
-    await userEvent.click(firstToggle);
+    await userEvent.click(headerToggle);
 
     expect(within(firstBubble).getByText(/\*\*First\*\* item/)).toBeInTheDocument();
     expect(within(firstBubble).queryByText("First", { selector: "strong" })).toBeNull();
-    expect(within(secondBubble).getByText("Second", { selector: "strong" })).toBeInTheDocument();
+    expect(within(secondBubble).getByText(/\*\*Second\*\* item/)).toBeInTheDocument();
+    expect(within(secondBubble).queryByText("Second", { selector: "strong" })).toBeNull();
 
-    await userEvent.click(firstToggle);
+    await userEvent.click(headerToggle);
     expect(within(firstBubble).getByText("First", { selector: "strong" })).toBeInTheDocument();
+    expect(within(secondBubble).getByText("Second", { selector: "strong" })).toBeInTheDocument();
   });
 
-  it("uses a dedicated streaming toggle sentinel without affecting persisted assistant messages", async () => {
+  it("thread-header toggle also drives the streaming bubble", async () => {
     setupMockChat({
       activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
       messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "**Persisted**", createdAt: "2026-04-08T00:00:00.000Z" }],
@@ -487,19 +524,19 @@ describe("ChatView", () => {
 
     const persistedBubble = screen.getByTestId("chat-message-msg-001");
     const streamingBubble = document.querySelector(".chat-message--streaming") as HTMLElement;
-    const [persistedToggle, streamingToggle] = screen.getAllByTestId("chat-message-render-toggle");
+    const headerToggle = screen.getByTestId("chat-thread-render-toggle");
 
     expect(within(streamingBubble).getByText("Live", { selector: "strong" })).toBeInTheDocument();
     expect(within(persistedBubble).getByText("Persisted", { selector: "strong" })).toBeInTheDocument();
 
-    await userEvent.click(streamingToggle);
+    await userEvent.click(headerToggle);
 
     expect(within(streamingBubble).getByText(/\*\*Live\*\* stream/)).toBeInTheDocument();
-    expect(within(persistedBubble).getByText("Persisted", { selector: "strong" })).toBeInTheDocument();
-
-    await userEvent.click(persistedToggle);
     expect(within(persistedBubble).getByText(/\*\*Persisted\*\*/)).toBeInTheDocument();
-    expect(within(streamingBubble).getByText(/\*\*Live\*\* stream/)).toBeInTheDocument();
+
+    await userEvent.click(headerToggle);
+    expect(within(streamingBubble).getByText("Live", { selector: "strong" })).toBeInTheDocument();
+    expect(within(persistedBubble).getByText("Persisted", { selector: "strong" })).toBeInTheDocument();
   });
 
   it("renders tool calls from persisted messages", () => {
@@ -590,8 +627,11 @@ describe("ChatView", () => {
     const group = screen.getByTestId("chat-tool-calls-group") as HTMLDetailsElement;
     expect(group).toBeInTheDocument();
     expect(group.open).toBe(false);
-    expect(screen.getByText("2 tool calls")).toBeInTheDocument();
-    expect(screen.getByText("read, grep")).toBeInTheDocument();
+
+    const summary = group.querySelector(".chat-tool-calls-group-summary") as HTMLElement;
+    expect(summary).toBeInTheDocument();
+    expect(summary.querySelector(".chat-tool-calls-count")).toHaveTextContent("2 tool calls");
+    expect(summary.querySelector(".chat-tool-calls-names")).toHaveTextContent("read, grep");
   });
 
   it("auto-opens grouped tool calls when any tool call is running", () => {
@@ -768,6 +808,8 @@ describe("ChatView", () => {
     const details = document.querySelector(".chat-tool-call") as HTMLDetailsElement | null;
     expect(details).toBeInTheDocument();
     expect(details?.open).toBe(false);
+    expect(details?.querySelector(".chat-tool-call-name")).toHaveTextContent("read");
+    expect(details?.querySelector(".chat-tool-call-status-text")).toHaveTextContent("completed");
   });
 
   it("truncates tool names when more than 5 unique", () => {
@@ -869,7 +911,10 @@ describe("ChatView", () => {
     expect(within(avatar!).queryByText("Fusion")).not.toBeInTheDocument();
   });
 
-  it("shows Fusion in assistant message avatar for fn agent sessions", () => {
+  it("hides per-message assistant identity for fn agent (model-only) sessions", () => {
+    // Model-only chats use the active model as their identity, which is
+    // already shown in the thread header. We deliberately suppress the
+    // per-message avatar to avoid repeating it on every reply.
     setupMockChat({
       activeSession: { id: "session-001", agentId: "__fn_agent__", status: "active", title: "Fusion Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
       messages: [
@@ -879,12 +924,11 @@ describe("ChatView", () => {
 
     render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
-    const avatar = document.querySelector(".chat-message-avatar") as HTMLElement | null;
-    expect(avatar).toBeInTheDocument();
-    expect(within(avatar!).getByText("Fusion")).toBeInTheDocument();
+    const messageBubble = screen.getByTestId("chat-message-msg-001");
+    expect(messageBubble.querySelector(".chat-message-avatar")).toBeNull();
   });
 
-  it("shows formatted model name in assistant message avatar for fn agent sessions", async () => {
+  it("hides per-message assistant identity for fn agent (model-only) sessions even when a model is configured", async () => {
     setupMockChat({
       activeSession: {
         id: "session-001",
@@ -902,14 +946,105 @@ describe("ChatView", () => {
 
     render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
-    const avatar = document.querySelector(".chat-message-avatar") as HTMLElement | null;
-    expect(avatar).toBeInTheDocument();
-
+    const messageBubble = screen.getByTestId("chat-message-msg-001");
+    expect(messageBubble.querySelector(".chat-message-avatar")).toBeNull();
+    // The model name still appears once in the thread header.
     await waitFor(() => {
-      expect(within(avatar!).getByText("Claude Sonnet 4.5")).toBeInTheDocument();
+      expect(screen.getByText("Claude Sonnet 4.5")).toBeInTheDocument();
     });
-    expect(within(avatar!).queryByText("Fusion")).not.toBeInTheDocument();
-    expect(avatar?.querySelector(".chat-model-tag")).toBeNull();
+  });
+
+  it("shows copy actions only for assistant responses in provider/model chats", () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "__fn_agent__",
+        status: "active",
+        title: "Fusion Chat",
+        modelProvider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [
+        { id: "msg-user", sessionId: "session-001", role: "user", content: "Question", createdAt: "2026-04-08T00:00:00.000Z" },
+        { id: "msg-assistant", sessionId: "session-001", role: "assistant", content: "Answer", createdAt: "2026-04-08T00:00:01.000Z" },
+      ],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    expect(screen.getByTestId("chat-copy-response-msg-assistant")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-copy-response-msg-user")).not.toBeInTheDocument();
+  });
+
+  it("copies raw provider response content and shows feedback for success/failure", async () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "__fn_agent__",
+        status: "active",
+        title: "Fusion Chat",
+        modelProvider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [
+        { id: "msg-assistant", sessionId: "session-001", role: "assistant", content: "**Raw** output", createdAt: "2026-04-08T00:00:01.000Z" },
+      ],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const copyButton = screen.getByTestId("chat-copy-response-msg-assistant");
+    expect(copyButton).not.toHaveTextContent("Copy");
+    await userEvent.click(copyButton);
+
+    expect(mockClipboardWriteText).toHaveBeenCalledWith("**Raw** output");
+    expect(screen.getByLabelText("Response copied")).toBeInTheDocument();
+
+    mockClipboardWriteText.mockRejectedValueOnce(new Error("denied"));
+    await userEvent.click(screen.getByTestId("chat-copy-response-msg-assistant"));
+    expect(screen.getByLabelText("Copy failed")).toBeInTheDocument();
+  });
+
+  it("shows streaming copy action for provider chats", () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "__fn_agent__",
+        status: "active",
+        title: "Fusion Chat",
+        modelProvider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [],
+      isStreaming: true,
+      streamingText: "Live answer",
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    expect(screen.getByTestId("chat-copy-response-streaming")).toBeInTheDocument();
+  });
+
+  it("does not show copy actions for non-provider sessions", () => {
+    setupMockChat({
+      activeSession: activeSessionFixture,
+      messages: [
+        { id: "msg-assistant", sessionId: "session-001", role: "assistant", content: "Answer", createdAt: "2026-04-08T00:00:01.000Z" },
+      ],
+      isStreaming: true,
+      streamingText: "Live answer",
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    expect(screen.queryByTestId("chat-copy-response-msg-assistant")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-copy-response-streaming")).not.toBeInTheDocument();
   });
 
   it("shows resolved agent name in streaming assistant avatar", async () => {
@@ -958,6 +1093,51 @@ describe("ChatView", () => {
     expect(clearPendingMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("intercepts exact /new and starts a fresh session instead of sending message", async () => {
+    const sendMessage = vi.fn();
+    const createSession = vi.fn().mockResolvedValue({ id: "session-new", agentId: "agent-001" });
+    const stopStreaming = vi.fn();
+    const clearPendingMessage = vi.fn();
+
+    setupMockChat({
+      activeSession: activeSessionFixture,
+      messages: [],
+      sendMessage,
+      createSession,
+      stopStreaming,
+      clearPendingMessage,
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const textarea = screen.getByTestId("chat-input");
+    await userEvent.type(textarea, "  /new  {enter}");
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(createSession).toHaveBeenCalledWith({ agentId: "agent-001" });
+    expect(stopStreaming).toHaveBeenCalledTimes(1);
+    expect(clearPendingMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not intercept non-exact /new text", async () => {
+    const sendMessage = vi.fn();
+    const createSession = vi.fn();
+    setupMockChat({
+      activeSession: activeSessionFixture,
+      messages: [],
+      sendMessage,
+      createSession,
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const textarea = screen.getByTestId("chat-input");
+    await userEvent.type(textarea, "/new now{enter}");
+
+    expect(sendMessage).toHaveBeenCalledWith("/new now", []);
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("does not intercept non-exact /clear text", async () => {
     const sendMessage = vi.fn();
     const createSession = vi.fn();
@@ -991,6 +1171,85 @@ describe("ChatView", () => {
     await userEvent.type(textarea, "Hello world{enter}");
 
     expect(sendMessage).toHaveBeenCalledWith("Hello world", []);
+  });
+
+  it("clears room composer on Enter after successful room send", async () => {
+    localStorage.setItem("fusion:chat-scope", "rooms");
+    const sendRoomMessage = vi.fn().mockResolvedValue(undefined);
+    setupMockChat({ activeSession: activeSessionFixture, messages: [] });
+    setupMockRooms({
+      activeRoom: {
+        id: "room-001",
+        projectId: "proj-123",
+        name: "backend",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      sendRoomMessage,
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    await userEvent.type(textarea, "Room hello{enter}");
+
+    await waitFor(() => {
+      expect(sendRoomMessage).toHaveBeenCalledWith("Room hello");
+    });
+    expect(textarea.value).toBe("");
+    localStorage.removeItem("fusion:chat-scope");
+  });
+
+  it("clears room composer on send button click after successful room send", async () => {
+    localStorage.setItem("fusion:chat-scope", "rooms");
+    const sendRoomMessage = vi.fn().mockResolvedValue(undefined);
+    const sendMessage = vi.fn();
+    setupMockChat({ activeSession: activeSessionFixture, messages: [], sendMessage });
+    setupMockRooms({
+      activeRoom: {
+        id: "room-001",
+        projectId: "proj-123",
+        name: "backend",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      sendRoomMessage,
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    await userEvent.type(textarea, "Room click hello");
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+
+    await waitFor(() => {
+      expect(sendRoomMessage).toHaveBeenCalledWith("Room click hello");
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
+    localStorage.removeItem("fusion:chat-scope");
+  });
+
+  it("keeps direct chat send behavior unchanged when chat rooms are enabled", async () => {
+    localStorage.setItem("fusion:chat-scope", "direct");
+    const sendMessage = vi.fn();
+    const sendRoomMessage = vi.fn();
+    setupMockChat({
+      activeSession: activeSessionFixture,
+      messages: [],
+      sendMessage,
+    });
+    setupMockRooms({ sendRoomMessage });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    await userEvent.type(textarea, "Direct hello{enter}");
+
+    expect(sendMessage).toHaveBeenCalledWith("Direct hello", []);
+    expect(sendRoomMessage).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("");
+    localStorage.removeItem("fusion:chat-scope");
   });
 
   it("does not send on Shift+Enter", async () => {
@@ -1184,6 +1443,49 @@ describe("ChatView", () => {
 
       expect(textarea.value).toBe("@Alpha ");
       expect(screen.queryByTestId("agent-mention-popup")).not.toBeInTheDocument();
+    });
+
+    it("uses room member ordering in popup and marks non-member mention chips in room messages", async () => {
+      setupMockChat({ activeSession: activeSessionFixture, messages: [] });
+      setupMockRooms({
+        activeRoom: {
+          id: "room-001",
+          slug: "engineering",
+          name: "engineering",
+          createdBy: "agent-001",
+          status: "active",
+          createdAt: "2026-04-08T00:00:00.000Z",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+        activeRoomMembers: [
+          { roomId: "room-001", agentId: "agent-001", role: "member", addedAt: "2026-04-08T00:00:00.000Z" },
+        ],
+        messages: [
+          {
+            id: "room-msg-1",
+            roomId: "room-001",
+            role: "user",
+            content: "Ping @Beta",
+            senderAgentId: "agent-001",
+            metadata: null,
+            attachments: [],
+            mentions: ["agent-002"],
+            createdAt: "2026-04-08T00:00:00.000Z",
+          },
+        ],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+      await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+      const textarea = screen.getByTestId("chat-input");
+      await userEvent.type(textarea, "@");
+
+      expect(await screen.findByTestId("agent-mention-members-header")).toBeInTheDocument();
+      expect(screen.queryByTestId("agent-mention-others-header")).not.toBeInTheDocument();
+
+      const nonMemberChip = screen.getByText("@Beta", { selector: ".chat-mention-chip--non-member" });
+      expect(nonMemberChip).toHaveAttribute("title", "Not a member of engineering");
     });
 
     it("renders assistant mentions as plain text in markdown mode", async () => {
@@ -1512,6 +1814,42 @@ describe("ChatView", () => {
   });
 
   describe("streaming states", () => {
+    it("keeps mobile thread visible when active session metadata refreshes during streaming", () => {
+      const mediaQuerySpy = mockViewportMode("mobile");
+      const streamingState: UseChatReturn = {
+        ...defaultChatState,
+        sessions: [{ ...activeSessionFixture }],
+        filteredSessions: [{ ...activeSessionFixture }],
+        activeSession: { ...activeSessionFixture },
+        messages: [],
+        isStreaming: true,
+        streamingText: "",
+        streamingThinking: "",
+      };
+      const refreshedStreamingState: UseChatReturn = {
+        ...streamingState,
+        sessions: [{ ...activeSessionFixture, updatedAt: "2026-04-08T00:05:00.000Z" }],
+        filteredSessions: [{ ...activeSessionFixture, updatedAt: "2026-04-08T00:05:00.000Z" }],
+        activeSession: null,
+      };
+
+      mockUseChat
+        .mockReturnValueOnce(streamingState)
+        .mockReturnValue(refreshedStreamingState);
+
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      expect(document.querySelector(".chat-message--streaming")?.textContent).toContain("Connecting");
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      expect(document.querySelector(".chat-message--streaming")?.textContent).toContain("Connecting");
+      expect(screen.queryByText("Start a new conversation")).not.toBeInTheDocument();
+      expect(screen.queryByText("No messages yet. Start the conversation!")).not.toBeInTheDocument();
+      expect(screen.getByTestId("chat-back-btn")).toBeInTheDocument();
+
+      void mediaQuerySpy;
+    });
+
     it("keeps the streaming indicator visible while message history is still loading", () => {
       setupMockChat({
         activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
@@ -1801,6 +2139,40 @@ describe("ChatView", () => {
     expect(headerModelTag).toBeNull();
   });
 
+  it("keeps provider identity text grouped in header while render toggle stays on the same row", () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "agent-001",
+        status: "active",
+        title: "Agent Chat",
+        modelProvider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [
+        { id: "msg-001", sessionId: "session-001", role: "assistant", content: "Hi!", createdAt: "2026-04-08T00:00:00.000Z" },
+      ],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const header = document.querySelector(".chat-thread-header") as HTMLElement | null;
+    const identity = screen.getByTestId("chat-thread-header-identity");
+    const toggle = screen.getByTestId("chat-thread-render-toggle");
+    const providerIcon = identity.querySelector(".provider-icon");
+    const modelTag = identity.querySelector(".chat-model-tag");
+
+    expect(header).toBeInTheDocument();
+    expect(providerIcon).toBeInTheDocument();
+    expect(within(identity).getByText("Agent Chat")).toBeInTheDocument();
+    expect(modelTag).toBeInTheDocument();
+    expect(modelTag).toHaveTextContent("Claude Sonnet 4.5");
+    expect(toggle).toBeInTheDocument();
+    expect(header?.children[header.children.length - 1]).toBe(toggle);
+    expect(document.querySelectorAll(".chat-thread-header .chat-model-tag")).toHaveLength(1);
+  });
+
   it("does not show model tag when session has no model", () => {
     setupMockChat({
       activeSession: {
@@ -1822,7 +2194,11 @@ describe("ChatView", () => {
     expect(modelTag).not.toBeInTheDocument();
   });
 
-  it("shows model tag in message avatar when non-fn session has model", () => {
+  it("does not repeat the model tag in per-message avatars for non-fn sessions", () => {
+    // Per-message model tags were intentionally removed — the model is shown
+    // once in the thread header. The avatar should still render with the
+    // agent name (no agent identity collapse for real agents) but no model
+    // tag inside it.
     setupMockChat({
       activeSession: {
         id: "session-001",
@@ -1840,12 +2216,13 @@ describe("ChatView", () => {
 
     render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
-    const avatar = document.querySelector(".chat-message-avatar") as HTMLElement | null;
+    const messageBubble = screen.getByTestId("chat-message-msg-001");
+    const avatar = messageBubble.querySelector(".chat-message-avatar") as HTMLElement | null;
     expect(avatar).toBeInTheDocument();
-    expect(avatar?.querySelector(".chat-model-tag")?.textContent).toContain("GPT");
+    expect(avatar?.querySelector(".chat-model-tag")).toBeNull();
   });
 
-  it("does not show duplicate model tag in message avatar for fn agent sessions", () => {
+  it("hides per-message identity entirely for fn agent (model-only) sessions even when model is set", () => {
     setupMockChat({
       activeSession: {
         id: "session-001",
@@ -1863,10 +2240,8 @@ describe("ChatView", () => {
 
     render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
-    const avatar = document.querySelector(".chat-message-avatar") as HTMLElement | null;
-    expect(avatar).toBeInTheDocument();
-    expect(within(avatar!).getByText("GPT-4o")).toBeInTheDocument();
-    expect(avatar?.querySelector(".chat-model-tag")).toBeNull();
+    const messageBubble = screen.getByTestId("chat-message-msg-001");
+    expect(messageBubble.querySelector(".chat-message-avatar")).toBeNull();
   });
 });
 
@@ -2056,6 +2431,25 @@ describe("Chat Session Delete Button", () => {
   });
 });
 
+describe("FN-3911 chat session list layout", () => {
+  const css = loadAllAppCss();
+
+  it("reserves right padding on title and preview rows so text clears the delete button", () => {
+    const titleMatch = css.match(/\.chat-session-title\s*\{([^}]*)\}/);
+    const previewMatch = css.match(/\.chat-session-preview\s*\{([^}]*)\}/);
+    expect(titleMatch).toBeTruthy();
+    expect(previewMatch).toBeTruthy();
+    expect(titleMatch?.[1]).toMatch(/padding-right:\s*calc\(var\(--space-md\)\s*\*\s*3\)/);
+    expect(previewMatch?.[1]).toMatch(/padding-right:\s*calc\(var\(--space-md\)\s*\*\s*3\)/);
+  });
+
+  it("applies a mobile padding override that still clears the larger delete button", () => {
+    expect(css).toMatch(
+      /@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-session-title,\s*\.chat-session-preview\s*\{\s*padding-right:\s*calc\(\(var\(--space-lg\)\s*\*\s*2\.25\)\s*\+\s*var\(--space-sm\)\);\s*\}/,
+    );
+  });
+});
+
 describe("Chat Session Delete Button CSS", () => {
   const css = loadAllAppCss();
 
@@ -2087,6 +2481,37 @@ describe("Chat Session Delete Button CSS", () => {
       }
     }
     expect(foundMobileDeleteBtn).toBe(true);
+  });
+});
+
+describe("ChatView CSS — mobile thread switcher", () => {
+  const css = loadAllAppCss();
+
+  it("includes mobile session switcher trigger and dropdown tokenized contracts", () => {
+    const triggerMatch = css.match(/\.chat-mobile-session-trigger\s*\{([^}]*)\}/);
+    const dropdownMatch = css.match(/\.chat-mobile-session-dropdown\s*\{([^}]*)\}/);
+    const optionMatch = css.match(/\.chat-mobile-session-option\s*\{([^}]*)\}/);
+    const optionTitleMatch = css.match(/\.chat-mobile-session-option-title\s*\{([^}]*)\}/);
+    expect(triggerMatch).toBeTruthy();
+    expect(dropdownMatch).toBeTruthy();
+    expect(optionMatch).toBeTruthy();
+    expect(optionTitleMatch).toBeTruthy();
+    expect(triggerMatch?.[1]).toContain("min-height: calc(var(--space-lg) * 2)");
+    expect(triggerMatch?.[1]).toContain("min-width: 0");
+    expect(triggerMatch?.[1]).toContain("line-height: normal");
+    expect(dropdownMatch?.[1]).toContain("background: var(--surface)");
+    expect(dropdownMatch?.[1]).toContain("border: 1px solid var(--border)");
+    expect(optionMatch?.[1]).toContain("min-height: calc(var(--space-lg) * 2.25)");
+    expect(optionMatch?.[1]).toContain("align-items: flex-start");
+    expect(optionMatch?.[1]).toContain("line-height: normal");
+    expect(optionTitleMatch?.[1]).toContain("display: block");
+    expect(optionTitleMatch?.[1]).toContain("line-height: normal");
+    expect(optionTitleMatch?.[1]).toContain("white-space: normal");
+    expect(optionTitleMatch?.[1]).toContain("overflow-wrap: anywhere");
+  });
+
+  it("keeps mobile override for header identity overflow visible so dropdown can render", () => {
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-thread-header-identity\s*\{[^}]*overflow:\s*visible;/);
   });
 });
 
@@ -2246,6 +2671,104 @@ describe("ChatView sidebar structure", () => {
     const sessionList = document.querySelector(".chat-session-list") as HTMLElement | null;
     expect(sessionList).toBeInTheDocument();
     expect(sessionList).toHaveClass("chat-sidebar-list");
+  });
+});
+
+describe("Direct/Rooms scope toggle", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("hides rooms UI when chatRooms experimental flag is off", () => {
+    setupMockChat({ sessions: [], filteredSessions: [] });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{}} />);
+
+    expect(screen.queryByTestId("chat-sidebar-scope-rooms")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-sidebar-rooms")).not.toBeInTheDocument();
+  });
+
+  it("defaults to Direct with sidebar list visible", () => {
+    setupMockChat({
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    expect(screen.getByTestId("chat-sidebar-scope-direct")).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("chat-sidebar-scope-rooms")).toHaveAttribute("aria-selected", "false");
+    expect(document.querySelector(".chat-session-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-sidebar-rooms-empty")).toBeNull();
+  });
+
+  it("shows rooms UI when chatRooms experimental flag is on", async () => {
+    setupMockChat({ sessions: [], filteredSessions: [] });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    expect(screen.getByTestId("chat-sidebar-scope-rooms")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+    expect(screen.getByTestId("chat-sidebar-rooms")).toBeInTheDocument();
+  });
+
+  it("shows rooms placeholder and hides direct search/list in Rooms scope", async () => {
+    setupMockChat({
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+
+    expect(screen.getByTestId("chat-sidebar-scope-rooms")).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("chat-sidebar-rooms-empty")).toBeInTheDocument();
+    expect(document.querySelector(".chat-session-list")).toBeNull();
+    expect(screen.queryByTestId("chat-search-input")).toBeNull();
+  });
+
+  it("switching back to Direct restores search/list and keeps active session highlight", async () => {
+    setupMockChat({
+      activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-direct"));
+
+    expect(screen.getByTestId("chat-search-input")).toBeInTheDocument();
+    expect(document.querySelector(".chat-session-list")).toBeInTheDocument();
+    expect(screen.getByTestId("chat-session-session-001")).toHaveClass("chat-session-item--active");
+  });
+
+  it("forces direct scope when localStorage persisted rooms but chatRooms is off", () => {
+    setupMockChat({ sessions: [], filteredSessions: [] });
+    localStorage.setItem("fusion:chat-scope", "rooms");
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{}} />);
+
+    expect(screen.queryByTestId("chat-sidebar-scope-rooms")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-search-input")).toBeInTheDocument();
+  });
+
+  it("persists scope in localStorage and restores Rooms on next mount", async () => {
+    setupMockChat({ sessions: [], filteredSessions: [] });
+
+    const { unmount } = render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+    expect(localStorage.getItem("fusion:chat-scope")).toBe("rooms");
+
+    unmount();
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    expect(screen.getByTestId("chat-sidebar-scope-rooms")).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("chat-sidebar-rooms-empty")).toBeInTheDocument();
   });
 });
 
@@ -2560,6 +3083,73 @@ describe("ChatView mobile behavior", () => {
     }
   });
 
+  it("mobile mode: thread header title opens quick session switcher and closes after selection", async () => {
+    const restoreMatchMedia = mockMobileViewport();
+    const selectSession = vi.fn();
+    try {
+      setupMockChat({
+        sessions: [
+          { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
+          { id: "session-002", agentId: "agent-002", status: "active", title: "Another Chat", createdAt: "2026-04-07T00:00:00.000Z", updatedAt: "2026-04-07T00:00:00.000Z" },
+        ],
+        filteredSessions: [
+          { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
+          { id: "session-002", agentId: "agent-002", status: "active", title: "Another Chat", createdAt: "2026-04-07T00:00:00.000Z", updatedAt: "2026-04-07T00:00:00.000Z" },
+        ],
+        activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
+        selectSession,
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await userEvent.click(screen.getByTestId("chat-mobile-session-trigger"));
+      expect(screen.getByTestId("chat-mobile-session-dropdown")).toBeInTheDocument();
+
+      await userEvent.click(screen.getByTestId("chat-mobile-session-option-session-002"));
+      expect(selectSession).toHaveBeenCalledWith("session-002");
+      expect(screen.queryByTestId("chat-mobile-session-dropdown")).not.toBeInTheDocument();
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("mobile mode: quick session switcher closes on outside click and is not shown for rooms", async () => {
+    const restoreMatchMedia = mockMobileViewport();
+    try {
+      setupMockChat({ activeSession: activeSessionFixture });
+      const initialRender = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      expect(screen.queryByTestId("chat-mobile-session-trigger")).toBeInTheDocument();
+      await userEvent.click(screen.getByTestId("chat-mobile-session-trigger"));
+      expect(screen.getByTestId("chat-mobile-session-dropdown")).toBeInTheDocument();
+
+      fireEvent.mouseDown(document.body);
+      await waitFor(() => {
+        expect(screen.queryByTestId("chat-mobile-session-dropdown")).not.toBeInTheDocument();
+      });
+
+      initialRender.unmount();
+
+      localStorage.setItem("fusion:chat-scope", "rooms");
+      setupMockRooms({
+        activeRoom: {
+          id: "room-001",
+          projectId: "proj-123",
+          name: "backend",
+          createdAt: "2026-04-08T00:00:00.000Z",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+      expect(screen.queryByTestId("chat-mobile-session-trigger")).not.toBeInTheDocument();
+      expect(screen.getByText("#backend")).toBeInTheDocument();
+    } finally {
+      localStorage.setItem("fusion:chat-scope", "direct");
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
   it("mobile mode: send button sends on first touch and keeps composer focused", async () => {
     const restoreMatchMedia = mockMobileViewport();
     const sendMessage = vi.fn();
@@ -2660,7 +3250,7 @@ describe("ChatView mobile behavior", () => {
     }
   });
 
-  it("mobile mode: applies --vv-height when keyboard opens with zero overlap (iOS last-resort signal)", async () => {
+  it("mobile mode: applies keyboard-active class for iOS fallback when viewport offset is present", async () => {
     const restoreMatchMedia = mockMobileViewport();
     const { listeners, mockVV } = mockMobileVisualViewport({
       innerHeight: 800,
@@ -2677,11 +3267,8 @@ describe("ChatView mobile behavior", () => {
 
       const thread = document.querySelector(".chat-thread") as HTMLDivElement;
       expect(thread).toBeInTheDocument();
-      expect(thread.style.getPropertyValue("--vv-height")).toBe("");
+      expect(thread.classList.contains("chat-thread--keyboard-active")).toBe(false);
 
-      // Focus the chat textarea so the hook treats the active element as a
-      // keyboard-focusable target — this is what unlocks the iOS last-resort
-      // signal where viewport shrinks but offsetTop+height closes the gap.
       const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
       await act(async () => {
         textarea.focus();
@@ -2690,10 +3277,6 @@ describe("ChatView mobile behavior", () => {
         document.dispatchEvent(new Event("focusin"));
       });
 
-      // iOS scenario: vv.height shrinks by 16px, vv.offsetTop also = 16.
-      // Both chromeOverlap (innerHeight - offsetTop - height) and the gap
-      // measurement are 0, but baselineHeight - vv.height = 16 trips the
-      // "viewport shrank" branch with overlap=0, keyboardOpen=true.
       Object.defineProperty(mockVV, "height", { value: 784, writable: true, configurable: true });
       Object.defineProperty(mockVV, "offsetTop", { value: 16, writable: true, configurable: true });
 
@@ -2701,13 +3284,60 @@ describe("ChatView mobile behavior", () => {
         for (const cb of listeners.resize) cb();
       });
 
-      // The thread style is gated on keyboardOpen (not keyboardOverlap > 0),
-      // so --vv-height must still be applied even when the computed overlap
-      // collapses to zero. Regression guard for the gating change in
-      // ChatView.tsx:766.
       await waitFor(() => {
         expect(thread.style.getPropertyValue("--keyboard-overlap")).toBe("0px");
         expect(thread.style.getPropertyValue("--vv-height")).toBe("784px");
+        expect(thread.classList.contains("chat-thread--keyboard-active")).toBe(true);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("mobile mode: removes keyboard-active class immediately on blur even before visualViewport settles", async () => {
+    const restoreMatchMedia = mockMobileViewport();
+    const { listeners, mockVV } = mockMobileVisualViewport({
+      innerHeight: 800,
+      vvHeight: 800,
+    });
+
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "Hello", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const thread = document.querySelector(".chat-thread") as HTMLDivElement;
+      expect(thread).toBeInTheDocument();
+
+      const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+      await act(async () => {
+        textarea.focus();
+      });
+      act(() => {
+        document.dispatchEvent(new Event("focusin"));
+      });
+
+      Object.defineProperty(mockVV, "height", { value: 560, writable: true, configurable: true });
+      Object.defineProperty(window, "innerHeight", { value: 560, writable: true, configurable: true });
+
+      act(() => {
+        for (const cb of listeners.resize) cb();
+      });
+
+      await waitFor(() => {
+        expect(thread.classList.contains("chat-thread--keyboard-active")).toBe(true);
+      });
+
+      textarea.blur();
+      act(() => {
+        document.dispatchEvent(new Event("focusout"));
+      });
+
+      await waitFor(() => {
+        expect(thread.classList.contains("chat-thread--keyboard-active")).toBe(false);
       });
     } finally {
       restoreMatchMedia.mockRestore();
@@ -2884,6 +3514,291 @@ describe("ChatView mobile behavior", () => {
       restoreMatchMedia.mockRestore();
     }
   });
+
+  it("shows jump-to-latest only after scrolling away from bottom and jumps back on click", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [
+          { id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" },
+        ],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1000 });
+      Object.defineProperty(messagesContainer, "clientHeight", { configurable: true, get: () => 200 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      scrollTopValue = 600;
+      fireEvent.scroll(messagesContainer);
+      expect(screen.getByTestId("chat-jump-to-latest")).toBeInTheDocument();
+
+      await userEvent.click(screen.getByTestId("chat-jump-to-latest"));
+      expect(scrollTopValue).toBe(1000);
+      await waitFor(() => {
+        expect(screen.queryByTestId("chat-jump-to-latest")).not.toBeInTheDocument();
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-3884: snaps to bottom when opening a session with loaded messages", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({ activeSession: activeSessionFixture, messages: [] });
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 950 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(950);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-3884: re-anchors when messagesLoading transitions to loaded with messages", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({ activeSession: activeSessionFixture, messages: [], messagesLoading: true });
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 980 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messagesLoading: false,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "Loaded", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(980);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-4040: mobile thread entry anchors to latest message", async () => {
+    const restoreMatchMedia = mockViewportMode("mobile");
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1040 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1040);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-4040: mobile visibility restore re-anchors chat thread to latest", async () => {
+    const restoreMatchMedia = mockViewportMode("mobile");
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 250;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1180 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+      fireEvent(document, new Event("visibilitychange"));
+      scrollTopValue = 300;
+
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1180);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    }
+  });
+
+  it("FN-3884: retries bottom anchor while container height keeps growing", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    const originalRaf = window.requestAnimationFrame;
+    const rafQueue: FrameRequestCallback[] = [];
+    window.requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      rafQueue.push(cb);
+      return rafQueue.length;
+    });
+
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      let scrollHeightValue = 600;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => scrollHeightValue });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      scrollHeightValue = 900;
+      while (rafQueue.length > 0) {
+        const cb = rafQueue.shift();
+        cb?.(performance.now());
+      }
+
+      expect(scrollTopValue).toBe(900);
+    } finally {
+      window.requestAnimationFrame = originalRaf;
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-3884: snaps to bottom when switching active session id", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 0;
+      let scrollHeightValue = 900;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => scrollHeightValue });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      setupMockChat({
+        activeSession: { ...activeSessionFixture, id: "session-002" },
+        messages: [{ id: "msg-101", sessionId: "session-002", role: "assistant", content: "Two", createdAt: "2026-04-08T00:01:00.000Z" }],
+      });
+      scrollHeightValue = 1300;
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1300);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-3884: does not yank when user scrolled up on same-session updates", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 700;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1200 });
+      Object.defineProperty(messagesContainer, "clientHeight", { configurable: true, get: () => 200 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      fireEvent.scroll(messagesContainer);
+
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [
+          { id: "msg-000", sessionId: "session-001", role: "assistant", content: "Older", createdAt: "2026-04-07T23:59:00.000Z" },
+          { id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" },
+        ],
+      });
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(700);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
 });
 
 describe("ChatView mobile CSS contract", () => {
@@ -2944,14 +3859,13 @@ describe("ChatView mobile CSS contract", () => {
     expect(mobileRuleContains(".chat-sidebar-list", "min-height: 0")).toBe(true);
   });
 
-  it("mobile .chat-sidebar-footer exists with display: flex and border-top", () => {
-    expect(mobileRuleContains(".chat-sidebar-footer", "display: flex")).toBe(true);
+  it("mobile .chat-sidebar-footer exists with display block and border-top", () => {
+    expect(mobileRuleContains(".chat-sidebar-footer", "display: block")).toBe(true);
     expect(mobileRuleContains(".chat-sidebar-footer", "border-top")).toBe(true);
   });
 
-  it("mobile .chat-sidebar-footer-btn has flex: 1 for full-width button", () => {
-    expect(mobileRuleContains(".chat-sidebar-footer-btn", "flex: 1")).toBe(true);
-    expect(mobileRuleContains(".chat-sidebar-footer-btn", "justify-content: center")).toBe(true);
+  it("mobile .chat-sidebar-footer-btn stays full-width and centered", () => {
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-sidebar-footer\s+\.chat-sidebar-footer-btn\s*\{[^}]*width:\s*100%[^}]*justify-content:\s*center/);
   });
 
   it("mobile does not override assistant render toggle visibility", () => {
@@ -2979,6 +3893,22 @@ describe("ChatView mobile CSS contract", () => {
   });
 
   it("mobile includes keyboard-aware chat-thread height rule", () => {
-    expect(css).toMatch(/\.chat-thread\[style\*=\"--keyboard-overlap\"\]\s*\{[^}]*--vv-height/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-thread--keyboard-active\s*\{[^}]*--vv-height/);
+  });
+
+  it("mobile widens chat bubbles for readability", () => {
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message\s*\{[^}]*max-width:\s*90%/);
+  });
+
+  it("mobile keeps thread-header identity and render toggle inline", () => {
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-thread-header\s*\{[^}]*flex-wrap:\s*nowrap/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-thread-header-identity\s*\{[^}]*flex:\s*1\s+1\s+auto[^}]*white-space:\s*nowrap/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-thread-header-render-toggle\s*\{[^}]*flex-shrink:\s*0/);
+  });
+
+  it("mobile keeps response copy action visible and touch-friendly", () => {
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*opacity:\s*1/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*min-width:\s*calc\(var\(--space-lg\)\s*\*\s*2\.25\)/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*min-height:\s*calc\(var\(--space-lg\)\s*\*\s*2\.25\)/);
   });
 });

@@ -3,9 +3,9 @@
  * All functions route through /api/proxy/:nodeId/... when a remote node is targeted.
  */
 
-import type { ProjectInfo } from "./api";
-import type { ProjectHealth, Task } from "@fusion/core";
-import { api, proxyApi } from "./api";
+import type { NodeProjectMappingInput, ProjectInfo } from "./api";
+import type { ProjectHealth, ProjectNodePathMapping, Task } from "@fusion/core";
+import { api, proxyApi, upsertProjectPathMapping } from "./api";
 
 /** Health information for a remote node */
 export interface RemoteNodeHealth {
@@ -120,3 +120,19 @@ export async function syncNodeAuth(nodeId: string): Promise<NodeAuthSyncResult> 
     body: JSON.stringify({}),
   });
 }
+
+/** Fetch all project path mappings for a node */
+export async function fetchNodeProjectPathMappings(nodeId: string): Promise<ProjectNodePathMapping[]> {
+  return api<ProjectNodePathMapping[]>(`/nodes/${encodeURIComponent(nodeId)}/path-mappings`);
+}
+
+/** Persist one mapping per selected project for a newly-created node. */
+export async function persistNodeProjectPathMappings(
+  nodeId: string,
+  projectMappings: NodeProjectMappingInput[],
+): Promise<ProjectNodePathMapping[]> {
+  return Promise.all(
+    projectMappings.map(({ projectId, path }) => upsertProjectPathMapping(projectId, nodeId, path)),
+  );
+}
+

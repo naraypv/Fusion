@@ -1,14 +1,32 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { AddNodeModal } from "../AddNodeModal";
-import type { NodeInfo } from "../../api";
 
 describe("AddNodeModal", () => {
   const defaultProps = {
     isOpen: true,
     onClose: vi.fn(),
     onSubmit: vi.fn().mockResolvedValue(undefined),
+    onDiscoverRemoteProjects: vi.fn().mockResolvedValue({ projects: [] }),
     addToast: vi.fn(),
+    projects: [
+      {
+        id: "proj-1",
+        name: "Project One",
+        path: "/workspace/project-one",
+        status: "active" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        id: "proj-2",
+        name: "Project Two",
+        path: "/workspace/project-two",
+        status: "active" as const,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ],
   };
 
   beforeEach(() => {
@@ -92,6 +110,7 @@ describe("AddNodeModal", () => {
         url: undefined,
         apiKey: undefined,
         maxConcurrent: 2,
+        projectMappings: [],
       }));
       expect(defaultProps.addToast).toHaveBeenCalledWith('Node "Test Node" registered', "success");
       expect(defaultProps.onClose).toHaveBeenCalled();
@@ -218,18 +237,22 @@ describe("AddNodeModal", () => {
     ).toBeInTheDocument();
   });
 
-  it("submits remote node with URL and API key", async () => {
-    render(<AddNodeModal {...defaultProps} />);
+  it("submits remote node with URL and API key after discovery", async () => {
+    const onDiscoverRemoteProjects = vi.fn().mockResolvedValue({
+      projects: [{
+        id: "remote-1",
+        name: "Project One",
+        path: "/srv/project-one",
+        status: "active",
+        isolationMode: "in-process",
+      }],
+    });
+    render(<AddNodeModal {...defaultProps} onDiscoverRemoteProjects={onDiscoverRemoteProjects} />);
 
-    // Fill name
     fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
       target: { value: "Remote Node" },
     });
-
-    // Switch to remote
     fireEvent.click(screen.getByRole("button", { name: "Remote" }));
-
-    // Fill URL and API key
     fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
       target: { value: "https://node.example.com" },
     });
@@ -238,6 +261,15 @@ describe("AddNodeModal", () => {
     });
     fireEvent.change(screen.getByPlaceholderText("Enter node API key"), {
       target: { value: "secret-key" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Discover Remote Projects" }));
+
+    await waitFor(() => {
+      expect(onDiscoverRemoteProjects).toHaveBeenCalledWith({
+        url: "https://node.example.com",
+        apiKey: "secret-key",
+      });
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
@@ -249,7 +281,180 @@ describe("AddNodeModal", () => {
         url: "https://node.example.com",
         apiKey: "secret-key",
         maxConcurrent: 2,
+        projectMappings: [],
       }));
     });
+  });
+
+  it("blocks remote submit until discovery succeeds", async () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
+      target: { value: "Remote Node" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Remote" }));
+    fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
+      target: { value: "https://node.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
+
+    expect(await screen.findByText("Discover remote projects before adding this node.")).toBeInTheDocument();
+    expect(defaultProps.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("validates selected project path is required", async () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
+      target: { value: "Node With Project" },
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project One" }));
+    fireEvent.change(screen.getByDisplayValue("/workspace/project-one"), {
+      target: { value: "" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
+
+    expect(await screen.findByText("Path is required")).toBeInTheDocument();
+    expect(defaultProps.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("validates selected project path is absolute", async () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
+      target: { value: "Node With Project" },
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project One" }));
+    fireEvent.change(screen.getByDisplayValue("/workspace/project-one"), {
+      target: { value: "relative/path" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
+
+    expect(await screen.findByText("Path must be absolute")).toBeInTheDocument();
+    expect(defaultProps.onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("prefills path from exact-name discovery match", async () => {
+    const onDiscoverRemoteProjects = vi.fn().mockResolvedValue({
+      projects: [{
+        id: "remote-1",
+        name: "Project One",
+        path: "/remote/project-one",
+        status: "active",
+        isolationMode: "in-process",
+      }],
+    });
+    render(<AddNodeModal {...defaultProps} onDiscoverRemoteProjects={onDiscoverRemoteProjects} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remote" }));
+    fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
+      target: { value: "https://node.example.com" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Discover Remote Projects" }));
+    await waitFor(() => {
+      expect(onDiscoverRemoteProjects).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project One" }));
+    expect(screen.getByDisplayValue("/remote/project-one")).toBeInTheDocument();
+  });
+
+  it("leaves ambiguous name matches unresolved", async () => {
+    const onDiscoverRemoteProjects = vi.fn().mockResolvedValue({
+      projects: [
+        {
+          id: "remote-1",
+          name: "Project One",
+          path: "/remote/project-one-a",
+          status: "active",
+          isolationMode: "in-process",
+        },
+        {
+          id: "remote-2",
+          name: "Project One",
+          path: "/remote/project-one-b",
+          status: "paused",
+          isolationMode: "child-process",
+        },
+      ],
+    });
+    render(<AddNodeModal {...defaultProps} onDiscoverRemoteProjects={onDiscoverRemoteProjects} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
+      target: { value: "Remote Node" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Remote" }));
+    fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
+      target: { value: "https://node.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Discover Remote Projects" }));
+    await waitFor(() => {
+      expect(onDiscoverRemoteProjects).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project One" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
+
+    expect(await screen.findByText("Path is required")).toBeInTheDocument();
+  });
+
+  it("shows discovery error inline", async () => {
+    const onDiscoverRemoteProjects = vi.fn().mockRejectedValue(new Error("upstream unavailable"));
+    render(<AddNodeModal {...defaultProps} onDiscoverRemoteProjects={onDiscoverRemoteProjects} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remote" }));
+    fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
+      target: { value: "https://node.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Discover Remote Projects" }));
+
+    expect(await screen.findByText("upstream unavailable")).toBeInTheDocument();
+  });
+
+  it("shows explicit zero-project discovery state", async () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remote" }));
+    fireEvent.change(screen.getByPlaceholderText("https://node.example.com"), {
+      target: { value: "https://node.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Discover Remote Projects" }));
+
+    expect(await screen.findByText("No projects discovered on remote node.")).toBeInTheDocument();
+  });
+
+  it("submits selected project mappings", async () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), {
+      target: { value: "Node With Project" },
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project One" }));
+    fireEvent.change(screen.getByDisplayValue("/workspace/project-one"), {
+      target: { value: "/mnt/node/project-one" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Node" }));
+
+    await waitFor(() => {
+      expect(defaultProps.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        name: "Node With Project",
+        projectMappings: [{ projectId: "proj-1", path: "/mnt/node/project-one" }],
+      }));
+    });
+  });
+
+  it("removes path input when project is deselected", () => {
+    render(<AddNodeModal {...defaultProps} />);
+
+    const checkbox = screen.getByRole("checkbox", { name: "Project One" });
+    fireEvent.click(checkbox);
+    expect(screen.getByDisplayValue("/workspace/project-one")).toBeInTheDocument();
+
+    fireEvent.click(checkbox);
+    expect(screen.queryByDisplayValue("/workspace/project-one")).not.toBeInTheDocument();
   });
 });

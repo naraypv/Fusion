@@ -40,6 +40,9 @@ function createMockCentralCore(projects: RegisteredProject[]): CentralCore {
     ),
     updateProject: vi.fn().mockResolvedValue(undefined),
     updateProjectHealth: vi.fn().mockResolvedValue(undefined),
+    resolveLocalProjectWorkingDirectory: vi
+      .fn()
+      .mockImplementation((projectId: string) => Promise.resolve(`/mapped/${projectId}`)),
   } as unknown as CentralCore;
 }
 
@@ -73,10 +76,13 @@ describe("ProjectEngineManager", () => {
 
       expect(engine).toBeDefined();
       expect(engine.start).toHaveBeenCalledOnce();
+      expect(
+        (centralCore.resolveLocalProjectWorkingDirectory as unknown as ReturnType<typeof vi.fn>),
+      ).toHaveBeenCalledWith("proj_aaa");
       expect(ProjectEngine).toHaveBeenCalledWith(
         expect.objectContaining({
           projectId: "proj_aaa",
-          workingDirectory: "/tmp/a",
+          workingDirectory: "/mapped/proj_aaa",
           isolationMode: "in-process",
         }),
         centralCore,
@@ -464,6 +470,9 @@ describe("ProjectEngineManager", () => {
           Promise.resolve(projectMap.get(id) ?? null),
         ),
         getProjectByPath: vi.fn().mockResolvedValue(null),
+        resolveLocalProjectWorkingDirectory: vi
+          .fn()
+          .mockImplementation((projectId: string) => Promise.resolve(`/mapped/${projectId}`)),
       } as unknown as CentralCore;
       const manager = new ProjectEngineManager(emptyCentralCore);
 

@@ -59,9 +59,27 @@ getRendererUrl()     // Returns URL or file:// path
 getRendererFilePath() // Returns absolute file path for loadFile()
 ```
 
+## First-run Shell Onboarding (Desktop)
+
+Desktop boots through a shell-owned mode chooser before mounting the dashboard app when the user has not completed mode selection yet.
+
+- **First run choice:** users choose **Local Fusion (bundled runtime)** or **Remote connection path**.
+- **Mode contract:** `desktopMode` is `"local" | "remote" | null` and `hasCompletedModeSelection` determines whether the renderer treats startup as first-run. IPC also exposes a renderer-safe `{ isFirstRun, desktopMode }` shape via `shell:getDesktopModeState`.
+- **Desktop mode restore:** launch mode is stored in `app.getPath("userData")/desktop-launch-mode.json` as `{ "mode": "choose" | "local" | "remote" }` and reused on relaunch.
+- **Restore rules:** `choose` keeps chooser-first startup behavior, `local` attempts to start the embedded local runtime on launch, and `remote` skips embedded runtime startup.
+- **Failure fallback:** if remembered `local` restore fails, the shell stops partial runtime state, falls back to `choose`, and persists that fallback to avoid broken relaunch loops.
+- **Remote profiles:** multiple saved profiles are supported (`name`, `serverUrl`, optional `authToken`) and can be created/edited/switched/deleted from the dashboard connection manager.
+- **Delete fallback:** if the active profile is deleted, desktop shell settings automatically select the first remaining profile; deleting the final profile leaves a valid empty payload (`activeProfileId: null`, `profiles: []`).
+- **Storage boundary:** shell connection state is stored only in desktop-local app data at `app.getPath("userData")/shell-connections.json` and is not written to `.fusion/config.json` or dashboard project storage keys.
+
+### Production vs dev bootstrap behavior
+
+- **Production (`fn desktop`)**: renderer mounts `DesktopShellBootstrap`, which resolves shell mode via preload/IPC and either renders the chooser or mounts the dashboard shell. In remote mode, the dashboard shell opens the native connection onboarding/manager flow instead of the local runtime path.
+- **Dev (`pnpm --filter @fusion/desktop dev`)**: same mode bootstrap flow runs; only the renderer source (Vite URL vs bundled file) changes.
+
 ## IPC Channel Reference
 
-`src/ipc.ts` registers the renderer ↔ main process bridge used by `window.fusionAPI`.
+`src/ipc.ts` registers renderer ↔ main process bridges used by `window.electronAPI` (desktop renderer transport/window controls) and `window.fusionShell` (shared shell connection contract for dashboard code).
 
 ### Renderer → Main (`ipcRenderer.invoke`)
 
@@ -73,7 +91,12 @@ getRendererFilePath() // Returns absolute file path for loadFile()
 | `window:isMaximized` | renderer → main | none | `Promise<boolean>` |
 | `app:getSystemInfo` | renderer → main | none | `Promise<{ platform; arch; electronVersion; nodeVersion; appVersion; }>` |
 | `app:checkForUpdates` | renderer → main | none | `Promise<{ status: "checking" } \| { status: "error"; error: string }>` |
-| `app:getServerPort` | renderer → main | none | `Promise<number \| undefined>` |
+| `app:getServerPort` | renderer → main | none | `Promise<number \| undefined>` (external CLI port when present; otherwise embedded local runtime port when running) |
+| `desktopRuntime:getStatus` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
+| `desktopRuntime:startLocal` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
+| `desktopRuntime:stopLocal` | renderer → main | none | `Promise<DesktopRuntimeStatus>` |
+| `desktopLaunchMode:getMode` | renderer → main | none | `Promise<"choose" \| "local" \| "remote">` |
+| `desktopLaunchMode:setMode` | renderer → main | `mode: "choose" \| "local" \| "remote"` | `Promise<"choose" \| "local" \| "remote">` |
 | `tray:updateStatus` | renderer → main | `status: "running" \| "paused" \| "stopped"` | `Promise<void>` |
 | `native:showExportDialog` | renderer → main | none | `Promise<string \| null>` |
 | `native:showImportDialog` | renderer → main | none | `Promise<string \| null>` |
@@ -86,19 +109,46 @@ getRendererFilePath() // Returns absolute file path for loadFile()
 | `update-available` | main → renderer | update info object (includes `version`) |
 | `update-downloaded` | main → renderer | no payload is currently forwarded by preload |
 
+## Local Bundled Runtime Lifecycle
+
+Desktop local mode uses an in-process runtime manager (`src/local-runtime.ts`) that mirrors the CLI desktop server pattern:
+
+- creates `TaskStore`, calls `init()` and `watch()`
+- creates the dashboard server with `createServer(store)`
+- listens on an ephemeral port (`0`, never `4040`)
+- reports runtime status as:
+  - `source`: `"embedded-local" | "external-cli" | "none"`
+  - `state`: `"stopped" | "starting" | "running" | "error"`
+  - optional `port`, `baseUrl`, and `error`
+- keeps shutdown idempotent and exact-once for embedded server close and store close
+
+### Runtime source rules
+
+- **external-cli**: when `FUSION_SERVER_PORT` is provided (for example by `fn desktop`), Electron treats the server as CLI-owned and does **not** start an embedded server. `desktopRuntime:stopLocal` is a no-op in this state and never kills the CLI-owned server.
+- **embedded-local**: when started inside Electron via runtime IPC or startup env activation.
+- **none**: no active runtime.
+
+### Activation rules
+
+- Desktop does **not** auto-start embedded local runtime by default.
+- Embedded local runtime starts at launch only when `FUSION_DESKTOP_MODE=local` is set.
+- Future onboarding/connection flows can start/stop embedded local runtime explicitly over IPC.
+
 ## Main Process Lifecycle
 
 `src/main.ts` orchestrates module startup in this order:
 
 1. `loadWindowState()`
-2. `createMainWindow(state)`
-3. `buildAppMenu({ mainWindow, appName: "Fusion" })`
-4. `setupTray(mainWindow, tray)`
-5. `registerIpcHandlers(mainWindow, tray)`
-6. `registerDeepLinkProtocol()`
-7. `setupDeepLinkHandler(mainWindow)`
-8. `setupAutoUpdater(mainWindow)`
-9. `mainWindow.maximize()` when restored state was maximized
+2. `loadDesktopLaunchMode()`
+3. Restore launch mode behavior (`local` attempts embedded runtime start; `remote`/`choose` skip)
+4. `createMainWindow(state)`
+5. `buildAppMenu({ mainWindow, appName: "Fusion" })`
+6. `setupTray(mainWindow, tray)`
+7. `registerIpcHandlers(mainWindow, tray)`
+8. `registerDeepLinkProtocol()`
+9. `setupDeepLinkHandler(mainWindow)`
+10. `setupAutoUpdater(mainWindow)`
+11. `mainWindow.maximize()` when restored state was maximized
 
 ### Window state and close-to-tray behavior
 
@@ -115,20 +165,38 @@ getRendererFilePath() // Returns absolute file path for loadFile()
 - Tray instance is destroyed (`tray.destroy()`)
 - `mainWindow` is nulled on `closed` for clean re-creation on macOS `activate`
 
-## Preload API (`window.fusionAPI`)
+## Preload APIs (`window.electronAPI` and `window.fusionShell`)
 
-`src/preload.ts` exposes a safe, context-isolated bridge:
+`src/preload.ts` exposes safe, context-isolated bridges:
 
-- Window control: `minimize()`, `maximize()`, `close()`, `isMaximized()`
-- App/system: `getSystemInfo()`, `checkForUpdates()`, `getServerPort()`
-- Tray: `updateTrayStatus(status)`
-- Native dialogs: `showExportDialog()`, `showImportDialog()`
-- Event subscriptions (return unsubscribe functions):
-  - `onDeepLink(callback)`
-  - `onUpdateAvailable(callback)`
-  - `onUpdateDownloaded(callback)`
+- `window.electronAPI`
+  - Window control: `minimize()`, `maximize()`, `close()`, `isMaximized()`
+  - App/system: `getSystemInfo()`, `checkForUpdates()`, `getServerPort()`
+  - Desktop runtime: `getDesktopRuntimeStatus()`, `startDesktopLocalRuntime()`, `stopDesktopLocalRuntime()`
+  - Desktop launch mode: `getDesktopLaunchMode()`, `setDesktopLaunchMode(mode)`
+  - Native shell management: `openConnectionManager()` (invokes `shell:openConnectionManager`)
+  - Tray: `updateTrayStatus(status)`
+  - Native dialogs: `showExportDialog()`, `showImportDialog()`
+  - Event subscriptions (return unsubscribe functions):
+    - `onDeepLink(callback)`
+    - `onUpdateAvailable(callback)`
+    - `onUpdateDownloaded(callback)`
+- `window.fusionShell`
+  - `getState()`, `listProfiles()`, `saveProfile()`, `deleteProfile()`
+  - `setActiveProfile()`, `setDesktopMode()`
+  - `startQrScan()`, `openConnectionManager()`, `subscribe(listener)`
+  - Together these cover create/delete/switch operations for shell-owned remote profiles without writing to project/global Fusion settings
+- `window.fusionAPI` remains as a backward-compatible alias of `window.electronAPI`.
 
-All preload typings are declared in `src/types.d.ts` (`FusionAPI`, `SystemInfo`, `UpdateCheckResult`, `DeepLinkResult`).
+All preload typings are declared in `src/types.d.ts`.
+
+### Regression coverage locked by tests
+
+Desktop tests under `src/__tests__/` now explicitly lock:
+- first-run mode projection and last-used mode restore (`choose`/`local`/`remote`)
+- local runtime startup only when local mode is active (and no unexpected startup in remote mode)
+- remote mode handoff persistence across relaunch behavior
+- preload `fusionShell` bridge channel wiring (`shell:getState`, profile CRUD/switching, mode state, QR, and connection-manager open)
 
 ## Module Integration Overview
 
@@ -186,6 +254,9 @@ The desktop shell installs a native menu with standard shortcuts.
   - `loadWindowState()` reads `window-state.json` from `app.getPath("userData")`.
   - `saveWindowState(mainWindow)` writes bounds/maximized state atomically (`.tmp` + rename).
   - `DEFAULT_WINDOW_STATE` is the fallback (`1280x900`, not maximized).
+- **Desktop launch-mode persistence**
+  - `loadDesktopLaunchMode()` reads `desktop-launch-mode.json` and returns `"choose" | "local" | "remote"` (invalid/missing files fall back to `"choose"`).
+  - `saveDesktopLaunchMode(mode)` writes the mode atomically (`.tmp` + rename).
 
 ## Deep Linking
 
@@ -222,6 +293,8 @@ FN-1076 depends on these exact exports and names.
 | `setupAutoUpdater` | `(mainWindow?) => void` |
 | `loadWindowState` | `() => Promise<WindowState \| null>` |
 | `saveWindowState` | `(mainWindow) => void` |
+| `loadDesktopLaunchMode` | `() => Promise<"choose" \| "local" \| "remote">` |
+| `saveDesktopLaunchMode` | `(mode) => Promise<void>` |
 | `DEFAULT_WINDOW_STATE` | `WindowState` |
 | `WindowState` | `interface` |
 

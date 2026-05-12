@@ -22,9 +22,12 @@ Use the 💡 button to open planning mode:
 - AI reasoning (thinking output) is preserved and visible throughout the session — expand the reasoning toggle to review the model's analysis before answering each question or accepting the summary
 - Produces summary + key deliverables
 - Create one task or **Break into Tasks** (multi-task generation with dependencies)
+- Summary view includes a **Priority** selector (`low`, `normal`, `high`, `urgent`) so single-task creation can set priority before task creation
+- Break-into-tasks mode includes per-subtask **Priority** selectors (`low`, `normal`, `high`, `urgent`) so each generated task can be prioritized before creation
 - Break-into-tasks descriptions are structured with subtask-specific guidance first, then a separate larger-plan context section (plus `## Planning Interview Context` when interview history exists)
 - Sessions persist when the modal is closed — resume from the sidebar list at any time; reasoning context is restored automatically
 - Back navigation rewinds the server-side planning session to the previous answered question so you can revise earlier answers and continue from the corrected turn
+- On the summary screen, **Refine Further** continues through the backend planning session (including resumed completed sessions) and waits for a real follow-up question or updated summary; it does not switch to an empty question view
 
 ### 3) Todo item → Plan Mode
 
@@ -37,6 +40,8 @@ In **Todos** view, each todo item includes a planning action:
 
 This action starts a planning session; it does **not** immediately create a task.
 
+For full Todo View behavior (enablement, list/item actions, API routes, and storage), see [Todo View](./todo-view.md).
+
 ### 4) Subtask Breakdown Dialog
 
 Use the 🌳 button:
@@ -44,6 +49,7 @@ Use the 🌳 button:
 - Generate 2–5 candidate subtasks
 - Drag to reorder
 - Add dependencies only on earlier items
+- Set each subtask's **Priority** (`low`, `normal`, `high`, `urgent`) before create
 - Create tasks in one action
 
 ### 5) Expanded Controls
@@ -56,6 +62,7 @@ Expand the creation panel (▼) to access additional controls:
 - **Models** (🧠) — Set per-task model overrides (executor, validator, planning)
 - **Priority** (🚩) — Set task priority (`low`, `normal`, `high`, `urgent`) before creation; the selected value is applied to the created task (it does not reset to default unless omitted)
 - **Agent** — Assign an agent to the task
+- **Branch settings** (`branch` / `baseBranch`) remain available in full task forms and task detail editing (not in Quick Entry)
 - **Review** — Set review rigor level (None, Plan Only, Plan and Code, Full)
 - **Browser Verify** — Enable browser verification workflow step
 
@@ -85,6 +92,10 @@ Fusion task columns:
 3. **in-progress** — executor active in isolated worktree
 4. **in-review** — implementation complete; awaiting finalization
    - If merge/finalization hits a terminal error, tasks can remain in `in-review` with `status: "failed"` for explicit follow-up. This state is intentionally preserved by recovery (not auto-bounced to `todo`).
+   - Retry behavior splits by step completion: `in-review` tasks with incomplete steps (`pending`/`in-progress`) are treated as execution failures and retried back to `todo` with `preserveProgress: true`; `in-review` tasks with all steps `done` are treated as merge/finalization failures and stay in `in-review` with merge retry state reset.
+   - Merge-confirmed tasks still respect `getTaskMergeBlocker()` before the final `in-review` → `done` move. If merge is confirmed but a blocker remains (for example, incomplete steps), Fusion parks the task in `in-review` with `status: "failed"` and an explicit blocker error instead of retry-looping auto-finalization.
+   - Self-healing can still auto-finalize retry-exhausted failed review tasks when it can prove their branch content already landed on the merge target, so already-merged work does not deadlock in `in-review`.
+   - Non-recoverable state-machine errors during finalization (for example `Invalid transition: 'todo' → 'done'`) are treated as terminal review failures: recovery must not re-enqueue these tasks for merge unless task state changes prove they are recoverable.
 5. **done** — merged/finalized
 6. **archived** — preserved history, optionally cleaned from filesystem
 
@@ -92,6 +103,7 @@ Board ordering behavior:
 - `todo` mirrors scheduler dispatch order: priority first (`urgent` → `low`), then oldest `createdAt` within a priority tier, then task ID as deterministic tie-break.
 - `triage`, `in-progress`, and `in-review` remain priority-first with task-ID tie-breaks (`in-review` still pins merge-active statuses above non-merging tasks).
 - The `done` column is recency-ordered by completion time (newest first), using `columnMovedAt` as primary and falling back to `updatedAt` then `createdAt` for legacy tasks.
+- The dashboard **list view default ordering matches these same per-column semantics** until a user clicks a sortable header (manual list sorting still overrides defaults).
 
 ### Lifecycle commands
 
@@ -101,6 +113,24 @@ fn task merge FN-001
 fn task archive FN-001
 fn task unarchive FN-001
 ```
+
+### Branch metadata semantics
+
+Task cards on the board only surface branch metadata when it is non-default/user-meaningful: they hide the conventional auto-generated working branch (`fusion/<task-id>` and suffixed variants) and hide the default merge target (`main`), while still showing custom working branches and non-default merge targets.
+
+The board header search panel now includes two **board-only** branch filters:
+- **Working branch** filters by `task.branch`
+- **Target branch** filters by `task.baseBranch`
+
+These filters apply only to board rendering (not list view). Each filter supports concrete branch values plus a **No branch** option that matches tasks where `branch` or `baseBranch` is unset. Persisted filter state remains intentionally deferred to follow-up task FN-3426.
+
+Task branch fields are intentionally distinct:
+
+- `task.branch` — the actual working branch used for the task worktree (for example `fusion/fn-1234` or a conflict-suffixed variant).
+- `task.baseBranch` — the task's configured merge target/base branch intent.
+- `task.executionStartBranch` — internal execution provenance used when scheduler/executor temporarily start from a dependency branch; this is transient and cleared during execution resets/recovery.
+
+`PrInfo.baseBranch` is unchanged and continues to represent pull-request target branch metadata.
 
 ### Dependency reconciliation guidance
 
@@ -113,6 +143,20 @@ Use supported TaskStore/API paths to reconcile safely:
 - Keep downstream blockers coherent (only tasks that still truly depend on unfinished work should remain blocked)
 
 Completion gating treats dependencies as resolved only when the dependency task is in `done`, `in-review`, or `archived`.
+
+Auto-merge recovery follow-up creation is deduplicated: Fusion creates at most one active (`not done/archived`) recovery task per unresolved parent failure, and merge-conflict recovery also deduplicates by active branch ownership to prevent parallel duplicate follow-ups on the same conflict branch.
+
+### Landed-task state reconciliation (maintenance)
+
+If a task already shipped (`column: done`) but still carries transient failure metadata (`status: failed`, `error`, `worktree`, `blockedBy`, recovery retry fields), reconcile through supported TaskStore/API paths so SQLite and task JSON stay in sync.
+
+Recommended pattern:
+- Audit first (dry-run) for contradictory `done` + transient-failure state.
+- Apply reconciliation with TaskStore-backed mutations (for example `moveTask(id, "done")` for done-normalization cleanup).
+- Add one durable reconciliation log entry explaining why stale transient fields were cleared (avoid duplicating historical failure logs).
+- Re-audit after apply and resolve or explicitly disposition any related stale follow-up tasks.
+
+Do **not** patch `.fusion/fusion.db` directly without synchronizing `.fusion/tasks/*/task.json` through a supported store-backed path.
 
 ## Task Execution Modes
 
@@ -160,6 +204,7 @@ Execution mode can be set during task creation or editing:
 
 - **Via API**: Include `executionMode` field in task create/update payload
 - **Via dashboard**: Select execution mode in the task creation dialog or task detail modal
+- **Task detail quick toggle**: In read mode, use the inline lightning-bolt control in task metadata to switch between **Standard** and **Fast** without entering full edit mode
 - **Values**: `"standard"` (default) or `"fast"`
 
 Example API payload:
@@ -188,6 +233,16 @@ Research document content appears in the existing **Documents** tab in Task Deta
 
 ## Task Detail Modal (Dashboard)
 
+The task detail modal exposes multiple tabs.
+
+In read mode, task metadata includes lightweight inline controls: priority can be changed from the priority chip, and execution mode can be toggled with a one-click lightning-bolt fast-mode button (Fast ↔ Standard) without opening full edit mode. These controls are intentionally aligned as a paired row (matched control height, baseline alignment, and mobile-safe wrapping) so frequent priority/mode changes stay quick and visually consistent.
+
+Task metadata also shows compact `Created` / `Updated` timestamps: recent values render as relative time (`just now`, `Xm`, `Xh`, `Xd`) and older values switch to short month/day dates; desktop keeps both timestamps on one row, with a mobile-stacked layout for readability.
+
+Task settings edited from the modal now auto-save as you edit (change/blur with debounce for text-like fields). This includes title, description, dependencies, working/base branch (`branch`/`baseBranch`), workflow-step selection, model overrides in the edit form, and source issue metadata. In shared create/edit task forms, the GitHub Tracking controls are placed at the bottom of **More options** after **Workflow Steps**. The footer Save button remains available, but normal field edits no longer depend on a manual save click.
+
+The edit footer shows inline autosave state (saving/saved/error), and successful saves propagate the returned task through `onTaskUpdated` so open detail/list state stays fresh.
+
 The task detail modal exposes multiple tabs:
 
 - **Details** — primary metadata and description
@@ -195,6 +250,11 @@ The task detail modal exposes multiple tabs:
 - **Log** — task event history
 - **Changes** — merge diff/change summary
 - **Workflow** — workflow step results (pass/fail/skip)
+- **Review** — actionable feedback surface (PR reviews/threads or reviewer-agent findings), manual refresh controls, and same-task revision actions for selected items
+- **Stats** — execution timing + token usage breakdown
+  - `Total execution time` prefers durable wall-clock execution window (`executionStartedAt` → `executionCompletedAt`)
+  - Fallback order for legacy tasks: `timedExecutionMs` when present, otherwise `[timing]` log sum + workflow runtime
+  - Workflow runtime is shown as a separate metric and is not double-counted into totals when `timedExecutionMs` is already available
 - **Comments** — collaboration thread + steering controls
 - **Model** — per-task model overrides and thinking level
 
@@ -216,10 +276,42 @@ This file is the contract for execution and review.
 ## Task Comments vs Steering Comments
 
 - **Task comments** (`fn task comment`) are general collaboration notes.
+- **Review tab feedback** is dedicated actionable review input (PR review data in pull-request mode, reviewer-agent findings in direct/non-PR mode) used to request same-task revisions.
+- Review data is served from task-scoped API endpoints: `GET /api/tasks/:id/review` and `POST /api/tasks/:id/review/refresh`.
+- Both endpoints return one normalized contract (`TaskReviewData`) with stable per-item `itemId` values and `sourceMode` (`pull-request` or `reviewer-agent`) so Review UI and per-item progress can share one read model.
+- The Review tab supports **manual refresh** without closing/reopening Task Detail:
+  - Pull-request mode refreshes live GitHub-backed review decision/thread/comment state and updates PR metadata freshness.
+  - Direct/non-PR mode refreshes normalized reviewer-agent feedback from persisted task review artifacts and does not call GitHub.
+- In direct/non-PR auto-merge mode, the Review tab shows parsed reviewer-agent feedback with explicit loading/error/empty states instead of sending users to raw comments or agent logs.
+- **Comments remains the general discussion surface**; Review remains the actionable review surface.
 - **Steering comments** (`fn task steer`) are execution guidance for the running agent.
 
 Steering comments can be injected mid-run into active executor sessions.
 
+When users select review items and trigger **Request revision** from the Review tab, Fusion starts an in-place same-task AI revision pass (no refinement child task):
+
+- Review addressing progress is persisted per selected item in task state, including a durable snapshot and lifecycle timestamps.
+- Each selected item transitions through `queued` → `in-progress` → `addressed`/`failed`, so Review progress survives refreshes and reloads even if upstream review data changes.
+- Persisted snapshots are rendered in the Review tab when the original source item is no longer present, while Comments remains dedicated to general discussion.
+
+- `in-progress` tasks receive compact steering guidance from the selected review items and continue on the same task/branch/worktree context.
+- `in-review` tasks are resumed back to `in-progress`, reopen the last completed step, and keep same-task branch/worktree context for the revision pass.
+- Assigned immediate-response agents are woken on-demand only when there is no active session; otherwise guidance is injected without forcing a new wake.
+
+### User comments and triage re-consideration
+
+User comments can trigger **re-triage** for already-planned but non-executing work:
+
+- `triage` + `awaiting-approval` → user comment sets `status: "needs-replan"`
+- `triage` or `todo` with a real (non-bootstrap-stub) `PROMPT.md` → user comment sets `status: "needs-replan"`
+- `triage` or `todo` with only bootstrap-stub/unplanned prompt content → no re-triage transition
+
+Execution ownership is preserved for active work:
+
+- User comments on `in-progress` and `in-review` tasks do **not** re-route those tasks back through triage.
+- Agent/system comments do **not** trigger comment-driven re-triage.
+
+This is distinct from steering comments: steering feedback targets the currently running executor session, while comment-driven re-triage requests a fresh specification pass for planned work.
 ## Refinement Tasks
 
 `fn task refine <id>` creates a new planning task that depends on the original done/in-review task.
@@ -279,6 +371,8 @@ Archive entries preserve key metadata needed for restoration, including:
 
 Import issues:
 
+- GitHub-imported tasks retain typed source issue metadata (`sourceIssue.provider/repository/externalIssueId/issueNumber/url`), which executor and merger flows use to include `Ref: owner/repo#N` in commit bodies.
+
 ```bash
 fn task import owner/repo --labels bug --limit 20
 fn task import owner/repo --interactive
@@ -299,6 +393,36 @@ Manual/non-auto-merge behavior:
 - Manual PR creation first checks for an existing PR on that branch and links it when found.
 - If no PR exists, Fusion pushes the task branch to `origin` before creating the PR.
 - When buffered actionable PR feedback exists on a PR that is already merged/closed and the task leaves `in-review`, Fusion creates a dependency-linked follow-up task in `triage` so feedback is not stranded.
+
+## GitHub Tracking Issues
+
+GitHub tracking issues are optional issues Fusion can create from Fusion tasks. They are **not** the same as imported source issues (`issueInfo` / `sourceIssue`): imported issues represent an existing GitHub issue that created the task, while tracking issues are new GitHub issues opened to track a Fusion task.
+
+When task creation runs with tracking enabled, Fusion attempts issue creation during task creation flows (including quick create, planning output, automation `create-task` workflow steps, and subtask creation paths that create tasks). For existing tasks, PATCH first persists any `githubTracking` mutation (enable/disable, repo override, or unlink), then evaluates whether the updated task is **enabled and still unlinked** and should trigger best-effort issue creation (including non-`githubTracking` edits). This keeps retry/create behavior consistent from Task Detail instead of relying on stale pre-patch state. Creation is best-effort and non-blocking: task updates and task creation still succeed even if repo resolution fails or GitHub calls fail.
+
+Tracking behavior is controlled per task:
+
+- `task.githubTracking.enabled` turns tracking on for that task.
+- `task.githubTracking.repoOverride` optionally forces a specific target repo (`owner/repo`).
+- In the dashboard **Task Detail** modal, eligible existing tasks (`triage`, `todo`, `in-progress`, `in-review`) always show a compact GitHub tracking summary row; linked-issue details and tracking controls are behind a disclosure arrow so tracking can still be enabled, disabled, or retargeted without reopening the task in a creation flow.
+- When a task is already tracking-enabled but still unlinked, Task Detail exposes a **Create tracking issue** action in the disclosure content (including non-editable columns like `done`) so "Issue not yet created" is not a dead-end state.
+- Clearing the Task Detail repo override stores `null`, which reverts repo resolution to project/global defaults.
+- Explicit task-level enablement is honored even when project/global GitHub tracking defaults are unset. If `enabled: true` and the repo resolves at task scope (for example via `repoOverride`), Fusion attempts tracking-issue creation on both create-time and eligible edit-time flows.
+- Explicit manual unlink (`githubTracking.issue: null`) does not recreate a tracking issue in that same update request, and disabling tracking does not create new issues.
+
+Repository resolution order:
+
+1. Task override: `task.githubTracking.repoOverride`
+2. Project default: `githubTrackingDefaultRepo`
+3. Global default: `githubTrackingDefaultRepo`
+
+When Fusion creates a tracking issue, it uses:
+
+- Title: `[FN-XXXX] Task title`
+- Body prefix: `Fusion task: FN-XXXX`
+- Body content: bounded plain-text task summary snippet (not full prompt content)
+
+GitHub authentication/settings are configured in [Settings Reference](./settings-reference.md) via `githubAuthMode` (`gh-cli` or `token`) and `githubAuthToken`.
 
 ## Completion Modes (`mergeStrategy`)
 
@@ -329,6 +453,15 @@ Tasks execute on an effective node selected by routing precedence:
 At dispatch time, scheduler routing is persisted on the task as:
 - `effectiveNodeId`
 - `effectiveNodeSource` (`task-override`, `project-default`, or `local`)
+
+### Create-time routing semantics
+
+Cluster-aware task creation separates two routing decisions:
+
+- **Transport node**: which node receives the `POST /api/tasks` request (can be local or proxied remote).
+- **Execution target** (`Task.nodeId`): which node should run the task later.
+
+These are intentionally independent. Routing a create request through node A does not force execution on node A unless `Task.nodeId` also points there.
 
 ### Per-task node override
 

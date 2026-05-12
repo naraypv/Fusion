@@ -250,6 +250,19 @@ describe("project-memory", () => {
       expect(instructions).toMatch(/consolidate|update.*refine.*existing|edit.*existing/i);
     });
 
+    it("includes explicit agent-vs-project memory scope guidance", () => {
+      const instructions = buildExecutionMemoryInstructions(testDir, { memoryBackendType: "file" });
+      expect(instructions).toContain('fn_memory_append(scope="agent")');
+      expect(instructions).toContain('fn_memory_append(scope="project")');
+      expect(instructions).toMatch(/private\/ephemeral|private operating context/i);
+    });
+
+    it("includes layer guidance for long-term vs daily memory", () => {
+      const instructions = buildExecutionMemoryInstructions(testDir, { memoryBackendType: "qmd" });
+      expect(instructions).toContain('layer="long-term"');
+      expect(instructions).toContain('layer="daily"');
+    });
+
     it("keeps qmd default path-agnostic", () => {
       const instructions = buildExecutionMemoryInstructions(testDir);
       expect(instructions).not.toContain("`.fusion/memory/MEMORY.md`");
@@ -523,6 +536,9 @@ describe("project-memory", () => {
       const instructions = buildTriageMemoryInstructions(testDir, settings);
       expect(instructions).toContain(".fusion/memory/MEMORY.md");
       expect(instructions).toContain("## Project Memory");
+      expect(instructions).toContain("fn_memory_append");
+      expect(instructions).toContain("Do **not** write");
+      expect(instructions).toContain("or any other memory files directly");
     });
 
     it("includes read-only wording for readonly backend without write directives", () => {
@@ -545,6 +561,8 @@ describe("project-memory", () => {
       expect(instructions).not.toContain(".fusion/memory/MEMORY.md");
       expect(instructions).toContain("memory_search");
       expect(instructions).toContain("memory_get");
+      expect(instructions).toContain("fn_memory_append");
+      expect(instructions).toContain("Do **not** write memory files directly");
     });
 
     it("QMD triage instructions completeness - contains consult guidance", () => {

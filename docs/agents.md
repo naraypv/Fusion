@@ -17,13 +17,15 @@ Every first-class editable agent field has a defined create/edit/import/template
 | `metadata` | ✓ | ✓ | ✓ | Arbitrary key-value data |
 | `title` | ✓ | ✓ | ✓ (from manifest) | Job title/description |
 | `icon` | ✓ | ✓ | ✓ (from manifest) | Emoji or icon identifier |
+| `imageUrl` | ✗ (set by avatar upload endpoint) | ✓ | ✗ | Uploaded avatar image URL (`/api/agents/:id/avatar`) |
 | `reportsTo` | ✓ | ✓ | ✓ (from manifest) | Parent agent ID |
 | `runtimeConfig` | ✓ | ✓ | ✗ | Heartbeat/budget config |
 | `permissions` | ✓ | ✓ | ✗ | Capability flags |
+| `permissionPolicy` | ✓ | ✓ | ✗ | Runtime action-gating policy for permanent agents (default/fallback: `unrestricted`) |
 | `instructionsPath` | ✓ | ✓ | ✗ | File-backed instructions path |
 | `instructionsText` | ✓ | ✓ | ✓ (from manifest `instructionBody`) | Inline instructions |
 | `soul` | ✓ | ✓ | ✗ | Personality/identity description |
-| `memory` | ✓ | ✓ | ✗ | Per-agent accumulated knowledge |
+| `memory` | ✓ | ✓ | ✓ (from manifest) | Per-agent accumulated knowledge |
 | `bundleConfig` | ✓ | ✓ | ✗ | Structured instruction bundle |
 
 ### Agent Companies Manifest Fields
@@ -36,18 +38,115 @@ Every first-class editable agent field has a defined create/edit/import/template
 | `role` | `role` (mapped to AgentCapability) | `custom` |
 | `reportsTo` | `reportsTo` | — |
 | `instructionBody` | `instructionsText` | — |
+| `memory` | `memory` | — |
 | `skills` | `metadata.skills` | — |
+
+## Permission Policy Presets (Permanent Agents)
+
+`permissionPolicy` is a first-class persisted policy contract for **runtime action gating**, separate from role/capability authorization and separate from dashboard persona presets.
+
+Built-in preset catalog:
+
+- `unrestricted` (default) — all v1 runtime action categories are `allow`
+- `approval-required` — all v1 runtime action categories are `require-approval`
+- `locked-down` — all v1 runtime action categories are `block`
+
+V1 runtime action categories:
+
+- `git_write`
+- `file_write_delete`
+- `command_execution`
+- `network_api`
+- `task_agent_mutation`
+- `none` (classifier-only read-only result; never stored as a policy rule key)
+
+`permissionPolicy` uses only the five sensitive categories above (everything except `none`) and the FN-3545 disposition contract:
+
+- `allow`
+- `block`
+- `require-approval`
+
+### Runtime gate v1 mapping (per tool invocation, permanent agents only)
+
+The engine classifies tool calls by behavior (not namespace alone):
+
+- `file_write_delete`: built-in `write` / `edit`, plus persistent write helpers like `fn_task_document_write`, `fn_memory_append`, `fn_task_attach`
+- `command_execution`: built-in `bash` when not classified as mutating git
+- `git_write`: mutating git shell commands run via `bash`
+- `network_api`: external/network-facing tools (for example `fn_research_run`, `fn_research_cancel`, `fn_research_retry`)
+- `task_agent_mutation`: task/agent mutation tools (for example `fn_update_agent_config`, `fn_task_pause`, `fn_spawn_agent`; action-gate task-import/create tools like `fn_task_create`, `fn_delegate_task`, `fn_task_import_github`, and `fn_task_import_github_issue` use this category in action-gate evaluation)
+- `none`: positively recognized read-only tools (`read`, `grep`, `find`, `ls`, list/show/get-style `fn_*` tools, plus permanent-agent coordination/task-creation helpers like `fn_task_create`, `fn_delegate_task`, `fn_task_import_github`, and `fn_task_import_github_issue`)
+
+`bash` git-write heuristic in v1:
+
+- Mutating git operations include: `git add`, `commit`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `stash`, `tag`, `push`, `reset`, `rm`, `mv`, `clean`, `worktree add/remove`, `checkout -b`, `switch -c`, `pull --rebase`, `restore --staged`, and branch/remote mutation forms.
+- Read-only git operations include: `git status`, `diff`, `log`, `show`, `rev-parse`, `branch --show-current`, `branch` listing, and `remote -v`.
+
+Unknown/unclassified tool fallback:
+
+- In permanent-agent sessions, unknown tools default to `require-approval` (fail-safe).
+- Category `none` only yields `allow` when the tool is positively recognized as read-only.
+- Internal Fusion runtime coordination tools (heartbeat completion, task/agent coordination, messaging, evaluations, identity reflection, memory bookkeeping) are exempt by design and always allowed so permanent-agent heartbeats can complete.
+- Operators can reload the in-memory exempt-tool registry at runtime via `POST /api/action-gate/reload` (optional body `{ "tools": string[] }`) to apply exemption-list updates without restarting the engine process.
+- Canonical tool classification/exemption sets live in `packages/engine/src/gating-classifications.ts` and are shared by both action-gate paths.
+
+Approval pause/resume lifecycle (FN-3548):
+
+- Permanent-agent gating short-circuits `block` and `require-approval` actions before tool execution and returns structured non-success tool results.
+- For `require-approval`, the engine creates/reuses a durable approval request and pauses execution with canonical `pauseReason: "awaiting-approval"`.
+- If task-backed, the owning task is paused (`Task.paused=true`, `pausedByAgentId=<requester>`); the requesting agent is paused (`state="paused"`, `pauseReason="awaiting-approval"`).
+- Dedupe semantics by `approvalDedupeKey`: `pending` reuses the same request, `approved` allows exactly one execution and then marks request `completed`, `denied` stays blocked, `completed` requires a fresh request.
+- HTTP decision endpoint resumes best-effort: `POST /api/approvals/:id/decision` with `{ decision: "approve" | "deny", comment? }` unpauses matching task/agent when they are paused for `awaiting-approval`.
+- Approval API surface: `GET /api/approvals` (supports status/limit/offset and returns `{ requests, total, pendingCount }`), `GET /api/approvals/:id` (includes request context + audit/history), `POST /api/approvals/:id/decision`.
+- Dashboard mailbox is the primary v1 resolution surface: approvals appear in the mailbox **Approvals** tab with pending/history views and inline approve/deny controls for pending requests.
+- Dashboard mailbox entry points (Header/Mobile nav) display pending-approval indicators so waiting approvals are visible before opening Mailbox.
+- Agents list/board cards and Agent Detail summary display per-agent `pendingApprovalCount` badges to show which agents are blocked by waiting approvals.
+
+Agent provisioning approvals (`agent_provisioning` category):
+
+- `fn_agent_create` / `fn_agent_delete` can return `pending_approval` under `projectSettings.agentProvisioning` policy (`approvalMode`, trusted roles/IDs, `alwaysApproveDelete`).
+- Approval request is persisted with provisioning context (`tool` + `params`) and visible in mailbox/API approval queues.
+- Dashboard/API decision route `POST /api/approvals/:id/decision` executes deferred provisioning on `approve` via engine dispatcher (`executeApprovedAgentProvisioning`) and never executes on `deny`.
+- Decision handling emits run-audit mutations: `agent:create:{requested,approved,denied}` and `agent:delete:{requested,approved,denied}` using original request task/run/requester linkage.
+- Malformed provisioning context or failed execution returns 500 from the decision route (no silent approval).
+
+Resolver decision table (`resolveAgentProvisioningPolicy`):
+
+| matchedRule | decision | Notes |
+| --- | --- | --- |
+| `missing-caller` | `deny` | Caller context missing. |
+| `privileged-caller` | `allow` | Bypasses trust checks and `alwaysApproveDelete`. |
+| `approval-mode-never` | `allow` | Global short-circuit, including deletes. |
+| `delete-always-approve` | `require-approval` | Default delete behavior when not short-circuited. |
+| `trusted-agent-id` | `allow` | Exact caller ID allowlist match. |
+| `trusted-role` | `allow` | Case-insensitive role allowlist match. |
+| `approval-mode-trusted-only` | `require-approval` | Untrusted fallback in default mode. |
+| `approval-mode-always` | `require-approval` | Approval always required unless privileged/never mode. |
+
+FN-3973 follow-through: `spawn_agent` evaluation is complete; governance remains in action-gate `task_agent_mutation` (ephemeral runtime lifecycle), not durable `agentProvisioning`.
+
+Default and legacy fallback behavior:
+
+- New **non-ephemeral/permanent** agents persist a normalized `permissionPolicy` using preset `unrestricted` when not explicitly provided.
+- Legacy permanent-agent rows missing `permissionPolicy` resolve to the same effective `unrestricted` policy at read time (no eager migration required).
+- Ephemeral/runtime task-worker agents are intentionally left unchanged and are not backfilled with a default `permissionPolicy`.
+
+Separation of concerns:
+
+- `permissions` capability flags (plus role defaults) determine what an agent is conceptually authorized to do (for example, `tasks:assign`, `agents:create`).
+- `permissionPolicy` determines how sensitive runtime actions are gated (`allow`, `block`, `require-approval`) once the capability path is in play.
+- Dashboard persona presets (`packages/dashboard/app/components/agent-presets/`) are UI templates for identity/behavior and are **not** the source of truth for permission-policy enforcement.
 
 ### System-Managed Fields (Not User-Editable)
 
 These fields are managed by the engine and cannot be directly edited:
 
 - `id` — Auto-generated unique identifier
-- `state` — Agent lifecycle state (managed by engine)
+- `state` — Agent lifecycle state (managed by engine). Non-ephemeral agents default to `active` on creation; ephemeral/task-worker agents default to `idle`.
 - `taskId` — Current working task (managed by scheduler)
 - `totalInputTokens` / `totalOutputTokens` — Token usage totals (managed by engine)
 - `createdAt` / `updatedAt` / `lastHeartbeatAt` — Timestamps (managed by system)
-- `lastError` — Last error message (managed by engine)
+- `lastError` — Last error message (managed by engine; cleared after successful recovery runs)
 - `pauseReason` — Reason for paused state (managed by engine)
 
 ### Stale Task Link Sanitization
@@ -78,19 +177,116 @@ The `taskId` field is suppressed in API responses when the linked task is in a t
 These fields can only be set during update (not on create):
 
 - `pauseReason` — Why the agent is paused
-- `lastError` — Last error message
+- `lastError` — Last error message (cleared when the agent successfully recovers)
 - `totalInputTokens` — Accumulated input token count
 - `totalOutputTokens` — Accumulated output token count
+
+## Execution Ownership for Assigned Agents
+
+When a task sets `assignedAgentId` to a **durable (non-ephemeral)** agent, that same agent is used as the active execution owner during runtime execution.
+
+Behavior:
+- Fusion links the durable agent's `taskId` to the running task for execution visibility
+- No synthetic `executor-FN-*` task-worker agent is created for that run
+- On completion/error, the durable agent's execution task link is cleared (the durable record is preserved)
+
+Fallback behavior remains unchanged:
+- Unassigned tasks still use runtime-managed `executor-FN-*` task-worker agents
+- Missing assigned agents, or assigned agents that are ephemeral/runtime-managed, fall back to task-worker execution ownership
+
+Execution-ownership sync intentionally avoids assignment-trigger side effects (`agent:assigned` wakeups) that are intended for control-plane delegation.
+
+### Assigned-agent runtime model precedence for task execution
+
+When a task is executed by an assigned durable agent, executor session model selection now prefers that agent's explicit runtime model when it is fully specified.
+
+Executor precedence for task runs:
+1. Assigned agent `runtimeConfig` model pair (combined `runtimeConfig.model = "provider/modelId"` or separate `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are present
+2. Task `modelProvider` + `modelId`
+3. Project/global execution lane fallbacks (same resolution as unassigned runs)
+
+If the assigned agent runtime model is missing or incomplete, Fusion falls back to the normal task/settings execution hierarchy.
+
+### Durable-agent heartbeat model precedence and unavailable-provider behavior
+
+Heartbeat sessions for durable agents resolve models with heartbeat-specific fallback semantics:
+
+1. Agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when present
+2. Execution-lane settings fallback (`executionProvider`/`executionModelId` → `executionGlobalProvider`/`executionGlobalModelId` → project/global defaults)
+
+When the runtime model is present and differs from execution-lane settings, heartbeat passes the execution-lane model as a fallback pair for session creation.
+
+If a heartbeat cannot create/run a session due to unavailable provider credentials or missing provider registration, Fusion records `resultJson.reason = "heartbeat_model_unavailable"` with actionable diagnostics in `resultJson.detail`/`stderrExcerpt`.
+
+### Durable-agent transient error auto-recovery
+
+Self-healing may auto-recover **durable (non-ephemeral)** agents stuck in `state="error"` when all eligibility checks pass:
+
+- agent is non-ephemeral (`isEphemeralAgent(...) === false`)
+- heartbeat runtime is enabled (`runtimeConfig.enabled !== false`)
+- no active heartbeat execution is already running for the agent
+- `lastError` classifies as transient network/infrastructure failure
+- `lastError` is **not** operator-actionable (credentials/model/billing-style failures)
+
+When eligible, self-healing uses bounded retries with persisted metadata at `agent.metadata.durableErrorRecovery`:
+
+- exponential cooldown (`30s` base, capped at `15m`)
+- retry budget cap (`5` attempts)
+- persisted `attempts`, `lastAttemptAt`, `nextRetryAt`, `exhausted`, and `lastReason`
+
+On restart attempts, the runtime triggers the normal heartbeat pipeline with `source: "automation"` and a structured `contextSnapshot.selfHealing` payload so operators can audit recovery runs in heartbeat history.
+
+Self-healing intentionally leaves agents in `error` (no auto-restart) when blockers are operator-actionable or non-transient, when cooldown has not elapsed, when active execution is present, or when retry budget is exhausted.
+
+- **Timer trigger:** run completes and the durable agent returns to `state="active"` (recoverable soft-fail).
+- **Assignment / on-demand trigger:** run completes with `resultJson.actionRequired = true`, then the durable agent is paused with `pauseReason="heartbeat-model-unavailable"` and `lastError` set to actionable credential guidance (including the missing provider name when detectable).
+
+After credentials are fixed, operators should resume the paused durable agent; subsequent heartbeats proceed normally.
+
+### Assigned-agent identity + planning model precedence for task triage
+
+When a triage/specification run targets a task with `assignedAgentId` and that agent is durable, planning now inherits the assigned agent context instead of only generic triage-role defaults.
+
+Triage inheritance behavior:
+1. The triage system prompt includes assigned-agent identity context and resolves instructions/soul/memory from that agent (including existing rating-aware instruction composition)
+2. Triage memory tools are created with assigned-agent memory context (`createMemoryTools(..., { agentMemory })`), so `fn_memory_search` / `fn_memory_get` can access `.fusion/agent-memory/{agentId}/...` during planning
+3. Planning model resolution prefers a complete assigned-agent runtime model pair first, then task planning overrides, then normal planning/project/global fallbacks
+
+As with execution, incomplete assigned-agent model configuration falls through cleanly to the existing planning hierarchy.
+
+### Task Detail Agent Log model provenance
+
+The Task Detail → Agent Log model header prefers runtime provenance markers written during execution/review:
+
+- `Executor using model: <provider>/<modelId>`
+- `Reviewer using model: <provider>/<modelId>`
+- `Triage using model: <provider>/<modelId>`
+
+This makes the header reflect the model that actually ran. For active runs with no runtime marker yet, the UI can use the currently assigned agent runtime model as a temporary fallback before falling back to task/settings resolution.
+
+### Ephemeral agent terminal cleanup
+
+Runtime-created ephemeral agents are removed immediately after terminal cleanup paths run:
+
+- Task-worker agents created by `InProcessRuntime` are deleted as soon as they reach paused cleanup paths after completion, error, or `agent:stateChanged` fallback cleanup.
+- Spawned child agents created by `TaskExecutor` are deleted immediately inside `terminateChildAgent()` after terminal cleanup state update.
+- User-managed non-ephemeral agents are never auto-deleted by these pathways.
+
+Because deletion is immediate, runtime helper agents should not remain visible in the dashboard or `AgentStore` after cleanup completes once paused-state cleanup (or run-level termination) finishes.
 
 ## Agents View (Dashboard)
 
 The agents surface provides:
 
-- Agent-first list/board/tree/org collection in the left pane (primary content appears first)
+- Agent-first list and board collections use the desktop split-pane layout (primary collection + detail pane)
+- Org Chart is a full-view mode that takes over the full Agents content area; selecting a node opens detail in that same full-width region with back navigation to the chart
 - Org chart nodes intentionally stay compact (role/state/health hierarchy signal only) and do not enumerate per-agent skill badges; detailed skills remain in list/board/detail surfaces
 - A cross-pane **Overview** strip above the split layout with summary metrics and a disclosure to expand active/running live cards
 - A compact **Controls** popup for secondary actions (state filter, Show system agents toggle, Import, and global Heartbeat Speed)
+- Agent import can also be launched from the selected **Agent Detail** header; this entry opens the import modal directly in the companies.sh browse flow so operators can discover and import packages without leaving the detail context
 - Detail/config panels
+- Agent Detail includes a **Mail** tab for inspecting that agent’s inbox/outbox; selecting a message opens full details, and selecting an unread inbox message marks it read
+- Split-view synchronization: successful saves and lifecycle actions from the right-side Agent Detail pane immediately refresh the left-side list/selection state (no wait for background polling)
 - A per-agent **Token Usage** panel that summarizes cumulative token consumption for the currently displayed agents
 - Run history
 - Task assignment context
@@ -128,7 +324,7 @@ Agent deletion is available from both the detail header lifecycle controls and t
 - The Settings-tab delete button reuses the same delete flow as the header action.
 - Deletion still requires confirmation before calling `DELETE /api/agents/:id`.
 - On successful deletion, the dashboard shows a success toast and closes the detail view.
-- Deletion availability is intentionally restricted to agents in `idle` or `terminated` state.
+- Deletion availability is intentionally restricted to agents in `idle` or `paused` state.
 
 ![Agents view](./screenshots/agents-view.png)
 
@@ -138,18 +334,25 @@ When engine sessions include per-agent memory context, the memory tools operate 
 
 Runtime behavior:
 
+- `fn_memory_append` supports dual scope writes:
+  - `scope="agent"` for private per-agent operating context (personal playbooks/checklists, self-management notes)
+  - `scope="project"` for shared repo-wide durable knowledge (architecture constraints, conventions, pitfalls)
 - `fn_memory_search` can surface snippets from:
   - `.fusion/agent-memory/{agentId}/MEMORY.md` (long-term)
   - `.fusion/agent-memory/{agentId}/DREAMS.md` (synthesized patterns)
   - `.fusion/agent-memory/{agentId}/YYYY-MM-DD.md` (daily notes)
 - `fn_memory_get` is intentionally bounded to those same files only.
-- Empty inline `agent.memory` does **not** disable search/read of existing dreams/daily files once the agent-memory workspace exists.
+- Agent memory resolution order is:
+  1. Inline `agent.memory` (highest priority)
+  2. `.fusion/agent-memory/{agentId}/MEMORY.md` (fallback when inline is empty, and supplemental long-term section when inline is present)
+  3. Additional `.fusion/agent-memory/{agentId}/DREAMS.md` and daily files surfaced via `fn_memory_search`/`fn_memory_get`
+- Empty inline `agent.memory` does **not** disable search/read of existing workspace files once the agent-memory workspace exists.
 
 This layered behavior is shared by heartbeat agents and task-scoped sessions that inherit agent identity.
 
 ## Research Tools in Planning/Execution Sessions
 
-Triage and executor runtime sessions now include a bounded research tool surface:
+Triage and executor runtime sessions include a bounded research tool surface only when `experimentalFeatures.researchView` is enabled for the project:
 
 - `fn_research_run` — create/start a bounded research run for a focused query
 - `fn_research_list` — list recent runs and statuses
@@ -162,11 +365,12 @@ Expected behavior and boundaries:
 
 - Agents should use research only when repository/local context is insufficient
 - Queries should stay narrow and task-scoped; avoid open-ended exploration
-- If research is disabled or provider setup is incomplete, tools return actionable `setup` responses instead of crashing
+- When `experimentalFeatures.researchView` is disabled, sessions do not register `fn_research_*` tools and prompts do not advertise research capabilities
+- If the research surface is enabled but an explicitly selected external provider is misconfigured (or web search is explicitly disabled), tools return actionable `setup` responses instead of crashing
 - Durable conclusions should be persisted with `fn_task_document_write` (for example, `key="research"`)
 - Research runs require the project engine to be running for processing; `fn_research_run` creates the run but does not block for completion unless `wait_for_completion` is set
 
-For the full research workflow, provider setup, CLI commands, and API reference, see the [Research guide](./research.md).
+For the full research workflow, builtin-default behavior, optional external provider setup, CLI commands, and API reference, see the [Research guide](./research.md).
 
 ## Built-In Agent Prompt Templates
 
@@ -202,15 +406,48 @@ The `runtimeConfig` field on agents supports the following options:
 |-------|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Whether heartbeat triggers are enabled for this agent |
 | `heartbeatIntervalMs` | `number` | — | How often the agent should wake up for heartbeat checks (ms) |
+| `autoClaimRelevantTasks` | `boolean` | `true` | During no-task heartbeats, opportunistically claim unowned relevant todo tasks that align with the agent's role/soul |
 | `heartbeatTimeoutMs` | `number` | — | Time without heartbeat before agent is considered unresponsive (ms) |
 | `maxConcurrentRuns` | `number` | `1` | Max concurrent heartbeat runs for this agent |
+| `runMissedHeartbeatOnStartup` | `boolean` | `false` | When enabled, if the server was down across this agent's scheduled heartbeat tick, fire one catch-up heartbeat at startup (only when `lastHeartbeatAt` is older than the resolved interval) |
+| `allowParallelExecution` | `boolean` | `true` (when unset) | Permanent agents only. When `false`, heartbeat and executor paths serialize symmetrically: a heartbeat will not start while the agent's bound task has an active executor session, and an executor session will not start while the agent has an active heartbeat run |
 | `messageResponseMode` | `"immediate" \| "on-heartbeat"` | `"immediate"` | Whether agent wakes immediately on message (immediate) or processes during heartbeat (on-heartbeat). See [Heartbeat Run Mailbox Checking](#heartbeat-run-mailbox-checking) |
+| `selfImproveEnabled` | `boolean` | `true` | Enable periodic self-improvement reflection prompts during heartbeat runs |
+| `selfImproveIntervalMs` | `number` | `14400000` (4h) | Minimum delay between self-improvement cycles (minimum enforced: 3600000 ms) |
+| `lastSelfImproveAt` | `string` (ISO timestamp) | — | Last recorded self-improvement checkpoint timestamp |
 | `modelProvider` | `string` | — | AI provider override for heartbeat session |
 | `modelId` | `string` | — | AI model ID override for heartbeat session |
 | `budgetConfig` | `AgentBudgetConfig` | — | Token budget governance settings |
 
 Heartbeat values are validated and minimum-clamped to 5 minutes (300,000 ms).
 Project setting `heartbeatMultiplier` (default `1`) scales resolved heartbeat intervals globally; per-agent `heartbeatIntervalMs` remains the base interval before multiplier scaling. This setting is configured from the **Agents** screen's **Controls** popup under "Heartbeat Speed".
+
+`runMissedHeartbeatOnStartup` defaults to `false` and is configured in **Agent Detail → Settings → Heartbeat Settings → Run Missed Heartbeat On Startup**.
+
+`allowParallelExecution` defaults to `true` when unset; setting it to `false` is serialized explicitly so operators can enforce non-parallel heartbeat/executor behavior for that permanent agent. Configure it in **Agent Detail → Settings → Heartbeat Settings → Allow Parallel Execution**.
+
+### No-task auto-claim behavior
+
+When an identity-bearing, non-ephemeral agent wakes with no assigned task and `runtimeConfig.autoClaimRelevantTasks !== false`, the heartbeat monitor scans open todo tasks and may claim one before constructing the prompt run.
+
+Guardrails:
+- Only unpaused, unassigned, unchecked-out todo tasks with satisfied dependencies are considered
+- Claims are rejected for terminal/paused/owned/conflicting tasks
+- Checkout safety is preserved (`checkout_conflict` paths are non-fatal skips)
+- On successful claim, the same heartbeat run switches into task-scoped execution (no nested run re-entry)
+
+Operators can disable this per agent in **Agent Detail → Settings → Heartbeat Settings → Auto-Claim Relevant Tasks**.
+
+### Self-improvement cycle
+
+When `selfImproveEnabled !== false`, heartbeat runs periodically enter a self-improvement phase once `selfImproveIntervalMs` has elapsed since `lastSelfImproveAt` (or first run with available ratings). During that phase the agent is prompted to:
+
+1. Call `fn_read_evaluations` to inspect ratings/reflections
+2. Identify recurring quality issues and trends
+3. Call `fn_update_identity` to adjust its own `soul`, `instructionsText`, or `memory`
+4. Record concise improvement decisions
+
+After a successful run, the monitor records `lastSelfImproveAt` in `runtimeConfig`.
 
 ## Agent Instructions (Dashboard)
 
@@ -289,6 +526,8 @@ For long-form prompt authoring, **Soul**, **Agent Memory**, and **Inline Instruc
 - Plain/edit mode and Markdown preview mode
 - Fullscreen expand/collapse editing for long content (safe-area-aware on mobile)
 
+In Agent Detail → **Agent Memory** → **Memory Files**, selected file content now also supports the same **Edit/Preview** markdown toggle. Preview renders the current in-memory draft (including unsaved edits), while save/edit controls remain gated by agent read-only state.
+
 These controls are also available on the editable review step, so prompt content can be reviewed and refined with the same markdown and fullscreen behavior before submit.
 
 ### Final review edits (step 2)
@@ -305,18 +544,23 @@ The final `createAgent(...)` call always uses the latest values from these step-
 
 ### Experimental planning-style onboarding
 
-When **Settings → Experimental Features → Planning-style Agent Onboarding** (`experimentalFeatures.agentOnboarding`) is enabled, clicking **New Agent** opens an AI-guided onboarding modal instead of jumping straight to the classic dialog.
+The **New Agent** dialog is the canonical launch point for agent creation.
 
-- The onboarding flow asks clarifying questions using repo-aware context (existing agents + preset/template options).
-- It generates a **draft** agent configuration summary (name/role/instructions and optional template or pattern provenance).
-- Clicking **Continue to agent form** hands that draft into the existing `NewAgentDialog` as a prefill for human review and edits.
-- The onboarding flow does **not** auto-create agents directly.
+When **Settings → Experimental Features → Planning-style Agent Onboarding** (`experimentalFeatures.agentOnboarding`) is enabled:
 
-When `experimentalFeatures.agentOnboarding` is disabled, the original `NewAgentDialog` behavior remains unchanged and opens immediately from **New Agent**.
+- Step 0 of the **New Agent** dialog includes an **AI Interview** entry point for create mode.
+- **Agent detail → Settings** includes an **AI Interview** action for edit mode on existing agents.
+- The interview flow asks clarifying questions using repo-aware context (existing agents + preset/template options for create mode, plus current agent configuration for edit mode).
+- It generates a **draft** configuration summary for review, including identity fields, `soul`, starter `instructionsText`, starter `memory`, heartbeat guidance (`heartbeatProcedurePath`, `heartbeatIntervalMs`, `heartbeatEnabled`), and draft-only runtime/model suggestions (`runtimeHint`, `modelHint`).
+- In create mode, confirming the summary (**Apply draft to agent form**) applies the generated draft into `NewAgentDialog`'s existing editable form fields (step 1 / custom flow) for manual review and edits before save.
+- In edit mode, **Apply draft to settings form** updates local editable fields in the settings UI.
+- The interview flow does **not** auto-create or auto-save agents directly; final persistence still happens only through the standard manual Create/Save action.
+
+When `experimentalFeatures.agentOnboarding` is disabled, the New Agent dialog still opens normally but the **AI Interview** entry point is hidden.
 
 The dashboard provides quick-start presets for common agent roles. Each preset includes:
 
-- **Name and icon** - Display identification
+- **Name, icon, and avatar** - Display identification (`imageUrl` takes priority over `icon` in UI rendering)
 - **Professional title** - Descriptive role title
 - **Soul** - Personality and operating principles defining how the agent thinks and communicates
 - **Instructions** - Actionable behavioral guidelines
@@ -439,7 +683,9 @@ To clear a specific override, click the **Reset** button in the UI. This sends `
 
 ## Inter-Agent Messaging
 
-Messaging is available in dashboard mailbox UI and CLI.
+Messaging is available in dashboard mailbox UI and CLI. In dashboard Mailbox → Agents, operators can choose **All agents** to browse a single combined agent-to-agent stream, or choose a specific agent to keep using per-agent inbox/outbox views.
+
+Agent-backed dashboard chat sessions (including plugin-runtime agents such as Hermes/OpenClaw/Paperclip) also expose mailbox tools (`fn_send_message`, `fn_read_messages`) when a `MessageStore` is wired for that project. Model-only chats without an attached agent do not expose these tools.
 
 ```bash
 fn message inbox
@@ -465,14 +711,28 @@ Heartbeat runs are composed from multiple prompt layers so each wake has full id
    - Inline instructions (`instructionsText`)
    - File-backed instructions (`instructionsPath`)
    - Soul/personality (`soul`)
-   - Agent memory (`memory`)
+   - Agent memory resolved from inline `agent.memory` first, then `.fusion/agent-memory/{agentId}/MEMORY.md` as fallback/supplement
    - Optional project memory guidance (when memory is enabled)
 3. **Execution prompt framing**
-   - `Identity Snapshot` block (agent ID/role + loaded soul/instructions/memory preview)
+   - `Identity Snapshot` block (agent ID/role + loaded soul/instructions/memory preview; `memory: loaded` when either inline memory or workspace `MEMORY.md` is present)
    - `Wake Delta` block (source, trigger detail, wake reason, assignment/comments/messages)
    - Heartbeat procedure block (task-scoped or no-task variant, plus optional per-agent procedure override file)
 
 This structure ensures every run re-anchors on identity, wake reason, and current context before taking action.
+
+### Default Procedure: Bound-Task Scope Discipline
+
+The shipped default `HEARTBEAT_PROCEDURE` (in `packages/engine/src/agent-heartbeat.ts`) now requires bound-task classification on each tick: `executor-class`, `blocked`, or `coordination-class`.
+
+- `executor-class` = implementation work (code/tests/docs prose/build-lint-typecheck)
+- `blocked` = blockedBy/dependency/peer/external wait state
+- `coordination-class` = planning/triage/routing/decision/review work
+
+When the bound task is `executor-class` or `blocked`, the default procedure directs the run to pivot toward coordination levers (in-progress risk scan, stale in-review queue, idle direct reports, strategic memory themes) rather than trying to advance implementation from heartbeat. When the task is `coordination-class`, the heartbeat can engage directly with the bound task.
+
+This behavior is inherited by new non-ephemeral agents because agent creation seeds a per-agent `HEARTBEAT.md` file from the built-in default. If an agent sets `heartbeatProcedurePath`, that markdown file fully replaces the built-in default at runtime.
+
+For pre-existing agents, use `POST /api/agents/:id/upgrade-heartbeat-procedure` (also exposed as **Upgrade to Default Heartbeat Procedure** in the agent detail Config tab) to re-seed from the current built-in constant. When the built-in default changes, running this upgrade propagates the new default to existing agents; direct operator edits to an agent’s existing procedure file are preserved unless this upgrade is run (the upgrade overwrites the per-agent file).
 
 ### Manual / On-Demand Runs Are Autonomous Heartbeats
 
@@ -487,6 +747,19 @@ Expected behavior for both manual and automatic triggers:
 
 Messages remain an important input signal, but they do not replace the heartbeat procedure.
 
+### Heartbeat/Executor Separation (Current Behavior)
+
+For permanent agents, heartbeat runs now continue as an ambient coordination loop even when the currently bound task is blocked from normal task progress.
+
+- **Heartbeat path**: coordination, wake processing, mailbox/delegation/memory/task-creation actions, and lightweight ambient follow-through.
+- **Executor path**: task-body implementation work from task steps/prompts.
+
+When `allowParallelExecution` is set to `false` on a permanent agent, the two paths serialize symmetrically:
+- Heartbeat does not start while the bound task has an active executor session.
+- Executor does not start while the agent has an active heartbeat run.
+
+When `allowParallelExecution` is `true` (default), both paths may run concurrently.
+
 ## Heartbeat Run Mailbox Checking
 
 When messaging tools are enabled for an agent, heartbeat runs check for unread mailbox messages during execution regardless of the trigger type. This ensures agents can see and respond to incoming messages without needing an explicit wake-on-message trigger.
@@ -495,11 +768,27 @@ When messaging tools are enabled for an agent, heartbeat runs check for unread m
 
 Mailbox replies use `message.metadata.replyTo.messageId` as the stable reply link.
 
-- `read_messages` includes each message ID in its human-readable output so agents can target a specific message.
-- `send_message` supports `reply_to_message_id`; when provided, the sent message is stored with `metadata.replyTo.messageId`.
+- `fn_read_messages` includes each message ID in its human-readable output so agents can target a specific message.
+- When a message has `metadata.replyTo.messageId`, `fn_read_messages` now includes one-level reply-parent context inline (and in structured tool details) so heartbeat/mailbox runs can understand what the message is replying to without expanding full threads.
+- `fn_send_message` supports `reply_to_message_id`; when provided, the sent message is stored with `metadata.replyTo.messageId`.
 - Heartbeat prompts explicitly instruct agents to include `reply_to_message_id` when replying.
 
 The dashboard mailbox UI also uses the same metadata contract when users click **Reply**, so user and agent replies share one threading model.
+
+### Dashboard user recipient convention
+
+For dashboard user messaging, agents should target the canonical user recipient ID `dashboard`.
+
+When an agent is sending to the dashboard user through `fn_send_message`, the message must be stored as `agent-to-user` (agent → dashboard user), not as a user/CLI → agent mailbox message.
+
+Runtime safeguards defensively normalize the legacy alias forms below to the same logical dashboard user:
+- `dashboard` (canonical)
+- `user:dashboard`
+- `User: user:dashboard`
+
+If the message type is omitted but the recipient normalizes to the dashboard user alias, routing defaults to the `agent-to-user` direction to preserve correct inbox semantics.
+
+This normalization applies on send and mailbox reads, so replies from agents still land in the dashboard inbox even when older alias-like recipient strings appear.
 
 ### How It Works
 
@@ -518,7 +807,18 @@ The `messageResponseMode` runtime configuration controls when agents are trigger
 | `immediate` | Agent wakes immediately when a message arrives (via hook callback) |
 | `on-heartbeat` | Agent processes messages during normal heartbeat runs only |
 
+In the dashboard **Agent Settings** UI, this is surfaced as **Message Response Mode** with matching help text.
+
 **Important**: Both modes include messages in the execution prompt. The `immediate` mode additionally triggers an immediate heartbeat run when a message arrives, while `on-heartbeat` relies on the agent's next scheduled heartbeat.
+
+### One-off send-time immediate wake override
+
+When sending a message to an agent from the dashboard mailbox composer, users can optionally enable **Wake agent immediately** for that send.
+
+- The checkbox is shown only for agent recipients.
+- If the target agent already uses `messageResponseMode: "immediate"`, the checkbox is shown as checked/locked to reflect that wake behavior is already always-on.
+- The send-time `wakeImmediately` flag is transport-level only; it does **not** change the agent's saved `runtimeConfig.messageResponseMode`.
+- On successful send with `wakeImmediately: true`, the API best-effort invokes an on-demand heartbeat (`triggerDetail: "wake-on-message"`) in the correct project scope.
 
 ### Message Visibility
 
@@ -542,16 +842,101 @@ Behavior:
   - `maxSpawnedAgentsGlobal` (default 20)
 - Child sessions terminate when parent task ends
 
+### Approval-governance relationship (FN-3973)
+
+`spawn_agent` is intentionally treated as an **ephemeral runtime mutation**, not durable provisioning:
+
+- `fn_spawn_agent` stays in action-gate `task_agent_mutation` classification.
+- Spawned children are created with ephemeral metadata (`metadata.type = "spawned"`) and task-scoped ownership (`reportsTo = parentTaskId`).
+- Parent teardown terminates/deletes spawned children; they are not durable hires.
+- Therefore `projectSettings.agentProvisioning` (FN-3791 policy for durable `fn_agent_create` / `fn_agent_delete`) does **not** govern `spawn_agent`.
+
+If a deployment config requires approval for `task_agent_mutation`, `spawn_agent` uses the standard action-gate approval pause/resume path (`awaiting-approval` + `/api/approvals/:id/decision`).
+
 ## Agent Delegation
 
-Executor and heartbeat agents can discover and delegate work to other agents using two built-in tools:
-
-- **`list_agents`** — List available agents with optional filters (role, state, includeEphemeral)
-- **`delegate_task`** — Create a task and assign it to a specific agent; the task enters `todo` and the agent picks it up on their next heartbeat
+Executor and heartbeat agents can coordinate through six built-in tools: `list_agents`, `delegate_task`, `agent_create`, `agent_delete`, `get_agent_config`, and `update_agent_config`.
 
 Delegation is designed for cross-agent handoff (e.g., an executor handing off to a QA agent). For parallel worktree-based parallelization, use `spawn_agent` instead.
 
+### `list_agents`
+
+List all available agents in the system. Shows each agent's name, role, state, personality (`soul`), and current assignment.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `role` | `string` (optional) | Filter by agent role/capability (e.g., `"executor"`, `"reviewer"`) |
+| `state` | `string` (optional) | Filter by agent state (e.g., `"idle"`, `"active"`, `"running"`) |
+| `includeEphemeral` | `boolean` (optional) | Include ephemeral/runtime agents (default: `false`) |
+
+### `delegate_task`
+
+Create a new task and assign it to a specific agent for execution. The task goes to `todo` and will be picked up by the target agent on their next heartbeat cycle.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `agent_id` | `string` (required) | The agent ID to delegate work to |
+| `description` | `string` (required) | What needs to be done |
+| `dependencies` | `string[]` (optional) | Task IDs this new task depends on |
+| `override` | `boolean` (optional) | Set true to bypass executor-role assignment policy |
+
+**Error cases:**
+- `"ERROR: Agent {agent_id} not found"`
+- `"ERROR: Cannot delegate to ephemeral/runtime agent {agent_id}"`
+- `"ERROR: Agent {agent_id} has role \"...\"; implementation task <new> requires an \"executor\"-role agent by default, with durable \"engineer\" supported only for explicit routing. Pass override=true to bypass."`
+
+### `agent_create`
+
+Create a new non-ephemeral direct-report agent. By default, the created agent reports to the caller; privileged (CEO-level) callers can set `reportsTo` to another manager.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | `string` (required) | Name for the new agent |
+| `role` | `"triage" \| "executor" \| "reviewer" \| "merger" \| "engineer" \| "custom"` (required) | Agent role/capability |
+| `soul` | `string` (optional) | Agent personality/identity text |
+| `instructions_text` | `string` (optional) | Inline custom instructions |
+| `instructions_path` | `string` (optional) | Path to instructions markdown file |
+| `reportsTo` | `string` (optional) | Manager agent ID. Defaults to the calling agent |
+| `heartbeat_interval_ms` | `number` (optional, min `1000`) | Heartbeat polling interval in milliseconds |
+| `heartbeat_timeout_ms` | `number` (optional, min `5000`) | Heartbeat timeout in milliseconds |
+| `max_concurrent_runs` | `number` (optional, min `1`) | Maximum concurrent heartbeat runs |
+| `message_response_mode` | `"immediate" \| "on-heartbeat"` (optional) | How the agent responds to messages |
+
+**Authorization rule:** Non-privileged callers may only create agents that report to themselves; privileged callers may set any `reportsTo` target.
+
+**Error case:**
+- `"ERROR: You can only create agents that report to you"`
+
+### `agent_delete`
+
+Delete a non-ephemeral direct-report agent. Deletion is blocked when the target holds a checkout lease unless `force: true` is provided, and assigned tasks can be reassigned during deletion via `reassign_to`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `agent_id` | `string` (required) | Agent ID to delete |
+| `force` | `boolean` (optional) | Force delete even if the agent currently holds a checkout lease |
+| `reassign_to` | `string` (optional) | Replacement agent ID for tasks currently assigned to the deleted agent |
+
+**Authorization rule:** Callers can delete agents where `target.reportsTo === caller.id`; privileged callers may delete any non-ephemeral agent.
+
+**Error cases:**
+- `"ERROR: Agent {agent_id} not found"`
+- `"ERROR: You can only delete agents that report to you"`
+- `"ERROR: Cannot delete ephemeral/runtime agent {agent_id}"`
+- Underlying store errors (for example, an active checkout lease) are returned as `"ERROR: {message}"`; provide `force: true` to bypass lease-related blocking.
+
+### Role-based assignment policy
+
+Implementation-task routing distinguishes explicit specialist assignment from generic backlog pickup:
+
+- **Explicit assignment/delegation** (`PATCH /api/tasks/:id/assign`, `fn_delegate_task`, `fn_task_create`/`fn_task_update` with `agentId`): `role: "executor"` is always supported, and durable `role: "engineer"` is also supported without override.
+- **Backlog pickup/auto-claim** (unassigned implementation work): remains executor-only by default; durable engineer agents do not auto-claim generic unassigned implementation backlog.
+- Other non-executor roles (for example `reviewer`, `merger`, `custom`) still require an explicit override path on that surface (`override: true`) when intentional.
+- Override delegations are persisted with task source metadata (`executorRoleOverride`) so inbox selection and heartbeat execution can intentionally run that assigned implementation task on the targeted durable non-executor agent.
+
 ## Heartbeat Monitoring and Trigger Scheduling
+
+Heartbeat/executor ownership now actively renews persisted task lease metadata while work is running (`checkoutLeaseRenewedAt` plus owner node/run context). Abandonment recovery is fenced by `checkoutLeaseEpoch` and executed only through `MeshLeaseManager.recoverAbandonedLease(...)`, so stale owners cannot reclaim tasks after recovery.
 
 Fusion's `HeartbeatTriggerScheduler` supports five trigger types:
 
@@ -593,6 +978,35 @@ Heartbeat runs from the Agents panel run on a **separate control-plane lane** th
 | HeartbeatTriggerScheduler | Utility/control plane | **NOT** semaphore-gated |
 | CronRunner | Utility/control plane | **NOT** semaphore-gated |
 
+### Timer Repair Sweep for Missing Registrations (FN-3959)
+
+`HeartbeatTriggerScheduler` now owns a timer-registration repair sweep so durable agents cannot stay unscheduled when in-memory timer entries are lost without a follow-up lifecycle event.
+
+Cadence:
+- **Immediate startup audit**: runs once in `start()` after lifecycle watchers are attached
+- **Periodic audit**: runs every 60s while the scheduler is active
+- **Cleanup**: periodic sweep interval is cleared in `stop()`
+
+Repair eligibility:
+- Durable (non-ephemeral/task-worker) agent
+- `runtimeConfig.enabled !== false`
+- Agent state is tickable: `active`, `running`, or `idle`
+- Agent is missing from the scheduler's in-memory `timers` map
+
+Repair outcomes:
+- **Missing timer, not stale**: timer is re-armed and INFO diagnostics are logged (`agentId`, resolved interval, elapsed time since `lastHeartbeatAt`)
+- **Missing timer, stale**: timer is re-armed, WARN diagnostics are logged, and `agent.metadata.heartbeatTimerRepair` is updated (`repairedAt`, `staleAtRepair`, `elapsedMs`, `staleThresholdMs`)
+
+Stale threshold:
+- Repair staleness defaults to **`2 × heartbeatIntervalMs`**
+- This is intentionally separate from dashboard display staleness (`4×` grace multiplier)
+
+Dashboard surfacing path:
+- The stale-repair metadata write uses the existing `AgentStore.updateAgent(...)` path
+- That emits `agent:updated`, which already flows through SSE (`packages/dashboard/src/sse.ts`)
+- `useAgents` already refreshes on `agent:updated`/`agent:stateChanged` (`packages/dashboard/app/hooks/useAgents.ts`)
+- No new SSE event is introduced; stale durable agents become dashboard-visible as `Unresponsive` through the existing refresh path
+
 ### Timer State Lifecycle (FN-2289)
 
 Heartbeat timers are armed for agents in valid working states and remain armed across state transitions:
@@ -603,15 +1017,51 @@ Heartbeat timers are armed for agents in valid working states and remain armed a
 - `idle` — Agent is between tasks, waiting for work
 
 **States where timers are cleared:**
-- `terminated` — Agent has completed or been stopped
 - `error` — Agent encountered an unrecoverable error
-- `paused` — Agent is paused (e.g., by budget exhaustion or manual action)
+- `paused` — Agent is paused (e.g., by budget exhaustion, manual stop, or manual pause)
+
+Lifecycle notes:
+- Agent lifecycle is `idle | active | running | paused | error` (there is no `terminated` `AgentState`).
+- Stop/termination flows land the agent in `paused`; `terminated` is reserved for heartbeat run status only.
 
 **Key behaviors:**
 - Timers remain armed when agents transition between `active`, `running`, and `idle` states
 - This ensures heartbeat cadence is maintained even when agents complete tasks and await new assignments
 - Ephemeral/task-worker agents are never armed with timers (managed directly by TaskExecutor)
 - The `runtimeConfig.enabled` flag is respected for disabling heartbeat monitoring entirely
+
+### Unresponsive Recovery (FN-3475)
+
+When a tracked agent misses heartbeat for `2 × heartbeatTimeoutMs`, the monitor now performs recovery (not termination):
+
+1. Dispose the stuck session and untrack the stale run
+2. `pauseAgent(agentId, { pauseReason: "heartbeat-unresponsive", stopActiveRun: false })`
+3. `resumeAgent(agentId, { triggerDetail: "unresponsive-recovery", triggerSource: "heartbeat-unresponsive", clearPauseReason: true })`
+
+Effects:
+- Agent state transitions `running/active → paused → active`
+- `pauseReason` is set to `heartbeat-unresponsive` during recovery and cleared on resume
+- Assigned tasks are auto-paused with `pausedByAgentId` during pause, then only those same tasks are auto-unpaused on resume
+- Resume triggers one on-demand heartbeat restart only when `runtimeConfig.enabled !== false`
+- `onTerminated` is a run-level callback for terminated heartbeat runs and is not used by unresponsive recovery
+
+### Timer Reconciliation Self-Healing (FN-3958)
+
+`HeartbeatTriggerScheduler` owns a periodic registration audit that reconciles durable-agent truth in `AgentStore` against the in-memory timer map.
+
+- Audit cadence: once immediately on scheduler start, then every 60 seconds while running
+- Repair target: durable, heartbeat-enabled agents in tickable states (`active`, `running`, `idle`) that are missing a timer entry
+- Safety guards: skip ephemeral/task-worker agents, skip disabled agents, skip non-tickable states, and skip agents with an active heartbeat run
+- Existing timer entries are left untouched (no interval reset/jitter churn)
+- Repair metadata: each audit re-arm writes `metadata.heartbeatTimerRepair` with `repairedAt` and a stale-at-repair indicator when the agent had already missed its expected cadence
+- Stale-at-repair threshold: defaults to `2 × heartbeatIntervalMs`; override with project setting `heartbeatRepairStaleMultiplier` (> 0) when you need a different sensitivity
+- Stale repairs emit a WARN log entry and still flow through the existing `agent:updated` refresh path for dashboard surfacing
+
+This covers the untracked timer-loss failure mode where no `agent:updated` event fires after a timer entry disappears. Manual stop/start is no longer required to re-arm the timer in that case.
+
+Separation of responsibilities:
+- **HeartbeatMonitor recovery** handles **tracked stale sessions** (stuck in-memory run/session cleanup + pause/resume restart)
+- **HeartbeatTriggerScheduler audit** handles **untracked missing-timer registration drift** (re-arm scheduling)
 
 ## Dashboard Health Status
 
@@ -621,29 +1071,30 @@ The dashboard displays agent health status in AgentsView, AgentListModal, and Ag
 
 | Label | Condition |
 |-------|-----------|
-| **Terminated** | Agent state is "terminated" |
 | **Error** | Agent state is "error" (uses lastError if available) |
 | **Paused** | Agent state is "paused" (uses pauseReason if available) |
 | **Running** | Agent state is "running" (task workers with `active` state also display "Running") |
-| **Disabled** | `runtimeConfig.enabled === false` |
+| **Heartbeat Disabled** | `runtimeConfig.enabled === false` |
 | **Starting...** | State is "active" with no lastHeartbeatAt |
 | **Idle** | Non-active state with no lastHeartbeatAt |
-| **Healthy** | Heartbeat is fresh within configured timeout |
-| **Unresponsive** | Heartbeat exceeded configured timeout |
+| **Healthy** | Heartbeat is fresh within the resolved interval-based staleness threshold |
+| **Unresponsive** | Heartbeat exceeded the resolved interval-based staleness threshold, or timer-repair metadata indicates scheduler-detected stale drift before the next successful heartbeat |
 
 ### Timeout Configuration
 
-Health status uses a timeout-based evaluation:
+Health status uses interval-based staleness evaluation:
 
-1. If `runtimeConfig.heartbeatTimeoutMs` is set on the agent, use that value
-2. Otherwise, use the default 60-second (60000ms) timeout
+1. Resolve the effective heartbeat interval from `runtimeConfig.heartbeatIntervalMs` (or the default 1 hour interval)
+2. Multiply that interval by the dashboard grace multiplier (`4×`)
+3. Apply a minimum staleness floor of 5 minutes
 
 ### Key Behaviors
 
 - **Monitoring disabled**: Agents with `runtimeConfig.enabled === false` display "Disabled" — they are NOT falsely labeled as "Unresponsive"
 - **Consistent across views**: All dashboard surfaces use the same centralized utility, ensuring consistent health labels everywhere
 - **Auto-refresh**: Health status is refreshed every 30 seconds while views are open to keep status current
-- **State-first evaluation**: Terminal states (terminated, error, paused, running) take priority over timeout-based evaluation
+- **State-first evaluation**: Explicit non-idle states (error, paused, running) take priority over timeout-based evaluation
+- **Repair-aware surfacing**: If scheduler audit repairs a missing timer and marks the agent stale, dashboard surfaces `Unresponsive` immediately until a newer heartbeat arrives
 
 ## Heartbeat Run Lifecycle
 
@@ -675,7 +1126,7 @@ When an agent already has an active run, attempts to start a new run return **40
 POST /api/agents/:id/runs → 409 { error: "Agent already has an active run", details: { runId } }
 ```
 
-After a run is completed (or terminated), a new run can be started successfully:
+After a run is completed (or terminated at the run level), a new run can be started successfully:
 
 ```
 POST /api/agents/:id/runs → 201 { id: "run-xxx", status: "active", ... }

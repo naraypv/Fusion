@@ -65,6 +65,19 @@ import type {
   SettingsSyncResult,
   GlobalSettings,
   ProviderAuthEntry,
+  ProjectNodePathMapping,
+  ProjectNodePathMappingUpsertInput,
+  ProjectNodePathMappingDeleteInput,
+  MeshSnapshotQuery,
+  MeshSnapshotRecord,
+  MeshSnapshotRecordInput,
+  MeshWriteQueueEntry,
+  MeshWriteQueueFilter,
+  MeshWriteQueueInput,
+  MeshWriteApplyResult,
+  MeshWriteFailureResult,
+  MeshDegradedReadState,
+  MeshWriteReplaySummary,
 } from "./types.js";
 import { getAppVersion, parseSemver } from "./app-version.js";
 import { validateDockerNodeConfig } from "./types.js";
@@ -74,7 +87,7 @@ import { NodeConnection } from "./node-connection.js";
 import { NodeDiscovery } from "./node-discovery.js";
 import { collectSystemMetrics } from "./system-metrics.js";
 import type { ConnectionOptions, ConnectionResult } from "./node-connection.js";
-
+import { createAuthMaterialSnapshot, createProjectSettingsSnapshot, validateSnapshotEnvelope, type AuthMaterialSnapshot, type ProjectSettingsSnapshot } from "./shared-mesh-state.js";
 // ── Event Types ───────────────────────────────────────────────────────────
 
 export interface CentralCoreEvents {
@@ -294,6 +307,21 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
         toJsonNullable(project.settings)
       );
 
+      const localNode = this.db!
+        .prepare("SELECT id FROM nodes WHERE type = 'local' ORDER BY createdAt ASC LIMIT 1")
+        .get() as { id: string } | undefined;
+      if (localNode) {
+        this.db!
+          .prepare(
+            `INSERT INTO projectNodePathMappings (projectId, nodeId, path, createdAt, updatedAt)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(projectId, nodeId) DO UPDATE SET
+               path = excluded.path,
+               updatedAt = excluded.updatedAt`
+          )
+          .run(project.id, localNode.id, project.path, now, now);
+      }
+
       // Initialize health record
       this.db!.prepare(
         `INSERT INTO projectHealth (projectId, status, updatedAt, totalTasksCompleted, totalTasksFailed)
@@ -438,28 +466,48 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       updatedAt: now,
     };
 
-    this.db!.prepare(
-      `UPDATE projects SET
-        name = ?,
-        path = ?,
-        status = ?,
-        isolationMode = ?,
-        updatedAt = ?,
-        lastActivityAt = ?,
-        nodeId = ?,
-        settings = ?
-       WHERE id = ?`
-    ).run(
-      updated.name,
-      updated.path,
-      updated.status,
-      updated.isolationMode,
-      updated.updatedAt,
-      updated.lastActivityAt ?? null,
-      updated.nodeId ?? null,
-      toJsonNullable(updated.settings),
-      id
-    );
+    this.db!.transaction(() => {
+      this.db!.prepare(
+        `UPDATE projects SET
+          name = ?,
+          path = ?,
+          status = ?,
+          isolationMode = ?,
+          updatedAt = ?,
+          lastActivityAt = ?,
+          nodeId = ?,
+          settings = ?
+         WHERE id = ?`
+      ).run(
+        updated.name,
+        updated.path,
+        updated.status,
+        updated.isolationMode,
+        updated.updatedAt,
+        updated.lastActivityAt ?? null,
+        updated.nodeId ?? null,
+        toJsonNullable(updated.settings),
+        id
+      );
+
+      if (updated.path !== project.path) {
+        const localNode = this.db!
+          .prepare("SELECT id FROM nodes WHERE type = 'local' ORDER BY createdAt ASC LIMIT 1")
+          .get() as { id: string } | undefined;
+
+        if (localNode) {
+          this.db!
+            .prepare(
+              `INSERT INTO projectNodePathMappings (projectId, nodeId, path, createdAt, updatedAt)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(projectId, nodeId) DO UPDATE SET
+                 path = excluded.path,
+                 updatedAt = excluded.updatedAt`
+            )
+            .run(id, localNode.id, updated.path, now, now);
+        }
+      }
+    });
 
     this.db!.bumpLastModified();
     this.emit("project:updated", updated);
@@ -1323,12 +1371,205 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       nodeId: node.id,
       nodeName: node.name,
       nodeUrl: node.url,
+      nodeType: node.type,
       status: node.status,
       metrics: node.systemMetrics ?? null,
       lastSeen: node.updatedAt,
       connectedAt: node.createdAt,
       knownPeers: peers,
     };
+  }
+
+  /**
+   * Return mesh snapshots for all locally known nodes from the central registry.
+   * This is a local-only read path and performs no remote fan-out.
+   */
+  async getLocalMeshSnapshot(): Promise<NodeMeshState[]> {
+    this.ensureInitialized();
+    const nodes = await this.listNodes();
+    const snapshots = await Promise.all(
+      nodes.map(async (node) => {
+        try {
+          return await this.getMeshState(node.id);
+        } catch {
+          return {
+            nodeId: node.id,
+            nodeName: node.name,
+            nodeUrl: node.url,
+            nodeType: node.type,
+            status: node.status,
+            metrics: node.systemMetrics ?? null,
+            lastSeen: node.updatedAt,
+            connectedAt: node.createdAt,
+            knownPeers: [],
+          } satisfies NodeMeshState;
+        }
+      }),
+    );
+
+    return snapshots;
+  }
+
+  async recordMeshSnapshot(input: MeshSnapshotRecordInput): Promise<MeshSnapshotRecord> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.db!.prepare(
+      `INSERT INTO meshSharedSnapshots (nodeId, projectId, scope, payload, snapshotVersion, capturedAt, sourceNodeId, sourceRunId, staleAfter, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(nodeId, projectId, scope) DO UPDATE SET
+         payload = excluded.payload,
+         snapshotVersion = excluded.snapshotVersion,
+         capturedAt = excluded.capturedAt,
+         sourceNodeId = excluded.sourceNodeId,
+         sourceRunId = excluded.sourceRunId,
+         staleAfter = excluded.staleAfter,
+         updatedAt = excluded.updatedAt`
+    ).run(
+      input.nodeId,
+      input.projectId ?? null,
+      input.scope,
+      JSON.stringify(input.payload),
+      input.snapshotVersion,
+      input.capturedAt,
+      input.sourceNodeId ?? null,
+      input.sourceRunId ?? null,
+      input.staleAfter ?? null,
+      now,
+    );
+    this.db!.bumpLastModified();
+    return { ...input, projectId: input.projectId ?? null, sourceNodeId: input.sourceNodeId ?? null, sourceRunId: input.sourceRunId ?? null, staleAfter: input.staleAfter ?? null, updatedAt: now };
+  }
+
+  async getLatestMeshSnapshot(query: MeshSnapshotQuery): Promise<MeshSnapshotRecord | null> {
+    this.ensureInitialized();
+    const row = this.db!.prepare(
+      `SELECT * FROM meshSharedSnapshots WHERE nodeId = ? AND projectId IS ? AND scope = ?`
+    ).get(query.nodeId, query.projectId ?? null, query.scope) as {
+      nodeId: string; projectId: string | null; scope: string; payload: string; snapshotVersion: string; capturedAt: string; sourceNodeId: string | null; sourceRunId: string | null; staleAfter: string | null; updatedAt: string;
+    } | undefined;
+    if (!row) return null;
+    return {
+      nodeId: row.nodeId,
+      projectId: row.projectId,
+      scope: row.scope,
+      payload: fromJson<Record<string, unknown>>(row.payload) ?? {},
+      snapshotVersion: row.snapshotVersion,
+      capturedAt: row.capturedAt,
+      sourceNodeId: row.sourceNodeId,
+      sourceRunId: row.sourceRunId,
+      staleAfter: row.staleAfter,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  async enqueueMeshWrite(input: MeshWriteQueueInput): Promise<MeshWriteQueueEntry> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    const id = `mq_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    this.db!.prepare(
+      `INSERT INTO meshWriteQueue (id, originNodeId, targetNodeId, projectId, scope, entityType, entityId, operation, payload, intentVersion, status, attemptCount, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)`
+    ).run(
+      id,
+      input.originNodeId,
+      input.targetNodeId,
+      input.projectId ?? null,
+      input.scope,
+      input.entityType,
+      input.entityId,
+      input.operation,
+      JSON.stringify(input.payload),
+      input.intentVersion,
+      now,
+      now,
+    );
+    this.db!.bumpLastModified();
+    return (await this.listPendingMeshWrites({ targetNodeId: input.targetNodeId })).find((entry) => entry.id === id)!;
+  }
+
+  async listPendingMeshWrites(filter: MeshWriteQueueFilter = {}): Promise<MeshWriteQueueEntry[]> {
+    this.ensureInitialized();
+    const conditions: string[] = [];
+    const values: Array<string> = [];
+    if (filter.originNodeId) { conditions.push("originNodeId = ?"); values.push(filter.originNodeId); }
+    if (filter.targetNodeId) { conditions.push("targetNodeId = ?"); values.push(filter.targetNodeId); }
+    if (filter.status) { conditions.push("status = ?"); values.push(filter.status); }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db!.prepare(
+      `SELECT * FROM meshWriteQueue ${whereClause} ORDER BY createdAt ASC, id ASC`
+    ).all(...values) as Array<{ id: string; originNodeId: string; targetNodeId: string; projectId: string | null; scope: string; entityType: string; entityId: string; operation: string; payload: string; intentVersion: string; status: MeshWriteQueueEntry["status"]; attemptCount: number; lastAttemptAt: string | null; lastError: string | null; createdAt: string; updatedAt: string; appliedAt: string | null }>;
+    return rows.map((row) => ({ ...row, payload: fromJson<Record<string, unknown>>(row.payload) ?? {} }));
+  }
+
+  async markMeshWriteReplayStarted(id: string): Promise<MeshWriteQueueEntry> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.db!.prepare(
+      `UPDATE meshWriteQueue SET status = 'replaying', attemptCount = attemptCount + 1, lastAttemptAt = ?, updatedAt = ? WHERE id = ?`
+    ).run(now, now, id);
+    this.db!.bumpLastModified();
+    return this.getMeshWriteQueueEntryById(id);
+  }
+
+  async markMeshWriteApplied(id: string, result: MeshWriteApplyResult): Promise<MeshWriteQueueEntry> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.db!.prepare(
+      `UPDATE meshWriteQueue SET status = 'applied', appliedAt = ?, updatedAt = ? WHERE id = ?`
+    ).run(result.appliedAt ?? now, now, id);
+    this.db!.bumpLastModified();
+    return this.getMeshWriteQueueEntryById(id);
+  }
+
+  async markMeshWriteFailed(id: string, result: MeshWriteFailureResult): Promise<MeshWriteQueueEntry> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.db!.prepare(
+      `UPDATE meshWriteQueue SET status = 'failed', lastError = ?, updatedAt = ? WHERE id = ?`
+    ).run(result.lastError, now, id);
+    this.db!.bumpLastModified();
+    return this.getMeshWriteQueueEntryById(id);
+  }
+
+  async getMeshDegradedReadState(query: MeshSnapshotQuery): Promise<MeshDegradedReadState> {
+    this.ensureInitialized();
+    const snapshot = await this.getLatestMeshSnapshot(query);
+    const now = Date.now();
+    const counts = this.db!.prepare(
+      `SELECT
+        SUM(CASE WHEN status IN ('pending','replaying','failed') THEN 1 ELSE 0 END) AS queueDepth,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pendingWriteCount,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failedWriteCount
+       FROM meshWriteQueue`
+    ).get() as { queueDepth: number | null; pendingWriteCount: number | null; failedWriteCount: number | null };
+
+    const asOf = snapshot?.capturedAt ?? new Date(now).toISOString();
+    return {
+      mode: snapshot ? "degraded" : "fresh",
+      asOf,
+      sourceNodeId: snapshot?.sourceNodeId ?? null,
+      snapshotVersion: snapshot?.snapshotVersion ?? null,
+      stalenessMs: Math.max(0, now - Date.parse(asOf)),
+      queueDepth: counts.queueDepth ?? 0,
+      pendingWriteCount: counts.pendingWriteCount ?? 0,
+      failedWriteCount: counts.failedWriteCount ?? 0,
+    };
+  }
+
+  async replayPendingMeshWritesForNode(targetNodeId: string): Promise<MeshWriteReplaySummary> {
+    this.ensureInitialized();
+    const pending = await this.listPendingMeshWrites({ targetNodeId, status: "pending" });
+    return { replayed: pending.length, applied: 0, failed: 0, queuedWriteIds: pending.map((entry) => entry.id) };
+  }
+
+  private getMeshWriteQueueEntryById(id: string): MeshWriteQueueEntry {
+    const row = this.db!.prepare(`SELECT * FROM meshWriteQueue WHERE id = ?`).get(id) as
+      | { id: string; originNodeId: string; targetNodeId: string; projectId: string | null; scope: string; entityType: string; entityId: string; operation: string; payload: string; intentVersion: string; status: MeshWriteQueueEntry["status"]; attemptCount: number; lastAttemptAt: string | null; lastError: string | null; createdAt: string; updatedAt: string; appliedAt: string | null }
+      | undefined;
+    if (!row) {
+      throw new Error(`Mesh write queue entry not found: ${id}`);
+    }
+    return { ...row, payload: fromJson<Record<string, unknown>>(row.payload) ?? {} };
   }
 
   /**
@@ -1653,6 +1894,231 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     };
     this.emit("project:updated", updated);
     return updated;
+  }
+
+  async createProjectNodePathMapping(input: ProjectNodePathMappingUpsertInput): Promise<ProjectNodePathMapping> {
+    this.ensureInitialized();
+
+    await this.assertProjectNodeMappingTargetsExist(input.projectId, input.nodeId);
+
+    const existing = await this.getProjectNodePathMapping(input.projectId, input.nodeId);
+    if (existing) {
+      throw new Error(`Project/node mapping already exists: ${input.projectId}/${input.nodeId}`);
+    }
+
+    const now = new Date().toISOString();
+    this.db!
+      .prepare(
+        `INSERT INTO projectNodePathMappings (projectId, nodeId, path, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(input.projectId, input.nodeId, input.path, now, now);
+    this.db!.bumpLastModified();
+
+    return {
+      projectId: input.projectId,
+      nodeId: input.nodeId,
+      path: input.path,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  async updateProjectNodePathMapping(input: ProjectNodePathMappingUpsertInput): Promise<ProjectNodePathMapping> {
+    this.ensureInitialized();
+
+    await this.assertProjectNodeMappingTargetsExist(input.projectId, input.nodeId);
+
+    const existing = await this.getProjectNodePathMapping(input.projectId, input.nodeId);
+    if (!existing) {
+      throw new Error(`Project/node mapping not found: ${input.projectId}/${input.nodeId}`);
+    }
+
+    const now = new Date().toISOString();
+    this.db!
+      .prepare(
+        `UPDATE projectNodePathMappings
+         SET path = ?, updatedAt = ?
+         WHERE projectId = ? AND nodeId = ?`
+      )
+      .run(input.path, now, input.projectId, input.nodeId);
+    this.db!.bumpLastModified();
+
+    return {
+      ...existing,
+      path: input.path,
+      updatedAt: now,
+    };
+  }
+
+  async getProjectNodePathMapping(
+    projectId: string,
+    nodeId: string,
+  ): Promise<ProjectNodePathMapping | undefined> {
+    this.ensureInitialized();
+
+    const row = this.db!
+      .prepare("SELECT * FROM projectNodePathMappings WHERE projectId = ? AND nodeId = ?")
+      .get(projectId, nodeId) as
+      | {
+          projectId: string;
+          nodeId: string;
+          path: string;
+          createdAt: string;
+          updatedAt: string;
+        }
+      | undefined;
+
+    return row ? this.rowToProjectNodePathMapping(row) : undefined;
+  }
+
+  async getProjectNodePath(projectId: string, nodeId: string): Promise<string | undefined> {
+    this.ensureInitialized();
+
+    const row = this.db!
+      .prepare("SELECT path FROM projectNodePathMappings WHERE projectId = ? AND nodeId = ?")
+      .get(projectId, nodeId) as { path: string } | undefined;
+
+    return row?.path;
+  }
+
+  async resolveProjectWorkingDirectory(projectId: string, nodeId: string): Promise<string> {
+    this.ensureInitialized();
+
+    const project = await this.getProject(projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`);
+    }
+
+    const node = await this.getNode(nodeId);
+    if (!node) {
+      throw new Error(`Node not found: ${nodeId}`);
+    }
+
+    const mappedPath = await this.getProjectNodePath(projectId, nodeId);
+    if (!mappedPath) {
+      throw new Error(
+        `Project/node path mapping not found for projectId=${projectId} nodeId=${nodeId}`,
+      );
+    }
+
+    return mappedPath;
+  }
+
+  async resolveLocalProjectWorkingDirectory(projectId: string): Promise<string> {
+    this.ensureInitialized();
+
+    const localNode = await this.getLocalNode();
+    if (!localNode) {
+      throw new Error("Local node not found");
+    }
+
+    return this.resolveProjectWorkingDirectory(projectId, localNode.id);
+  }
+
+  async listProjectNodePathMappings(filters?: {
+    projectId?: string;
+    nodeId?: string;
+  }): Promise<ProjectNodePathMapping[]> {
+    this.ensureInitialized();
+
+    if (filters?.projectId && filters?.nodeId) {
+      const row = await this.getProjectNodePathMapping(filters.projectId, filters.nodeId);
+      return row ? [row] : [];
+    }
+
+    if (filters?.projectId) {
+      const rows = this.db!
+        .prepare("SELECT * FROM projectNodePathMappings WHERE projectId = ? ORDER BY nodeId")
+        .all(filters.projectId) as Array<{
+        projectId: string;
+        nodeId: string;
+        path: string;
+        createdAt: string;
+        updatedAt: string;
+      }>;
+      return rows.map((row) => this.rowToProjectNodePathMapping(row));
+    }
+
+    if (filters?.nodeId) {
+      const rows = this.db!
+        .prepare("SELECT * FROM projectNodePathMappings WHERE nodeId = ? ORDER BY projectId")
+        .all(filters.nodeId) as Array<{
+        projectId: string;
+        nodeId: string;
+        path: string;
+        createdAt: string;
+        updatedAt: string;
+      }>;
+      return rows.map((row) => this.rowToProjectNodePathMapping(row));
+    }
+
+    const rows = this.db!
+      .prepare("SELECT * FROM projectNodePathMappings ORDER BY projectId, nodeId")
+      .all() as Array<{
+      projectId: string;
+      nodeId: string;
+      path: string;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+    return rows.map((row) => this.rowToProjectNodePathMapping(row));
+  }
+
+  async listProjectNodePathMappingsForProject(projectId: string): Promise<ProjectNodePathMapping[]> {
+    this.ensureInitialized();
+
+    const project = await this.getProject(projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`);
+    }
+
+    return this.listProjectNodePathMappings({ projectId });
+  }
+
+  async listProjectNodePathMappingsForNode(nodeId: string): Promise<ProjectNodePathMapping[]> {
+    this.ensureInitialized();
+
+    const node = await this.getNode(nodeId);
+    if (!node) {
+      throw new Error(`Node not found: ${nodeId}`);
+    }
+
+    return this.listProjectNodePathMappings({ nodeId });
+  }
+
+  async upsertProjectNodePathMapping(input: ProjectNodePathMappingUpsertInput): Promise<ProjectNodePathMapping> {
+    this.ensureInitialized();
+
+    const existing = await this.getProjectNodePathMapping(input.projectId, input.nodeId);
+    if (existing) {
+      return this.updateProjectNodePathMapping(input);
+    }
+
+    return this.createProjectNodePathMapping(input);
+  }
+
+  async removeProjectNodePathMapping(
+    inputOrProjectId: ProjectNodePathMappingDeleteInput | string,
+    nodeIdArg?: string,
+  ): Promise<void> {
+    this.ensureInitialized();
+
+    const projectId =
+      typeof inputOrProjectId === "string" ? inputOrProjectId : inputOrProjectId.projectId;
+    const nodeId = typeof inputOrProjectId === "string" ? nodeIdArg : inputOrProjectId.nodeId;
+
+    if (!nodeId) {
+      throw new Error("Node ID is required");
+    }
+
+    const result = this.db!
+      .prepare("DELETE FROM projectNodePathMappings WHERE projectId = ? AND nodeId = ?")
+      .run(projectId, nodeId) as { changes?: number };
+
+    if ((result.changes ?? 0) > 0) {
+      this.db!.bumpLastModified();
+    }
   }
 
   // ── Project Health API ──────────────────────────────────────────────────
@@ -2216,6 +2682,18 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     }
   }
 
+  private async assertProjectNodeMappingTargetsExist(projectId: string, nodeId: string): Promise<void> {
+    const project = await this.getProject(projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`);
+    }
+
+    const node = await this.getNode(nodeId);
+    if (!node) {
+      throw new Error(`Node not found: ${nodeId}`);
+    }
+  }
+
   private rowToProject(row: {
     id: string;
     name: string;
@@ -2339,6 +2817,22 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       status: row.status as NodeStatus,
       lastSeen: row.lastSeen,
       connectedAt: row.connectedAt,
+    };
+  }
+
+  private rowToProjectNodePathMapping(row: {
+    projectId: string;
+    nodeId: string;
+    path: string;
+    createdAt: string;
+    updatedAt: string;
+  }): ProjectNodePathMapping {
+    return {
+      projectId: row.projectId,
+      nodeId: row.nodeId,
+      path: row.path,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
     };
   }
 
@@ -2847,6 +3341,46 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       remoteVersion: remote,
       status: "compatible",
       message: `Patch version difference only: local ${local} vs remote ${remote}`,
+    };
+  }
+
+  getProjectSettingsSnapshot(globalSettings: GlobalSettings): Promise<ProjectSettingsSnapshot> {
+    return (async () => {
+      const payload = await this.getSettingsForSync(globalSettings);
+      return createProjectSettingsSnapshot({
+        global: payload.global ?? {},
+        projects: payload.projects,
+      }, payload.exportedAt);
+    })();
+  }
+
+  async applyProjectSettingsSnapshot(snapshot: ProjectSettingsSnapshot): Promise<SettingsSyncResult> {
+    validateSnapshotEnvelope(snapshot);
+    const payloadWithoutChecksum: Omit<SettingsSyncPayload, "checksum"> = {
+      global: snapshot.payload.global,
+      projects: snapshot.payload.projects,
+      providerAuth: undefined,
+      exportedAt: snapshot.exportedAt,
+      version: 1,
+    };
+    const checksum = createHash("sha256")
+      .update(JSON.stringify(payloadWithoutChecksum))
+      .digest("hex");
+
+    return this.applyRemoteSettings({ ...payloadWithoutChecksum, checksum });
+  }
+
+  getAuthMaterialSnapshot(providerAuth?: Record<string, ProviderAuthEntry>): AuthMaterialSnapshot {
+    return createAuthMaterialSnapshot(providerAuth);
+  }
+
+  applyAuthMaterialSnapshot(snapshot: AuthMaterialSnapshot): { success: true; authCount: number; providerAuth: Record<string, ProviderAuthEntry> } {
+    validateSnapshotEnvelope(snapshot);
+    const providerAuth = { ...(snapshot.payload.providerAuth ?? {}) };
+    return {
+      success: true,
+      authCount: Object.keys(providerAuth).length,
+      providerAuth,
     };
   }
 

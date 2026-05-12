@@ -13,6 +13,7 @@ import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
 import { ApiError, sendErrorResponse } from "./api-error.js";
 import { getOrCreateProjectStore, evictAllProjectStores, setOnProjectFirstCreated } from "./project-store-resolver.js";
+import { getOrCreateScopedChatStore } from "./chat-project-services.js";
 import { getTerminalService, STALE_SESSION_THRESHOLD_MS } from "./terminal-service.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { terminalSessionManager } from "./terminal.js";
@@ -214,9 +215,18 @@ export interface ServerOptions {
   /** Optional PluginRunner for plugin hooks, routes, and lifecycle operations */
   pluginRunner?: {
     getPluginRoutes(): Array<{ pluginId: string; route: import("@fusion/core").PluginRouteDefinition }>;
+    getPluginWorkflowStepTemplates?(): Array<{ pluginId: string; template: import("@fusion/core").WorkflowStepTemplate }>;
     getRuntimeById?(runtimeId: string): unknown;
     createRuntimeContext?(pluginId: string): Promise<unknown>;
     reloadPlugin?(pluginId: string): Promise<unknown>;
+    checkPluginSetup?(pluginId: string): Promise<import("@fusion/core").PluginSetupCheckResult>;
+    installPluginSetup?(pluginId: string): Promise<void | { success: boolean; error?: string }>;
+    uninstallPluginSetup?(pluginId: string): Promise<void | { success: boolean; error?: string }>;
+    getPluginSetupInfo?(): Array<{
+      pluginId: string;
+      manifest: import("@fusion/core").PluginSetupManifest;
+      hooks: import("@fusion/core").PluginSetupHooks;
+    }>;
   };
   /** Optional ChatStore for chat session management */
   chatStore?: import("@fusion/core").ChatStore;
@@ -257,6 +267,16 @@ export interface ServerOptions {
    * settings PUT to fail.
    */
   onUseClaudeCliToggled?: (prev: boolean, next: boolean) => void;
+  /**
+   * Lazily install a bundled runtime plugin (e.g. Hermes/OpenClaw/Paperclip
+   * runtimes) the first time the user clicks Save in Settings. The dashboard
+   * has no knowledge of the on-disk bundle layout, so the host (CLI) injects
+   * this hook. Returns true if the plugin is now registered (either freshly
+   * installed or already present), false if the bundle could not be resolved
+   * (e.g. plugin id is unknown) so the route can fall through to its standard
+   * "plugin not found" error.
+   */
+  ensureBundledPluginInstalled?: (pluginId: string) => Promise<boolean>;
   /**
    * Returns the host's last-observed resolution of the bundled
    * `@fusion/pi-claude-cli` extension. Populated by serve/daemon/dashboard
@@ -641,15 +661,18 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       let agentStore;
       let messageStore: MessageStore | undefined;
       let automationStore: AutomationStore | undefined;
+      let scopedChatStore = chatStore;
       if (engineManager) {
         const engine = engineManager.getEngine(projectId);
         scopedStore = engine?.getTaskStore() ?? await getOrCreateProjectStore(projectId);
+        scopedChatStore = getOrCreateScopedChatStore(scopedStore);
         // Use the engine's stores if available
         agentStore = engine?.getAgentStore();
         messageStore = engine?.getMessageStore();
         automationStore = engine?.getAutomationStore();
       } else {
         scopedStore = await getOrCreateProjectStore(projectId);
+        scopedChatStore = getOrCreateScopedChatStore(scopedStore);
       }
       // Fallback: create AgentStore if engine doesn't have one
       if (!agentStore) {
@@ -670,7 +693,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
         },
         agentStore,
         messageStore,
-        chatStore,
+        scopedChatStore,
         automationStore,
       )(req, res);
     } catch (err: unknown) {
@@ -923,6 +946,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     chatAgentStore,
     options?.pluginRunner,
     () => store.getSettings(),
+    options?.engine?.getMessageStore(),
   );
 
   const runAiSessionCleanup = (maxAgeMs: number, source: "initial" | "scheduled") => {
@@ -1032,10 +1056,12 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   app.get("/api/health", (_req, res) => {
+    const database = store.getDatabaseHealth();
     res.json({
-      status: "ok",
+      status: database.corruptionDetected ? "degraded" : "ok",
       version: cliPackageVersion,
       uptime: Math.floor(process.uptime()),
+      database,
     });
   });
 
@@ -1163,8 +1189,36 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   });
 
   if (!isHeadless) {
-    // SPA fallback
-    app.get("/{*splat}", (_req, res) => {
+    app.get("/tasks/:id", (req, res, next) => {
+      const taskId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      if (!taskId || !/^[A-Z]+-\d+$/.test(taskId)) {
+        next();
+        return;
+      }
+
+      const params = new URLSearchParams();
+      params.set("task", taskId);
+      const project = typeof req.query.project === "string" ? req.query.project : undefined;
+      if (project) {
+        params.set("project", project);
+      }
+
+      res.redirect(301, `/?${params.toString()}`);
+    });
+
+    // SPA fallback. Only serve index.html for navigation requests — never for
+    // hashed asset URLs (/assets/*, /icons/*, /fonts/*) or any path that looks
+    // like a static file. Returning index.html for a missing JS chunk poisons
+    // the page with a text/html module script (strict MIME failure → blank
+    // shell on reload). A real 404 lets versionCheck detect the stale chunk
+    // and recover.
+    const STATIC_PREFIXES = ["/assets/", "/icons/", "/fonts/", "/brands/"];
+    app.get("/{*splat}", (req, res) => {
+      const path = req.path;
+      if (STATIC_PREFIXES.some((p) => path.startsWith(p)) || /\.[a-z0-9]+$/i.test(path)) {
+        res.status(404).end();
+        return;
+      }
       res.sendFile(join(clientDir, "index.html"));
     });
   }
@@ -1527,7 +1581,7 @@ export function setupBadgeWebSocket(
   };
 
   // Prime cache with existing tasks from default store
-  void store.listTasks({ slim: true, includeArchived: false }).then((tasks) => {
+  void store.listTasks({ slim: true, includeArchived: false, startupMemo: true }).then((tasks) => {
     for (const task of tasks) {
       badgeSnapshots.set(`default:${task.id}`, {
         prInfo: task.prInfo ?? null,

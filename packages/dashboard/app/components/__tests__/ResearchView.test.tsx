@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
 import { Header } from "../Header";
 import { ResearchView } from "../ResearchView";
 
@@ -109,6 +110,17 @@ describe("ResearchView", () => {
     mockUseResearch.mockReturnValue(baseHookValue);
   });
 
+  it("renders run form in default zero-config state", async () => {
+    mockFetchSettings.mockResolvedValue({});
+    mockFetchAuthStatus.mockResolvedValue({ providers: [] });
+
+    render(<ResearchView projectId="p1" />);
+
+    expect(await screen.findByLabelText("Query")).toBeInTheDocument();
+    expect(screen.queryByText(/Research defaults are incomplete/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("research-state-unavailable")).not.toBeInTheDocument();
+  });
+
   it("shows authentication setup state when required credentials are missing", async () => {
     mockFetchSettings.mockResolvedValue(configuredResearchSettings);
     render(<ResearchView projectId="p1" />);
@@ -120,6 +132,21 @@ describe("ResearchView", () => {
     mockFetchAuthStatus.mockResolvedValue({ providers: [{ id: "openrouter", type: "api_key", authenticated: true }] });
     render(<ResearchView projectId="p1" />);
     expect(await screen.findByTestId("research-state-empty")).toBeInTheDocument();
+  });
+
+  it("shows friendly web-search disabled state when provider is none", async () => {
+    const onOpenSettings = vi.fn();
+    mockFetchSettings.mockResolvedValue({ researchGlobalWebSearchProvider: "none" });
+    mockFetchAuthStatus.mockResolvedValue({ providers: [] });
+
+    render(<ResearchView projectId="p1" onOpenSettings={onOpenSettings} />);
+
+    expect(await screen.findByTestId("research-state-web-search-disabled")).toHaveTextContent(
+      "Web search is disabled. Page Fetch, Local Docs, GitHub and LLM Synthesis still work.",
+    );
+    expect(screen.getByRole("checkbox", { name: "Web Search" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Re-enable Web Search" }));
+    expect(onOpenSettings).toHaveBeenCalledWith("research-global");
   });
 
   it("renders selected run details, citations, and history", async () => {
@@ -201,12 +228,12 @@ describe("ResearchView", () => {
 
     mockUseResearch.mockReturnValue({
       ...baseHookValue,
-      runs: [{ id: "RR-1", title: "t", query: "q", status: "pending" }],
+      runs: [{ id: "RR-1", title: "t", query: "q", status: "queued" }],
       selectedRun: {
         id: "RR-1",
         title: "t",
         query: "q",
-        status: "pending",
+        status: "queued",
         events: [{ id: "E-1", message: "queued" }],
         results: { summary: "Summary", findings: [{ id: "finding-1", heading: "Finding", content: "Impact." }], citations: [] },
       },
@@ -239,12 +266,12 @@ describe("ResearchView", () => {
     const attachRunToTask = vi.fn().mockResolvedValue({});
     mockUseResearch.mockReturnValue({
       ...baseHookValue,
-      runs: [{ id: "RR-1", title: "t", query: "q", status: "pending" }],
+      runs: [{ id: "RR-1", title: "t", query: "q", status: "queued" }],
       selectedRun: {
         id: "RR-1",
         title: "t",
         query: "q",
-        status: "pending",
+        status: "queued",
         events: [],
         results: { summary: "Summary", findings: [{ id: "finding-1", heading: "Finding", content: "Impact." }], citations: [] },
       },
@@ -298,7 +325,7 @@ describe("ResearchView", () => {
       setSearchQuery,
       setSelectedRunId,
       runs: [
-        { id: "RR-1", title: "Alpha", query: "alpha", status: "pending" },
+        { id: "RR-1", title: "Alpha", query: "alpha", status: "queued" },
         { id: "RR-2", title: "Beta", query: "beta", status: "completed" },
       ],
     });
@@ -331,24 +358,6 @@ describe("ResearchView", () => {
     expect(onOpenSettings).toHaveBeenCalledWith("research-project");
   });
 
-  it("shows incomplete defaults setup CTA routed to global research settings", async () => {
-    mockFetchSettings.mockResolvedValue({
-      researchSettings: { enabled: true },
-      researchGlobalDefaults: {
-        searchProvider: "tavily",
-        synthesisProvider: undefined,
-        synthesisModelId: undefined,
-        maxSourcesPerRun: 20,
-      },
-    });
-    mockFetchAuthStatus.mockResolvedValue({ providers: [{ id: "tavily", type: "api_key", authenticated: true }] });
-
-    const onOpenSettings = vi.fn();
-    render(<ResearchView projectId="p1" onOpenSettings={onOpenSettings} />);
-    expect(await screen.findByText(/Research defaults are incomplete/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
-    expect(onOpenSettings).toHaveBeenCalledWith("research-global");
-  });
 
   it("shows authentication CTA when provider credentials are missing", async () => {
     mockFetchSettings.mockResolvedValue({
@@ -460,9 +469,72 @@ describe("ResearchView", () => {
     expect(await screen.findByTestId("research-state-empty")).toBeInTheDocument();
   });
 
-  it("includes mobile layout media rule", async () => {
-    const css = await import("../ResearchView.css?inline");
-    expect(css.default).toContain("@media (max-width: 768px)");
-    expect(css.default).toContain(".research-view__layout");
+  it("wires create-task modal payload with trimmed fields and attachment toggle", async () => {
+    const createTaskFromRun = vi.fn().mockResolvedValue({});
+    mockUseResearch.mockReturnValue({
+      ...baseHookValue,
+      createTaskFromRun,
+      runs: [{ id: "RR-1", title: "t", query: "q", status: "completed" }],
+      selectedRun: {
+        id: "RR-1",
+        title: "t",
+        query: "q",
+        status: "completed",
+        events: [],
+        results: { summary: "Summary", findings: [{ id: "finding-1", heading: "Finding", content: "Impact." }], citations: [] },
+      },
+      selectedRunId: "RR-1",
+    });
+    mockFetchAuthStatus.mockResolvedValue({ providers: [{ id: "openrouter", type: "api_key", authenticated: true }] });
+
+    render(<ResearchView projectId="p1" />);
+    fireEvent.click((await screen.findAllByText("Create Task"))[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Title"), { target: { value: "  Follow up task  " } });
+    fireEvent.change(within(dialog).getByLabelText("Description"), { target: { value: "  Take action now.  " } });
+    fireEvent.click(within(dialog).getByLabelText("Attach markdown export artifact"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create Task" }));
+
+    await waitFor(() => {
+      expect(createTaskFromRun).toHaveBeenCalledWith("RR-1", "Follow up task", "finding-1", "Take action now.", "normal", true);
+    });
+  });
+
+  it("keeps enrich action disabled until a task id is provided", async () => {
+    mockUseResearch.mockReturnValue({
+      ...baseHookValue,
+      runs: [{ id: "RR-1", title: "t", query: "q", status: "completed" }],
+      selectedRun: {
+        id: "RR-1",
+        title: "t",
+        query: "q",
+        status: "completed",
+        events: [],
+        results: { summary: "Summary", findings: [{ id: "finding-1", heading: "Finding", content: "Impact." }], citations: [] },
+      },
+      selectedRunId: "RR-1",
+    });
+    mockFetchAuthStatus.mockResolvedValue({ providers: [{ id: "openrouter", type: "api_key", authenticated: true }] });
+
+    render(<ResearchView projectId="p1" />);
+    fireEvent.click((await screen.findAllByText("Enrich Task"))[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    const enrichButton = within(dialog).getByRole("button", { name: "Enrich Task" });
+    expect(enrichButton).toBeDisabled();
+
+    const targetInput = within(dialog).getByRole("combobox", { name: "Target task" });
+    fireEvent.change(targetInput, { target: { value: "FN-1" } });
+    await waitFor(() => expect(enrichButton).not.toBeDisabled());
+  });
+
+  it("FN-3912: research view content is scrollable on mobile", () => {
+    const css = loadAllAppCss();
+    const baseCss = loadAllAppCssBaseOnly();
+
+    expect(baseCss).toMatch(/\.research-view__layout\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*minmax\(0,\s*2fr\);[^}]*\}/);
+
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*\{[^}]*\.research-view\s*\{[^}]*overflow-y:\s*auto;[^}]*-webkit-overflow-scrolling:\s*touch;[^}]*padding-bottom:\s*calc\(var\(--space-md\)\s*\+\s*var\(--mobile-nav-height\)\s*\+\s*env\(safe-area-inset-bottom,\s*0px\)\s*\+\s*var\(--standalone-bottom-gap\)\);[^}]*\}/);
   });
 });

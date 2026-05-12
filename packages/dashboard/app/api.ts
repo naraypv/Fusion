@@ -5,3 +5,4 @@
  * while implementation lives under `app/api/*` modules.
  */
 export * from "./api/legacy";
+export * from "./api-node";

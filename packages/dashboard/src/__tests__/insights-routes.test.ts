@@ -259,8 +259,8 @@ describe("Insights routes", () => {
     expect((res.body as { error: string }).error).toContain("Invalid trigger");
   });
 
-  it("POST /api/insights/run returns 409 when an active run exists for trigger", async () => {
-    storeA.getInsightStore().createRun("", { trigger: "manual" });
+  it("POST /api/insights/run returns structured 409 details when active run is still live", async () => {
+    const activeRun = storeA.getInsightStore().createRun("", { trigger: "manual" });
 
     const res = await request(
       app,
@@ -271,6 +271,79 @@ describe("Insights routes", () => {
     );
 
     expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: "Insight generation is already running",
+      details: {
+        code: "ACTIVE_RUN_CONFLICT",
+        activeRunId: activeRun.id,
+        activeRunStatus: "pending",
+        trigger: "manual",
+      },
+    });
+  });
+
+  it("POST /api/insights/run recovers stale active run older than orphan grace", async () => {
+    const insightStore = storeA.getInsightStore();
+    const staleRun = insightStore.createRun("", { trigger: "manual" });
+    const staleAt = new Date(Date.now() - 45_000).toISOString();
+    storeA.getDatabase().prepare("UPDATE project_insight_runs SET startedAt = ? WHERE id = ?").run(staleAt, staleRun.id);
+
+    const res = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({ trigger: "manual" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+
+    const recoveredRun = insightStore.getRun(staleRun.id);
+    expect(recoveredRun?.status).toBe("failed");
+    expect(recoveredRun?.lifecycle.terminalReason).toBe("failed");
+    expect(recoveredRun?.lifecycle.terminalCause).toBe("orphaned_active_run_recovered");
+    expect(recoveredRun?.lifecycle.failureClass).toBe("non_retryable");
+    expect(recoveredRun?.lifecycle.retryable).toBe(false);
+
+    const events = insightStore.listRunEvents(staleRun.id);
+    expect(events.some((event) => event.type === "warning" && event.message.includes("Recovered orphaned active run"))).toBe(true);
+    expect(events.some((event) => event.type === "status_changed" && event.status === "failed")).toBe(true);
+  });
+
+  it("POST /api/insights/run uses createdAt fallback for stale check when startedAt is null", async () => {
+    const insightStore = storeA.getInsightStore();
+    const staleRun = insightStore.createRun("", { trigger: "manual" });
+    const staleCreatedAt = new Date(Date.now() - 45_000).toISOString();
+    storeA.getDatabase().prepare("UPDATE project_insight_runs SET createdAt = ?, startedAt = NULL WHERE id = ?").run(staleCreatedAt, staleRun.id);
+
+    const res = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({ trigger: "manual" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(insightStore.getRun(staleRun.id)?.status).toBe("failed");
+  });
+
+  it("POST /api/insights/run does not recover young active runs before grace threshold", async () => {
+    const insightStore = storeA.getInsightStore();
+    const run = insightStore.createRun("", { trigger: "manual" });
+    const youngAt = new Date(Date.now() - 5_000).toISOString();
+    storeA.getDatabase().prepare("UPDATE project_insight_runs SET startedAt = ? WHERE id = ?").run(youngAt, run.id);
+
+    const res = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({ trigger: "manual" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(409);
+    expect(insightStore.getRun(run.id)?.status).toBe("pending");
   });
 
   it("POST /api/insights/run persists completed run metadata", async () => {
@@ -383,6 +456,94 @@ describe("Insights routes", () => {
     expect(retriedRes.status).toBe(201);
     const retried = retriedRes.body as { lifecycle: { retryOfRunId: string } };
     expect(retried.lifecycle.retryOfRunId).toBe(retryableRun.id);
+  });
+
+  it("POST /api/insights/runs/:id/retry preserves the original run's custom model", async () => {
+    // Create a run with a custom model that fails with a retryable error
+    piMocks.promptWithFallback.mockRejectedValue(new Error("HTTP 503"));
+    const failedRes = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({
+        trigger: "manual",
+        modelProvider: "openai",
+        modelId: "gpt-4o",
+      }),
+      { "Content-Type": "application/json" },
+    );
+    expect(failedRes.status).toBe(201);
+    const failedRun = failedRes.body as { id: string; inputMetadata: Record<string, unknown> };
+
+    // The failed run should have persisted the model info in inputMetadata
+    expect(failedRun.inputMetadata?.metadata).toMatchObject({
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+
+    // Reset mock so retry succeeds
+    piMocks.promptWithFallback.mockResolvedValue(undefined);
+    piMocks.createFnAgent.mockClear();
+
+    const retriedRes = await request(app, "POST", `/api/insights/runs/${failedRun.id}/retry`, JSON.stringify({}), {
+      "Content-Type": "application/json",
+    });
+    expect(retriedRes.status).toBe(201);
+
+    // The retry should pass the original model to createFnAgent
+    expect(piMocks.createFnAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultProvider: "openai",
+        defaultModelId: "gpt-4o",
+      }),
+    );
+  });
+
+  it("POST /api/insights/run passes explicit model override to createFnAgent", async () => {
+    const res = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({
+        trigger: "manual",
+        modelProvider: "openai",
+        modelId: "gpt-4o",
+      }),
+      { "Content-Type": "application/json" },
+    );
+    expect(res.status).toBe(201);
+
+    // createFnAgent should have been called with the explicit override
+    expect(piMocks.createFnAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultProvider: "openai",
+        defaultModelId: "gpt-4o",
+        fallbackProvider: undefined,
+        fallbackModelId: undefined,
+      }),
+    );
+  });
+
+  it("POST /api/insights/run without model override uses settings resolution", async () => {
+    const res = await request(
+      app,
+      "POST",
+      "/api/insights/run",
+      JSON.stringify({
+        trigger: "manual",
+      }),
+      { "Content-Type": "application/json" },
+    );
+    expect(res.status).toBe(201);
+
+    // Without override, provider/model come from settings resolution
+    // (which returns undefined when no planning settings are configured)
+    expect(piMocks.createFnAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fallbackProvider: undefined,
+        fallbackModelId: undefined,
+      }),
+    );
   });
 
   it("POST /api/insights/:id/create-task returns task-conversion payload", async () => {

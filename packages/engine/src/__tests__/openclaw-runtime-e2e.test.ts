@@ -116,6 +116,11 @@ describe("OpenClaw runtime E2E pipeline", () => {
           return;
         }
 
+        if (args.includes("mcp") && args.includes("set")) {
+          child.emit("close", 0);
+          return;
+        }
+
         if (args.includes("agent") && args.includes("--json")) {
           const payload = JSON.stringify({
             payloads: [{ text: "OpenClaw response" }],
@@ -148,7 +153,7 @@ describe("OpenClaw runtime E2E pipeline", () => {
   });
 
   it("loads OpenClaw plugin and executes through OpenClaw runtime", async () => {
-    const pluginStore = new PluginStore(testRoot, { inMemoryDb: true });
+    const pluginStore = new PluginStore(testRoot, { inMemoryDb: true, centralGlobalDir: testRoot });
     await pluginStore.init();
 
     await pluginStore.registerPlugin({
@@ -197,6 +202,13 @@ describe("OpenClaw runtime E2E pipeline", () => {
       cwd: testRoot,
       systemPrompt: "You are helpful",
       tools: "coding",
+      customTools: [{
+        name: "fn_task_list",
+        label: "fn_task_list",
+        description: "list",
+        parameters: { type: "object" },
+        execute: vi.fn(),
+      } as any],
       skills: ["bash"],
     });
 
@@ -209,10 +221,26 @@ describe("OpenClaw runtime E2E pipeline", () => {
       "openclaw/openclaw-agent/openclaw/openclaw-agent",
     );
     expect(mockCreateFnAgent).not.toHaveBeenCalled();
+
+    const spawnArgs = mockSpawn.mock.calls.map(([, args]) => args as string[]);
+    expect(spawnArgs.some((args) => args.includes("mcp") && args.includes("set"))).toBe(true);
+    expect(spawnArgs.some((args) => args.includes("agent") && args.includes("--profile"))).toBe(true);
+  });
+
+  it("keeps agent argv unchanged when no custom tools are provided", async () => {
+    const adapterModule = await import(pathToFileURL(openClawPluginModulePath()).href);
+    const adapter = new adapterModule.OpenClawRuntimeAdapter({ agentId: "openclaw-agent" });
+    const { session } = await adapter.createSession({ cwd: testRoot, systemPrompt: "sys" });
+    await adapter.promptWithFallback(session, "hello");
+
+    const agentCall = mockSpawn.mock.calls.find(([, args]) => (args as string[]).includes("agent"));
+    expect(agentCall).toBeTruthy();
+    const agentArgs = agentCall?.[1] as string[];
+    expect(agentArgs.includes("--profile")).toBe(false);
   });
 
   it("falls back to default pi runtime when OpenClaw plugin is not installed", async () => {
-    const pluginStore = new PluginStore(testRoot, { inMemoryDb: true });
+    const pluginStore = new PluginStore(testRoot, { inMemoryDb: true, centralGlobalDir: testRoot });
     await pluginStore.init();
 
     const taskStore = createTaskStoreMock(testRoot);

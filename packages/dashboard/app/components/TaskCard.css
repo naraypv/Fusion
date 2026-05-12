@@ -12,6 +12,8 @@
     opacity var(--transition-normal);
   user-select: none;
   touch-action: pan-x pan-y;
+  container-type: inline-size;
+  container-name: task-card;
 }
 .card:hover {
   background: var(--card-hover);
@@ -31,7 +33,7 @@
 }
 .card.file-drop-target {
   border: 2px dashed var(--todo);
-  background: rgba(88, 166, 255, 0.08);
+  background: color-mix(in srgb, var(--todo) 8%, transparent);
 }
 
 /* Agent-active glow: animated border glow when an agent is actively working on a task.
@@ -39,8 +41,8 @@
 .card.agent-active {
   border-color: var(--in-progress);
   box-shadow:
-    0 0 8px rgba(var(--in-progress-rgb), 0.4),
-    0 0 20px rgba(var(--in-progress-rgb), 0.15);
+    0 0 8px color-mix(in srgb, var(--in-progress) 40%, transparent),
+    0 0 20px color-mix(in srgb, var(--in-progress) 15%, transparent);
   animation: agent-glow 2.5s ease-in-out infinite;
 }
 
@@ -48,13 +50,13 @@
   0%,
   100% {
     box-shadow:
-      0 0 8px rgba(var(--in-progress-rgb), 0.4),
-      0 0 20px rgba(var(--in-progress-rgb), 0.15);
+      0 0 8px color-mix(in srgb, var(--in-progress) 40%, transparent),
+      0 0 20px color-mix(in srgb, var(--in-progress) 15%, transparent);
   }
   50% {
     box-shadow:
-      0 0 12px rgba(var(--in-progress-rgb), 0.6),
-      0 0 28px rgba(var(--in-progress-rgb), 0.25);
+      0 0 12px color-mix(in srgb, var(--in-progress) 60%, transparent),
+      0 0 28px color-mix(in srgb, var(--in-progress) 25%, transparent);
   }
 }
 
@@ -77,6 +79,43 @@
   font-size: 0.8125rem;
   line-height: 1.4;
   word-break: break-word;
+}
+
+.card-branch-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+}
+
+.card-branch-chip {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: var(--space-xs);
+  padding: calc(var(--space-xs) / 4) calc(var(--space-sm) - (var(--space-xs) / 4));
+  border-radius: var(--radius-pill);
+  border: var(--btn-border-width) solid color-mix(in srgb, var(--text-muted) 35%, transparent);
+  background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  color: var(--text-muted);
+  font-size: 0.625rem;
+}
+
+.card-branch-label {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.card-branch-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--text);
 }
 
 /* z-index + position: relative so .card-dep-badge tooltip renders above .card-title */
@@ -119,7 +158,7 @@
 
 .card-status-badge.paused {
   background: var(--status-done-bg-deep);
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
 }
 
 .card-status-badge.awaiting-approval {
@@ -149,7 +188,7 @@
 }
 .card-status-badge--archived {
   background: var(--status-archived-bg);
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
 }
 
 .card.stuck {
@@ -305,23 +344,23 @@
    Distinct from agent-active (purple glow), failed (red left border + error block), and paused (dimmed opacity). */
 .card.awaiting-approval {
   border-left: 3px solid var(--triage);
-  background: rgba(210, 153, 34, 0.06);
+  background: color-mix(in srgb, var(--triage) 6%, transparent);
   animation: approval-pulse 3s ease-in-out infinite;
 }
 
 @keyframes approval-pulse {
   0%,
   100% {
-    background: rgba(210, 153, 34, 0.06);
+    background: color-mix(in srgb, var(--triage) 6%, transparent);
   }
   50% {
-    background: rgba(210, 153, 34, 0.12);
+    background: color-mix(in srgb, var(--triage) 12%, transparent);
   }
 }
 
 .card.paused {
   opacity: 0.55;
-  border-left: 3px solid var(--text-secondary, #888);
+  border-left: 3px solid var(--text-muted);
   cursor: default;
 }
 
@@ -372,13 +411,52 @@
   cursor: default;
 }
 
-.card-scope-badge[data-tooltip]:hover::after {
+.card-fanout-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--space-xs) / 2);
+  font-size: 0.6875rem;
+  color: var(--color-info);
+  position: relative;
+  cursor: default;
+}
+
+.card-fanout-count {
+  font-family: var(--font-mono);
+}
+
+.card-fanout-badge--stale {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  border-radius: var(--radius-pill);
+  padding-inline: calc(var(--space-xs) / 2);
+}
+
+.card-fanout-badge--high-impact {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 16%, transparent);
+  border-radius: var(--radius-pill);
+  padding-inline: var(--space-xs);
+  font-weight: 600;
+}
+
+.card-fanout-badge--high-impact .card-fanout-count {
+  color: var(--text);
+}
+
+.card-fanout-badge--escalated {
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 16%, transparent);
+}
+
+.card-scope-badge[data-tooltip]:hover::after,
+.card-fanout-badge[data-tooltip]:hover::after {
   content: attr(data-tooltip);
   position: absolute;
   bottom: 100%;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--bg-card);
+  background: var(--card);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -438,13 +516,13 @@
 .card-agent-badge {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-xs);
   font-size: 0.625rem;
   font-weight: 600;
   color: var(--text-muted);
   background: color-mix(in srgb, var(--text-muted) 18%, transparent);
-  border: 1px solid color-mix(in srgb, var(--text-muted) 35%, transparent);
-  padding: 2px 6px;
+  border: var(--btn-border-width) solid color-mix(in srgb, var(--text-muted) 35%, transparent);
+  padding: calc(var(--space-xs) / 4) calc(var(--space-sm) - (var(--space-xs) / 4));
   border-radius: var(--radius-pill);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -467,9 +545,26 @@
 
 .card-agent-badge-text {
   min-width: 0;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@container task-card (max-width: 240px) {
+  .card-agent-badge-text {
+    display: none;
+  }
+}
+
+@media (max-width: 768px) {
+  .card-agent-badge-text {
+    display: none;
+  }
+
+  .card-fanout-badge--high-impact {
+    padding-inline: calc(var(--space-xs) / 2);
+  }
 }
 
 .card-agent-badge--loading {
@@ -766,7 +861,7 @@
 .card-edit-desc-textarea:focus {
   border-color: var(--todo);
   box-shadow: var(--focus-ring);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 .card-edit-desc-textarea::placeholder {
@@ -800,7 +895,8 @@
   color: var(--text-muted);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  transition: opacity var(--transition-fast), background var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .card:hover .card-edit-btn {
@@ -829,10 +925,10 @@
   background: transparent;
   border: none;
   border-radius: var(--radius-sm);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, color 0.15s;
+  transition: opacity var(--transition-fast), color var(--transition-fast);
 }
 
 .card:hover .card-delete-btn {
@@ -840,7 +936,7 @@
 }
 
 .card-delete-btn:hover {
-  color: var(--color-error, #f85149);
+  color: var(--color-error);
 }
 
 .card-delete-btn:focus {
@@ -866,7 +962,8 @@
   color: var(--text-muted);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+  transition: opacity var(--transition-fast), background var(--transition-fast),
+    color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .card:hover .card-archive-btn,
@@ -908,7 +1005,8 @@
   color: var(--text-muted);
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+  transition: opacity var(--transition-fast), background var(--transition-fast),
+    color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .card:hover .card-send-back-btn {
@@ -929,7 +1027,7 @@
 
 .card-send-back-menu {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + var(--space-xs));
   right: 0;
   z-index: 50;
   min-width: 100px;
@@ -943,7 +1041,7 @@
 .card-send-back-menu-item {
   display: block;
   width: 100%;
-  padding: 6px 12px;
+  padding: calc(var(--space-sm) - (var(--space-xs) / 4)) var(--space-md);
   font-size: 0.75rem;
   font-weight: 400;
   color: var(--text);
@@ -951,16 +1049,16 @@
   border: none;
   cursor: pointer;
   text-align: left;
-  transition: background 0.1s;
+  transition: background var(--transition-instant);
 }
 
 .card-send-back-menu-item:hover {
-  background: var(--surface-hover);
+  background: var(--surface-hover, color-mix(in srgb, var(--text) 6%, transparent));
 }
 
 .card-send-back-menu-item:focus {
   outline: none;
-  background: var(--surface-hover);
+  background: var(--surface-hover, color-mix(in srgb, var(--text) 6%, transparent));
 }
 
 /* Loading state during save */
@@ -992,11 +1090,11 @@
   /* Card edit button: always visible on mobile (no hover) */
   .card-edit-btn {
     opacity: 1;
-    width: 32px;
-    height: 32px;
-    margin-right: -8px;
-    margin-top: -8px;
-    margin-bottom: -8px;
+    width: calc(var(--space-xl) + var(--space-md));
+    height: calc(var(--space-xl) + var(--space-md));
+    margin-right: calc(-1 * var(--space-sm));
+    margin-top: calc(-1 * var(--space-sm));
+    margin-bottom: calc(-1 * var(--space-sm));
     border-radius: var(--radius-md);
   }
 
@@ -1008,11 +1106,11 @@
   /* Card delete button: always visible on mobile (no hover) */
   .card-delete-btn {
     opacity: 1;
-    width: 32px;
-    height: 32px;
-    margin-right: -8px;
-    margin-top: -8px;
-    margin-bottom: -8px;
+    width: calc(var(--space-xl) + var(--space-md));
+    height: calc(var(--space-xl) + var(--space-md));
+    margin-right: calc(-1 * var(--space-sm));
+    margin-top: calc(-1 * var(--space-sm));
+    margin-bottom: calc(-1 * var(--space-sm));
     border-radius: var(--radius-md);
   }
 
@@ -1078,6 +1176,18 @@
   .card-agent-created-badge {
     font-size: 0.5625rem;
     padding: calc(var(--space-xs) / 4) var(--space-sm);
+  }
+
+  .card-branch-row {
+    gap: calc(var(--space-xs) / 2);
+  }
+
+  .card-branch-chip {
+    max-width: 100%;
+  }
+
+  .card-branch-value {
+    max-width: 18ch;
   }
 
   /* Card: wrap dependency badges */

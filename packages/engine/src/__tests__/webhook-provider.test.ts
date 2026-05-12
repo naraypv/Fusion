@@ -65,15 +65,42 @@ describe("WebhookNotificationProvider", () => {
 
   it("sendNotification formats Generic correctly", async () => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
-    await provider.initialize({ webhookUrl: "https://example.com/hook", webhookFormat: "generic" });
+    await provider.initialize({
+      webhookUrl: "https://example.com/hook",
+      webhookFormat: "generic",
+      dashboardHost: "http://dash",
+      projectId: "p1",
+    });
 
-    await provider.sendNotification("in-review", { taskId: "FN-1", taskTitle: "My Task", event: "in-review" });
+    await provider.sendNotification("message:agent-to-user", {
+      taskId: "FN-1",
+      taskTitle: "My Task",
+      event: "message:agent-to-user",
+      metadata: {
+        messageId: "msg-1",
+        fromId: "agent-1",
+        toId: "user:dashboard",
+        fromName: "Triage Bot",
+        toName: "Dashboard User",
+        preview: "hello",
+      },
+    });
 
     const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
     const payload = JSON.parse(String(requestInit.body));
-    expect(payload.event).toBe("in-review");
+    expect(payload.event).toBe("message:agent-to-user");
     expect(payload.timestamp).toEqual(expect.any(String));
     expect(payload.task).toEqual({ id: "FN-1", title: "My Task" });
+    expect(payload.metadata).toEqual(
+      expect.objectContaining({
+        messageId: "msg-1",
+        fromId: "agent-1",
+        toId: "user:dashboard",
+        fromName: "Triage Bot",
+        toName: "Dashboard User",
+      }),
+    );
+    expect(payload.clickUrl).toBe("http://dash/?project=p1&task=FN-1#message-msg-1");
   });
 
   it("sendNotification returns success on HTTP 200", async () => {
@@ -138,12 +165,19 @@ describe("WebhookNotificationProvider", () => {
     ["planning-awaiting-input", "is awaiting your input during planning"],
     ["gridlock", "Pipeline gridlocked"],
     ["fallback-used", "Fusion recovered by switching from"],
+    ["message:agent-to-user", "From: Triage Bot → You: hello"],
+    ["message:agent-to-agent", "From: Triage Bot → To: Executor Bot: hello"],
     ["unknown-event", 'Event "unknown-event" for task My Task'],
   ])("message formatting for %s", async (event, expectedPart) => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
     await provider.initialize({ webhookUrl: "https://example.com/hook", webhookFormat: "slack" });
 
-    await provider.sendNotification(event, { taskId: "FN-1", taskTitle: "My Task", event });
+    await provider.sendNotification(event, {
+      taskId: "FN-1",
+      taskTitle: "My Task",
+      event,
+      metadata: { fromId: "agent-1", toId: "agent-2", fromName: "Triage Bot", toName: "Executor Bot", preview: "hello" },
+    });
 
     const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(requestInit.body));

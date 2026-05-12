@@ -153,7 +153,7 @@ vi.mock("@fusion/engine", async () => {
   });
 });
 
-import { AgentStore, Database, RoutineStore, isGhAvailable, isGhAuthenticated } from "@fusion/core";
+import { AgentStore, Database, RoutineStore, TaskStore as CoreTaskStore, isGhAvailable, isGhAuthenticated } from "@fusion/core";
 import { createFnAgent } from "@fusion/engine";
 
 const mockIsGhAvailable = vi.mocked(isGhAvailable);
@@ -204,6 +204,8 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     deleteTaskDocument: vi.fn().mockResolvedValue(undefined),
     updatePrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
+    linkGithubIssue: vi.fn().mockResolvedValue(undefined),
+    recordActivity: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
@@ -427,7 +429,7 @@ describe("POST /tasks/:id/retry", () => {
       mergeRetries: 0,
     });
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.logEntry).toHaveBeenCalledWith("KB-001", "Retry requested from dashboard (in-review retry, mergeRetries reset)");
+    expect(store.logEntry).toHaveBeenCalledWith("KB-001", "Retry requested from dashboard (in-review merge retry, mergeRetries reset)");
   });
 
   it("retries a stuck-killed in-review task without moving columns", async () => {
@@ -449,7 +451,7 @@ describe("POST /tasks/:id/retry", () => {
       mergeRetries: 0,
     });
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(store.logEntry).toHaveBeenCalledWith("KB-001", "Retry requested from dashboard (in-review retry, mergeRetries reset)");
+    expect(store.logEntry).toHaveBeenCalledWith("KB-001", "Retry requested from dashboard (in-review merge retry, mergeRetries reset)");
   });
 
   it("preserves worktree/branch when retrying in-review task", async () => {
@@ -478,6 +480,102 @@ describe("POST /tasks/:id/retry", () => {
     expect(updateCall).not.toHaveProperty("baseCommitSha");
     expect(updateCall).not.toHaveProperty("recoveryRetryCount");
     expect(updateCall).not.toHaveProperty("nextRecoveryAt");
+  });
+
+  it("retries execution-failed in-review task by moving to todo with progress preserved", async () => {
+    const executionFailedTask = {
+      ...FAKE_TASK_DETAIL,
+      column: "in-review" as const,
+      status: "failed",
+      steps: [
+        { name: "Step 0", status: "done" },
+        { name: "Step 1", status: "in-progress" },
+        { name: "Step 2", status: "pending" },
+      ],
+    };
+    const movedTask = { ...executionFailedTask, column: "todo" as const, status: undefined };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(executionFailedTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(executionFailedTask);
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/retry", JSON.stringify({}), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("KB-001", {
+      status: null,
+      error: null,
+      stuckKillCount: 0,
+    });
+    expect(store.moveTask).toHaveBeenCalledWith("KB-001", "todo", { preserveProgress: true });
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "KB-001",
+      "Retry requested from dashboard (execution failure in-review → todo, preserving progress)",
+    );
+  });
+
+  it("retries merge-failed in-review task by staying in-review with mergeRetries reset", async () => {
+    const mergeFailedTask = {
+      ...FAKE_TASK_DETAIL,
+      column: "in-review" as const,
+      status: "failed",
+      steps: [
+        { name: "Step 0", status: "done" },
+        { name: "Step 1", status: "done" },
+        { name: "Step 2", status: "done" },
+      ],
+    };
+    (store.getTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(mergeFailedTask)
+      .mockResolvedValueOnce(mergeFailedTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(mergeFailedTask);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/retry", JSON.stringify({}), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("KB-001", {
+      status: null,
+      error: null,
+      stuckKillCount: 0,
+      mergeRetries: 0,
+    });
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "KB-001",
+      "Retry requested from dashboard (in-review merge retry, mergeRetries reset)",
+    );
+  });
+
+  it("retries stuck-killed in-review task with incomplete steps moves to todo", async () => {
+    const stuckTask = {
+      ...FAKE_TASK_DETAIL,
+      column: "in-review" as const,
+      status: "stuck-killed",
+      steps: [
+        { name: "Step 0", status: "done" },
+        { name: "Step 1", status: "pending" },
+      ],
+    };
+    const movedTask = { ...stuckTask, column: "todo" as const, status: undefined };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(stuckTask);
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(stuckTask);
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/KB-001/retry", JSON.stringify({}), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(store.moveTask).toHaveBeenCalledWith("KB-001", "todo", { preserveProgress: true });
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "KB-001",
+      "Retry requested from dashboard (execution failure in-review → todo, preserving progress)",
+    );
+    const updateCall = (store.updateTask as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    expect(updateCall).not.toHaveProperty("mergeRetries");
   });
 
   it("retries a stranded planning triage task in triage and removes stale prompt", async () => {
@@ -1386,8 +1484,9 @@ describe("PATCH /tasks/:id", () => {
     expect(res.body.dependencies).toEqual(["FN-002"]);
   });
 
-  it("forwards priority to store.updateTask", async () => {
-    const updatedTask = { ...FAKE_TASK_DETAIL, priority: "high" as const };
+  it("forwards priority to store.updateTask without changing task column", async () => {
+    const triageTask = { ...FAKE_TASK_DETAIL, column: "triage" as const, status: "awaiting-approval" as const };
+    const updatedTask = { ...triageTask, priority: "high" as const };
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
 
     const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({ priority: "high" }), {
@@ -1397,6 +1496,8 @@ describe("PATCH /tasks/:id", () => {
     expect(res.status).toBe(200);
     expect(store.updateTask).toHaveBeenCalledWith("KB-001", { priority: "high" });
     expect(res.body.priority).toBe("high");
+    expect(res.body.column).toBe("triage");
+    expect(res.body.status).toBe("awaiting-approval");
   });
 
   it("forwards priority=null to store.updateTask (resets to default)", async () => {
@@ -1654,6 +1755,221 @@ describe("PATCH /tasks/:id", () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toContain("sourceIssue.externalIssueId");
+  });
+
+  it("forwards githubTracking updates including null issue unlink", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL });
+
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({
+      githubTracking: {
+        enabled: true,
+        repoOverride: "runfusion/fusion",
+        issue: null,
+      },
+    }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("KB-001", {
+      githubTracking: {
+        enabled: true,
+        repoOverride: "runfusion/fusion",
+        issue: null,
+      },
+    });
+  });
+
+  it("creates and links a tracking issue when enabling tracking on an existing task with resolvable repo", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "runfusion",
+      repo: "fusion",
+      number: 73,
+      htmlUrl: "https://github.com/runfusion/fusion/issues/73",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ githubAuthMode: "token", githubAuthToken: "tok" });
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      githubTracking: { enabled: true, repoOverride: "runfusion/fusion" },
+    });
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      githubTracking: {
+        enabled: true,
+        repoOverride: "runfusion/fusion",
+        issue: { owner: "runfusion", repo: "fusion", number: 73, url: "https://github.com/runfusion/fusion/issues/73", createdAt: "2026-01-01T00:00:00.000Z" },
+      },
+    });
+
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({
+      githubTracking: {
+        enabled: true,
+        repoOverride: "runfusion/fusion",
+      },
+    }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "runfusion", repo: "fusion" }));
+    expect(store.linkGithubIssue).toHaveBeenCalledWith("KB-001", expect.objectContaining({ owner: "runfusion", repo: "fusion", number: 73 }));
+    createIssueSpy.mockRestore();
+  });
+
+  it("PATCH persists githubTracking for existing tasks and links created issue with a real store", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "kb-routes-patch-github-tracking-"));
+    const globalDir = mkdtempSync(join(tmpdir(), "kb-routes-patch-github-tracking-global-"));
+    const realStore = new CoreTaskStore(rootDir, globalDir, { inMemoryDb: true });
+    await realStore.init();
+
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "runfusion",
+      repo: "fusion",
+      number: 74,
+      htmlUrl: "https://github.com/runfusion/fusion/issues/74",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    try {
+      await realStore.updateSettings({
+        githubAuthMode: "token",
+        githubAuthToken: "tok",
+        githubTrackingDefaultRepo: "runfusion/fusion",
+      });
+      const created = await realStore.createTask({ description: "route patch flow", column: "todo" });
+
+      const app = express();
+      app.use(express.json());
+      app.use("/api", createApiRoutes(realStore));
+
+      const res = await REQUEST(app, "PATCH", `/api/tasks/${created.id}`, JSON.stringify({
+        githubTracking: { enabled: true },
+      }), {
+        "Content-Type": "application/json",
+      });
+
+      expect(res.status).toBe(200);
+      expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "runfusion", repo: "fusion" }));
+      expect(res.body.githubTracking?.enabled).toBe(true);
+      expect(res.body.githubTracking?.issue).toMatchObject({
+        owner: "runfusion",
+        repo: "fusion",
+        number: 74,
+      });
+
+      const persisted = await realStore.getTask(created.id);
+      expect(persisted.githubTracking?.enabled).toBe(true);
+      expect(persisted.githubTracking?.issue?.number).toBe(74);
+    } finally {
+      createIssueSpy.mockRestore();
+      realStore.close();
+      rmSync(rootDir, { recursive: true, force: true });
+      rmSync(globalDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not recreate tracking issue during explicit manual unlink patch", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "runfusion",
+      repo: "fusion",
+      number: 99,
+      htmlUrl: "https://github.com/runfusion/fusion/issues/99",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL });
+
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({
+      githubTracking: { issue: null },
+    }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(createIssueSpy).not.toHaveBeenCalled();
+    expect(store.getTask).not.toHaveBeenCalled();
+    createIssueSpy.mockRestore();
+  });
+
+  it("does not create tracking issue when disabling tracking", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "runfusion",
+      repo: "fusion",
+      number: 100,
+      htmlUrl: "https://github.com/runfusion/fusion/issues/100",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      githubTracking: { enabled: false, repoOverride: "runfusion/fusion" },
+    });
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      githubTracking: { enabled: false, repoOverride: "runfusion/fusion" },
+    });
+
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({
+      githubTracking: { enabled: false },
+    }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(createIssueSpy).not.toHaveBeenCalled();
+    createIssueSpy.mockRestore();
+  });
+
+  it("retries tracking issue creation on non-tracking patch when task is enabled but unlinked", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "runfusion",
+      repo: "fusion",
+      number: 101,
+      htmlUrl: "https://github.com/runfusion/fusion/issues/101",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ githubAuthMode: "token", githubAuthToken: "tok" });
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      title: "Retitled",
+      githubTracking: { enabled: true, repoOverride: "runfusion/fusion" },
+    });
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "KB-001",
+      title: "Retitled",
+      githubTracking: {
+        enabled: true,
+        repoOverride: "runfusion/fusion",
+        issue: { owner: "runfusion", repo: "fusion", number: 101, url: "https://github.com/runfusion/fusion/issues/101", createdAt: "2026-01-01T00:00:00.000Z" },
+      },
+    });
+
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({ title: "Retitled" }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "runfusion", repo: "fusion" }));
+    expect(store.linkGithubIssue).toHaveBeenCalledWith("KB-001", expect.objectContaining({ number: 101 }));
+    createIssueSpy.mockRestore();
+  });
+
+  it("returns 400 for invalid githubTracking repo override format", async () => {
+    const res = await REQUEST(buildApp(), "PATCH", "/api/tasks/KB-001", JSON.stringify({
+      githubTracking: {
+        repoOverride: "invalid repo",
+      },
+    }), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("owner/repo");
   });
 
   it("does not clear model or assignee fields when they are omitted", async () => {
@@ -2054,6 +2370,8 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
   let tempDir: string;
   let fusionDir: string;
   let agentId: string;
+  let reviewerAgentId: string;
+  let engineerAgentId: string;
   let store: TaskStore;
 
   // Agent store init + createAgent is ~50ms per call; hoisted to beforeAll
@@ -2070,13 +2388,24 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
       name: "Assignment test agent",
       role: "executor",
     });
+    const reviewer = await agentStore.createAgent({
+      name: "Assignment reviewer agent",
+      role: "reviewer",
+    });
+    const engineer = await agentStore.createAgent({
+      name: "Assignment engineer agent",
+      role: "engineer",
+    });
     agentId = agent.id;
+    reviewerAgentId = reviewer.id;
+    engineerAgentId = engineer.id;
   }, 30_000);
 
   beforeEach(() => {
     store = createMockStore({
       getFusionDir: vi.fn().mockReturnValue(fusionDir),
       updateTask: vi.fn(),
+      getTask: vi.fn().mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-200", column: "todo" }),
       listTasks: vi.fn().mockResolvedValue([]),
       selectNextTaskForAgent: vi.fn().mockResolvedValue(null),
     } as any);
@@ -2107,6 +2436,58 @@ describe("PATCH /tasks/:id/assign and GET /agents/:id/tasks", () => {
     expect(res.status).toBe(200);
     expect(store.updateTask).toHaveBeenCalledWith("FN-200", { assignedAgentId: agentId });
     expect(res.body.assignedAgentId).toBe(agentId);
+  }, 20000);
+
+  it("allows assigning implementation task to durable engineer without override", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-200",
+      assignedAgentId: engineerAgentId,
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-200/assign",
+      JSON.stringify({ agentId: engineerAgentId }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-200", { assignedAgentId: engineerAgentId });
+  }, 20000);
+
+  it("returns 409 when assigning implementation task to reviewer without override", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-200/assign",
+      JSON.stringify({ agentId: reviewerAgentId }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("requires an \"executor\"-role agent");
+    expect(store.updateTask).not.toHaveBeenCalled();
+  }, 20000);
+
+  it("allows non-executor assignment when override is true", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-200",
+      assignedAgentId: reviewerAgentId,
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-200/assign",
+      JSON.stringify({ agentId: reviewerAgentId, override: true }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-200", { assignedAgentId: reviewerAgentId });
   }, 20000);
 
   it("returns 404 when assigning to a non-existent agent", async () => {

@@ -10,9 +10,9 @@
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
-import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput } from "@fusion/core";
-import { dailyMemoryPath, ensureOpenClawMemoryFiles, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
+import { join, relative, resolve } from "node:path";
+import type { AgentStore, AgentState, AgentCapability, AgentUpdateInput, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings } from "@fusion/core";
+import { DASHBOARD_USER_ID, canAgentTakeImplementationTaskForExplicitRouting, dailyMemoryPath, ensureOpenClawMemoryFiles, extractAgentProvisioningRequest, formatRoleMismatchReason, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTitleSummarizerSettingsModel, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh, summarizeTitle } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
 import { ResearchProviderRegistry } from "./research/provider-registry.js";
 import { ResearchStepRunner } from "./research-step-runner.js";
@@ -20,6 +20,9 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createLogger } from "./logger.js";
+import { fetchWebContent, WebFetchError } from "./web-fetch.js";
+import type { RunAuditor } from "./run-audit.js";
+import { computeApprovalDedupeKey } from "./agent-action-gate.js";
 
 // ── Tool parameter schemas (canonical definitions) ────────────────────────
 
@@ -55,6 +58,14 @@ export const reflectOnPerformanceParams = Type.Object({
   ),
 });
 
+export const readEvaluationsParams = Type.Object({});
+
+export const updateIdentityParams = Type.Object({
+  soul: Type.Optional(Type.String({ description: "Updated soul/personality text" })),
+  instructionsText: Type.Optional(Type.String({ description: "Updated operating instructions" })),
+  memory: Type.Optional(Type.String({ description: "Updated agent memory text" })),
+});
+
 export const listAgentsParams = Type.Object({
   role: Type.Optional(
     Type.String({ description: "Filter by agent role/capability (e.g., 'executor', 'reviewer', 'qa')" }),
@@ -73,6 +84,7 @@ export const delegateTaskParams = Type.Object({
   dependencies: Type.Optional(
     Type.Array(Type.String(), { description: "Task IDs this new task depends on (e.g. [\"KB-001\"])" }),
   ),
+  override: Type.Optional(Type.Boolean({ description: "Set true to bypass executor-role assignment policy" })),
 });
 
 export const getAgentConfigParams = Type.Object({
@@ -92,6 +104,35 @@ export const updateAgentConfigParams = Type.Object({
     Type.Literal("immediate"),
     Type.Literal("on-heartbeat"),
   ], { description: "How agent responds to messages" })),
+});
+
+export const createAgentParams = Type.Object({
+  name: Type.String({ description: "Name for the new agent" }),
+  role: Type.Union([
+    Type.Literal("triage"),
+    Type.Literal("executor"),
+    Type.Literal("reviewer"),
+    Type.Literal("merger"),
+    Type.Literal("engineer"),
+    Type.Literal("custom"),
+  ], { description: "Agent role/capability" }),
+  soul: Type.Optional(Type.String({ description: "Agent personality/identity text", maxLength: 10000 })),
+  instructions_text: Type.Optional(Type.String({ description: "Inline custom instructions", maxLength: 50000 })),
+  instructions_path: Type.Optional(Type.String({ description: "Path to instructions markdown file", maxLength: 500 })),
+  reportsTo: Type.Optional(Type.String({ description: "Manager agent ID. Defaults to the calling agent." })),
+  heartbeat_interval_ms: Type.Optional(Type.Number({ description: "Heartbeat polling interval in ms", minimum: 1000 })),
+  heartbeat_timeout_ms: Type.Optional(Type.Number({ description: "Heartbeat timeout in ms", minimum: 5000 })),
+  max_concurrent_runs: Type.Optional(Type.Number({ description: "Max concurrent heartbeat runs", minimum: 1 })),
+  message_response_mode: Type.Optional(Type.Union([
+    Type.Literal("immediate"),
+    Type.Literal("on-heartbeat"),
+  ], { description: "How agent responds to messages" })),
+});
+
+export const deleteAgentParams = Type.Object({
+  agent_id: Type.String({ description: "Agent ID to delete" }),
+  force: Type.Optional(Type.Boolean({ description: "Force delete even if the agent currently holds a checkout lease" })),
+  reassign_to: Type.Optional(Type.String({ description: "Optional replacement agent ID for tasks currently assigned to the deleted agent" })),
 });
 
 export const sendMessageParams = Type.Object({
@@ -120,6 +161,13 @@ export const memoryGetParams = Type.Object({
   path: Type.String({ description: "Memory path from fn_memory_search, e.g. .fusion/memory/MEMORY.md or .fusion/memory/YYYY-MM-DD.md" }),
   startLine: Type.Optional(Type.Number({ description: "1-based start line (default: 1)" })),
   lineCount: Type.Optional(Type.Number({ description: "Number of lines to read (default: 120, max: 400)" })),
+});
+
+export const webFetchParams = Type.Object({
+  url: Type.String({ description: "URL to fetch (http/https only)" }),
+  prompt: Type.Optional(Type.String({ description: "Optional extraction hint for downstream summarization" })),
+  timeoutMs: Type.Optional(Type.Number({ description: "Request timeout in milliseconds" })),
+  maxBytes: Type.Optional(Type.Number({ description: "Maximum content bytes to return" })),
 });
 
 export const researchRunParams = Type.Object({
@@ -185,6 +233,10 @@ type MemorySearchHit = {
 
 const log = createLogger("agent-tools");
 
+const MAX_INSTRUCTIONS_TEXT_LENGTH = 50_000;
+const MAX_MEMORY_LENGTH = 50_000;
+const MAX_SOUL_LENGTH = 10_000;
+
 const AGENT_MEMORY_ROOT = ".fusion/agent-memory";
 const AGENT_MEMORY_FILENAME = "MEMORY.md";
 const AGENT_DREAMS_FILENAME = "DREAMS.md";
@@ -192,11 +244,11 @@ const agentQmdRefreshState = new Map<string, { lastStartedAt: number; inFlight?:
 const AGENT_QMD_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const DAILY_AGENT_MEMORY_RE = /^\d{4}-\d{2}-\d{2}\.md$/;
 
-function sanitizeAgentMemoryId(agentId: string): string {
+export function sanitizeAgentMemoryId(agentId: string): string {
   return agentId.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
 }
 
-function agentMemoryDisplayPath(agentId: string): string {
+export function agentMemoryDisplayPath(agentId: string): string {
   return `${AGENT_MEMORY_ROOT}/${sanitizeAgentMemoryId(agentId)}/${AGENT_MEMORY_FILENAME}`;
 }
 
@@ -208,7 +260,7 @@ function agentMemoryDirectory(rootDir: string, agentId: string): string {
   return join(rootDir, AGENT_MEMORY_ROOT, sanitizeAgentMemoryId(agentId));
 }
 
-function agentMemoryFilePath(rootDir: string, agentId: string): string {
+export function agentMemoryFilePath(rootDir: string, agentId: string): string {
   return join(agentMemoryDirectory(rootDir, agentId), AGENT_MEMORY_FILENAME);
 }
 
@@ -218,6 +270,26 @@ function agentDreamsFilePath(rootDir: string, agentId: string): string {
 
 function agentDailyFilePath(rootDir: string, agentId: string, date = new Date()): string {
   return join(agentMemoryDirectory(rootDir, agentId), `${date.toISOString().slice(0, 10)}.md`);
+}
+
+export async function readAgentMemoryWorkspaceLongTerm(rootDir: string, agentId: string): Promise<string> {
+  const safeRoot = typeof rootDir === "string" ? rootDir.trim() : "";
+  const safeAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (!safeRoot || !safeAgentId) {
+    return "";
+  }
+
+  const filePath = agentMemoryFilePath(safeRoot, safeAgentId);
+  try {
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile()) {
+      return "";
+    }
+    const content = await readFile(filePath, "utf-8");
+    return typeof content === "string" ? content.trim() : "";
+  } catch {
+    return "";
+  }
 }
 
 export function qmdAgentMemoryCollectionName(rootDir: string, agentId: string): string {
@@ -408,11 +480,19 @@ function normalizeQmdAgentMemoryResultPath(rootDir: string, agentId: string, raw
     return resolveAgentMemoryPath(rootDir, agentId, candidate)?.displayPath ?? fallbackPath;
   }
 
-  const filename = candidate.split("/").pop()?.toLowerCase() ?? "";
-  if (filename === AGENT_MEMORY_FILENAME.toLowerCase()) {
+  const workspacePath = resolve(agentMemoryDirectory(rootDir, agentId)).replace(/\\/g, "/");
+  const candidateAbs = resolve(rootDir, candidate).replace(/\\/g, "/");
+  const relToWorkspace = relative(workspacePath, candidateAbs).replace(/\\/g, "/");
+  if (relToWorkspace && !relToWorkspace.startsWith("..") && !relToWorkspace.includes("/../")) {
+    const maybeDisplayPath = `${agentPrefix}${relToWorkspace}`;
+    return resolveAgentMemoryPath(rootDir, agentId, maybeDisplayPath)?.displayPath ?? fallbackPath;
+  }
+
+  const filename = candidate.split("/").pop() ?? "";
+  if (filename.toLowerCase() === AGENT_MEMORY_FILENAME.toLowerCase()) {
     return agentMemoryDisplayPath(agentId);
   }
-  if (filename === AGENT_DREAMS_FILENAME.toLowerCase()) {
+  if (filename.toLowerCase() === AGENT_DREAMS_FILENAME.toLowerCase()) {
     return agentDreamsDisplayPath(agentId);
   }
   if (DAILY_AGENT_MEMORY_RE.test(filename)) {
@@ -834,8 +914,8 @@ export function createMemoryAppendTool(rootDir: string, settings?: MemoryToolSet
     name: "fn_memory_append",
     label: "Append Memory",
     description:
-      "Append concise Markdown to project memory. Use long-term only for durable conventions/decisions/pitfalls; " +
-      "use daily for running observations and open loops. Skip this tool when there is no reusable memory.",
+      "Append concise Markdown to memory. Use scope=\"agent\" for private operating context and scope=\"project\" for workspace-wide durable knowledge. " +
+      "Use layer=\"long-term\" for durable conventions/decisions/pitfalls and layer=\"daily\" for running observations/open loops.",
     parameters: memoryAppendParams,
     execute: async (_id: string, params: Static<typeof memoryAppendParams>) => {
       const content = params.content.trim();
@@ -877,6 +957,60 @@ export function createMemoryAppendTool(rootDir: string, settings?: MemoryToolSet
         content: [{ type: "text" as const, text: `Appended to ${params.layer} memory.` }],
         details: { scope, layer: params.layer },
       };
+    },
+  };
+}
+
+export function createWebFetchTool(options?: { allowPrivateHosts?: boolean }): ToolDefinition {
+  return {
+    name: "fn_web_fetch",
+    label: "WebFetch",
+    description: "Fetch and extract readable text from a URL (lightweight HTTP fetch, no JS rendering).",
+    parameters: webFetchParams,
+    execute: async (_id: string, params: Static<typeof webFetchParams>) => {
+      try {
+        const result = await fetchWebContent(params.url, {
+          timeoutMs: params.timeoutMs,
+          maxBytes: params.maxBytes,
+          allowPrivateHosts: options?.allowPrivateHosts ?? false,
+        });
+        const sections = [
+          `URL: ${result.finalUrl}`,
+          `Status: ${result.status}`,
+          `Content-Type: ${result.contentType}`,
+          params.prompt ? `Prompt: ${params.prompt}` : undefined,
+          result.title ? `Title: ${result.title}` : undefined,
+          "",
+          result.content,
+          result.truncated ? "\n[truncated to maxBytes]" : "",
+        ].filter(Boolean);
+        return {
+          content: [{ type: "text" as const, text: sections.join("\n") }],
+          details: {
+            finalUrl: result.finalUrl,
+            status: result.status,
+            contentType: result.contentType,
+            title: result.title,
+            truncated: result.truncated,
+            bytesRead: result.bytesRead,
+            prompt: params.prompt,
+          },
+        };
+      } catch (error) {
+        if (error instanceof WebFetchError) {
+          return {
+            content: [{ type: "text" as const, text: `ERROR [${error.code}]: ${error.message}` }],
+            details: { code: error.code, message: error.message },
+            isError: true,
+          };
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `ERROR [network-error]: ${message}` }],
+          details: { code: "network-error", message },
+          isError: true,
+        };
+      }
     },
   };
 }
@@ -949,6 +1083,162 @@ export function createReflectOnPerformanceTool(
  * @param agentStore - AgentStore for agent discovery
  * @returns ToolDefinition for the `fn_list_agents` tool
  */
+function formatScore(score: number | null | undefined): string {
+  if (typeof score !== "number" || !Number.isFinite(score)) return "n/a";
+  return score.toFixed(2);
+}
+
+function buildPreview(value: string, limit = 100): string {
+  const trimmed = value.trim();
+  return trimmed.length > limit ? `${trimmed.slice(0, limit)}…` : trimmed;
+}
+
+export function createReadEvaluationsTool(
+  agentStore: AgentStore,
+  reflectionStore: ReflectionStore | undefined,
+  agentId: string,
+): ToolDefinition {
+  return {
+    name: "fn_read_evaluations",
+    label: "Read Evaluations",
+    description: "Read your ratings, recent feedback, and reflection history to support self-improvement.",
+    parameters: readEvaluationsParams,
+    execute: async (_id: string, _params: Static<typeof readEvaluationsParams>) => {
+      const [summary, ratings] = await Promise.all([
+        agentStore.getRatingSummary(agentId),
+        agentStore.getRatings(agentId, { limit: 10 }),
+      ]);
+
+      const latestReflection = reflectionStore
+        ? await reflectionStore.getLatestReflection(agentId)
+        : null;
+      const reflections = reflectionStore
+        ? await reflectionStore.getReflections(agentId, 5)
+        : [];
+
+      const hasRatings = ratings.length > 0 || summary.totalRatings > 0;
+      const hasReflections = Boolean(latestReflection) || reflections.length > 0;
+
+      if (!hasRatings && !hasReflections) {
+        return {
+          content: [{ type: "text" as const, text: "No evaluation data available yet." }],
+          details: {},
+        };
+      }
+
+      const lines: string[] = [
+        "Evaluation Summary",
+        `- Average score: ${formatScore(summary.averageScore)}`,
+        `- Trend: ${summary.trend}`,
+        `- Total ratings: ${summary.totalRatings}`,
+      ];
+
+      const categoryEntries = Object.entries(summary.categoryAverages ?? {});
+      if (categoryEntries.length > 0) {
+        lines.push("", "Category averages:");
+        for (const [category, score] of categoryEntries) {
+          lines.push(`- ${category}: ${formatScore(score)}`);
+        }
+      }
+
+      const commentedRatings = ratings.filter((rating) => rating.comment?.trim());
+      if (commentedRatings.length > 0) {
+        lines.push("", "Recent rating comments:");
+        for (const rating of commentedRatings.slice(0, 5)) {
+          lines.push(`- [${rating.score}/5] ${rating.comment!.trim()}`);
+        }
+      }
+
+      if (latestReflection) {
+        lines.push("", "Latest reflection:", `- Summary: ${latestReflection.summary}`);
+        if (latestReflection.insights.length > 0) {
+          lines.push("- Insights:");
+          latestReflection.insights.forEach((insight) => lines.push(`  - ${insight}`));
+        }
+        if (latestReflection.suggestedImprovements.length > 0) {
+          lines.push("- Suggested improvements:");
+          latestReflection.suggestedImprovements.forEach((item) => lines.push(`  - ${item}`));
+        }
+      }
+
+      if (reflections.length > 0) {
+        lines.push("", "Recent reflection history:");
+        for (const reflection of reflections.slice(0, 5)) {
+          lines.push(`- ${reflection.timestamp}: ${reflection.summary}`);
+        }
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {},
+      };
+    },
+  };
+}
+
+export function createUpdateIdentityTool(agentStore: AgentStore, agentId: string): ToolDefinition {
+  return {
+    name: "fn_update_identity",
+    label: "Update Identity",
+    description: "Update your own soul, instructionsText, or memory fields based on evaluation feedback.",
+    parameters: updateIdentityParams,
+    execute: async (_id: string, params: Static<typeof updateIdentityParams>) => {
+      const updates: AgentUpdateInput = {};
+
+      if (params.soul !== undefined) {
+        const soul = params.soul.trim();
+        if (soul.length > MAX_SOUL_LENGTH) {
+          return {
+            content: [{ type: "text" as const, text: `ERROR: soul exceeds ${MAX_SOUL_LENGTH} character limit` }],
+            details: {},
+          };
+        }
+        updates.soul = soul;
+      }
+
+      if (params.instructionsText !== undefined) {
+        const instructionsText = params.instructionsText.trim();
+        if (instructionsText.length > MAX_INSTRUCTIONS_TEXT_LENGTH) {
+          return {
+            content: [{ type: "text" as const, text: `ERROR: instructionsText exceeds ${MAX_INSTRUCTIONS_TEXT_LENGTH} character limit` }],
+            details: {},
+          };
+        }
+        updates.instructionsText = instructionsText;
+      }
+
+      if (params.memory !== undefined) {
+        const memory = params.memory.trim();
+        if (memory.length > MAX_MEMORY_LENGTH) {
+          return {
+            content: [{ type: "text" as const, text: `ERROR: memory exceeds ${MAX_MEMORY_LENGTH} character limit` }],
+            details: {},
+          };
+        }
+        updates.memory = memory;
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "ERROR: Provide at least one field to update" }],
+          details: {},
+        };
+      }
+
+      await agentStore.updateAgent(agentId, updates);
+
+      const confirmations = Object.entries(updates).map(([key, value]) => `- ${key}: ${buildPreview(String(value))}`);
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Updated identity fields:\n${confirmations.join("\n")}`,
+        }],
+        details: { updatedFields: Object.keys(updates) },
+      };
+    },
+  };
+}
+
 export function createListAgentsTool(agentStore: AgentStore): ToolDefinition {
   return {
     name: "fn_list_agents",
@@ -1064,6 +1354,11 @@ export function createGetAgentConfigTool(agentStore: AgentStore, callingAgentId:
   };
 }
 
+function isCallerPrivileged(caller: { id: string; role: string; reportsTo?: string | null } | null): boolean {
+  if (!caller) return false;
+  return caller.role === "ceo" || caller.reportsTo == null;
+}
+
 export function createUpdateAgentConfigTool(agentStore: AgentStore, callingAgentId: string): ToolDefinition {
   return {
     name: "fn_update_agent_config",
@@ -1171,6 +1466,261 @@ export function createUpdateAgentConfigTool(agentStore: AgentStore, callingAgent
  * @param taskStore - TaskStore for task creation
  * @returns ToolDefinition for the `fn_delegate_task` tool
  */
+type AgentProvisioningToolOptions = {
+  hireApprovalEnabled?: boolean;
+  approvalRequestStore?: ApprovalRequestStore;
+  settingsProvider?: () => Promise<ProjectSettings | undefined>;
+  runAuditor?: RunAuditor;
+};
+
+export function createAgentCreateTool(
+  agentStore: AgentStore,
+  callingAgentId: string,
+  options?: AgentProvisioningToolOptions,
+): ToolDefinition {
+  return {
+    name: "fn_agent_create",
+    label: "Create Agent",
+    description: "Create a new non-ephemeral direct-report agent.",
+    parameters: createAgentParams,
+    execute: async (_id: string, params: Static<typeof createAgentParams>) => {
+      const caller = await agentStore.getAgent(callingAgentId);
+      const privileged = isCallerPrivileged(caller);
+      const reportsTo = params.reportsTo ?? callingAgentId;
+
+      if (!privileged && reportsTo !== callingAgentId) {
+        return {
+          content: [{ type: "text" as const, text: "ERROR: You can only create agents that report to you" }],
+          details: {},
+        };
+      }
+
+      const settings = await options?.settingsProvider?.();
+      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
+        ? { agentProvisioning: { approvalMode: "never" as const } }
+        : settings;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_create",
+        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
+        settings: fallbackSettings,
+      });
+      await options?.runAuditor?.database({ type: "agent:create:requested", target: callingAgentId, metadata: { policy } });
+
+      if (policy.decision === "require-approval") {
+        if (!options?.approvalRequestStore) {
+          await options?.runAuditor?.database({ type: "agent:create:denied", target: callingAgentId, metadata: { policy, reason: "approval-store-missing" } });
+          return {
+            content: [{ type: "text" as const, text: `DENIED: agent provisioning requires approval but approval storage is unavailable (${policy.matchedRule})` }],
+            details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
+          };
+        }
+
+        const approvalDedupeKey = computeApprovalDedupeKey({
+          agentId: callingAgentId,
+          toolName: "fn_agent_create",
+          category: "agent_provisioning",
+          resourceType: "agent",
+          resourceId: reportsTo,
+          operation: `create:${params.name}:${params.role}:${reportsTo}`,
+        });
+
+        const request = options.approvalRequestStore.create({
+          requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
+          targetAction: {
+            category: "agent_provisioning",
+            action: "create",
+            summary: `Create agent ${params.name} (${params.role})`,
+            resourceType: "agent",
+            resourceId: "",
+            context: { tool: "fn_agent_create", params, approvalDedupeKey },
+          },
+        });
+
+        return {
+          content: [{ type: "text" as const, text: `Approval required to create agent ${params.name}. Request ${request.id} created.` }],
+          details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
+        };
+      }
+
+      if (policy.decision === "deny") {
+        await options?.runAuditor?.database({ type: "agent:create:denied", target: callingAgentId, metadata: { policy } });
+        return {
+          content: [{ type: "text" as const, text: `DENIED: agent provisioning blocked by policy (${policy.matchedRule})` }],
+          details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode },
+        };
+      }
+
+      const runtimeConfig: Record<string, unknown> = {
+        ...(params.heartbeat_interval_ms !== undefined ? { heartbeatIntervalMs: params.heartbeat_interval_ms } : {}),
+        ...(params.heartbeat_timeout_ms !== undefined ? { heartbeatTimeoutMs: params.heartbeat_timeout_ms } : {}),
+        ...(params.max_concurrent_runs !== undefined ? { maxConcurrentRuns: params.max_concurrent_runs } : {}),
+        ...(params.message_response_mode !== undefined ? { messageResponseMode: params.message_response_mode } : {}),
+      };
+
+      const created = await agentStore.createAgent({
+        name: params.name,
+        role: params.role,
+        ...(params.soul !== undefined ? { soul: params.soul } : {}),
+        ...(params.instructions_text !== undefined ? { instructionsText: params.instructions_text } : {}),
+        ...(params.instructions_path !== undefined ? { instructionsPath: params.instructions_path } : {}),
+        reportsTo,
+        ...(Object.keys(runtimeConfig).length > 0 ? { runtimeConfig } : {}),
+      });
+
+      if (options?.hireApprovalEnabled) {
+        await agentStore.updateAgentState(created.id, "paused");
+        await agentStore.updateAgent(created.id, {
+          metadata: { ...(created.metadata ?? {}), pendingApproval: true },
+        });
+      }
+
+      await options?.runAuditor?.database({ type: "agent:create:approved", target: created.id, metadata: { policy, autoApproved: true } });
+      return {
+        content: [{ type: "text" as const, text: `Created agent ${created.name} (${created.id})${options?.hireApprovalEnabled ? " in pending_approval" : ""}` }],
+        details: { outcome: "created", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agent: created, agentId: created.id, pendingApproval: options?.hireApprovalEnabled === true },
+      };
+    },
+  };
+}
+
+export function createAgentDeleteTool(
+  agentStore: AgentStore,
+  callingAgentId: string,
+  options?: AgentProvisioningToolOptions,
+): ToolDefinition {
+  return {
+    name: "fn_agent_delete",
+    label: "Delete Agent",
+    description: "Delete one of your direct-report non-ephemeral agents.",
+    parameters: deleteAgentParams,
+    execute: async (_id: string, params: Static<typeof deleteAgentParams>) => {
+      const caller = await agentStore.getAgent(callingAgentId);
+      const target = await agentStore.getAgent(params.agent_id);
+      if (!target) {
+        return {
+          content: [{ type: "text" as const, text: `ERROR: Agent ${params.agent_id} not found` }],
+          details: { outcome: "denied", matchedRule: "missing-target", effectiveMode: "trusted-only", agentId: params.agent_id },
+        };
+      }
+
+      const privileged = isCallerPrivileged(caller);
+      if (!privileged && target.reportsTo !== callingAgentId) {
+        return {
+          content: [{ type: "text" as const, text: "ERROR: You can only delete agents that report to you" }],
+          details: {},
+        };
+      }
+
+      if (isEphemeralAgent(target)) {
+        return { content: [{ type: "text" as const, text: `ERROR: Cannot delete ephemeral/runtime agent ${params.agent_id}` }], details: {} };
+      }
+
+      const settings = await options?.settingsProvider?.();
+      const fallbackSettings = !options?.settingsProvider && !options?.approvalRequestStore
+        ? { agentProvisioning: { approvalMode: "never" as const } }
+        : settings;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_delete",
+        caller: caller ? { id: caller.id, role: caller.role, isPrivileged: privileged } : undefined,
+        settings: fallbackSettings,
+      });
+      await options?.runAuditor?.database({ type: "agent:delete:requested", target: target.id, metadata: { policy } });
+
+      if (policy.decision === "require-approval") {
+        if (!options?.approvalRequestStore) {
+          await options?.runAuditor?.database({ type: "agent:delete:denied", target: target.id, metadata: { policy, reason: "approval-store-missing" } });
+          return {
+            content: [{ type: "text" as const, text: `DENIED: agent delete requires approval but approval storage is unavailable (${policy.matchedRule})` }],
+            details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+          };
+        }
+
+        const approvalDedupeKey = computeApprovalDedupeKey({
+          agentId: callingAgentId,
+          toolName: "fn_agent_delete",
+          category: "agent_provisioning",
+          resourceType: "agent",
+          resourceId: target.id,
+          operation: `delete:${target.id}:${params.force === true ? "force" : "normal"}:${params.reassign_to ?? ""}`,
+        });
+
+        const request = options.approvalRequestStore.create({
+          requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
+          targetAction: {
+            category: "agent_provisioning",
+            action: "delete",
+            summary: `Delete agent ${target.name} (${target.id})`,
+            resourceType: "agent",
+            resourceId: target.id,
+            context: { tool: "fn_agent_delete", params, approvalDedupeKey },
+          },
+        });
+
+        return {
+          content: [{ type: "text" as const, text: `Approval required to delete agent ${target.name}. Request ${request.id} created.` }],
+          details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+        };
+      }
+
+      if (policy.decision === "deny") {
+        await options?.runAuditor?.database({ type: "agent:delete:denied", target: target.id, metadata: { policy } });
+        return {
+          content: [{ type: "text" as const, text: `DENIED: agent delete blocked by policy (${policy.matchedRule})` }],
+          details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+        };
+      }
+
+      try {
+        await agentStore.deleteAgent(params.agent_id, { force: params.force === true, reassignTo: params.reassign_to });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text" as const, text: `ERROR: ${message}` }], details: {} };
+      }
+
+      await options?.runAuditor?.database({ type: "agent:delete:approved", target: target.id, metadata: { policy, autoApproved: true } });
+      return {
+        content: [{ type: "text" as const, text: `Deleted agent ${target.name} (${target.id})` }],
+        details: { outcome: "deleted", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: target.id },
+      };
+    },
+  };
+}
+
+export async function executeApprovedAgentProvisioning(
+  approvalRequest: { id: string; status: string; targetAction: { resourceId: string } } & Parameters<typeof extractAgentProvisioningRequest>[0],
+  deps: { agentStore: AgentStore },
+): Promise<{ deletedId: string } | Awaited<ReturnType<AgentStore["createAgent"]>>> {
+  if (approvalRequest.status !== "approved") {
+    throw new Error(`Approval request ${approvalRequest.id} must be approved before provisioning execution`);
+  }
+
+  const { tool, params } = extractAgentProvisioningRequest(approvalRequest);
+  if (tool === "fn_agent_create") {
+    const runtimeConfig: Record<string, unknown> = {
+      ...(typeof params.heartbeat_interval_ms === "number" ? { heartbeatIntervalMs: params.heartbeat_interval_ms } : {}),
+      ...(typeof params.heartbeat_timeout_ms === "number" ? { heartbeatTimeoutMs: params.heartbeat_timeout_ms } : {}),
+      ...(typeof params.max_concurrent_runs === "number" ? { maxConcurrentRuns: params.max_concurrent_runs } : {}),
+      ...(typeof params.message_response_mode === "string" ? { messageResponseMode: params.message_response_mode } : {}),
+    };
+
+    return deps.agentStore.createAgent({
+      name: String(params.name),
+      role: String(params.role) as never,
+      ...(typeof params.soul === "string" ? { soul: params.soul } : {}),
+      ...(typeof params.instructions_text === "string" ? { instructionsText: params.instructions_text } : {}),
+      ...(typeof params.instructions_path === "string" ? { instructionsPath: params.instructions_path } : {}),
+      reportsTo: typeof params.reportsTo === "string" ? params.reportsTo : undefined,
+      ...(Object.keys(runtimeConfig).length > 0 ? { runtimeConfig } : {}),
+    });
+  }
+
+  await deps.agentStore.deleteAgent(approvalRequest.targetAction.resourceId, {
+    force: params.force === true,
+    reassignTo: typeof params.reassign_to === "string" ? params.reassign_to : undefined,
+  });
+  return { deletedId: approvalRequest.targetAction.resourceId };
+}
+
 export function createDelegateTaskTool(
   agentStore: AgentStore,
   taskStore: TaskStore,
@@ -1202,13 +1752,25 @@ export function createDelegateTaskTool(
         };
       }
 
+      const override = params.override === true;
+      const newTaskRef = { id: "<new>", column: "todo" } as const;
+      if (!override && !canAgentTakeImplementationTaskForExplicitRouting(agent, { column: newTaskRef.column })) {
+        return {
+          content: [{ type: "text" as const, text: `ERROR: ${formatRoleMismatchReason(agent, newTaskRef)}` }],
+          details: {},
+        };
+      }
+
       // Create task assigned to the target agent
       const task = await createAgentTask(taskStore, {
         description: params.description,
         dependencies: params.dependencies,
         column: "todo",
         assignedAgentId: params.agent_id,
-        source: { sourceType: "api" },
+        source: {
+          sourceType: "api",
+          ...(override ? { sourceMetadata: { executorRoleOverride: true } } : {}),
+        },
       }, options);
 
       const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";
@@ -1258,8 +1820,13 @@ export function createSendMessageTool(messageStore: MessageStore, fromAgentId: s
       }
 
       try {
-        const messageType = params.type ?? "agent-to-agent";
-        const recipientType = messageType === "agent-to-user" ? "user" : "agent";
+        const inferredDashboardRecipient = normalizeMessageParticipant(params.to_id, "user");
+        const messageType = params.type
+          ?? (inferredDashboardRecipient.id === DASHBOARD_USER_ID ? "agent-to-user" : "agent-to-agent");
+        const recipientType: "user" | "agent" = messageType === "agent-to-user" ? "user" : "agent";
+        const recipient = recipientType === "user"
+          ? normalizeMessageParticipant(params.to_id, recipientType)
+          : { id: params.to_id, type: recipientType };
         const replyToMessageId = params.reply_to_message_id?.trim();
 
         if (params.reply_to_message_id !== undefined && !replyToMessageId) {
@@ -1272,8 +1839,8 @@ export function createSendMessageTool(messageStore: MessageStore, fromAgentId: s
         const message = messageStore.sendMessage({
           fromId: fromAgentId,
           fromType: "agent",
-          toId: params.to_id,
-          toType: recipientType,
+          toId: recipient.id,
+          toType: recipient.type,
           content,
           type: messageType,
           ...(replyToMessageId ? { metadata: { replyTo: { messageId: replyToMessageId } } } : {}),
@@ -1282,7 +1849,7 @@ export function createSendMessageTool(messageStore: MessageStore, fromAgentId: s
         return {
           content: [{
             type: "text" as const,
-            text: `Message sent to ${params.to_id} (ID: ${message.id})`,
+            text: `Message sent to ${recipient.id === DASHBOARD_USER_ID ? DASHBOARD_USER_ID : params.to_id} (ID: ${message.id})`,
           }],
           details: { messageId: message.id },
         };
@@ -1529,6 +2096,43 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
 }
 
 export function createReadMessagesTool(messageStore: MessageStore, agentId: string): ToolDefinition {
+  const REPLY_CONTEXT_CONTENT_MAX_CHARS = 400;
+
+  const trimReplyContent = (value: string): string => {
+    if (value.length <= REPLY_CONTEXT_CONTENT_MAX_CHARS) {
+      return value;
+    }
+    return `${value.slice(0, REPLY_CONTEXT_CONTENT_MAX_CHARS - 1)}…`;
+  };
+
+  const resolveReplyContext = (msg: Message): {
+    parentMessageId: string;
+    parentMessage: Message | null;
+    missingParent: boolean;
+  } | null => {
+    const metadata = msg.metadata;
+    const parentMessageId = typeof metadata === "object"
+      && metadata !== null
+      && "replyTo" in metadata
+      && typeof metadata.replyTo === "object"
+      && metadata.replyTo !== null
+      && "messageId" in metadata.replyTo
+      && typeof metadata.replyTo.messageId === "string"
+      ? metadata.replyTo.messageId
+      : null;
+
+    if (!parentMessageId) {
+      return null;
+    }
+
+    const parentMessage = messageStore.getMessage(parentMessageId);
+    return {
+      parentMessageId,
+      parentMessage,
+      missingParent: !parentMessage,
+    };
+  };
+
   return {
     name: "fn_read_messages",
     label: "Read Messages",
@@ -1554,10 +2158,28 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           };
         }
 
-        const lines = messages.map((msg: Message) => {
-          const timestamp = new Date(msg.createdAt).toLocaleString();
-          const readStatus = msg.read ? "[read] " : "[unread] ";
-          return `${readStatus}[id: ${msg.id}] [from: ${msg.fromType}:${msg.fromId}] ${msg.content} (${timestamp})`;
+        const messageEntries = messages.map((msg: Message) => {
+          const replyContext = resolveReplyContext(msg);
+          return {
+            message: msg,
+            replyContext,
+          };
+        });
+
+        const lines = messageEntries.map(({ message, replyContext }) => {
+          const timestamp = new Date(message.createdAt).toLocaleString();
+          const readStatus = message.read ? "[read] " : "[unread] ";
+          const baseLine = `${readStatus}[id: ${message.id}] [from: ${message.fromType}:${message.fromId}] ${message.content} (${timestamp})`;
+          if (!replyContext) {
+            return baseLine;
+          }
+
+          if (replyContext.parentMessage) {
+            const parent = replyContext.parentMessage;
+            return `${baseLine}\n  ↳ reply-to [id: ${parent.id}] [from: ${parent.fromType}:${parent.fromId}] ${trimReplyContent(parent.content)}`;
+          }
+
+          return `${baseLine}\n  ↳ reply-to [id: ${replyContext.parentMessageId}] (missing parent message)`;
         });
 
         return {
@@ -1565,7 +2187,15 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
             type: "text" as const,
             text: `Messages (${messages.length}):\n${lines.join("\n")}`,
           }],
-          details: { messages },
+          details: {
+            messages,
+            threadContext: messageEntries
+              .filter((entry) => entry.replyContext)
+              .map((entry) => ({
+                messageId: entry.message.id,
+                replyTo: entry.replyContext,
+              })),
+          },
         };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);

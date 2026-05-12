@@ -164,7 +164,8 @@
 }
 
 .mission-manager__sidebar {
-  width: calc((var(--space-xl) * 11) + var(--space-md) + var(--space-xs));
+  width: 300px;
+  min-width: 0;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -173,14 +174,52 @@
   overflow: hidden;
 }
 
-/* Desktop split-only sidebar header layout for mission quick actions. */
-.mission-manager__sidebar-header {
+.mission-manager__sidebar-resize-handle {
+  position: relative;
+  width: var(--space-sm);
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+  transition: background var(--transition-fast);
+}
+
+.mission-manager__sidebar-resize-handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: var(--space-xs);
+  transform: translateX(-50%);
+}
+
+.mission-manager__sidebar-resize-handle:hover::before,
+.mission-manager__sidebar-resize-handle:active::before {
+  background: color-mix(in srgb, var(--todo) 30%, transparent);
+}
+
+.mission-manager__sidebar-resize-handle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
+}
+
+/* Desktop split-only sidebar footer action bar for mission creation CTA. */
+.mission-manager__sidebar-footer {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   gap: var(--space-sm);
   padding: var(--space-md);
-  border-bottom: var(--btn-border-width) solid var(--border);
+  border-top: var(--btn-border-width) solid var(--border);
+}
+
+.mission-manager__sidebar-cta {
+  width: 100%;
+  min-height: calc(var(--space-lg) * 2 + var(--space-xs));
+  justify-content: center;
+  gap: var(--space-sm);
+  font-size: inherit;
 }
 
 /* Hide duplicate sidebar title; the shared header already labels this view. */
@@ -280,6 +319,31 @@
 
 .mission-manager__empty--large {
   padding: var(--space-2xl) var(--space-xl);
+}
+
+.mission-manager__empty--mission {
+  gap: var(--space-md);
+  max-width: 420px;
+  margin: 0 auto;
+}
+
+.mission-manager__empty-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.mission-manager__empty-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.mission-manager__empty-cta {
+  margin-top: var(--space-sm);
+  gap: var(--space-sm);
 }
 
 /* ── Status Badge ── */
@@ -437,6 +501,16 @@
 
 .mission-resume-prompt .mission-add-btn {
   width: auto;
+}
+
+.mission-list__top-action {
+  display: flex;
+}
+
+.mission-list__primary-cta {
+  width: 100%;
+  justify-content: center;
+  gap: var(--space-sm);
 }
 
 .mission-list__footer {
@@ -648,9 +722,41 @@
   box-shadow: inset 0 0 0 1px var(--todo);
 }
 
+.mission-list__item--interview {
+  border-style: dashed;
+}
+
+.mission-interview-status {
+  background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+  color: var(--text);
+}
+
+.mission-interview-status--generating {
+  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+}
+
+.mission-interview-status--awaiting_input {
+  background: color-mix(in srgb, var(--todo) 16%, transparent);
+}
+
+.mission-interview-status--error {
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+
 /* Desktop split-only selected-state background keeps focus contrast in sidebar cards. */
 .mission-manager__sidebar .mission-list__item--selected {
   background: var(--card);
+}
+
+/* In the narrow sidebar, stack so the title gets full width and action buttons sit on their own row. */
+.mission-manager__sidebar .mission-list__item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-sm);
+}
+
+.mission-manager__sidebar .mission-list__item-actions {
+  justify-content: flex-end;
 }
 
 .mission-list__item-content {
@@ -662,6 +768,15 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
+  min-width: 0;
+}
+
+.mission-list__item-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
 }
 
 .mission-list__item-icon {
@@ -670,6 +785,8 @@
 }
 
 .mission-list__item-title {
+  flex: 1;
+  min-width: 0;
   font-size: 14px;
   font-weight: 500;
   color: var(--text);
@@ -705,8 +822,13 @@
 
 .mission-list__item-summary {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-md);
+  gap: var(--space-xs) var(--space-md);
+  margin-top: var(--space-xs);
+}
+
+.mission-list__item-activity {
   margin-top: var(--space-xs);
 }
 
@@ -717,8 +839,9 @@
 }
 
 .mission-list__item-progress {
-  flex: 1;
+  width: 100%;
   height: 4px;
+  margin-top: var(--space-xs);
   background: var(--bg-tertiary);
   border-radius: 2px;
   overflow: hidden;
@@ -729,7 +852,7 @@
   height: 100%;
   background: var(--color-success);
   border-radius: 2px;
-  transition: width 0.3s ease;
+  transition: width var(--transition-slow);
 }
 
 .mission-health-badge {
@@ -780,12 +903,6 @@
 .mission-relative-time {
   font-size: 11px;
   color: var(--text-dim);
-}
-
-.mission-list__item-active-slice {
-  margin: var(--space-xs) 0 0;
-  font-size: calc(var(--space-sm) + var(--space-xs) * 0.75);
-  color: var(--text-muted);
 }
 
 /* ================================================================
@@ -1368,7 +1485,7 @@
 }
 
 .mission-plan-state-indicator--not-started {
-  background: color-mix(in srgb, var(--text-secondary) 30%, transparent);
+  background: color-mix(in srgb, var(--text-muted) 30%, transparent);
 }
 
 .mission-plan-state-indicator--planned {
@@ -1395,15 +1512,15 @@
 .mission-triage-preview {
   margin-top: var(--space-sm);
   padding: var(--space-sm) var(--space-md);
-  border: 1px solid var(--border-primary);
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  background: var(--surface);
 }
 
 .mission-triage-preview__header {
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   margin-bottom: var(--space-xs);
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -1413,7 +1530,7 @@
   white-space: pre-wrap;
   font-size: 12px;
   font-family: var(--font-mono, monospace);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   max-height: 200px;
   overflow-y: auto;
   padding: var(--space-xs);
@@ -1484,7 +1601,7 @@
 .mission-assertions__title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
@@ -1504,7 +1621,7 @@
 
 /* ── Single Assertion ── */
 .mission-assertion {
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: var(--space-sm);
@@ -1536,7 +1653,7 @@
 
 .mission-assertion__text {
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   white-space: pre-wrap;
   line-height: 1.5;
   margin-bottom: var(--space-sm);
@@ -1545,7 +1662,7 @@
 .mission-assertion__linked-count {
   font-size: 11px;
   color: var(--text-dim);
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 1px 6px;
@@ -1583,7 +1700,7 @@
   left: 0;
   right: 0;
   z-index: 100;
-  background: var(--surface-raised);
+  background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-md);
@@ -1613,7 +1730,7 @@
   border: none;
   cursor: pointer;
   text-align: left;
-  transition: background-color 0.1s;
+  transition: background-color var(--transition-instant);
 }
 
 .mission-assertion__feature-picker-item:hover:not(:disabled) {
@@ -1645,7 +1762,7 @@
   align-items: center;
   gap: var(--space-sm);
   padding: var(--space-xs) 0;
-  border-bottom: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border);
 }
 
 .mission-assertion__linked-feature:last-child {
@@ -1947,7 +2064,7 @@
   padding: var(--space-md);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  background: var(--surface);
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
@@ -2342,9 +2459,9 @@
     overflow-x: hidden;
   }
 
-  /* Detail view safe area bottom padding */
+  /* Detail view bottom padding stays content-only; shared project-content wrapper reserves nav/footer/safe-area space. */
   .mission-detail {
-    padding-bottom: calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
+    padding-bottom: var(--space-lg);
   }
 
   .mission-detail__autopilot {

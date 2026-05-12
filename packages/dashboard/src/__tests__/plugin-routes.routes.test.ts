@@ -7,6 +7,7 @@ import type { PluginInstallation } from "@fusion/core";
 import type { PluginStore } from "@fusion/core";
 import type { PluginLoader } from "@fusion/core";
 import { createApiRoutes } from "../routes.js";
+import { createPluginRouter } from "../plugin-routes.js";
 import { get as performGet, request as performRequest } from "../test-request.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
 
@@ -56,6 +57,15 @@ function createMockPluginLoader(overrides: Partial<PluginLoader> = {}): PluginLo
     stopAllPlugins: vi.fn().mockResolvedValue(undefined),
     invokeHook: vi.fn().mockResolvedValue(undefined),
     reloadPlugin: vi.fn().mockResolvedValue(undefined),
+    createRouteContext: vi.fn().mockImplementation(async (pluginId: string, ctx: Record<string, unknown>) => ({
+      pluginId,
+      taskStore: ctx.taskStore,
+      settings: ctx.settings ?? {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      emitEvent: vi.fn(),
+      createAiSession: (ctx as { createAiSession?: unknown }).createAiSession,
+      resolveProjectTaskStore: ctx.resolveProjectTaskStore,
+    })),
     ...overrides,
   } as unknown as PluginLoader;
 }
@@ -328,7 +338,7 @@ describe("GET /plugins/:id/settings", () => {
     expect(res.body).toEqual({ apiKey: "secret", enabled: true });
   });
 
-  it("returns 404 for non-existent plugin", async () => {
+  it("returns 404 for non-existent non-bundled plugin", async () => {
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       Object.assign(new Error('Plugin "nonexistent" not found'), { code: "ENOENT" }),
     );
@@ -337,6 +347,17 @@ describe("GET /plugins/:id/settings", () => {
 
     expect(res.status).toBe(404);
     expect(res.body).toHaveProperty("error");
+  });
+
+  it("returns empty settings for bundled runtime plugin before first install", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error('Plugin "fusion-plugin-hermes-runtime" not found'), { code: "ENOENT" }),
+    );
+
+    const res = await GET(buildApp(), "/api/plugins/fusion-plugin-hermes-runtime/settings");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
   });
 
   it("supports projectId query param scoping", async () => {
@@ -675,13 +696,24 @@ describe("POST /plugins/:id/disable", () => {
 describe("POST /plugins/:id/reload", () => {
   let store: TaskStore;
   let pluginStore: PluginStore;
-  let pluginRunner: { getPluginRoutes: ReturnType<typeof vi.fn>; reloadPlugin: ReturnType<typeof vi.fn> };
+  let pluginRunner: {
+    getPluginRoutes: ReturnType<typeof vi.fn>;
+    reloadPlugin: ReturnType<typeof vi.fn>;
+    checkPluginSetup: ReturnType<typeof vi.fn>;
+    installPluginSetup: ReturnType<typeof vi.fn>;
+    uninstallPluginSetup: ReturnType<typeof vi.fn>;
+    getPluginSetupInfo: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(() => {
     pluginStore = createMockPluginStore();
     pluginRunner = {
       getPluginRoutes: vi.fn().mockReturnValue([]),
       reloadPlugin: vi.fn().mockResolvedValue(undefined),
+      checkPluginSetup: vi.fn().mockResolvedValue({ status: "installed" }),
+      installPluginSetup: vi.fn().mockResolvedValue({ success: true }),
+      uninstallPluginSetup: vi.fn().mockResolvedValue({ success: true }),
+      getPluginSetupInfo: vi.fn().mockReturnValue([]),
     };
     store = createMockTaskStore({
       getPluginStore: vi.fn().mockReturnValue(pluginStore),
@@ -759,6 +791,161 @@ describe("POST /plugins/:id/reload", () => {
   });
 });
 
+describe("plugin setup routes", () => {
+  let store: TaskStore;
+  let pluginStore: PluginStore;
+  let pluginRunner: {
+    getPluginRoutes: ReturnType<typeof vi.fn>;
+    checkPluginSetup: ReturnType<typeof vi.fn>;
+    installPluginSetup: ReturnType<typeof vi.fn>;
+    uninstallPluginSetup: ReturnType<typeof vi.fn>;
+    getPluginSetupInfo: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    pluginStore = createMockPluginStore();
+    pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([]),
+      checkPluginSetup: vi.fn().mockResolvedValue({ status: "installed", version: "1.0.0" }),
+      installPluginSetup: vi.fn().mockResolvedValue({ success: true }),
+      uninstallPluginSetup: vi.fn().mockResolvedValue({ success: true }),
+      getPluginSetupInfo: vi.fn().mockReturnValue([]),
+    };
+    store = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+    });
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, {
+      pluginStore,
+      pluginLoader: createMockPluginLoader(),
+      pluginRunner,
+    }));
+    return app;
+  }
+
+  it("GET /plugins/:id/setup-status returns hasSetup true result", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, state: "started" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/plugins/test-plugin/setup-status");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasSetup: true, status: "installed", version: "1.0.0" });
+  });
+
+  it("GET /plugins/:id/setup-status returns hasSetup false when no setup", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, state: "started" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/plugins/test-plugin/setup-status");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasSetup: false });
+  });
+
+  it("GET /plugins/:id/setup-status returns deferred status when plugin is not started", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, state: "installed" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/plugins/test-plugin/setup-status");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      hasSetup: true,
+      setupCheckDeferred: true,
+      deferredReason: "plugin-not-started",
+      pluginState: "installed",
+    });
+    expect(pluginRunner.checkPluginSetup).not.toHaveBeenCalled();
+  });
+
+  it("GET /plugins/:id/setup-status returns 404 for nonexistent plugin", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('Plugin "missing" not found'));
+
+    const res = await REQUEST(buildApp(), "GET", "/api/plugins/missing/setup-status");
+    expect(res.status).toBe(404);
+  });
+
+  it("POST /plugins/:id/setup/install returns success true", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn(), install: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/setup/install", {});
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+  });
+
+  it("POST /plugins/:id/setup/install returns setup failure result", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn(), install: vi.fn() },
+      },
+    ]);
+    pluginRunner.installPluginSetup.mockResolvedValueOnce({ success: false, error: "install failed" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/setup/install", {});
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: false, error: "install failed" });
+  });
+
+  it("POST /plugins/:id/setup/install returns 400 when no install hook", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...FAKE_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/setup/install", {});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("no install hook");
+  });
+
+  it("POST /plugins/:id/setup/uninstall returns success and failure results", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValue([
+      {
+        pluginId: "test-plugin",
+        manifest: { binaryName: "agent-browser", description: "Binary" },
+        hooks: { checkSetup: vi.fn(), uninstall: vi.fn() },
+      },
+    ]);
+
+    const successRes = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/setup/uninstall", {});
+    expect(successRes.status).toBe(200);
+    expect(successRes.body).toEqual({ success: true });
+
+    pluginRunner.uninstallPluginSetup.mockResolvedValueOnce({ success: false, error: "uninstall failed" });
+    const failureRes = await REQUEST(buildApp(), "POST", "/api/plugins/test-plugin/setup/uninstall", {});
+    expect(failureRes.status).toBe(200);
+    expect(failureRes.body).toEqual({ success: false, error: "uninstall failed" });
+  });
+});
+
 describe("PUT /plugins/:id/settings", () => {
   let store: TaskStore;
   let pluginStore: PluginStore;
@@ -827,6 +1014,123 @@ describe("PUT /plugins/:id/settings", () => {
   });
 });
 
+describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", () => {
+  let store: TaskStore;
+  let pluginStore: PluginStore;
+
+  beforeEach(() => {
+    pluginStore = createMockPluginStore();
+    store = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+    });
+  });
+
+  function buildAppWithBundleHook(
+    ensureBundledPluginInstalled: (id: string) => Promise<boolean>,
+  ) {
+    const app = express();
+    app.use(express.json());
+    app.use(
+      "/api",
+      createApiRoutes(store, {
+        pluginStore,
+        pluginLoader: createMockPluginLoader(),
+        ensureBundledPluginInstalled,
+      }),
+    );
+    return app;
+  }
+
+  it("auto-installs a bundled runtime plugin on first save", async () => {
+    // Plugin not yet registered → first getPlugin throws.
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("Plugin not found"),
+    );
+    (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...FAKE_PLUGIN,
+      id: "fusion-plugin-hermes-runtime",
+      settings: { apiKey: "k" },
+    });
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-hermes-runtime/settings",
+      { settings: { apiKey: "k" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(ensure).toHaveBeenCalledWith("fusion-plugin-hermes-runtime");
+    expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
+  });
+
+  it("skips auto-install when the plugin is already registered", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
+    (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-hermes-runtime/settings",
+      { settings: { apiKey: "k" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(ensure).not.toHaveBeenCalled();
+  });
+
+  it("does not invoke auto-install for non-bundled plugin ids", async () => {
+    (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce(FAKE_PLUGIN);
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/some-third-party-plugin/settings",
+      { settings: { apiKey: "k" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(ensure).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 with intentional message when bundled auto-install reports missing bundle", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("Plugin not found"),
+    );
+    const ensure = vi.fn().mockResolvedValue(false);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-hermes-runtime/settings",
+      { settings: { apiKey: "k" } },
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("is unavailable in this build");
+  });
+
+  it("returns 500 when auto-install throws", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("Plugin not found"),
+    );
+    const ensure = vi.fn().mockRejectedValue(new Error("bundle missing"));
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-hermes-runtime/settings",
+      { settings: { apiKey: "k" } },
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("Failed to auto-install");
+  });
+});
+
 describe("DELETE /plugins/:id", () => {
   let store: TaskStore;
   let pluginStore: PluginStore;
@@ -882,6 +1186,73 @@ describe("DELETE /plugins/:id", () => {
 
     expect(res.status).toBe(204);
     expect(mockGetOrCreateProjectStore).toHaveBeenCalledWith("proj_123");
+  });
+});
+
+describe("plugin-defined route dispatch", () => {
+  it("registers PATCH routes from plugins", () => {
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        { pluginId: "fusion-plugin-roadmap", route: { method: "PATCH", path: "/roadmaps/x", handler: vi.fn() } },
+      ]),
+    };
+
+    const pluginStore = createMockPluginStore();
+    const router = createPluginRouter(pluginStore, createMockPluginLoader({
+      createRouteContext: vi.fn().mockResolvedValue({
+        pluginId: "fusion-plugin-roadmap",
+        taskStore: createMockTaskStore(),
+        settings: {},
+        logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+        emitEvent: vi.fn(),
+      }),
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "fusion-plugin-roadmap" } }),
+    } as any), pluginRunner as any, createMockTaskStore());
+
+    const stack = (router as any).stack as Array<{ route?: { path: string; methods: Record<string, boolean> } }>;
+    const patchRoute = stack.find((layer) => layer.route?.path === "/fusion-plugin-roadmap/roadmaps/x");
+    expect(patchRoute?.route?.methods.patch).toBe(true);
+  });
+
+  it("passes scoped taskStore and createAiSession through pluginLoader.createRouteContext", async () => {
+    const routeHandler = vi.fn().mockResolvedValue({ ok: true });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        { pluginId: "fusion-plugin-roadmap", route: { method: "POST", path: "/ctx-check", handler: routeHandler } },
+      ]),
+    };
+    const scopedPluginStore = createMockPluginStore();
+    const scopedTaskStore = createMockTaskStore({ getPluginStore: vi.fn().mockReturnValue(scopedPluginStore) });
+    mockGetOrCreateProjectStore.mockResolvedValue(scopedTaskStore);
+    const createRouteContext = vi.fn().mockImplementation(async (_pluginId: string, overrides: any) => ({
+      pluginId: "fusion-plugin-roadmap",
+      taskStore: overrides.taskStore,
+      settings: overrides.settings,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      emitEvent: vi.fn(),
+      createAiSession: vi.fn(),
+      resolveProjectTaskStore: overrides.resolveProjectTaskStore,
+    }));
+    const pluginLoader = createMockPluginLoader({
+      createRouteContext,
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "fusion-plugin-roadmap" } }),
+    } as any);
+    const pluginStore = createMockPluginStore();
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner as any, createMockTaskStore()));
+
+    const res = await REQUEST(app, "POST", "/api/plugins/fusion-plugin-roadmap/ctx-check", { projectId: "proj_123" });
+    expect(res.status).toBe(200);
+    expect(createRouteContext).toHaveBeenCalledWith("fusion-plugin-roadmap", expect.objectContaining({
+      taskStore: scopedTaskStore,
+      resolveProjectTaskStore: projectStoreResolver.getOrCreateProjectStore,
+    }));
+    expect(routeHandler).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ taskStore: scopedTaskStore, createAiSession: expect.any(Function) }),
+    );
   });
 });
 

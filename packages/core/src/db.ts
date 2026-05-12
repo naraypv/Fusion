@@ -12,6 +12,7 @@ import { DatabaseSync } from "./sqlite-adapter.js";
 import { isAbsolute, join } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { DEFAULT_PROJECT_SETTINGS } from "./types.js";
 import type { PluginOnSchemaInit } from "./plugin-types.js";
 import type { SteeringComment, TaskComment } from "./types.js";
@@ -88,7 +89,7 @@ export function probeFts5(db: DatabaseSync): boolean {
 
 // ── Schema Definition ────────────────────────────────────────────────
 
-const SCHEMA_VERSION = 61;
+const SCHEMA_VERSION = 72;
 
 function normalizeTaskComments(
   steeringComments: SteeringComment[] | undefined,
@@ -152,6 +153,7 @@ const SCHEMA_SQL = `
 -- Tasks table with JSON columns for nested data
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
+  lineageId TEXT,
   title TEXT,
   description TEXT NOT NULL,
   priority TEXT DEFAULT 'normal',
@@ -165,6 +167,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   paused INTEGER DEFAULT 0,
   baseBranch TEXT,
   branch TEXT,
+  executionStartBranch TEXT,
   baseCommitSha TEXT,
   modelPresetId TEXT,
   modelProvider TEXT,
@@ -200,9 +203,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   attachments TEXT DEFAULT '[]',
   steeringComments TEXT DEFAULT '[]',
   comments TEXT DEFAULT '[]',
+  review TEXT,
+  reviewState TEXT,
   workflowStepResults TEXT DEFAULT '[]',
   prInfo TEXT,
   issueInfo TEXT,
+  githubTracking TEXT,
   sourceIssueProvider TEXT,
   sourceIssueRepository TEXT,
   sourceIssueExternalIssueId TEXT,
@@ -223,7 +229,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   sourceSessionId TEXT,
   sourceMessageId TEXT,
   sourceParentTaskId TEXT,
-  sourceMetadata TEXT
+  sourceMetadata TEXT,
+  checkedOutBy TEXT,
+  checkedOutAt TEXT,
+  checkoutNodeId TEXT,
+  checkoutRunId TEXT,
+  checkoutLeaseRenewedAt TEXT,
+  checkoutLeaseEpoch INTEGER DEFAULT 0
 );
 
 -- Config table (single row with project settings)
@@ -235,6 +247,35 @@ CREATE TABLE IF NOT EXISTS config (
   workflowSteps TEXT DEFAULT '[]',
   updatedAt TEXT
 );
+
+CREATE TABLE IF NOT EXISTS distributed_task_id_state (
+  prefix TEXT PRIMARY KEY,
+  nextSequence INTEGER NOT NULL,
+  committedClusterTaskCount INTEGER NOT NULL,
+  lastCommittedTaskId TEXT,
+  updatedAt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS distributed_task_id_reservations (
+  reservationId TEXT PRIMARY KEY,
+  prefix TEXT NOT NULL,
+  nodeId TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  taskId TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'committed', 'aborted', 'expired')),
+  reason TEXT CHECK (reason IS NULL OR reason IN ('abort', 'expired', 'failed-create')),
+  expiresAt TEXT NOT NULL,
+  committedAt TEXT,
+  abortedAt TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  FOREIGN KEY (prefix) REFERENCES distributed_task_id_state(prefix) ON DELETE CASCADE,
+  UNIQUE(prefix, sequence),
+  UNIQUE(prefix, taskId)
+);
+
+CREATE INDEX IF NOT EXISTS idxDistributedTaskIdReservationsPrefixStatus ON distributed_task_id_reservations(prefix, status);
+CREATE INDEX IF NOT EXISTS idxDistributedTaskIdReservationsExpiry ON distributed_task_id_reservations(status, expiresAt);
 
 -- Workflow step definitions
 CREATE TABLE IF NOT EXISTS workflow_steps (
@@ -277,6 +318,23 @@ CREATE TABLE IF NOT EXISTS archivedTasks (
 );
 
 CREATE INDEX IF NOT EXISTS idxArchivedTasksId ON archivedTasks(id);
+
+CREATE TABLE IF NOT EXISTS task_commit_associations (
+  id TEXT PRIMARY KEY,
+  taskLineageId TEXT NOT NULL,
+  taskIdSnapshot TEXT NOT NULL,
+  commitSha TEXT NOT NULL,
+  commitSubject TEXT NOT NULL,
+  authoredAt TEXT NOT NULL,
+  matchedBy TEXT NOT NULL CHECK (matchedBy IN ('canonical-lineage-trailer', 'legacy-task-id-trailer', 'legacy-subject', 'manual-reconciliation')),
+  confidence TEXT NOT NULL CHECK (confidence IN ('canonical', 'legacy', 'ambiguous')),
+  note TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  UNIQUE(taskLineageId, commitSha, matchedBy)
+);
+CREATE INDEX IF NOT EXISTS idxTaskCommitAssociationsLineage ON task_commit_associations(taskLineageId);
+CREATE INDEX IF NOT EXISTS idxTaskCommitAssociationsCommitSha ON task_commit_associations(commitSha);
 
 -- Automations table
 CREATE TABLE IF NOT EXISTS automations (
@@ -466,6 +524,72 @@ CREATE TABLE IF NOT EXISTS research_run_events (
 );
 CREATE INDEX IF NOT EXISTS idxResearchRunEventsRunIdSeq ON research_run_events(runId, seq);
 
+-- Eval run persistence (FN-3387)
+CREATE TABLE IF NOT EXISTS eval_runs (
+  id TEXT PRIMARY KEY,
+  projectId TEXT NOT NULL,
+  status TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  window TEXT NOT NULL DEFAULT '{}',
+  requestedTaskIds TEXT NOT NULL DEFAULT '[]',
+  evaluatedTaskIds TEXT NOT NULL DEFAULT '[]',
+  counts TEXT NOT NULL DEFAULT '{"totalTasks":0,"scoredTasks":0,"skippedTasks":0,"erroredTasks":0}',
+  aggregateScores TEXT,
+  summary TEXT,
+  error TEXT,
+  provenance TEXT,
+  metadata TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  startedAt TEXT,
+  completedAt TEXT,
+  cancelledAt TEXT
+);
+CREATE INDEX IF NOT EXISTS idxEvalRunsProjectIdCreatedAt ON eval_runs(projectId, createdAt);
+CREATE INDEX IF NOT EXISTS idxEvalRunsProjectTriggerStatus ON eval_runs(projectId, trigger, status);
+CREATE INDEX IF NOT EXISTS idxEvalRunsStatusCreatedAt ON eval_runs(status, createdAt);
+
+CREATE TABLE IF NOT EXISTS eval_task_results (
+  id TEXT PRIMARY KEY,
+  runId TEXT NOT NULL,
+  taskId TEXT NOT NULL,
+  taskSnapshot TEXT NOT NULL,
+  status TEXT NOT NULL,
+  overallScore REAL,
+  maxScore REAL,
+  categoryScores TEXT NOT NULL DEFAULT '[]',
+  rationale TEXT,
+  summary TEXT,
+  evidence TEXT NOT NULL DEFAULT '[]',
+  deterministicSignals TEXT NOT NULL DEFAULT '[]',
+  aiSignals TEXT,
+  followUps TEXT NOT NULL DEFAULT '[]',
+  provenance TEXT,
+  metadata TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  FOREIGN KEY (runId) REFERENCES eval_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxEvalTaskResultsRunIdCreatedAt ON eval_task_results(runId, createdAt);
+CREATE INDEX IF NOT EXISTS idxEvalTaskResultsTaskIdCreatedAt ON eval_task_results(taskId, createdAt);
+CREATE INDEX IF NOT EXISTS idxEvalTaskResultsStatusRunId ON eval_task_results(status, runId);
+CREATE UNIQUE INDEX IF NOT EXISTS idxEvalTaskResultsRunTaskUnique ON eval_task_results(runId, taskId);
+
+CREATE TABLE IF NOT EXISTS eval_run_events (
+  id TEXT PRIMARY KEY,
+  runId TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  status TEXT,
+  taskId TEXT,
+  metadata TEXT,
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (runId) REFERENCES eval_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxEvalRunEventsRunIdSeq ON eval_run_events(runId, seq);
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS __meta (
   key TEXT PRIMARY KEY,
@@ -558,6 +682,8 @@ CREATE TABLE IF NOT EXISTS plugins (
   settingsSchema TEXT,
   error TEXT,
   dependencies TEXT DEFAULT '[]',
+  aiScanOnLoad INTEGER NOT NULL DEFAULT 0,
+  lastSecurityScan TEXT,
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL
 );
@@ -582,54 +708,10 @@ CREATE TABLE IF NOT EXISTS routines (
   nextRunAt TEXT,
   runCount INTEGER DEFAULT 0,
   runHistory TEXT DEFAULT '[]',
+  scope TEXT DEFAULT 'project',
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL
 );
-
--- Roadmap persistence tables (FN-1690)
--- Standalone roadmap: Roadmap → RoadmapMilestone → RoadmapFeature
--- with deterministic ordering indexes and FK cascade integrity
-
--- Roadmaps table
-CREATE TABLE IF NOT EXISTS roadmaps (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  description TEXT,
-  createdAt TEXT NOT NULL,
-  updatedAt TEXT NOT NULL
-);
-
--- Roadmap milestones table
-CREATE TABLE IF NOT EXISTS roadmap_milestones (
-  id TEXT PRIMARY KEY,
-  roadmapId TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT,
-  orderIndex INTEGER NOT NULL,
-  createdAt TEXT NOT NULL,
-  updatedAt TEXT NOT NULL,
-  FOREIGN KEY (roadmapId) REFERENCES roadmaps(id) ON DELETE CASCADE
-);
-
--- Roadmap features table
-CREATE TABLE IF NOT EXISTS roadmap_features (
-  id TEXT PRIMARY KEY,
-  milestoneId TEXT NOT NULL,
-  title TEXT NOT NULL,
-  description TEXT,
-  orderIndex INTEGER NOT NULL,
-  createdAt TEXT NOT NULL,
-  updatedAt TEXT NOT NULL,
-  FOREIGN KEY (milestoneId) REFERENCES roadmap_milestones(id) ON DELETE CASCADE
-);
-
--- Covering index for deterministic milestone ordering within a roadmap
-CREATE INDEX IF NOT EXISTS idxRoadmapMilestonesRoadmapOrder
-  ON roadmap_milestones(roadmapId, orderIndex, createdAt, id);
-
--- Covering index for deterministic feature ordering within a milestone
-CREATE INDEX IF NOT EXISTS idxRoadmapFeaturesMilestoneOrder
-  ON roadmap_features(milestoneId, orderIndex, createdAt, id);
 
 -- Insight persistence tables (FN-1877)
 -- Normalized insight entities and insight-generation run records
@@ -729,18 +811,291 @@ CREATE INDEX IF NOT EXISTS idxTodoItemsListId ON todo_items(listId);
 CREATE INDEX IF NOT EXISTS idxTodoItemsSortOrder ON todo_items(listId, sortOrder);
 `;
 
+const TABLE_LEVEL_CONSTRAINT_PREFIXES = new Set([
+  "PRIMARY",
+  "FOREIGN",
+  "UNIQUE",
+  "CHECK",
+  "CONSTRAINT",
+]);
+
+function normalizeSqlIdentifier(identifier: string): string {
+  const trimmed = identifier.trim();
+  if (!trimmed) return trimmed;
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("`") && trimmed.endsWith("`")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseCreateTableSchemasFromSql(sql: string): Map<string, Map<string, string>> {
+  const schema = new Map<string, Map<string, string>>();
+  const createTableRegex = /CREATE TABLE\s+(?:IF NOT EXISTS\s+)?((?:["`]|\[)?[A-Za-z_][A-Za-z0-9_]*(?:["`]|\])?)\s*\(([\s\S]*?)\)\s*;/g;
+
+  for (const match of sql.matchAll(createTableRegex)) {
+    const tableName = normalizeSqlIdentifier(match[1]);
+    const body = match[2] ?? "";
+    const columns = new Map<string, string>();
+
+    for (const rawLine of body.split("\n")) {
+      const noComment = rawLine.replace(/--.*$/, "").trim();
+      if (!noComment) continue;
+      const line = noComment.endsWith(",") ? noComment.slice(0, -1).trim() : noComment;
+      if (!line) continue;
+
+      const firstWord = line.split(/\s+/, 1)[0]?.toUpperCase() ?? "";
+      if (TABLE_LEVEL_CONSTRAINT_PREFIXES.has(firstWord)) continue;
+
+      const columnMatch = line.match(/^((?:["`]|\[)?[A-Za-z_][A-Za-z0-9_]*(?:["`]|\])?)\s+(.+)$/);
+      if (!columnMatch) continue;
+      const columnName = normalizeSqlIdentifier(columnMatch[1]);
+      const columnDefinition = columnMatch[2].trim();
+      if (!columnDefinition) continue;
+      columns.set(columnName, columnDefinition);
+    }
+
+    schema.set(tableName, columns);
+  }
+
+  return schema;
+}
+
+const SCHEMA_TABLE_SCHEMAS = parseCreateTableSchemasFromSql(SCHEMA_SQL);
+
+export function getSchemaSqlTableSchemas(): Map<string, Map<string, string>> {
+  return new Map([...SCHEMA_TABLE_SCHEMAS].map(([table, columns]) => [table, new Map(columns)]));
+}
+
+export function getSchemaCompatibilityTableSchemas(): Map<string, Map<string, string>> {
+  const tables = getSchemaSqlTableSchemas();
+  for (const [table, columns] of Object.entries(MIGRATION_ONLY_TABLE_SCHEMAS)) {
+    tables.set(table, new Map(Object.entries(columns)));
+  }
+  return tables;
+}
+
+export const MIGRATION_ONLY_TABLE_SCHEMAS: Record<string, Record<string, string>> = {
+  ai_sessions: {
+    id: "TEXT PRIMARY KEY",
+    type: "TEXT NOT NULL",
+    status: "TEXT NOT NULL",
+    title: "TEXT NOT NULL",
+    inputPayload: "TEXT NOT NULL",
+    conversationHistory: "TEXT DEFAULT '[]'",
+    currentQuestion: "TEXT",
+    result: "TEXT",
+    thinkingOutput: "TEXT DEFAULT ''",
+    error: "TEXT",
+    projectId: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+    lockedByTab: "TEXT",
+    lockedAt: "TEXT",
+    archived: "INTEGER DEFAULT 0",
+  },
+  messages: {
+    id: "TEXT PRIMARY KEY",
+    fromId: "TEXT NOT NULL",
+    fromType: "TEXT NOT NULL",
+    toId: "TEXT NOT NULL",
+    toType: "TEXT NOT NULL",
+    content: "TEXT NOT NULL",
+    type: "TEXT NOT NULL",
+    read: "INTEGER DEFAULT 0",
+    metadata: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+  },
+  agentRatings: {
+    id: "TEXT PRIMARY KEY",
+    agentId: "TEXT NOT NULL",
+    raterType: "TEXT NOT NULL",
+    raterId: "TEXT",
+    score: "INTEGER NOT NULL CHECK(score BETWEEN 1 AND 5)",
+    category: "TEXT",
+    comment: "TEXT",
+    runId: "TEXT",
+    taskId: "TEXT",
+    createdAt: "TEXT NOT NULL",
+  },
+  chat_sessions: {
+    id: "TEXT PRIMARY KEY",
+    agentId: "TEXT NOT NULL",
+    title: "TEXT",
+    status: "TEXT NOT NULL DEFAULT 'active'",
+    projectId: "TEXT",
+    modelProvider: "TEXT",
+    modelId: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+    cliSessionFile: "TEXT",
+    inFlightGeneration: "TEXT",
+  },
+  chat_messages: {
+    id: "TEXT PRIMARY KEY",
+    sessionId: "TEXT NOT NULL",
+    role: "TEXT NOT NULL",
+    content: "TEXT NOT NULL",
+    thinkingOutput: "TEXT",
+    metadata: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    attachments: "TEXT",
+  },
+  runAuditEvents: {
+    id: "TEXT PRIMARY KEY",
+    timestamp: "TEXT NOT NULL",
+    taskId: "TEXT",
+    agentId: "TEXT NOT NULL",
+    runId: "TEXT NOT NULL",
+    domain: "TEXT NOT NULL",
+    mutationType: "TEXT NOT NULL",
+    target: "TEXT NOT NULL",
+    metadata: "TEXT",
+  },
+  mission_contract_assertions: {
+    id: "TEXT PRIMARY KEY",
+    milestoneId: "TEXT NOT NULL",
+    title: "TEXT NOT NULL",
+    assertion: "TEXT NOT NULL",
+    status: "TEXT NOT NULL DEFAULT 'pending'",
+    orderIndex: "INTEGER NOT NULL DEFAULT 0",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+  },
+  mission_feature_assertions: {
+    featureId: "TEXT NOT NULL",
+    assertionId: "TEXT NOT NULL",
+    createdAt: "TEXT NOT NULL",
+  },
+  mission_validator_runs: {
+    id: "TEXT PRIMARY KEY",
+    featureId: "TEXT NOT NULL",
+    milestoneId: "TEXT NOT NULL",
+    sliceId: "TEXT NOT NULL",
+    status: "TEXT NOT NULL DEFAULT 'running'",
+    triggerType: "TEXT NOT NULL DEFAULT 'auto'",
+    implementationAttempt: "INTEGER NOT NULL DEFAULT 0",
+    validatorAttempt: "INTEGER NOT NULL DEFAULT 0",
+    summary: "TEXT",
+    blockedReason: "TEXT",
+    startedAt: "TEXT NOT NULL",
+    completedAt: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+    taskId: "TEXT",
+  },
+  mission_validator_failures: {
+    id: "TEXT PRIMARY KEY",
+    runId: "TEXT NOT NULL",
+    featureId: "TEXT NOT NULL",
+    assertionId: "TEXT NOT NULL",
+    message: "TEXT",
+    expected: "TEXT",
+    actual: "TEXT",
+    createdAt: "TEXT NOT NULL",
+  },
+  mission_fix_feature_lineage: {
+    id: "TEXT PRIMARY KEY",
+    sourceFeatureId: "TEXT NOT NULL",
+    fixFeatureId: "TEXT NOT NULL",
+    runId: "TEXT NOT NULL",
+    failedAssertionIds: "TEXT NOT NULL DEFAULT '[]'",
+    createdAt: "TEXT NOT NULL",
+  },
+  verification_cache: {
+    treeSha: "TEXT NOT NULL",
+    testCommand: "TEXT NOT NULL DEFAULT ''",
+    buildCommand: "TEXT NOT NULL DEFAULT ''",
+    recordedAt: "TEXT NOT NULL",
+    taskId: "TEXT",
+  },
+  approval_requests: {
+    id: "TEXT PRIMARY KEY",
+    status: "TEXT NOT NULL",
+    requesterActorId: "TEXT NOT NULL",
+    requesterActorType: "TEXT NOT NULL",
+    requesterActorName: "TEXT NOT NULL",
+    targetActionCategory: "TEXT NOT NULL",
+    targetActionOperation: "TEXT NOT NULL",
+    targetActionSummary: "TEXT NOT NULL",
+    targetResourceType: "TEXT NOT NULL",
+    targetResourceId: "TEXT NOT NULL",
+    targetContext: "TEXT",
+    taskId: "TEXT",
+    runId: "TEXT",
+    requestedAt: "TEXT NOT NULL",
+    decidedAt: "TEXT",
+    completedAt: "TEXT",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+  },
+  approval_request_audit_events: {
+    id: "TEXT PRIMARY KEY",
+    requestId: "TEXT NOT NULL",
+    eventType: "TEXT NOT NULL",
+    actorId: "TEXT NOT NULL",
+    actorType: "TEXT NOT NULL",
+    actorName: "TEXT NOT NULL",
+    note: "TEXT",
+    createdAt: "TEXT NOT NULL",
+  },
+  chat_rooms: {
+    id: "TEXT PRIMARY KEY",
+    name: "TEXT NOT NULL",
+    slug: "TEXT NOT NULL",
+    description: "TEXT",
+    projectId: "TEXT",
+    createdBy: "TEXT",
+    status: "TEXT NOT NULL DEFAULT 'active'",
+    createdAt: "TEXT NOT NULL",
+    updatedAt: "TEXT NOT NULL",
+  },
+  chat_room_members: {
+    roomId: "TEXT NOT NULL",
+    agentId: "TEXT NOT NULL",
+    role: "TEXT NOT NULL DEFAULT 'member'",
+    addedAt: "TEXT NOT NULL",
+  },
+  chat_room_messages: {
+    id: "TEXT PRIMARY KEY",
+    roomId: "TEXT NOT NULL",
+    role: "TEXT NOT NULL",
+    content: "TEXT NOT NULL",
+    thinkingOutput: "TEXT",
+    metadata: "TEXT",
+    attachments: "TEXT",
+    senderAgentId: "TEXT",
+    mentions: "TEXT",
+    createdAt: "TEXT NOT NULL",
+  },
+};
+
 // ── Database Class ───────────────────────────────────────────────────
 
+type SharedIntegrityCheckState = {
+  timer: ReturnType<typeof setTimeout> | null;
+  subscribers: Set<Database>;
+  running: boolean;
+};
+
 export class Database {
+  private static readonly sharedIntegrityChecks = new Map<string, SharedIntegrityCheckState>();
+
   private db: DatabaseSync;
   private readonly dbPath: string;
   private readonly inMemory: boolean;
   /** Returns the database file path (or ":memory:" for in-memory databases). */
   get path(): string { return this.dbPath; }
   corruptionDetected = false;
+  integrityCheckPending = false;
+  integrityCheckLastRunAt: string | null = null;
   /** Tracks transaction nesting depth for savepoint-based nested transactions. */
   private transactionDepth = 0;
   private readonly _fts5Available: boolean;
+  private integrityCheckScheduled = false;
+  private closed = false;
 
 
   constructor(fusionDir: string, options?: { inMemory?: boolean }) {
@@ -789,10 +1144,11 @@ export class Database {
     // and there's no other writer to coordinate with — so we skip WAL-only
     // tuning there.
     if (!inMemory) {
+      // Wait up to 5s for locks to clear before returning SQLITE_BUSY.
+      // Set this before other PRAGMAs so they also benefit from lock waiting.
+      this.db.exec("PRAGMA busy_timeout = 5000");
       // Enable WAL mode for concurrent reader/writer access
       this.db.exec("PRAGMA journal_mode = WAL");
-      // Wait up to 5s for locks to clear before returning SQLITE_BUSY
-      this.db.exec("PRAGMA busy_timeout = 5000");
       // In WAL mode NORMAL is nearly as durable as FULL with much lower fsync cost.
       this.db.exec("PRAGMA synchronous = NORMAL");
       // Checkpoint every 100 pages (~400 KB) to keep WAL small and reduce
@@ -947,48 +1303,9 @@ export class Database {
    * and seed meta values.
    */
   init(): void {
-    // Startup integrity check — run BEFORE any writes to avoid
-    // compounding corruption. Attempts WAL checkpoint recovery on failure.
-    const integrity = this.integrityCheck();
-    if (!integrity.ok) {
-      this.corruptionDetected = true;
-      console.warn(`[fusion:db] Database integrity check FAILED for ${this.dbPath} — corruption detected`);
-      // Attempt WAL checkpoint recovery
-      try {
-        this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-        const recheck = this.integrityCheck();
-        if (recheck.ok) {
-          this.corruptionDetected = false;
-          console.warn(`[fusion:db] Database recovered via WAL checkpoint: ${this.dbPath}`);
-        } else {
-          const recheckMsg = ("errors" in recheck && Array.isArray(recheck.errors))
-            ? recheck.errors.slice(0, 3).join(" | ")
-            : "unknown";
-          console.error(
-            `[fusion:db] Database is corrupted and could not be auto-recovered. ` +
-            `Run: sqlite3 ${this.dbPath} ".recover" | sqlite3 ${this.dbPath}.recovered`,
-          );
-          throw new Error(
-            `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Integrity errors: ${recheckMsg}`,
-          );
-        }
-      } catch (err) {
-        // Re-throw our own abort error; wrap others
-        if (err instanceof Error && err.message.startsWith("[fusion:db] Refusing")) {
-          throw err;
-        }
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[fusion:db] Database corruption detected for ${this.dbPath} and checkpoint recovery failed: ${errMsg}. ` +
-          "Manual recovery required.",
-        );
-        throw new Error(
-          `[fusion:db] Refusing to initialize corrupted database at ${this.dbPath}. Recovery error: ${errMsg}`,
-        );
-      }
-    }
-
     this.db.exec(SCHEMA_SQL);
+
+    this.scheduleBackgroundIntegrityCheck();
 
     // Seed schemaVersion and lastModified idempotently
     this.db.exec(
@@ -1002,7 +1319,10 @@ export class Database {
     this.migrate();
 
     // Compatibility backfills that must run even when schemaVersion is current.
+    this.ensureSchemaCompatibility();
     this.ensureRoutinesSchemaCompatibility();
+    this.ensureInsightRunsSchemaCompatibility();
+    this.ensureEvalTaskResultsSchemaCompatibility();
 
     // Seed config row idempotently with default settings
     const configNow = new Date().toISOString();
@@ -1023,6 +1343,26 @@ export class Database {
    * re-run even if a previous migration partially applied.
    */
   /**
+   * Applies unconditional column reconciliation for all known project DB tables.
+   *
+   * FN-3879 introduced a tasks checkout-column self-heal, FN-3898 formalized it,
+   * and FN-3887 generalized the guardrail so migration-version drift no longer
+   * determines whether additive columns exist. Invariant: every column declared
+   * in SCHEMA_SQL or MIGRATION_ONLY_TABLE_SCHEMAS exists on any live table after
+   * this method returns, regardless of the persisted schemaVersion.
+   */
+  private ensureSchemaCompatibility(): void {
+    const knownTableSchemas = getSchemaCompatibilityTableSchemas();
+
+    for (const [tableName, columns] of knownTableSchemas) {
+      if (!this.hasTable(tableName)) continue;
+      for (const [columnName, columnDefinition] of columns) {
+        this.addColumnIfMissing(tableName, columnName, columnDefinition);
+      }
+    }
+  }
+
+  /**
    * Applies idempotent compatibility fixes for legacy routines table shapes.
    *
    * Some older databases contain `routines` without `agentId`, or with NULL
@@ -1034,21 +1374,6 @@ export class Database {
       return;
     }
 
-    this.addColumnIfMissing("routines", "agentId", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("routines", "command", "TEXT");
-    this.addColumnIfMissing("routines", "steps", "TEXT");
-    this.addColumnIfMissing("routines", "timeoutMs", "INTEGER");
-    this.addColumnIfMissing("routines", "catchUpPolicy", "TEXT NOT NULL DEFAULT 'run_one'");
-    this.addColumnIfMissing("routines", "executionPolicy", "TEXT NOT NULL DEFAULT 'queue'");
-    this.addColumnIfMissing("routines", "catchUpLimit", "INTEGER DEFAULT 5");
-    this.addColumnIfMissing("routines", "lastRunAt", "TEXT");
-    this.addColumnIfMissing("routines", "lastRunResult", "TEXT");
-    this.addColumnIfMissing("routines", "nextRunAt", "TEXT");
-    this.addColumnIfMissing("routines", "runCount", "INTEGER DEFAULT 0");
-    this.addColumnIfMissing("routines", "runHistory", "TEXT DEFAULT '[]'");
-    this.addColumnIfMissing("routines", "scope", "TEXT DEFAULT 'project'");
-    this.addColumnIfMissing("routines", "enabled", "INTEGER DEFAULT 1");
-
     this.db.exec("UPDATE routines SET agentId = '' WHERE agentId IS NULL");
     this.db.exec("UPDATE routines SET scope = 'project' WHERE scope IS NULL OR TRIM(scope) = ''");
 
@@ -1057,8 +1382,35 @@ export class Database {
     this.db.exec("CREATE INDEX IF NOT EXISTS idxRoutinesScope ON routines(scope)");
   }
 
+  /**
+   * Applies idempotent post-schema compatibility fixes for project_insight_runs.
+   *
+   * Column reconciliation is handled by ensureSchemaCompatibility(); this method
+   * remains focused on index creation that should run after the generic column
+   * backfill pass.
+   */
+  private ensureInsightRunsSchemaCompatibility(): void {
+    if (!this.hasTable("project_insight_runs")) {
+      return;
+    }
+
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idxInsightRunsProjectTriggerStatus ON project_insight_runs(projectId, trigger, status)`);
+  }
+
+  private ensureEvalTaskResultsSchemaCompatibility(): void {
+    if (!this.hasTable("eval_task_results")) {
+      return;
+    }
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idxEvalTaskResultsRunTaskUnique ON eval_task_results(runId, taskId)");
+  }
+
   private migrate(): void {
     const version = this.getSchemaVersion() || 1;
+
+    if (this.hasTable("tasks")) {
+      this.addColumnIfMissing("tasks", "executionStartBranch", "TEXT");
+      this.addColumnIfMissing("tasks", "review", "TEXT");
+    }
 
     if (version >= SCHEMA_VERSION) return;
 
@@ -1370,6 +1722,10 @@ export class Database {
       this.applyMigration(20, () => {
         this.addColumnIfMissing("tasks", "checkedOutBy", "TEXT");
         this.addColumnIfMissing("tasks", "checkedOutAt", "TEXT");
+        this.addColumnIfMissing("tasks", "checkoutNodeId", "TEXT");
+        this.addColumnIfMissing("tasks", "checkoutRunId", "TEXT");
+        this.addColumnIfMissing("tasks", "checkoutLeaseRenewedAt", "TEXT");
+        this.addColumnIfMissing("tasks", "checkoutLeaseEpoch", "INTEGER DEFAULT 0");
       });
     }
 
@@ -1465,7 +1821,8 @@ export class Database {
             modelProvider TEXT,
             modelId TEXT,
             createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL
+            updatedAt TEXT NOT NULL,
+            inFlightGeneration TEXT
           )
         `);
         this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatSessionsAgentId ON chat_sessions(agentId)`);
@@ -1502,6 +1859,10 @@ export class Database {
 
     if (version < 24) {
       this.applyMigration(24, () => {
+        // Legacy project-local plugin table (introduced in v24) is retained for
+        // one-shot migration reads by PluginStore.migrateLegacyProjectRows().
+        // Post-FN-3722 all new plugin install writes must go to central
+        // plugin_installs + project_plugin_states tables; writes here are a bug.
         this.db.exec(`
           CREATE TABLE IF NOT EXISTS plugins (
             id TEXT PRIMARY KEY,
@@ -1517,6 +1878,8 @@ export class Database {
             settingsSchema TEXT,
             error TEXT,
             dependencies TEXT DEFAULT '[]',
+            aiScanOnLoad INTEGER NOT NULL DEFAULT 0,
+            lastSecurityScan TEXT,
             createdAt TEXT NOT NULL,
             updatedAt TEXT NOT NULL
           )
@@ -1768,66 +2131,6 @@ export class Database {
         this.db.exec(`CREATE INDEX IF NOT EXISTS idxFixLineageSourceFeatureId ON mission_fix_feature_lineage(sourceFeatureId)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS idxFixLineageFixFeatureId ON mission_fix_feature_lineage(fixFeatureId)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS idxFixLineageRunId ON mission_fix_feature_lineage(runId)`);
-      });
-    }
-
-    // Roadmap persistence tables (FN-1690)
-    // Standalone roadmap: Roadmap → RoadmapMilestone → RoadmapFeature
-    // with deterministic ordering indexes and FK cascade integrity
-    if (version < 32) {
-      this.applyMigration(32, () => {
-        // Roadmaps table
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS roadmaps (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL
-          )
-        `);
-
-        // Roadmap milestones table
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS roadmap_milestones (
-            id TEXT PRIMARY KEY,
-            roadmapId TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            orderIndex INTEGER NOT NULL,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL,
-            FOREIGN KEY (roadmapId) REFERENCES roadmaps(id) ON DELETE CASCADE
-          )
-        `);
-
-        // Roadmap features table
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS roadmap_features (
-            id TEXT PRIMARY KEY,
-            milestoneId TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            orderIndex INTEGER NOT NULL,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL,
-            FOREIGN KEY (milestoneId) REFERENCES roadmap_milestones(id) ON DELETE CASCADE
-          )
-        `);
-
-        // Covering index for deterministic milestone ordering within a roadmap
-        // Covers: WHERE roadmapId = ? ORDER BY orderIndex ASC, createdAt ASC, id ASC
-        this.db.exec(`
-          CREATE INDEX IF NOT EXISTS idxRoadmapMilestonesRoadmapOrder
-            ON roadmap_milestones(roadmapId, orderIndex, createdAt, id)
-        `);
-
-        // Covering index for deterministic feature ordering within a milestone
-        // Covers: WHERE milestoneId = ? ORDER BY orderIndex ASC, createdAt ASC, id ASC
-        this.db.exec(`
-          CREATE INDEX IF NOT EXISTS idxRoadmapFeaturesMilestoneOrder
-            ON roadmap_features(milestoneId, orderIndex, createdAt, id)
-        `);
       });
     }
 
@@ -2413,6 +2716,282 @@ export class Database {
       });
     }
 
+    if (version < 62) {
+      this.applyMigration(62, () => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS eval_runs (
+            id TEXT PRIMARY KEY,
+            projectId TEXT NOT NULL,
+            status TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            window TEXT NOT NULL DEFAULT '{}',
+            requestedTaskIds TEXT NOT NULL DEFAULT '[]',
+            evaluatedTaskIds TEXT NOT NULL DEFAULT '[]',
+            counts TEXT NOT NULL DEFAULT '{"totalTasks":0,"scoredTasks":0,"skippedTasks":0,"erroredTasks":0}',
+            aggregateScores TEXT,
+            summary TEXT,
+            error TEXT,
+            provenance TEXT,
+            metadata TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            startedAt TEXT,
+            completedAt TEXT,
+            cancelledAt TEXT
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalRunsProjectIdCreatedAt ON eval_runs(projectId, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalRunsProjectTriggerStatus ON eval_runs(projectId, trigger, status)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalRunsStatusCreatedAt ON eval_runs(status, createdAt)`);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS eval_task_results (
+            id TEXT PRIMARY KEY,
+            runId TEXT NOT NULL,
+            taskId TEXT NOT NULL,
+            taskSnapshot TEXT NOT NULL,
+            status TEXT NOT NULL,
+            overallScore REAL,
+            maxScore REAL,
+            categoryScores TEXT NOT NULL DEFAULT '[]',
+            rationale TEXT,
+            summary TEXT,
+            evidence TEXT NOT NULL DEFAULT '[]',
+            deterministicSignals TEXT NOT NULL DEFAULT '[]',
+            aiSignals TEXT,
+            followUps TEXT NOT NULL DEFAULT '[]',
+            provenance TEXT,
+            metadata TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            FOREIGN KEY (runId) REFERENCES eval_runs(id) ON DELETE CASCADE
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalTaskResultsRunIdCreatedAt ON eval_task_results(runId, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalTaskResultsTaskIdCreatedAt ON eval_task_results(taskId, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalTaskResultsStatusRunId ON eval_task_results(status, runId)`);
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idxEvalTaskResultsRunTaskUnique ON eval_task_results(runId, taskId)`);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS eval_run_events (
+            id TEXT PRIMARY KEY,
+            runId TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT,
+            taskId TEXT,
+            metadata TEXT,
+            createdAt TEXT NOT NULL,
+            FOREIGN KEY (runId) REFERENCES eval_runs(id) ON DELETE CASCADE
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxEvalRunEventsRunIdSeq ON eval_run_events(runId, seq)`);
+      });
+    }
+
+    if (version < 64) {
+      this.applyMigration(64, () => {
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idxEvalTaskResultsRunTaskUnique ON eval_task_results(runId, taskId)`);
+      });
+    }
+
+    if (version < 65) {
+      this.applyMigration(65, () => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS distributed_task_id_state (
+            prefix TEXT PRIMARY KEY,
+            nextSequence INTEGER NOT NULL,
+            committedClusterTaskCount INTEGER NOT NULL,
+            lastCommittedTaskId TEXT,
+            updatedAt TEXT NOT NULL
+          )
+        `);
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS distributed_task_id_reservations (
+            reservationId TEXT PRIMARY KEY,
+            prefix TEXT NOT NULL,
+            nodeId TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            taskId TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('reserved', 'committed', 'aborted', 'expired')),
+            reason TEXT CHECK (reason IS NULL OR reason IN ('abort', 'expired', 'failed-create')),
+            expiresAt TEXT NOT NULL,
+            committedAt TEXT,
+            abortedAt TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            FOREIGN KEY (prefix) REFERENCES distributed_task_id_state(prefix) ON DELETE CASCADE,
+            UNIQUE(prefix, sequence),
+            UNIQUE(prefix, taskId)
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxDistributedTaskIdReservationsPrefixStatus ON distributed_task_id_reservations(prefix, status)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxDistributedTaskIdReservationsExpiry ON distributed_task_id_reservations(status, expiresAt)`);
+      });
+    }
+
+    if (version < 66) {
+      this.applyMigration(66, () => {
+        this.addColumnIfMissing("plugins", "aiScanOnLoad", "INTEGER NOT NULL DEFAULT 0");
+        this.addColumnIfMissing("plugins", "lastSecurityScan", "TEXT");
+      });
+    }
+
+    if (version < 67) {
+      // Drop the project_auth_* tables introduced by the old migration 63
+      // (FN-3544). The pluggable project-auth feature was removed before any
+      // production usage; these tables are orphaned on DBs that ran the old
+      // migration. Drop sessions/providers/memberships before users so the
+      // foreign-key cascade order is honored.
+      this.applyMigration(67, () => {
+        this.db.exec(`DROP TABLE IF EXISTS project_auth_sessions`);
+        this.db.exec(`DROP TABLE IF EXISTS project_auth_providers`);
+        this.db.exec(`DROP TABLE IF EXISTS project_auth_memberships`);
+        this.db.exec(`DROP TABLE IF EXISTS project_auth_users`);
+      });
+    }
+
+    if (version < 68) {
+      this.applyMigration(68, () => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS approval_requests (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            requesterActorId TEXT NOT NULL,
+            requesterActorType TEXT NOT NULL,
+            requesterActorName TEXT NOT NULL,
+            targetActionCategory TEXT NOT NULL,
+            targetActionOperation TEXT NOT NULL,
+            targetActionSummary TEXT NOT NULL,
+            targetResourceType TEXT NOT NULL,
+            targetResourceId TEXT NOT NULL,
+            targetContext TEXT,
+            taskId TEXT,
+            runId TEXT,
+            requestedAt TEXT NOT NULL,
+            decidedAt TEXT,
+            completedAt TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxApprovalRequestsStatusCreatedAt ON approval_requests(status, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxApprovalRequestsRequesterCreatedAt ON approval_requests(requesterActorId, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxApprovalRequestsTaskCreatedAt ON approval_requests(taskId, createdAt)`);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS approval_request_audit_events (
+            id TEXT PRIMARY KEY,
+            requestId TEXT NOT NULL,
+            eventType TEXT NOT NULL,
+            actorId TEXT NOT NULL,
+            actorType TEXT NOT NULL,
+            actorName TEXT NOT NULL,
+            note TEXT,
+            createdAt TEXT NOT NULL,
+            FOREIGN KEY (requestId) REFERENCES approval_requests(id) ON DELETE CASCADE
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxApprovalRequestAuditRequestCreatedAt ON approval_request_audit_events(requestId, createdAt, id)`);
+      });
+    }
+
+    if (version < 69) {
+      this.applyMigration(69, () => {
+        this.addColumnIfMissing("tasks", "reviewState", "TEXT");
+      });
+    }
+
+    if (version < 70) {
+      this.applyMigration(70, () => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS chat_rooms (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            description TEXT,
+            projectId TEXT,
+            createdBy TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL
+          )
+        `);
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idxChatRoomsSlug ON chat_rooms(projectId, slug)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatRoomsProjectId ON chat_rooms(projectId)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatRoomsStatus ON chat_rooms(status)`);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS chat_room_members (
+            roomId TEXT NOT NULL,
+            agentId TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            addedAt TEXT NOT NULL,
+            PRIMARY KEY (roomId, agentId),
+            FOREIGN KEY (roomId) REFERENCES chat_rooms(id) ON DELETE CASCADE
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatRoomMembersAgentId ON chat_room_members(agentId)`);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS chat_room_messages (
+            id TEXT PRIMARY KEY,
+            roomId TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            thinkingOutput TEXT,
+            metadata TEXT,
+            attachments TEXT,
+            senderAgentId TEXT,
+            mentions TEXT,
+            createdAt TEXT NOT NULL,
+            FOREIGN KEY (roomId) REFERENCES chat_rooms(id) ON DELETE CASCADE
+          )
+        `);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatRoomMessagesRoomCreatedAt ON chat_room_messages(roomId, createdAt)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxChatRoomMessagesRoomId ON chat_room_messages(roomId)`);
+      });
+    }
+
+    if (version < 71) {
+      this.applyMigration(71, () => {
+        this.addColumnIfMissing("tasks", "githubTracking", "TEXT");
+      });
+    }
+
+    if (version < 72) {
+      this.applyMigration(72, () => {
+        this.addColumnIfMissing("tasks", "lineageId", "TEXT");
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idxTasksLineageId ON tasks(lineageId)`);
+        const missing = this.db.prepare("SELECT id FROM tasks WHERE lineageId IS NULL OR trim(lineageId) = ''").all() as Array<{ id: string }>;
+        const updateLineage = this.db.prepare("UPDATE tasks SET lineageId = ? WHERE id = ?");
+        for (const row of missing) {
+          updateLineage.run(randomUUID(), row.id);
+        }
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS task_commit_associations (
+            id TEXT PRIMARY KEY,
+            taskLineageId TEXT NOT NULL,
+            taskIdSnapshot TEXT NOT NULL,
+            commitSha TEXT NOT NULL,
+            commitSubject TEXT NOT NULL,
+            authoredAt TEXT NOT NULL,
+            matchedBy TEXT NOT NULL CHECK (matchedBy IN ('canonical-lineage-trailer', 'legacy-task-id-trailer', 'legacy-subject', 'manual-reconciliation')),
+            confidence TEXT NOT NULL CHECK (confidence IN ('canonical', 'legacy', 'ambiguous')),
+            note TEXT,
+            createdAt TEXT NOT NULL,
+            updatedAt TEXT NOT NULL,
+            UNIQUE(taskLineageId, commitSha, matchedBy)
+          )
+        `);
+        this.db.exec("CREATE INDEX IF NOT EXISTS idxTaskCommitAssociationsLineage ON task_commit_associations(taskLineageId)");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idxTaskCommitAssociationsCommitSha ON task_commit_associations(commitSha)");
+      });
+    }
+
   }
 
   /**
@@ -2517,10 +3096,81 @@ export class Database {
     return { busy: row?.busy ?? 0, log: row?.log ?? 0, checkpointed: row?.checkpointed ?? 0 };
   }
 
+  private scheduleBackgroundIntegrityCheck(): void {
+    if (this.inMemory || this.integrityCheckScheduled || this.closed) {
+      return;
+    }
+
+    this.integrityCheckScheduled = true;
+    this.integrityCheckPending = true;
+
+    const existing = Database.sharedIntegrityChecks.get(this.dbPath);
+    if (existing) {
+      existing.subscribers.add(this);
+      return;
+    }
+
+    const shared: SharedIntegrityCheckState = {
+      timer: null,
+      subscribers: new Set([this]),
+      running: false,
+    };
+
+    shared.timer = setTimeout(() => {
+      shared.timer = null;
+      shared.running = true;
+
+      const participants = [...shared.subscribers].filter((instance) => !instance.closed);
+      const primary = participants[0];
+      const startedAt = new Date().toISOString();
+
+      let integrity: ReturnType<Database["integrityCheck"]> = { ok: true };
+      if (primary) {
+        integrity = primary.integrityCheck();
+      }
+
+      for (const participant of participants) {
+        participant.integrityCheckPending = false;
+        participant.integrityCheckLastRunAt = startedAt;
+        participant.corruptionDetected = !integrity.ok;
+      }
+
+      if (!integrity.ok) {
+        const errorSummary = integrity.errors.slice(0, 3).join(" | ");
+        console.error(
+          `[fusion:db] Background integrity check detected corruption for ${this.dbPath}: ${errorSummary}`,
+        );
+      }
+
+      Database.sharedIntegrityChecks.delete(this.dbPath);
+    }, 3000);
+
+    Database.sharedIntegrityChecks.set(this.dbPath, shared);
+  }
+
   /**
    * Close the database connection.
    */
   close(): void {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+
+    const shared = Database.sharedIntegrityChecks.get(this.dbPath);
+    if (shared) {
+      shared.subscribers.delete(this);
+      if (!shared.running && shared.subscribers.size === 0) {
+        if (shared.timer) {
+          clearTimeout(shared.timer);
+          shared.timer = null;
+        }
+        Database.sharedIntegrityChecks.delete(this.dbPath);
+      }
+    }
+
+    this.integrityCheckPending = false;
     this.db.close();
   }
 

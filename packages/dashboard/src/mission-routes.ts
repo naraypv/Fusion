@@ -14,7 +14,7 @@
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { TaskStore } from "@fusion/core";
+import { TaskStore, resolvePlanningSettingsModel } from "@fusion/core";
 import { getOrCreateProjectStore } from "./project-store-resolver.js";
 import type {
   Mission,
@@ -55,6 +55,7 @@ import {
   rateLimited,
 } from "./api-error.js";
 import type { AiSessionStore } from "./ai-session-store.js";
+import { resolveBranchAssignmentContext, resolveBranchSelection } from "./routes/branch-selection.js";
 
 // ── Validation Utilities ────────────────────────────────────────────────────
 
@@ -405,19 +406,26 @@ export function createMissionRouter(
 
       try {
         const ip = req.ip || req.socket.remoteAddress || "unknown";
-        const { store: scopedStore } = await getProjectContext(req);
+        const { store: scopedStore, projectId } = await getProjectContext(req);
         const rootDir = scopedStore.getRootDir();
         const settings = await scopedStore.getSettings();
 
         const { createMissionInterviewSession } = await import("./mission-interview.js");
+
+        // Resolve effective model: explicit override wins, then fall back to
+        // planning settings chain (planning-specific → project defaults → global defaults).
+        const effectiveModel = resolvePlanningSettingsModel(settings);
+        const resolvedProvider = modelProvider ?? effectiveModel.provider;
+        const resolvedModelId = modelId ?? effectiveModel.modelId;
 
         const sessionId = await createMissionInterviewSession(
           ip,
           missionTitle.trim(),
           rootDir,
           settings.promptOverrides,
-          modelProvider,
-          modelId,
+          resolvedProvider,
+          resolvedModelId,
+          projectId ?? null,
         );
         res.status(201).json({ sessionId });
       } catch (err: unknown) {
@@ -2435,7 +2443,7 @@ export function createMissionRouter(
     "/features/:featureId/triage",
     catchTypedHandler(async (req, res) => {
       const { featureId } = req.params;
-      const { taskTitle, taskDescription } = req.body || {};
+      const { taskTitle, taskDescription, branch, baseBranch, branchSelection, branchAssignment } = req.body || {};
 
       if (!validateFeatureId(featureId)) {
         throw badRequest("Invalid feature ID format");
@@ -2447,10 +2455,18 @@ export function createMissionRouter(
       }
 
       try {
+        const { branch: resolvedBranch, baseBranch: resolvedBaseBranch } =
+          resolveBranchSelection(branchSelection, branch, baseBranch);
+        const { mode: branchMode } = resolveBranchAssignmentContext(branchAssignment);
         const feature = await missionStore.triageFeature(
           featureId,
           taskTitle || undefined,
           taskDescription || undefined,
+          {
+            branch: resolvedBranch,
+            baseBranch: resolvedBaseBranch,
+            assignmentMode: branchMode,
+          },
         );
         res.json(feature);
       } catch (err: unknown) {
@@ -2475,6 +2491,7 @@ export function createMissionRouter(
     "/slices/:sliceId/triage-all",
     catchTypedHandler(async (req, res) => {
       const { sliceId } = req.params;
+      const { branch, baseBranch, branchSelection, branchAssignment } = req.body || {};
 
       if (!validateSliceId(sliceId)) {
         throw badRequest("Invalid slice ID format");
@@ -2486,7 +2503,14 @@ export function createMissionRouter(
       }
 
       try {
-        const triaged = await missionStore.triageSlice(sliceId);
+        const { branch: resolvedBranch, baseBranch: resolvedBaseBranch } =
+          resolveBranchSelection(branchSelection, branch, baseBranch);
+        const { mode: branchMode } = resolveBranchAssignmentContext(branchAssignment);
+        const triaged = await missionStore.triageSlice(sliceId, {
+          branch: resolvedBranch,
+          baseBranch: resolvedBaseBranch,
+          assignmentMode: branchMode,
+        });
         res.json({ triaged, count: triaged.length });
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : String(err);

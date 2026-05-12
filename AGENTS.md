@@ -83,12 +83,67 @@ Fusion supports multiple projects with a central registry at `~/.fusion/fusion-c
 
 ## Testing
 
+Tests are required. Typechecks and manual verification are not substitutes for real tests with assertions.
+
+Use the narrowest command that exercises the behavior you changed, then broaden before reporting completion. Prefer local verification over waiting for GitHub Actions.
+
 ```bash
-VITEST_MAX_WORKERS=4 pnpm test  # run all tests
-pnpm build         # build all packages
+pnpm test              # changed-only workspace tests; falls back to the workspace quality gate in safety contexts
+pnpm test:full         # full workspace quality gate, clean-worktree compatible
+pnpm lint              # lint all packages
+pnpm build             # build workspace packages, excluding desktop/mobile
+pnpm verify:workspace  # canonical pre-merge gate: lint -> test:full -> build
 ```
 
-Tests are required. Typechecks and manual verification are not substitutes for real tests with assertions.
+`pnpm test:full` is the default broad local gate. It runs each package's default test script with capped worker fanout:
+
+```bash
+FUSION_TEST_TOTAL_WORKERS=4 FUSION_TEST_CONCURRENCY=2 pnpm -r --workspace-concurrency=2 test
+```
+
+Do not casually raise worker counts to make a run faster; dashboard/jsdom and integration-heavy packages can become slower or unstable when oversubscribed. Use `VITEST_MAX_WORKERS=<n>` only for targeted package-level investigation.
+
+### Dashboard Test Lanes
+
+Dashboard has a curated default gate plus explicit exhaustive lanes:
+
+```bash
+pnpm --filter @fusion/dashboard test                # curated app/API quality gate
+pnpm --filter @fusion/dashboard test:deep           # exhaustive app + API suite
+pnpm --filter @fusion/dashboard test:app            # exhaustive React/jsdom app tests
+pnpm --filter @fusion/dashboard test:api            # exhaustive Node API/server tests
+pnpm --filter @fusion/dashboard test:browser-smoke  # local browser CSS/layout smoke
+pnpm --filter @fusion/dashboard test:build          # built client output contract
+```
+
+Run the default dashboard gate for ordinary dashboard work. Run `test:deep` when changing broad dashboard architecture, shared modal/view infrastructure, route registration, or anything that could invalidate the curated selection. Run `test:browser-smoke` for layout, responsive, navigation, modal, or CSS changes. Run `test:build` for Vite/build output, lazy-loading, chunking, static asset, or client-dist changes.
+
+### Package-Specific Test Commands
+
+Common targeted lanes:
+
+```bash
+pnpm --filter @fusion/core test
+pnpm --filter @fusion/engine test
+pnpm --filter @runfusion/fusion test
+pnpm test:scripts
+node --test scripts/__tests__/*.test.mjs
+```
+
+For a single Vitest file, prefer package-local `exec vitest` so argument forwarding does not accidentally run the whole package:
+
+```bash
+pnpm --filter @fusion/core exec vitest run src/__tests__/central-db.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/dashboard exec vitest run --project dashboard-app-quality app/components/__tests__/TaskCard.test.tsx --silent=passed-only --reporter=dot
+```
+
+### Before Reporting Done
+
+- For code changes: run the affected package tests and any directly relevant browser/build lane.
+- For cross-package, shared test infrastructure, or CI changes: run `pnpm test:full`.
+- For production/bundling-sensitive changes: run `pnpm build`.
+- For final verification on substantial work: run `pnpm verify:workspace` unless there is a clear reason to split the commands and report them separately.
+- If you intentionally do not run a relevant lane, say why.
 
 ### Test File Organization
 
@@ -122,6 +177,11 @@ Prefer `it.each` over copy-pasted `it()` blocks. When trimming: keep the first c
 Port 4040 is the production dashboard port. A user's live dashboard session is typically running there. **Agents must NEVER:**
 - Run `kill`, `kill -9`, `pkill`, or `killall` against processes on port 4040
 - Start a test server on port 4040 — always use `--port 0` for random free port
+
+## Architecture
+
+- Merge deadlock self-healing now has three layered defenses: `SelfHealingManager.recoverAlreadyMergedReviewTasks()` and `SelfHealingManager.clearStaleBlockedBy()` in `packages/engine/src/self-healing.ts`, plus the paused-aware in-review scope filter in `packages/engine/src/scheduler.ts` (`inReviewWithWorktree` excludes `paused` tasks). Together these auto-finalize already-landed retry-exhausted review tasks, clear stale downstream blockers, and prevent paused review cards from re-blocking overlap dispatch.
+- Restart recovery is coordinated through `RestartRecoveryCoordinator` (`packages/engine/src/restart-recovery-coordinator.ts`), which classifies interrupted `in-progress` runs at runtime startup: no-progress `fn_task_done` failures are safely requeued to `todo`, then remaining orphaned work is resumed via the executor.
 
 ## Engine Process Rules
 
@@ -199,6 +259,17 @@ The pi extension provides tools and a `/fn` command for interacting with fn from
 
 The extension has no skills — tool descriptions give the LLM everything it needs.
 
+### WebFetch tool (`fn_web_fetch`)
+
+Use `fn_web_fetch` for lightweight URL reads from agent/chat sessions. It performs an HTTP GET, follows redirects, extracts readable text (including HTML→text and JSON pretty-print), and returns bounded content.
+
+`fn_web_fetch` is a universal baseline capability and is available by default across all agent roles/surfaces (executor, step-session, reviewer, merger, triage, and heartbeat, including engineer/custom direct-report paths routed through heartbeat).
+
+- Default limits: `timeoutMs=30000` and `maxBytes=512000` (500 KB)
+- Security: blocks private/loopback/link-local hosts (including DNS-resolved private addresses) unless explicitly overridden in internal/test contexts
+- Scope: read-only fetch (no JS rendering, no auth flows, no POST/cookie workflows)
+- Use `agent-browser` skill when pages require JavaScript execution, interactive navigation, or richer browser behavior
+
 ## Agent Spawning (`spawn_agent` tool)
 
 The executor agent can spawn child agents that run in parallel. Each spawned agent:
@@ -234,7 +305,21 @@ The executor agent can spawn child agents that run in parallel. Each spawned age
 
 ## Agent Delegation Tools
 
-Four tools enable inter-agent coordination — discovering agents, delegating tasks, and managing direct-report configuration.
+Six tools enable inter-agent coordination — discovering agents, provisioning/decommissioning direct reports, delegating tasks, and managing direct-report configuration.
+
+### `agent_create` Tool
+
+Create a non-ephemeral agent that reports to the caller (or, for CEO-level callers, any `reportsTo` target).
+
+Provisioning is policy-gated via `projectSettings.agentProvisioning` (`approvalMode`, `trustedRoles`, `trustedAgentIds`, `alwaysApproveDelete`). Tool responses use `details.outcome` values `created`, `deleted`, `pending_approval`, or `denied`. Pending requests are resolved via dashboard/API approval decision route (`POST /api/approvals/:id/decision`), which executes deferred provisioning on approve.
+
+### `agent_delete` Tool
+
+Delete a non-ephemeral direct report. If the target holds a task checkout lease, deletion is blocked unless `force: true`. Assigned tasks can be reassigned via `reassign_to` or released/unassigned.
+
+Provisioning policy also applies to deletes (`details.outcome`: `deleted`, `pending_approval`, or `denied`). Provisioning emits audit events `agent:create:{requested,approved,denied}` and `agent:delete:{requested,approved,denied}` tied to the originating run/task metadata.
+
+FN-3973 decision: `spawn_agent` remains under generic action-gate `task_agent_mutation` governance and is intentionally excluded from durable `agentProvisioning` policy. Rationale: spawned children are ephemeral (`metadata.type = "spawned"`), parent-task scoped (`reportsTo=<taskId>`), and auto-terminated with parent teardown.
 
 ### `list_agents` Tool
 
@@ -268,6 +353,7 @@ Create a new task and assign it to a specific agent for execution. The task goes
 | `agent_id` | `string` (required) | The agent ID to delegate work to |
 | `description` | `string` (required) | What needs to be done |
 | `dependencies` | `string[]` (optional) | Task IDs this new task depends on |
+| `override` | `boolean` (optional) | Set true to bypass executor-role assignment policy |
 
 **Example workflow — CEO agent discovers QA agent and delegates testing:**
 
@@ -289,6 +375,7 @@ delegate_task({
 **Error cases:**
 - `"ERROR: Agent {agent_id} not found"` — The agent ID does not exist
 - `"ERROR: Cannot delegate to ephemeral/runtime agent {agent_id}"` — Cannot delegate to runtime task-worker agents (use `spawn_agent` for parallel worktree tasks instead)
+- `"ERROR: Agent {agent_id} has role \"...\"; implementation task <new> requires an \"executor\"-role agent. Pass override=true to bypass."` — Non-executor target blocked unless `override: true`
 
 ### `get_agent_config` Tool
 
@@ -550,10 +637,10 @@ The test config (`vitest.config.ts`) includes `test.css: { include: [/.+/] }` so
 
 ### Lazy-Loaded Heavy Views
 
-These 13 views are lazy-loaded via `React.lazy()` to manage bundle size:
+These 16 views are lazy-loaded via `React.lazy()` to manage bundle size:
 
-- `AgentsView`, `RoadmapsView`, `NodesView`, `ChatView`, `MemoryView`
-- `DevServerView`, `InsightsView`, `DocumentsView`, `SkillsView`
+- `AgentsView`, `NodesView`, `ChatView`, `MemoryView`
+- `DevServerView`, `InsightsView`, `DocumentsView`, `SkillsView`, `ResearchView`, `EvalsView`, `TodoView`, `StashRecoveryView`
 - `SetupWizardModal`, `PluginManager`, `PiExtensionsManager`, `AgentDetailView`
 
 They are loaded in `App.tsx` / `AppModals.tsx` / `SettingsModal.tsx` / `AgentsView.tsx` with `<Suspense fallback={null}>`. 
@@ -642,6 +729,7 @@ Semantic status colors:
 | `--color-warning` | Warning amber |
 | `--color-info` | Info blue |
 | `--color-muted` | Muted gray |
+| `--accent-text` | Foreground text/icon color on `--accent` surfaces |
 
 **Rule:** Never use raw hex or `rgba(...)` for colors in component styles. Use `var(--token)` or `color-mix(in srgb, var(--color) X%, transparent)` for translucent backgrounds. The only place hardcoded colors are acceptable is inside `:root` theme blocks defining tokens.
 

@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { PluginStore } from "../plugin-store.js";
+import { Database, toJson } from "../db.js";
+import { CentralDatabase } from "../central-db.js";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
@@ -20,19 +22,66 @@ function makeManifest(overrides: Partial<PluginManifest> = {}): PluginManifest {
   };
 }
 
+function seedLegacyPluginRow(
+  projectRoot: string,
+  row: {
+    id: string;
+    name: string;
+    version: string;
+    path: string;
+    enabled?: number;
+    state?: PluginState;
+    error?: string | null;
+    settings?: Record<string, unknown>;
+    updatedAt?: string;
+  },
+): void {
+  const db = new Database(join(projectRoot, ".fusion"));
+  db.init();
+  const now = row.updatedAt ?? new Date().toISOString();
+  db.prepare(`
+    INSERT INTO plugins (
+      id, name, version, description, author, homepage, path,
+      enabled, state, settings, settingsSchema, error, dependencies,
+      aiScanOnLoad, lastSecurityScan, createdAt, updatedAt
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    row.id,
+    row.name,
+    row.version,
+    null,
+    null,
+    null,
+    row.path,
+    row.enabled ?? 1,
+    row.state ?? "installed",
+    toJson(row.settings ?? {}),
+    null,
+    row.error ?? null,
+    toJson([]),
+    0,
+    null,
+    now,
+    now,
+  );
+}
+
 describe("PluginStore", () => {
   let rootDir: string;
   let store: PluginStore;
+  let centralDir: string;
 
   beforeEach(async () => {
     rootDir = makeTmpDir();
-    // In-memory SQLite for test speed; see store.test.ts beforeEach.
-    store = new PluginStore(rootDir, { inMemoryDb: true });
+    centralDir = makeTmpDir();
+    // In-memory project DB + isolated central DB directory.
+    store = new PluginStore(rootDir, { inMemoryDb: true, centralGlobalDir: centralDir });
     await store.init();
   });
 
   afterEach(async () => {
     await rm(rootDir, { recursive: true, force: true });
+    await rm(centralDir, { recursive: true, force: true });
   });
 
   // ── init ──────────────────────────────────────────────────────────
@@ -41,7 +90,7 @@ describe("PluginStore", () => {
     it("creates the database file", async () => {
       // Asserts a real file on disk exists, which the in-memory
       // beforeEach store can't satisfy — open a disk-backed store.
-      const diskStore = new PluginStore(rootDir);
+      const diskStore = new PluginStore(rootDir, { centralGlobalDir: centralDir });
       await diskStore.init();
       const dbPath = join(rootDir, ".fusion", "fusion.db");
       const { existsSync } = await import("node:fs");
@@ -60,6 +109,148 @@ describe("PluginStore", () => {
       // If the table doesn't exist, listPlugins would fail
       const plugins = await store.listPlugins();
       expect(Array.isArray(plugins)).toBe(true);
+    });
+  });
+
+  describe("migration", () => {
+    it("migrates legacy project plugin rows into central install and project state", async () => {
+      const migrationProject = makeTmpDir();
+      const migrationCentral = makeTmpDir();
+      try {
+        seedLegacyPluginRow(migrationProject, {
+          id: "legacy-plugin",
+          name: "Legacy Plugin",
+          version: "1.2.3",
+          path: "/legacy/path",
+          enabled: 0,
+          state: "error",
+          error: "boom",
+          settings: { token: "abc" },
+        });
+
+        const migrationStore = new PluginStore(migrationProject, { centralGlobalDir: migrationCentral });
+        await migrationStore.init();
+
+        const plugin = await migrationStore.getPlugin("legacy-plugin");
+        expect(plugin.path).toBe("/legacy/path");
+        expect(plugin.enabled).toBe(false);
+        expect(plugin.state).toBe("error");
+        expect(plugin.error).toBe("boom");
+        expect(plugin.settings).toEqual({ token: "abc" });
+      } finally {
+        await rm(migrationProject, { recursive: true, force: true });
+        await rm(migrationCentral, { recursive: true, force: true });
+      }
+    });
+
+    it("is idempotent across repeated init and store rehydration", async () => {
+      const migrationProject = makeTmpDir();
+      const migrationCentral = makeTmpDir();
+      try {
+        seedLegacyPluginRow(migrationProject, {
+          id: "legacy-idempotent",
+          name: "Legacy Idempotent",
+          version: "1.0.0",
+          path: "/legacy/idempotent",
+        });
+
+        const migrationStore = new PluginStore(migrationProject, { centralGlobalDir: migrationCentral });
+        await migrationStore.init();
+        await migrationStore.init();
+
+        const reopenedStore = new PluginStore(migrationProject, { centralGlobalDir: migrationCentral });
+        await reopenedStore.init();
+
+        const plugins = await reopenedStore.listPlugins();
+        expect(plugins.filter((plugin) => plugin.id === "legacy-idempotent")).toHaveLength(1);
+
+        const centralDb = new CentralDatabase(migrationCentral);
+        centralDb.init();
+        const installCount = centralDb
+          .prepare("SELECT COUNT(*) as count FROM plugin_installs WHERE id = ?")
+          .get("legacy-idempotent") as { count: number };
+        expect(installCount.count).toBe(1);
+
+        const localDb = new Database(join(migrationProject, ".fusion"));
+        localDb.init();
+        const marker = localDb
+          .prepare("SELECT value FROM __meta WHERE key = 'pluginCentralMigrationV1'")
+          .get() as { value: string } | undefined;
+        expect(marker?.value).toBe("done");
+      } finally {
+        await rm(migrationProject, { recursive: true, force: true });
+        await rm(migrationCentral, { recursive: true, force: true });
+      }
+    });
+
+    it("shows globally installed plugin in another project as disabled until explicitly enabled", async () => {
+      const projectA = makeTmpDir();
+      const projectB = makeTmpDir();
+      const sharedCentral = makeTmpDir();
+      try {
+        const storeA = new PluginStore(projectA, { centralGlobalDir: sharedCentral });
+        const storeB = new PluginStore(projectB, { centralGlobalDir: sharedCentral });
+        await storeA.init();
+        await storeB.init();
+
+        await storeA.registerPlugin({
+          manifest: makeManifest({ id: "shared-global", name: "Shared Global" }),
+          path: "/plugins/shared-global",
+        });
+
+        const inProjectB = await storeB.getPlugin("shared-global");
+        expect(inProjectB.enabled).toBe(false);
+
+        await storeB.enablePlugin("shared-global");
+        const enabledInProjectB = await storeB.getPlugin("shared-global");
+        expect(enabledInProjectB.enabled).toBe(true);
+      } finally {
+        await rm(projectA, { recursive: true, force: true });
+        await rm(projectB, { recursive: true, force: true });
+        await rm(sharedCentral, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps latest updatedAt install metadata across projects while preserving per-project enablement", async () => {
+      const projectA = makeTmpDir();
+      const projectB = makeTmpDir();
+      const sharedCentral = makeTmpDir();
+      try {
+        seedLegacyPluginRow(projectA, {
+          id: "shared-legacy",
+          name: "Shared Legacy Old",
+          version: "1.0.0",
+          path: "/old/path",
+          enabled: 1,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+        seedLegacyPluginRow(projectB, {
+          id: "shared-legacy",
+          name: "Shared Legacy New",
+          version: "2.0.0",
+          path: "/new/path",
+          enabled: 0,
+          updatedAt: "2026-02-01T00:00:00.000Z",
+        });
+
+        const storeA = new PluginStore(projectA, { centralGlobalDir: sharedCentral });
+        const storeB = new PluginStore(projectB, { centralGlobalDir: sharedCentral });
+        await storeA.init();
+        await storeB.init();
+
+        const pluginFromA = await storeA.getPlugin("shared-legacy");
+        const pluginFromB = await storeB.getPlugin("shared-legacy");
+
+        expect(pluginFromA.name).toBe("Shared Legacy New");
+        expect(pluginFromA.version).toBe("2.0.0");
+        expect(pluginFromA.path).toBe("/new/path");
+        expect(pluginFromA.enabled).toBe(true);
+        expect(pluginFromB.enabled).toBe(false);
+      } finally {
+        await rm(projectA, { recursive: true, force: true });
+        await rm(projectB, { recursive: true, force: true });
+        await rm(sharedCentral, { recursive: true, force: true });
+      }
     });
   });
 
@@ -99,6 +290,29 @@ describe("PluginStore", () => {
       const plugin = await store.registerPlugin({ manifest, path: "/path/to/plugin" });
 
       expect(plugin.dependencies).toEqual(["other-plugin"]);
+    });
+
+    it("defaults aiScanOnLoad to false", async () => {
+      const manifest = makeManifest({ id: "scan-default" });
+      const plugin = await store.registerPlugin({ manifest, path: "/path/to/plugin" });
+      expect(plugin.aiScanOnLoad).toBe(false);
+    });
+
+    it("round-trips lastSecurityScan metadata", async () => {
+      const manifest = makeManifest({ id: "scan-roundtrip" });
+      await store.registerPlugin({ manifest, path: "/path/to/plugin", aiScanOnLoad: true });
+      await store.updatePlugin("scan-roundtrip", {
+        lastSecurityScan: {
+          verdict: "warning",
+          summary: "review",
+          findings: [],
+          scannedAt: new Date().toISOString(),
+          scannedFiles: ["manifest.json"],
+        },
+      });
+      const loaded = await store.getPlugin("scan-roundtrip");
+      expect(loaded.aiScanOnLoad).toBe(true);
+      expect(loaded.lastSecurityScan?.verdict).toBe("warning");
     });
 
     it("registers plugin with settings schema", async () => {

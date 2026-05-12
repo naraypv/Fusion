@@ -37,9 +37,11 @@ describe("CLI bundle output", () => {
     expect(content).not.toMatch(/from\s+["']@fusion\/core["']/);
     expect(content).not.toMatch(/from\s+["']@fusion\/dashboard["']/);
     expect(content).not.toMatch(/from\s+["']@fusion\/engine["']/);
+    expect(content).not.toMatch(/from\s+["']@fusion-plugin-examples\/roadmap["']/);
     expect(content).not.toContain('"@fusion/core"');
     expect(content).not.toContain('"@fusion/dashboard"');
     expect(content).not.toContain('"@fusion/engine"');
+    expect(content).not.toContain('"@fusion-plugin-examples/fusion-plugin-roadmap"');
   });
 
   it("does not contain runtime memory-backend side-load imports", () => {
@@ -158,13 +160,102 @@ describe("CLI bundle output", () => {
     expect(existsSync(join(stagedRoot, "src", "process-manager.ts"))).toBe(true);
   });
 
-  it("dist/plugins/fusion-plugin-dependency-graph/ is staged with a valid manifest", () => {
+  it("dist/plugins/fusion-plugin-dependency-graph/ is staged as bundled runtime output", () => {
     const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-dependency-graph");
     const manifestPath = join(stagedRoot, "manifest.json");
+    const packageJsonPath = join(stagedRoot, "package.json");
 
     expect(existsSync(manifestPath)).toBe(true);
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string; name?: string };
     expect(manifest.id).toBe("fusion-plugin-dependency-graph");
+    expect(typeof manifest.name).toBe("string");
+    expect(manifest.name?.length).toBeGreaterThan(0);
+
+    expect(existsSync(join(stagedRoot, "bundled.js"))).toBe(true);
+    expect(existsSync(join(stagedRoot, "src"))).toBe(false);
+
+    const stagedPkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
+      exports?: { "."?: { import?: string } };
+    };
+    expect(stagedPkg.exports?.["."]?.import).toBe("./bundled.js");
+  });
+
+  it("dist/plugins/fusion-plugin-roadmap/ is staged as bundled runtime output", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-roadmap");
+    const manifestPath = join(stagedRoot, "manifest.json");
+    const packageJsonPath = join(stagedRoot, "package.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string; name?: string };
+    expect(manifest.id).toBe("fusion-plugin-roadmap");
+    expect(typeof manifest.name).toBe("string");
+    expect(manifest.name?.length).toBeGreaterThan(0);
+
+    expect(existsSync(join(stagedRoot, "bundled.js"))).toBe(true);
+    expect(existsSync(join(stagedRoot, "src"))).toBe(false);
+
+    const stagedPkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
+      exports?: { "."?: { import?: string } };
+    };
+    expect(stagedPkg.exports?.["."]?.import).toBe("./bundled.js");
+  });
+
+  it("dist/plugins/fusion-plugin-whatsapp-chat/ is staged with a valid manifest", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-whatsapp-chat");
+    const manifestPath = join(stagedRoot, "manifest.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string; name?: string };
+    expect(manifest.id).toBe("fusion-plugin-whatsapp-chat");
+    expect(typeof manifest.name).toBe("string");
+    expect(manifest.name?.length).toBeGreaterThan(0);
+  });
+
+  it("dist/plugins/fusion-plugin-cli-printing-press/ is staged with source entry for bundled install", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-cli-printing-press");
+    const manifestPath = join(stagedRoot, "manifest.json");
+    const packageJsonPath = join(stagedRoot, "package.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string; name?: string };
+    expect(manifest.id).toBe("fusion-plugin-cli-printing-press");
+    expect(typeof manifest.name).toBe("string");
+    expect(manifest.name?.length).toBeGreaterThan(0);
+
+    expect(existsSync(join(stagedRoot, "src", "index.ts"))).toBe(true);
+    const stagedPkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
+      exports?: { "."?: { import?: string } };
+    };
+    expect(stagedPkg.exports?.["."]?.import).toBe("./src/index.ts");
+  });
+
+  it("dist/plugins/fusion-plugin-openclaw-runtime/ is staged with required bridge assets", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-openclaw-runtime");
+    const manifestPath = join(stagedRoot, "manifest.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    expect(existsSync(join(stagedRoot, "bundled.js"))).toBe(true);
+    expect(existsSync(join(stagedRoot, "mcp-schema-server.cjs"))).toBe(true);
+  });
+
+  it("dist/plugins/fusion-plugin-droid-runtime/ is staged with required bridge assets", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-droid-runtime");
+    const manifestPath = join(stagedRoot, "manifest.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string };
+    expect(manifest.id).toBe("fusion-plugin-droid-runtime");
+    expect(existsSync(join(stagedRoot, "bundled.js"))).toBe(true);
+    expect(existsSync(join(stagedRoot, "mcp-schema-server.cjs"))).toBe(true);
+  });
+
+  it("dist/plugins/fusion-plugin-cursor-runtime/ is staged with a valid manifest", () => {
+    const stagedRoot = join(cliRoot, "dist", "plugins", "fusion-plugin-cursor-runtime");
+    const manifestPath = join(stagedRoot, "manifest.json");
+
+    expect(existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { id?: string; name?: string };
+    expect(manifest.id).toBe("fusion-plugin-cursor-runtime");
     expect(typeof manifest.name).toBe("string");
     expect(manifest.name?.length).toBeGreaterThan(0);
   });

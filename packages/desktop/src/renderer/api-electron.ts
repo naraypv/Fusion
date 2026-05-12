@@ -18,7 +18,7 @@ export interface ApiResponsePayload {
 
 export interface ElectronApiLike {
   invoke?: (channel: string, payload?: unknown) => Promise<unknown>;
-  getServerPort?: () => Promise<number>;
+  getServerPort?: () => Promise<number | undefined>;
 }
 
 export interface WindowLike {

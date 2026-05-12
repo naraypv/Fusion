@@ -204,6 +204,7 @@ export type PluginLifecycleTransition =
   | "enabled"
   | "disabled"
   | "error"
+  | "state-changed"
   | "uninstalled"
   | "settings-updated";
 
@@ -214,11 +215,25 @@ export type MessageSseEventType =
   | "message:read"
   | "message:deleted";
 
+export type ApprovalSseEventType = "approval:requested" | "approval:updated" | "approval:decided";
+
+type ApprovalSseListener = (event: ApprovalSseEventType, payload: unknown, projectId?: string) => void;
+
+const approvalSseListeners = new Set<ApprovalSseListener>();
+
+export function emitApprovalSseEvent(event: ApprovalSseEventType, payload: unknown, projectId?: string): void {
+  for (const listener of approvalSseListeners) {
+    listener(event, payload, projectId);
+  }
+}
+
 /**
  * Normalized plugin lifecycle payload emitted via SSE.
  * This is the stable contract the UI can reconcile.
  */
 export interface PluginLifecyclePayload {
+  /** Global install metadata event vs project runtime-state event */
+  scope: "global" | "project";
   /** Plugin identifier */
   pluginId: string;
   /** Normalized transition type */
@@ -261,13 +276,10 @@ function mapSourceEventToTransition(
       return "disabled";
 
     case "plugin:stateChanged":
-      // If the new state is "error", emit the "error" transition
       if (plugin.state === "error") {
         return "error";
       }
-      // For other state changes (started, stopped), we don't emit a dedicated transition
-      // but still emit the lifecycle event for observability
-      return "error"; // Map to "error" as a fallback for non-standard state transitions
+      return "state-changed";
 
     case "plugin:unregistered":
       return "uninstalled";
@@ -291,12 +303,15 @@ function createPluginLifecyclePayload(
   plugin: PluginInstallation,
   projectId?: string,
 ): PluginLifecyclePayload {
+  const transition = mapSourceEventToTransition(sourceEvent, plugin);
+  const scope = transition === "installing" || transition === "uninstalled" ? "global" : "project";
   return {
+    scope,
     pluginId: plugin.id,
-    transition: mapSourceEventToTransition(sourceEvent, plugin),
+    transition,
     sourceEvent,
     timestamp: new Date().toISOString(),
-    projectId,
+    projectId: scope === "project" ? projectId : undefined,
     enabled: plugin.enabled,
     state: plugin.state,
     version: plugin.version,
@@ -553,6 +568,11 @@ export function createSSE(
       send(`event: message:deleted\ndata: ${JSON.stringify({ id: messageId })}\n\n`);
     };
 
+    const onApprovalEvent: ApprovalSseListener = (event, payload, eventProjectId) => {
+      if (projectId && eventProjectId && eventProjectId !== projectId) return;
+      send(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    };
+
     // --- Chat store event handlers ---
     const onChatSessionCreated = (session: unknown) => {
       send(`event: chat:session:created\ndata: ${JSON.stringify(session)}\n\n`);
@@ -572,6 +592,38 @@ export function createSSE(
 
     const onChatMessageDeleted = (messageId: string) => {
       send(`event: chat:message:deleted\ndata: ${JSON.stringify({ id: messageId })}\n\n`);
+    };
+
+    const onChatRoomCreated = (room: unknown) => {
+      send(`event: chat:room:created\ndata: ${JSON.stringify(room)}\n\n`);
+    };
+
+    const onChatRoomUpdated = (room: unknown) => {
+      send(`event: chat:room:updated\ndata: ${JSON.stringify(room)}\n\n`);
+    };
+
+    const onChatRoomDeleted = (roomId: string) => {
+      send(`event: chat:room:deleted\ndata: ${JSON.stringify({ id: roomId })}\n\n`);
+    };
+
+    const onChatRoomMemberAdded = (member: unknown) => {
+      send(`event: chat:room:member:added\ndata: ${JSON.stringify(member)}\n\n`);
+    };
+
+    const onChatRoomMemberRemoved = (payload: unknown) => {
+      send(`event: chat:room:member:removed\ndata: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    const onChatRoomMessageAdded = (message: unknown) => {
+      send(`event: chat:room:message:added\ndata: ${JSON.stringify(message)}\n\n`);
+    };
+
+    const onChatRoomMessageUpdated = (message: unknown) => {
+      send(`event: chat:room:message:updated\ndata: ${JSON.stringify(message)}\n\n`);
+    };
+
+    const onChatRoomMessageDeleted = (messageId: string) => {
+      send(`event: chat:room:message:deleted\ndata: ${JSON.stringify({ id: messageId })}\n\n`);
     };
 
     // --- Automation store event handlers ---
@@ -668,12 +720,21 @@ export function createSSE(
         messageStore.off("message:read", onMessageRead);
         messageStore.off("message:deleted", onMessageDeleted);
       }
+      approvalSseListeners.delete(onApprovalEvent);
       if (chatStore) {
         chatStore.off("chat:session:created", onChatSessionCreated);
         chatStore.off("chat:session:updated", onChatSessionUpdated);
         chatStore.off("chat:session:deleted", onChatSessionDeleted);
         chatStore.off("chat:message:added", onChatMessageAdded);
         chatStore.off("chat:message:deleted", onChatMessageDeleted);
+        chatStore.off("chat:room:created", onChatRoomCreated);
+        chatStore.off("chat:room:updated", onChatRoomUpdated);
+        chatStore.off("chat:room:deleted", onChatRoomDeleted);
+        chatStore.off("chat:room:member:added", onChatRoomMemberAdded);
+        chatStore.off("chat:room:member:removed", onChatRoomMemberRemoved);
+        chatStore.off("chat:room:message:added", onChatRoomMessageAdded);
+        chatStore.off("chat:room:message:updated", onChatRoomMessageUpdated);
+        chatStore.off("chat:room:message:deleted", onChatRoomMessageDeleted);
       }
       if (automationStore) {
         automationStore.off("schedule:created", onScheduleCreated);
@@ -776,6 +837,14 @@ export function createSSE(
       chatStore.on("chat:session:deleted", onChatSessionDeleted);
       chatStore.on("chat:message:added", onChatMessageAdded);
       chatStore.on("chat:message:deleted", onChatMessageDeleted);
+      chatStore.on("chat:room:created", onChatRoomCreated);
+      chatStore.on("chat:room:updated", onChatRoomUpdated);
+      chatStore.on("chat:room:deleted", onChatRoomDeleted);
+      chatStore.on("chat:room:member:added", onChatRoomMemberAdded);
+      chatStore.on("chat:room:member:removed", onChatRoomMemberRemoved);
+      chatStore.on("chat:room:message:added", onChatRoomMessageAdded);
+      chatStore.on("chat:room:message:updated", onChatRoomMessageUpdated);
+      chatStore.on("chat:room:message:deleted", onChatRoomMessageDeleted);
     }
 
     if (automationStore) {
@@ -796,6 +865,8 @@ export function createSSE(
     // Sent as a named event so the client's EventSource can detect it
     // (SSE comments starting with ":" are silently consumed and never
     // fire event listeners in the browser).
+    approvalSseListeners.add(onApprovalEvent);
+
     registerManagedConnection({
       id: connectionId,
       clientId,

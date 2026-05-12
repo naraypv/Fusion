@@ -71,6 +71,10 @@ import {
   fetchAgentRunTimeline,
   streamChatResponse,
   fetchMemoryBackendStatus,
+  fetchPluginDashboardViews,
+  fetchPluginUiSlots,
+  fetchTaskReviewData,
+  refreshTaskReviewData,
   type ProjectInfo,
   type ProjectHealth,
   type ActivityFeedEntry,
@@ -78,6 +82,8 @@ import {
   type GlobalConcurrencyState,
   type ExecutorStats,
   type ExecutorState,
+  triggerInsightRun,
+  fetchTaskCommitAssociations,
 } from "../api";
 import type { Task, TaskDetail, BatchStatusResponse, MergeResult } from "@fusion/core";
 import { clearAuthToken } from "../auth";
@@ -214,6 +220,43 @@ describe("fetchTaskDetail", () => {
 
     await expect(fetchTaskDetail("FN-001")).rejects.toThrow("Server error");
     expect(globalThis.fetch).toHaveBeenCalledTimes(2); // initial + 1 retry
+  });
+});
+
+describe("fetchTaskCommitAssociations", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("requests the commit-associations endpoint", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      taskId: "FN-001",
+      lineageId: "lineage-1",
+      associations: [],
+    }));
+
+    await fetchTaskCommitAssociations("FN-001");
+
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/commit-associations", {
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  it("adds projectId query when provided", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      taskId: "FN-001",
+      lineageId: "lineage-1",
+      associations: [],
+    }));
+
+    await fetchTaskCommitAssociations("FN-001", "project-abc");
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "/api/tasks/FN-001/commit-associations?projectId=project-abc",
+      { headers: { "Content-Type": "application/json" } },
+    );
   });
 });
 
@@ -441,6 +484,33 @@ describe("updateTask", () => {
     expect(body).not.toHaveProperty("executionMode");
   });
 
+  it("sends branch and baseBranch (including null clears) in update payload", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      ...FAKE_TASK,
+      branch: undefined,
+      baseBranch: undefined,
+    }));
+
+    await updateTask("FN-001", { branch: null, baseBranch: "main" });
+
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001", {
+      headers: { "Content-Type": "application/json" },
+      method: "PATCH",
+      body: JSON.stringify({ branch: null, baseBranch: "main" }),
+    });
+  });
+
+  it("omits branch and baseBranch from update payload when unset", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, { ...FAKE_TASK, title: "Updated" }));
+
+    await updateTask("FN-001", { title: "Updated" });
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body).not.toHaveProperty("branch");
+    expect(body).not.toHaveProperty("baseBranch");
+  });
+
   it("sends sourceIssue object when source metadata is provided", async () => {
     const sourceIssue = {
       provider: "github",
@@ -551,6 +621,67 @@ describe("createTask", () => {
     const call = vi.mocked(globalThis.fetch).mock.calls[0];
     const body = JSON.parse((call[1] as RequestInit).body as string);
     expect(body.priority).toBe("urgent");
+  });
+
+  it("serializes branch and baseBranch in create payload", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      ...FAKE_CREATED_TASK,
+      branch: "fusion/fn-branch",
+      baseBranch: "main",
+    }));
+
+    await createTask({
+      description: "Task with branches",
+      branch: "fusion/fn-branch",
+      baseBranch: "main",
+    });
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.branch).toBe("fusion/fn-branch");
+    expect(body.baseBranch).toBe("main");
+  });
+
+  it("omits branch and baseBranch in create payload when unset", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, FAKE_CREATED_TASK));
+
+    await createTask({ description: "Task without branch fields" });
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body).not.toHaveProperty("branch");
+    expect(body).not.toHaveProperty("baseBranch");
+  });
+
+  it("serializes nodeId in create payload when execution target is specified", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, {
+      ...FAKE_CREATED_TASK,
+      nodeId: "node-exec-1",
+    }));
+
+    await createTask({
+      description: "Task with remote execution target",
+      nodeId: "node-exec-1",
+    });
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.nodeId).toBe("node-exec-1");
+  });
+
+  it("routes createTask through node proxy when transportNodeId differs from local node", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, FAKE_CREATED_TASK));
+
+    await createTask(
+      { description: "Proxy-routed task", nodeId: "node-exec-2" },
+      "proj-1",
+      { transportNodeId: "node-remote", localNodeId: "node-local" },
+    );
+
+    const call = vi.mocked(globalThis.fetch).mock.calls[0];
+    expect(call[0]).toBe("/api/proxy/node-remote/tasks?projectId=proj-1");
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.nodeId).toBe("node-exec-2");
   });
 
   it("sends POST with multiple fields including executionMode", async () => {
@@ -689,6 +820,51 @@ describe("task comments api", () => {
     expect(globalThis.fetch).toHaveBeenCalledWith("/api/tasks/FN-001/comments/c1", {
       headers: { "Content-Type": "application/json" },
       method: "DELETE",
+    });
+  });
+});
+
+describe("plugin dashboard view API wrappers", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("fetchPluginDashboardViews calls /api/plugins/dashboard-views", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, [
+      {
+        pluginId: "fusion-plugin-roadmap",
+        view: { viewId: "roadmaps", label: "Roadmaps", componentPath: "./dashboard-view" },
+      },
+    ]));
+
+    const result = await fetchPluginDashboardViews("project-a");
+
+    expect(result).toHaveLength(1);
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/plugins/dashboard-views?projectId=project-a", {
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+
+  it("fetchPluginUiSlots calls /api/plugins/ui-slots and keeps slot shape", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, [
+      {
+        pluginId: "fusion-plugin-roadmap",
+        slot: {
+          slotId: "task-detail-tab",
+          label: "Roadmap Details",
+          componentPath: "./task-detail.js",
+        },
+      },
+    ]));
+
+    const result = await fetchPluginUiSlots("project-a");
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toHaveProperty("slot");
+    expect(globalThis.fetch).toHaveBeenCalledWith("/api/plugins/ui-slots?projectId=project-a", {
+      headers: { "Content-Type": "application/json" },
     });
   });
 });
@@ -936,3 +1112,76 @@ describe("batchUpdateTaskModels", () => {
   });
 });
 
+describe("triggerInsightRun", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    clearAuthToken();
+    localStorage.removeItem("fn.authToken");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearAuthToken();
+    localStorage.removeItem("fn.authToken");
+  });
+
+  it("sends POST to /api/insights/run without model params by default", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, { id: "INSR-test", status: "completed" }));
+
+    await triggerInsightRun("manual");
+
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body).not.toHaveProperty("modelProvider");
+    expect(body).not.toHaveProperty("modelId");
+    expect(body.trigger).toBe("manual");
+  });
+
+  it("includes modelProvider and modelId in POST body when provided", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, { id: "INSR-test", status: "completed" }));
+
+    await triggerInsightRun("manual", undefined, undefined, "openai", "gpt-4o");
+
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body.modelProvider).toBe("openai");
+    expect(body.modelId).toBe("gpt-4o");
+  });
+
+  it("omits model params when provider is empty string", async () => {
+    globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, { id: "INSR-test", status: "completed" }));
+
+    await triggerInsightRun("manual", undefined, undefined, "", "");
+
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(call[1].body);
+    expect(body).not.toHaveProperty("modelProvider");
+    expect(body).not.toHaveProperty("modelId");
+  });
+});
+
+
+describe("task review data api wrappers", () => {
+  it("fetchTaskReviewData calls task review endpoint", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      mockFetchResponse(true, { mode: "reviewer-agent", refreshable: true, fetchedAt: null, summary: null, items: [] })
+    ) as unknown as typeof fetch;
+    await fetchTaskReviewData("FN-123", "proj-1");
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "/api/tasks/FN-123/review?projectId=proj-1",
+      expect.any(Object)
+    );
+  });
+
+  it("refreshTaskReviewData posts to refresh endpoint", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      mockFetchResponse(true, { mode: "pull-request", refreshable: true, fetchedAt: "2026-05-01T00:00:00.000Z", summary: null, items: [] })
+    ) as unknown as typeof fetch;
+    await refreshTaskReviewData("FN-123");
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "/api/tasks/FN-123/review/refresh",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+});

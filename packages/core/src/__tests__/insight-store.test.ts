@@ -173,10 +173,15 @@ describe("InsightStore", () => {
     it("filters by status", () => {
       store.createInsight("proj", { title: "A", category: "quality", status: "confirmed", provenance: createProvenance() });
       store.createInsight("proj", { title: "B", category: "quality", status: "generated", provenance: createProvenance() });
+      store.createInsight("proj", { title: "C", category: "quality", status: "archived", provenance: createProvenance() });
 
       const list = store.listInsights({ projectId: "proj", status: "confirmed" });
       expect(list).toHaveLength(1);
       expect(list[0].title).toBe("A");
+
+      const archived = store.listInsights({ projectId: "proj", status: "archived" });
+      expect(archived).toHaveLength(1);
+      expect(archived[0].title).toBe("C");
     });
 
     it("supports pagination with limit and offset", () => {
@@ -248,6 +253,18 @@ describe("InsightStore", () => {
       expect(updated!.createdAt).toBe(original.createdAt);
       // updatedAt should be >= original.createdAt (updated after creation)
       expect(updated!.updatedAt >= original.createdAt).toBe(true);
+    });
+
+    it("updates status to archived", () => {
+      const original = store.createInsight("proj", {
+        title: "Archive me",
+        category: "quality",
+        status: "confirmed",
+        provenance: createProvenance(),
+      });
+
+      const updated = store.updateInsight(original.id, { status: "archived" });
+      expect(updated?.status).toBe("archived");
     });
 
     it("returns undefined for non-existent insight", () => {
@@ -869,7 +886,7 @@ describe("Migration: pre-33 DB upgrade", () => {
       // Step 1: Create a fresh database at v33 (runs all migrations up to 33)
       const db1 = createDatabase(legacyDir);
       db1.init();
-      expect(db1.getSchemaVersion()).toBe(61);
+      expect(db1.getSchemaVersion()).toBe(72);
       db1.close();
 
       // Step 2: Manually downgrade to version 32 and drop insight tables
@@ -904,7 +921,7 @@ describe("Migration: pre-33 DB upgrade", () => {
       expect(tableNamesBefore).not.toContain("project_insight_runs");
       // Now run init — this triggers the v32→v33 migration
       db3.init();
-      expect(db3.getSchemaVersion()).toBe(61);
+      expect(db3.getSchemaVersion()).toBe(72);
 
       // Step 4: Verify insight tables exist after migration
       const tablesAfter = db3.prepare(
@@ -935,15 +952,67 @@ describe("Migration: pre-33 DB upgrade", () => {
     try {
       const db1 = createDatabase(testDir);
       db1.init();
-      expect(db1.getSchemaVersion()).toBe(61);
+      expect(db1.getSchemaVersion()).toBe(72);
       db1.close();
 
       const db2 = createDatabase(testDir);
       expect(() => db2.init()).not.toThrow();
-      expect(db2.getSchemaVersion()).toBe(61);
+      expect(db2.getSchemaVersion()).toBe(72);
       db2.close();
     } finally {
       rmSync(testDir, { recursive: true, force: true });
+    }
+  });
+
+  it("ensureInsightRunsSchemaCompatibility adds lifecycle column to legacy table", () => {
+    const compatDir = mkdtempSync(join(tmpdir(), "fn-insight-compat-"));
+
+    try {
+      // Step 1: Create a fresh DB and run migrations
+      const db1 = createDatabase(compatDir);
+      db1.init();
+      expect(db1.getSchemaVersion()).toBe(72);
+
+      // Step 2: Strip lifecycle and cancelledAt columns by recreating the
+      // table without them. This simulates a DB that was created before the
+      // lifecycle columns were added and already past v59 when they landed.
+      db1.exec(`
+        CREATE TABLE project_insight_runs_legacy AS
+          SELECT id, projectId, trigger, status, summary, error,
+                 insightsCreated, insightsUpdated, inputMetadata, outputMetadata,
+                 createdAt, startedAt, completedAt
+          FROM project_insight_runs
+      `);
+      db1.exec("DROP TABLE project_insight_runs");
+      db1.exec("ALTER TABLE project_insight_runs_legacy RENAME TO project_insight_runs");
+
+      // Verify lifecycle column is gone
+      const colsBefore = db1.prepare("PRAGMA table_info(project_insight_runs)").all() as Array<{ name: string }>;
+      const colNamesBefore = colsBefore.map((c) => c.name);
+      expect(colNamesBefore).not.toContain("lifecycle");
+      expect(colNamesBefore).not.toContain("cancelledAt");
+      db1.close();
+
+      // Step 3: Re-open — ensureInsightRunsSchemaCompatibility should add the
+      // missing columns unconditionally.
+      const db2 = createDatabase(compatDir);
+      db2.init();
+
+      const colsAfter = db2.prepare("PRAGMA table_info(project_insight_runs)").all() as Array<{ name: string }>;
+      const colNamesAfter = colsAfter.map((c) => c.name);
+      expect(colNamesAfter).toContain("lifecycle");
+      expect(colNamesAfter).toContain("cancelledAt");
+
+      // Step 4: Creating a run must not throw — proves the INSERT path works
+      // with the restored columns.
+      const s = new InsightStore(db2);
+      const run = s.createRun("proj", { trigger: "manual" });
+      expect(run.id).toBeTruthy();
+      expect(run.lifecycle).toBeDefined();
+
+      db2.close();
+    } finally {
+      rmSync(compatDir, { recursive: true, force: true });
     }
   });
 });

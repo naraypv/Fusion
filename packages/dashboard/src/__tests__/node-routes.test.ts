@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { Task } from "@fusion/core";
 import { request } from "../test-request.js";
@@ -15,10 +15,12 @@ const mockCheckNodeHealth = vi.fn();
 const mockUpdateProject = vi.fn();
 const mockAssignProjectToNode = vi.fn();
 const mockUnassignProjectFromNode = vi.fn();
-const mockGetMeshState = vi.fn();
+const mockGetLocalMeshSnapshot = vi.fn();
+const mockGetLocalNode = vi.fn();
 const mockGetNodeVersionInfo = vi.fn();
 const mockSyncPlugins = vi.fn();
 const mockCheckVersionCompatibility = vi.fn();
+const mockListProjectNodePathMappingsForNode = vi.fn();
 
 vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
@@ -36,10 +38,12 @@ vi.mock("@fusion/core", async () => {
       updateProject: mockUpdateProject,
       assignProjectToNode: mockAssignProjectToNode,
       unassignProjectFromNode: mockUnassignProjectFromNode,
-      getMeshState: mockGetMeshState,
+      getLocalMeshSnapshot: mockGetLocalMeshSnapshot,
+      getLocalNode: mockGetLocalNode,
       getNodeVersionInfo: mockGetNodeVersionInfo,
       syncPlugins: mockSyncPlugins,
       checkVersionCompatibility: mockCheckVersionCompatibility,
+      listProjectNodePathMappingsForNode: mockListProjectNodePathMappingsForNode,
     })),
   };
 });
@@ -98,6 +102,10 @@ function makeNode(overrides: Partial<Record<string, unknown>> = {}) {
 describe("Node routes", () => {
   const app = createServer(new MockStore() as any);
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockListNodes.mockResolvedValue([]);
@@ -133,16 +141,20 @@ describe("Node routes", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
-    mockGetMeshState.mockResolvedValue({
-      nodeId: "node_local",
-      nodeName: "local-node",
-      nodeUrl: undefined,
-      status: "online",
-      metrics: null,
-      lastSeen: "2026-01-01T00:00:00.000Z",
-      connectedAt: "2026-01-01T00:00:00.000Z",
-      knownPeers: [],
-    });
+    mockGetLocalNode.mockResolvedValue({ id: "node_local", type: "local" });
+    mockGetLocalMeshSnapshot.mockResolvedValue([
+      {
+        nodeId: "node_local",
+        nodeName: "local-node",
+        nodeUrl: undefined,
+        nodeType: "local",
+        status: "online",
+        metrics: null,
+        lastSeen: "2026-01-01T00:00:00.000Z",
+        connectedAt: "2026-01-01T00:00:00.000Z",
+        knownPeers: [],
+      },
+    ]);
     mockGetNodeVersionInfo.mockResolvedValue(undefined);
     mockSyncPlugins.mockResolvedValue({
       localNodeId: "node_local",
@@ -158,6 +170,156 @@ describe("Node routes", () => {
       status: "compatible",
       message: "Versions match",
     });
+    mockListProjectNodePathMappingsForNode.mockResolvedValue([]);
+  });
+
+  describe("POST /api/nodes/discover-projects", () => {
+    it("returns normalized remote project discovery payload on success", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ([
+          {
+            id: "proj_1",
+            name: "Project One",
+            path: "/srv/project-one",
+            status: "active",
+            isolationMode: "in-process",
+          },
+        ]),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const res = await request(
+        app,
+        "POST",
+        "/api/nodes/discover-projects",
+        JSON.stringify({ url: "https://node.example.com", apiKey: "secret" }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        projects: [
+          {
+            id: "proj_1",
+            name: "Project One",
+            path: "/srv/project-one",
+            status: "active",
+            isolationMode: "in-process",
+          },
+        ],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://node.example.com/api/projects",
+        expect.objectContaining({
+          method: "GET",
+          headers: { Authorization: "Bearer secret" },
+          signal: expect.any(AbortSignal),
+        }),
+      );
+    });
+
+    it("returns upstream HTTP failure status and message", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        json: async () => ({ error: "upstream down" }),
+      }));
+
+      const res = await request(
+        app,
+        "POST",
+        "/api/nodes/discover-projects",
+        JSON.stringify({ url: "https://node.example.com" }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ error: "upstream down" });
+    });
+
+    it("returns 401 when upstream rejects auth", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        json: async () => ({ error: "Invalid API key" }),
+      }));
+
+      const res = await request(
+        app,
+        "POST",
+        "/api/nodes/discover-projects",
+        JSON.stringify({ url: "https://node.example.com", apiKey: "wrong" }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: "Invalid API key" });
+    });
+
+    it("rejects malformed upstream payload", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ projects: [] }),
+      }));
+
+      const res = await request(
+        app,
+        "POST",
+        "/api/nodes/discover-projects",
+        JSON.stringify({ url: "https://node.example.com" }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(res.status).toBe(502);
+      expect(res.body).toEqual({ error: "Remote node returned malformed project discovery payload" });
+    });
+
+    it("returns 504 on timeout/unreachable abort", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(Object.assign(new Error("aborted"), { name: "AbortError" })));
+
+      const res = await request(
+        app,
+        "POST",
+        "/api/nodes/discover-projects",
+        JSON.stringify({ url: "https://node.example.com" }),
+        { "Content-Type": "application/json" },
+      );
+
+      expect(res.status).toBe(504);
+      expect(res.body).toEqual({ error: "Remote node discovery request timed out" });
+    });
+  });
+
+  it("GET /api/nodes/:id/path-mappings returns node mappings", async () => {
+    mockListProjectNodePathMappingsForNode.mockResolvedValue([
+      {
+        projectId: "proj_1",
+        nodeId: "node_local",
+        path: "/tmp/project",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+
+    const res = await request(app, "GET", "/api/nodes/node_local/path-mappings");
+
+    expect(res.status).toBe(200);
+    expect(mockListProjectNodePathMappingsForNode).toHaveBeenCalledWith("node_local");
+  });
+
+  it("GET /api/nodes/:id/path-mappings returns 404 when node missing", async () => {
+    mockListProjectNodePathMappingsForNode.mockRejectedValue(new Error("Node not found: node_missing"));
+
+    const res = await request(app, "GET", "/api/nodes/node_missing/path-mappings");
+
+    expect(res.status).toBe(404);
   });
 
   it("GET /api/nodes returns an empty array when no nodes are registered", async () => {
@@ -337,42 +499,38 @@ describe("Node routes", () => {
     expect(res.status).toBe(404);
   });
 
-  it("GET /api/mesh/state returns mesh topology state", async () => {
-    const localMeshState = {
-      nodeId: "node_local",
-      nodeName: "local",
-      nodeUrl: undefined,
-      status: "online" as const,
-      metrics: null,
-      lastSeen: "2026-01-01T00:00:00.000Z",
-      connectedAt: "2026-01-01T00:00:00.000Z",
-      knownPeers: [],
-    };
-    const remoteMeshState = {
-      nodeId: "node_remote",
-      nodeName: "remote",
-      nodeUrl: "http://remote:3001",
-      status: "online" as const,
-      metrics: { cpuUsage: 30, memoryUsed: 2e9, memoryTotal: 8e9, storageUsed: 100e9, storageTotal: 500e9, uptime: 3600000, reportedAt: "2026-01-01T00:00:00.000Z" },
-      lastSeen: "2026-01-01T00:00:00.000Z",
-      connectedAt: "2026-01-01T00:00:00.000Z",
-      knownPeers: [{ id: "peer_1", nodeId: "node_remote", peerNodeId: "node_local", name: "local", url: "http://localhost:3001", status: "online" as const, lastSeen: "2026-01-01T00:00:00.000Z", connectedAt: "2026-01-01T00:00:00.000Z" }],
-    };
-
+  it("GET /api/mesh/state returns mesh topology snapshot", async () => {
     mockListNodes.mockResolvedValue([
       makeNode({ id: "node_local", name: "local", type: "local" }),
       makeNode({ id: "node_remote", name: "remote", type: "remote", url: "http://remote:3001" }),
     ]);
-    mockGetMeshState
-      .mockResolvedValueOnce(localMeshState)
-      .mockResolvedValueOnce(remoteMeshState);
+
+    const remoteMeshState = {
+      sourceNodeId: "node_remote",
+      collectedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [
+        {
+          nodeId: "node_remote",
+          nodeName: "remote",
+          nodeUrl: "http://remote:3001",
+          nodeType: "remote" as const,
+          status: "online" as const,
+          metrics: { cpuUsage: 30, memoryUsed: 2e9, memoryTotal: 8e9, storageUsed: 100e9, storageTotal: 500e9, uptime: 3600000, reportedAt: "2026-01-01T00:00:00.000Z" },
+          lastSeen: "2026-01-01T00:00:00.000Z",
+          connectedAt: "2026-01-01T00:00:00.000Z",
+          knownPeers: [{ id: "peer_1", nodeId: "node_remote", peerNodeId: "node_local", name: "local", url: "http://localhost:3001", status: "online" as const, lastSeen: "2026-01-01T00:00:00.000Z", connectedAt: "2026-01-01T00:00:00.000Z" }],
+        },
+      ],
+    };
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => remoteMeshState }));
 
     const res = await request(app, "GET", "/api/mesh/state");
 
     expect(res.status).toBe(200);
-    expect((res.body as any[])).toHaveLength(2);
-    expect((res.body as any[])[0].nodeId).toBe("node_local");
-    expect((res.body as any[])[1].nodeId).toBe("node_remote");
+    expect((res.body as { nodes: Array<{ nodeId: string }> }).nodes).toHaveLength(2);
+    expect((res.body as { nodes: Array<{ nodeId: string }> }).nodes[0].nodeId).toBe("node_local");
+    expect((res.body as { nodes: Array<{ nodeId: string }> }).nodes[1].nodeId).toBe("node_remote");
   });
 
   it("GET /api/nodes/:id/metrics returns systemMetrics from node", async () => {

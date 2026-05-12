@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { CronRunner, createAiPromptExecutor, isInProcessBackupCommand } from "../cron-runner.js";
+import { CronRunner, createAiPromptExecutor, isInProcessBackupCommand, isInProcessMemoryBackupCommand, isInProcessScheduledEvalCommand } from "../cron-runner.js";
 import type { AiPromptExecutor } from "../cron-runner.js";
 import type { TaskStore, AutomationStore, ScheduledTask, AutomationRunResult, AutomationStep, Settings } from "@fusion/core";
 import { randomUUID } from "node:crypto";
@@ -15,6 +15,10 @@ const piModuleMocks = vi.hoisted(() => ({
   promptWithFallback: vi.fn(),
 }));
 
+const coreModuleMocks = vi.hoisted(() => ({
+  runMemoryBackupCommand: vi.fn(),
+}));
+
 vi.mock("../logger.js", () => ({
   createLogger: () => ({
     log: cronLoggerSpies.log,
@@ -27,6 +31,14 @@ vi.mock("../pi.js", () => ({
   createFnAgent: piModuleMocks.createFnAgent,
   promptWithFallback: piModuleMocks.promptWithFallback,
 }));
+
+vi.mock("@fusion/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@fusion/core")>();
+  return {
+    ...actual,
+    runMemoryBackupCommand: coreModuleMocks.runMemoryBackupCommand,
+  };
+});
 
 // Default settings inline to avoid @fusion/core build dependency during tests
 const DEFAULT_SETTINGS: Settings = {
@@ -103,6 +115,10 @@ describe("CronRunner", () => {
       session: {
         dispose: vi.fn(),
       },
+    });
+    coreModuleMocks.runMemoryBackupCommand.mockResolvedValue({
+      success: true,
+      output: "memory backup ok",
     });
   });
 
@@ -1841,5 +1857,104 @@ describe("CronRunner", () => {
         expect(isInProcessBackupCommand(cmd)).toBe(false);
       });
     }
+  });
+
+  describe("isInProcessMemoryBackupCommand", () => {
+    const positives = [
+      "fn memory-backup --create",
+      "npx runfusion.ai memory-backup --create",
+      "  fn memory-backup --create  ",
+      "FN MEMORY-BACKUP --CREATE",
+    ];
+
+    const negatives: Array<string | undefined> = [
+      "fn memory-backup --list",
+      "fn memory-backup",
+      "fn backup --create",
+      "",
+      undefined,
+    ];
+
+    for (const cmd of positives) {
+      it(`intercepts: ${cmd}`, () => {
+        expect(isInProcessMemoryBackupCommand(cmd)).toBe(true);
+      });
+    }
+
+    for (const cmd of negatives) {
+      it(`does NOT intercept: ${JSON.stringify(cmd)}`, () => {
+        expect(isInProcessMemoryBackupCommand(cmd)).toBe(false);
+      });
+    }
+  });
+
+  describe("memory backup in-process dispatch", () => {
+    it("routes fn memory-backup --create through runMemoryBackupCommand", async () => {
+      const store = createMockStore() as unknown as TaskStore & { getFusionDir: () => string };
+      store.getFusionDir = vi.fn().mockReturnValue("/tmp/.fusion");
+      const schedule = createMockSchedule({ id: "mem-bk", command: "fn memory-backup --create" });
+      runner = new CronRunner(store, createMockAutomationStore());
+
+      const runResult = await (runner as unknown as { executeLegacyCommand: (s: ScheduledTask, startedAt: string) => Promise<AutomationRunResult> })
+        .executeLegacyCommand(schedule, new Date().toISOString());
+
+      expect(coreModuleMocks.runMemoryBackupCommand).toHaveBeenCalledWith("/tmp/.fusion", expect.any(Object));
+      expect(runResult.success).toBe(true);
+      expect(runResult.output).toContain("memory backup ok");
+    });
+  });
+
+  describe("isInProcessScheduledEvalCommand", () => {
+    it("matches canonical scheduled eval command", () => {
+      expect(isInProcessScheduledEvalCommand("fn eval --scheduled-batch")).toBe(true);
+      expect(isInProcessScheduledEvalCommand("fusion eval --scheduled-batch --flag")).toBe(true);
+    });
+
+    it("rejects non-canonical and shell-metachar commands", () => {
+      expect(isInProcessScheduledEvalCommand("fn eval")).toBe(false);
+      expect(isInProcessScheduledEvalCommand("fn eval --scheduled-batch && echo x")).toBe(false);
+      expect(isInProcessScheduledEvalCommand("echo fn eval --scheduled-batch")).toBe(false);
+    });
+  });
+
+  describe("scheduled eval command feature gating", () => {
+    it("returns a disabled result when evalsView experimental feature is off", async () => {
+      const store = createMockStore({ experimentalFeatures: { evalsView: false } as Settings["experimentalFeatures"] });
+      const schedule = createMockSchedule({ id: "eval-off", command: "fn eval --scheduled-batch" });
+      runner = new CronRunner(store, createMockAutomationStore());
+
+      const runResult = await (runner as unknown as { executeLegacyCommand: (s: ScheduledTask, startedAt: string) => Promise<AutomationRunResult> })
+        .executeLegacyCommand(schedule, new Date().toISOString());
+      expect(runResult.success).toBe(false);
+      expect(runResult.output).toBe("evals-experimental-disabled");
+      expect(runResult.error).toBe("Evals experimental feature is disabled");
+    });
+
+    it("does not return the disabled sentinel when evalsView experimental feature is on", async () => {
+      const store = createMockStore({ experimentalFeatures: { evalsView: true } as Settings["experimentalFeatures"] }) as unknown as {
+        getEvalStore: () => {
+          listRuns: () => Array<{ id: string; status: string; metadata?: Record<string, unknown>; window: { until?: string } }>;
+          createRun: (input: { projectId: string; trigger: string; scope: string; window: { since?: string; until: string }; metadata: Record<string, unknown> }) => { id: string; startedAt?: string; window: { until: string } };
+          appendRunEvent: (runId: string, event: Record<string, unknown>) => void;
+          updateRun: (runId: string, patch: Record<string, unknown>) => void;
+        };
+        listTasks: (opts: { column: string }) => Promise<Array<{ id: string; column: string; createdAt: string; updatedAt: string; executionCompletedAt?: string; title: string; summary?: string }>>;
+      };
+
+      store.getEvalStore = () => ({
+        listRuns: () => [],
+        createRun: () => ({ id: "run-1", window: { until: new Date().toISOString() } }),
+        appendRunEvent: () => {},
+        updateRun: () => {},
+      });
+      store.listTasks = async () => [];
+
+      const schedule = createMockSchedule({ id: "eval-on", command: "fn eval --scheduled-batch" });
+      runner = new CronRunner(store as unknown as TaskStore, createMockAutomationStore());
+
+      const runResult = await (runner as unknown as { executeLegacyCommand: (s: ScheduledTask, startedAt: string) => Promise<AutomationRunResult> })
+        .executeLegacyCommand(schedule, new Date().toISOString());
+      expect(runResult.output).not.toBe("evals-experimental-disabled");
+    });
   });
 });

@@ -1,7 +1,25 @@
 import { defineConfig } from "tsup";
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build as esbuildBuild } from "esbuild";
+
+// Runtime plugin ids that ship inside the published CLI tarball. Each plugin's
+// entry is esbuild-bundled into dist/plugins/<id>/bundled.js with workspace
+// deps (@fusion/plugin-sdk) inlined, since npm publish strips node_modules
+// directories. See ensureBundledPluginInstalled for the loader-side counterpart.
+const RUNTIME_PLUGIN_IDS = [
+  "fusion-plugin-hermes-runtime",
+  "fusion-plugin-openclaw-runtime",
+  "fusion-plugin-paperclip-runtime",
+  "fusion-plugin-cursor-runtime",
+  "fusion-plugin-droid-runtime",
+] as const;
+
+const RUNTIME_PLUGINS_WITH_MCP_SCHEMA_SERVER = new Set([
+  "fusion-plugin-openclaw-runtime",
+  "fusion-plugin-droid-runtime",
+]);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dashboardClientSrc = join(__dirname, "..", "dashboard", "dist", "client");
@@ -14,6 +32,14 @@ const llamaCppSrc = join(__dirname, "..", "pi-llama-cpp");
 const llamaCppDest = join(__dirname, "dist", "pi-llama-cpp");
 const dependencyGraphPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-dependency-graph");
 const dependencyGraphPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-dependency-graph");
+const whatsappChatPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-whatsapp-chat");
+const whatsappChatPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-whatsapp-chat");
+const roadmapPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-roadmap");
+const roadmapPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-roadmap");
+const reportsPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-reports");
+const reportsPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-reports");
+const cliPrintingPressPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-cli-printing-press");
+const cliPrintingPressPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-cli-printing-press");
 const dashboardClientStub = `<!doctype html>
 <html lang="en">
   <head>
@@ -30,6 +56,76 @@ const dashboardClientStub = `<!doctype html>
 </html>
 `;
 
+type BundlePluginEntryOptions = {
+  pluginId: string;
+  srcDir: string;
+  destDir: string;
+  withMcpAsset?: boolean;
+};
+
+async function bundlePluginEntry({ pluginId, srcDir, destDir, withMcpAsset = false }: BundlePluginEntryOptions) {
+  if (existsSync(destDir)) {
+    rmSync(destDir, { recursive: true, force: true });
+  }
+  if (!existsSync(srcDir)) {
+    console.warn(
+      `WARNING: Plugin source not found at ${srcDir}; ${pluginId} will be unavailable in the published package.`,
+    );
+    return;
+  }
+
+  mkdirSync(destDir, { recursive: true });
+  cpSync(join(srcDir, "manifest.json"), join(destDir, "manifest.json"));
+
+  const srcPkg = JSON.parse(readFileSync(join(srcDir, "package.json"), "utf-8"));
+  const destPkg = {
+    name: srcPkg.name,
+    version: srcPkg.version,
+    type: "module",
+    exports: { ".": { import: "./bundled.js" } },
+    private: true,
+  };
+  writeFileSync(join(destDir, "package.json"), JSON.stringify(destPkg, null, 2));
+
+  const srcEntry = join(srcDir, "src", "index.ts");
+  const builtEntry = join(srcDir, "dist", "index.js");
+  const entry = existsSync(srcEntry) ? srcEntry : builtEntry;
+  if (!existsSync(entry)) {
+    throw new Error(`No entry found for ${pluginId} (looked for src/index.ts and dist/index.js)`);
+  }
+
+  await esbuildBuild({
+    entryPoints: [entry],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node22",
+    outfile: join(destDir, "bundled.js"),
+    external: ["@fusion/core", "@fusion/engine"],
+    alias: {
+      "@fusion/plugin-sdk": join(__dirname, "..", "plugin-sdk", "src", "index.ts"),
+    },
+    logLevel: "warning",
+  });
+
+  if (withMcpAsset) {
+    const mcpServerAsset = join(srcDir, "src", "mcp-schema-server.cjs");
+    if (!existsSync(mcpServerAsset)) {
+      throw new Error(
+        `[tsup] Missing required bridge asset for ${pluginId} at ${mcpServerAsset}; expected committed source file mcp-schema-server.cjs.`,
+      );
+    }
+    cpSync(mcpServerAsset, join(destDir, "mcp-schema-server.cjs"));
+  }
+
+  const bundledOutput = join(destDir, "bundled.js");
+  if (!existsSync(bundledOutput)) {
+    throw new Error(`[tsup] Missing bundled output for ${pluginId}: expected ${bundledOutput}`);
+  }
+
+  console.log(`Bundled plugin ${pluginId} to dist/plugins/${pluginId}/bundled.js`);
+}
+
 export default defineConfig({
   entry: ["src/bin.ts", "src/extension.ts"],
   format: ["esm"],
@@ -38,7 +134,7 @@ export default defineConfig({
   esbuildOptions(options) {
     options.conditions = [...(options.conditions || []), "source"];
   },
-  noExternal: [/^@fusion\//],
+  noExternal: [/^@fusion\//, /^@fusion-plugin-examples\//],
   // Native module: leave node-pty (aliased to @homebridge fork) out of the
   // bundle. esbuild can't statically resolve its conditional native require()s
   // (build/Release/pty.node, build/Debug/conpty.node, ...).
@@ -113,19 +209,72 @@ export default defineConfig({
       );
     }
 
-    if (existsSync(dependencyGraphPluginDest)) {
-      rmSync(dependencyGraphPluginDest, { recursive: true, force: true });
+    await bundlePluginEntry({
+      pluginId: "fusion-plugin-dependency-graph",
+      srcDir: dependencyGraphPluginSrc,
+      destDir: dependencyGraphPluginDest,
+    });
+
+    if (existsSync(whatsappChatPluginDest)) {
+      rmSync(whatsappChatPluginDest, { recursive: true, force: true });
     }
-    if (existsSync(dependencyGraphPluginSrc)) {
-      mkdirSync(dependencyGraphPluginDest, { recursive: true });
-      cpSync(join(dependencyGraphPluginSrc, "manifest.json"), join(dependencyGraphPluginDest, "manifest.json"));
-      cpSync(join(dependencyGraphPluginSrc, "package.json"), join(dependencyGraphPluginDest, "package.json"));
-      cpSync(join(dependencyGraphPluginSrc, "src"), join(dependencyGraphPluginDest, "src"), { recursive: true });
-      console.log("Copied dependency graph plugin to dist/plugins/fusion-plugin-dependency-graph/");
+    if (existsSync(whatsappChatPluginSrc)) {
+      mkdirSync(whatsappChatPluginDest, { recursive: true });
+      cpSync(join(whatsappChatPluginSrc, "manifest.json"), join(whatsappChatPluginDest, "manifest.json"));
+      cpSync(join(whatsappChatPluginSrc, "package.json"), join(whatsappChatPluginDest, "package.json"));
+      cpSync(join(whatsappChatPluginSrc, "src"), join(whatsappChatPluginDest, "src"), { recursive: true });
+      console.log("Copied WhatsApp chat plugin to dist/plugins/fusion-plugin-whatsapp-chat/");
     } else {
       console.warn(
-        `WARNING: Dependency graph plugin source not found at ${dependencyGraphPluginSrc}; bundled auto-install will be unavailable.`,
+        `WARNING: WhatsApp chat plugin source not found at ${whatsappChatPluginSrc}; bundled auto-install will be unavailable.`,
       );
+    }
+
+    await bundlePluginEntry({
+      pluginId: "fusion-plugin-roadmap",
+      srcDir: roadmapPluginSrc,
+      destDir: roadmapPluginDest,
+    });
+
+    if (existsSync(reportsPluginDest)) {
+      rmSync(reportsPluginDest, { recursive: true, force: true });
+    }
+    if (existsSync(reportsPluginSrc)) {
+      mkdirSync(reportsPluginDest, { recursive: true });
+      cpSync(join(reportsPluginSrc, "manifest.json"), join(reportsPluginDest, "manifest.json"));
+      cpSync(join(reportsPluginSrc, "package.json"), join(reportsPluginDest, "package.json"));
+      cpSync(join(reportsPluginSrc, "src"), join(reportsPluginDest, "src"), { recursive: true });
+      console.log("Copied reports plugin to dist/plugins/fusion-plugin-reports/");
+    } else {
+      console.warn(
+        `WARNING: Reports plugin source not found at ${reportsPluginSrc}; bundled auto-install will be unavailable.`,
+      );
+    }
+
+    if (existsSync(cliPrintingPressPluginDest)) {
+      rmSync(cliPrintingPressPluginDest, { recursive: true, force: true });
+    }
+    if (existsSync(cliPrintingPressPluginSrc)) {
+      mkdirSync(cliPrintingPressPluginDest, { recursive: true });
+      cpSync(join(cliPrintingPressPluginSrc, "manifest.json"), join(cliPrintingPressPluginDest, "manifest.json"));
+      cpSync(join(cliPrintingPressPluginSrc, "package.json"), join(cliPrintingPressPluginDest, "package.json"));
+      cpSync(join(cliPrintingPressPluginSrc, "src"), join(cliPrintingPressPluginDest, "src"), { recursive: true });
+      console.log("Copied cli-printing-press plugin to dist/plugins/fusion-plugin-cli-printing-press/");
+    } else {
+      console.warn(
+        `WARNING: cli-printing-press plugin source not found at ${cliPrintingPressPluginSrc}; bundled auto-install will be unavailable.`,
+      );
+    }
+
+    // Bundle each runtime plugin into a self-contained ESM file so npm/npx
+    // installs can load them without the workspace `@fusion/plugin-sdk`.
+    for (const pluginId of RUNTIME_PLUGIN_IDS) {
+      await bundlePluginEntry({
+        pluginId,
+        srcDir: join(__dirname, "..", "..", "plugins", pluginId),
+        destDir: join(__dirname, "dist", "plugins", pluginId),
+        withMcpAsset: RUNTIME_PLUGINS_WITH_MCP_SCHEMA_SERVER.has(pluginId),
+      });
     }
 
     if (existsSync(dashboardClientDest)) {

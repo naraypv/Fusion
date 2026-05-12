@@ -68,6 +68,31 @@ vi.mock("../../api", () => ({
         icon: "layout-grid",
         toolMode: "readonly",
       },
+      {
+        id: "plugin:agent-browser:workflow-check",
+        name: "Plugin Workflow Check",
+        description: "Plugin contributed workflow validation",
+        prompt: "Run plugin workflow check",
+        category: "Plugin",
+        icon: "puzzle",
+        toolMode: "coding",
+      },
+    ],
+  })),
+  fetchPluginWorkflowStepTemplates: vi.fn(() => Promise.resolve({
+    templates: [
+      {
+        pluginId: "agent-browser",
+        template: {
+          id: "plugin:agent-browser:workflow-check",
+          name: "Plugin Workflow Check",
+          description: "Plugin contributed workflow validation",
+          prompt: "Run plugin workflow check",
+          category: "Plugin",
+          icon: "puzzle",
+          toolMode: "coding",
+        },
+      },
     ],
   })),
   createWorkflowStepFromTemplate: vi.fn((templateId?: string) => {
@@ -157,6 +182,7 @@ import {
   deleteWorkflowStep,
   refineWorkflowStepPrompt,
   fetchWorkflowStepTemplates,
+  fetchPluginWorkflowStepTemplates,
   createWorkflowStepFromTemplate,
   fetchModels,
 } from "../../api";
@@ -199,7 +225,7 @@ describe("WorkflowStepManager", () => {
     });
   });
 
-  it("opens create form when Add button is clicked", async () => {
+  it("shows create chooser first when Add button is clicked", async () => {
     vi.mocked(fetchWorkflowSteps).mockResolvedValueOnce([]);
 
     render(<WorkflowStepManager isOpen={true} onClose={onClose} addToast={addToast} />);
@@ -210,9 +236,26 @@ describe("WorkflowStepManager", () => {
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
 
-    expect(screen.getByTestId("workflow-step-form")).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-step-name")).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-step-description")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-step-create-chooser")).toBeInTheDocument();
+    expect(screen.getByTestId("create-custom-step")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-step-form")).not.toBeInTheDocument();
+  });
+
+  it("creates a step from chooser template action", async () => {
+    vi.mocked(fetchWorkflowSteps).mockResolvedValue([]);
+
+    render(<WorkflowStepManager isOpen={true} onClose={onClose} addToast={addToast} />);
+
+    await screen.findByTestId("add-workflow-step");
+    fireEvent.click(screen.getByTestId("add-workflow-step"));
+
+    const chooserTemplate = await screen.findByTestId("chooser-template-browser-verification");
+    fireEvent.click(within(chooserTemplate).getByTestId("chooser-add-template-browser-verification"));
+
+    await waitFor(() => {
+      expect(createWorkflowStepFromTemplate).toHaveBeenCalledWith("browser-verification", undefined);
+      expect(addToast).toHaveBeenCalledWith("Added Browser Verification workflow step", "success");
+    });
   });
 
   it("submits new workflow step", async () => {
@@ -227,6 +270,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -399,6 +443,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(screen.getByTestId("workflow-step-mode-selector")).toBeInTheDocument();
     expect(screen.getByTestId("mode-prompt")).toBeInTheDocument();
@@ -415,6 +460,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     // Default is prompt mode — should show prompt field
     expect(screen.getByTestId("workflow-step-prompt")).toBeInTheDocument();
@@ -461,6 +507,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -488,6 +535,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -557,6 +605,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const defaultOnCheckbox = screen.getByTestId("workflow-step-default-on") as HTMLInputElement;
     expect(defaultOnCheckbox).toBeInTheDocument();
@@ -575,6 +624,7 @@ describe("WorkflowStepManager", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -756,6 +806,19 @@ describe("WorkflowStepManager templates tab", () => {
       expect(addToast).toHaveBeenCalledWith("Added Frontend UX Design workflow step", "success");
     });
   });
+
+  it("shows plugin template badge and puzzle icon", async () => {
+    vi.mocked(fetchWorkflowSteps).mockResolvedValueOnce([]);
+
+    render(<WorkflowStepManager isOpen={true} onClose={onClose} addToast={addToast} />);
+
+    fireEvent.click(await screen.findByTestId("tab-templates"));
+
+    const templateCard = await screen.findByTestId("template-plugin:agent-browser:workflow-check");
+    expect(templateCard.querySelector(".lucide-puzzle")).toBeInTheDocument();
+    expect(within(templateCard).getByText("agent-browser")).toBeInTheDocument();
+    expect(fetchPluginWorkflowStepTemplates).toHaveBeenCalled();
+  });
 });
 
 describe("WorkflowStepManager theme class structure", () => {
@@ -847,6 +910,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(container.querySelector(".wfm-form")).toBeInTheDocument();
     expect(container.querySelector(".wfm-form-title")).toBeInTheDocument();
@@ -866,6 +930,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(container.querySelector(".wfm-mode-selector")).toBeInTheDocument();
     expect(container.querySelectorAll(".wfm-mode-btn")).toHaveLength(4); // 2 mode + 2 phase
@@ -883,6 +948,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(container.querySelector(".wfm-prompt-textarea")).toBeInTheDocument();
     expect(container.querySelector(".wfm-prompt-header")).toBeInTheDocument();
@@ -901,6 +967,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(container.querySelector(".wfm-checkbox-label")).toBeInTheDocument();
   });
@@ -917,6 +984,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     expect(container.querySelector(".wfm-form-actions")).toBeInTheDocument();
   });
@@ -949,6 +1017,7 @@ describe("WorkflowStepManager theme class structure", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
     fireEvent.click(screen.getByTestId("mode-script"));
 
     expect(container.querySelector(".wfm-no-scripts")).toBeInTheDocument();
@@ -966,6 +1035,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     // Model override field should be visible in prompt mode
     expect(screen.getByTestId("workflow-step-model-field")).toBeInTheDocument();
@@ -982,6 +1052,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
     fireEvent.click(screen.getByTestId("mode-script"));
 
     // Model override field should NOT be visible in script mode
@@ -998,6 +1069,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     // Select a model via the mock dropdown
     const selectBtn = screen.getByTestId("dropdown-select-Model override for this workflow step");
@@ -1030,6 +1102,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -1066,6 +1139,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     const nameInput = screen.getByTestId("workflow-step-name");
     const descInput = screen.getByTestId("workflow-step-description");
@@ -1222,6 +1296,7 @@ describe("WorkflowStepManager model override", () => {
     });
 
     fireEvent.click(screen.getByTestId("add-workflow-step"));
+    fireEvent.click(screen.getByTestId("create-custom-step"));
 
     // No model selected — clear button should NOT be visible
     expect(screen.queryByTestId("clear-model-override")).not.toBeInTheDocument();

@@ -12,7 +12,6 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import {
   CentralCore,
-  PluginStore,
   PluginLoader,
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
@@ -61,7 +60,7 @@ import {
 } from "./llama-cpp-extension.js";
 import { resolveSelfExtension } from "./self-extension.js";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getClaudeCodeCredentialPaths, getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import { ensureBundledDependencyGraphPluginInstalled } from "../plugins/bundled-plugin-install.js";
 import { syncStartupModels } from "./startup-model-sync.js";
@@ -367,12 +366,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   }
 
   // ── PluginStore: plugin installation management ─────────────────────
-  // Some mocked stores used in tests may not implement getRootDir(); fall
-  // back to the resolved runtime cwd in that case.
-  const storeRootDir = typeof (store as { getRootDir?: () => string }).getRootDir === "function"
-    ? (store as { getRootDir: () => string }).getRootDir()
-    : cwd;
-  const pluginStore = new PluginStore(storeRootDir);
+  const pluginStore = store.getPluginStore();
   await pluginStore.init();
 
   // ── PluginLoader: plugin lifecycle management ───────────────────────
@@ -424,6 +418,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const supplementalAuthStorage = createReadOnlyAuthFileStorage([
     ...getLegacyAuthPaths(),
     getCodexCliAuthPath(),
+    ...getClaudeCodeCredentialPaths(),
   ]);
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, [supplementalAuthStorage]);
   const modelRegistry = ModelRegistry.create(mergedAuthStorage, getModelRegistryModelsPath());

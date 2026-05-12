@@ -576,6 +576,7 @@ describe("scanIdleWorktrees", () => {
 
     const idle = await scanIdleWorktrees("/root", store);
 
+    expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false, startupMemo: true });
     expect(idle).toContain("/root/.worktrees/calm-river");
     expect(idle).toContain("/root/.worktrees/bold-eagle");
     expect(idle).not.toContain("/root/.worktrees/swift-falcon");

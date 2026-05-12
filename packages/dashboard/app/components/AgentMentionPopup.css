@@ -38,8 +38,8 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  padding: 6px 12px;
-  font-size: 13px;
+  padding: calc(var(--space-sm) - (var(--space-xs) / 2)) var(--space-md);
+  font-size: calc(var(--space-sm) + var(--space-xs) * 1.25);
   color: var(--text);
   cursor: pointer;
   border: none;
@@ -74,24 +74,39 @@
 }
 
 .agent-mention-empty {
-  padding: 10px 12px;
-  font-size: 12px;
+  padding: calc(var(--space-sm) + (var(--space-xs) / 2)) var(--space-md);
+  font-size: var(--space-md);
   color: var(--text-dim);
 }
 
-.file-mention-popup-loading .spinner {
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--border);
-  border-top-color: var(--text-muted);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+.agent-mention-section-header {
+  padding: var(--space-xs) var(--space-md);
+  font-size: calc(var(--space-sm) + var(--space-xs) * 0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.agent-mention-hint {
+  padding: var(--space-xs) var(--space-md);
+  font-size: var(--space-md);
+  color: var(--text-muted);
+}
+
+.agent-mention-member-dot {
+  background: var(--color-success);
 }
 
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 768px) {
+  .agent-mention-popup {
+    min-width: 200px;
+    max-width: min(280px, 100%);
   }
 }
 

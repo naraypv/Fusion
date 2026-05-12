@@ -46,6 +46,69 @@ vi.mock("../agent-session-helpers.js", async () => {
       const hint = runtimeConfig?.runtimeHint;
       return typeof hint === "string" && hint.trim().length > 0 ? hint.trim() : undefined;
     },
+    resolveExecutorSessionModel: (
+      taskModelProvider: string | undefined,
+      taskModelId: string | undefined,
+      settings: Record<string, unknown> | undefined,
+      assignedAgentRuntimeConfig?: Record<string, unknown>,
+    ) => {
+      const model = typeof assignedAgentRuntimeConfig?.model === "string" ? assignedAgentRuntimeConfig.model : "";
+      const slash = model.indexOf("/");
+      if (slash > 0 && slash < model.length - 1) {
+        return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+      }
+      if (taskModelProvider && taskModelId) return { provider: taskModelProvider, modelId: taskModelId };
+      if (typeof settings?.executionProvider === "string" && typeof settings?.executionModelId === "string") {
+        return { provider: settings.executionProvider as string, modelId: settings.executionModelId as string };
+      }
+      if (typeof settings?.executionGlobalProvider === "string" && typeof settings?.executionGlobalModelId === "string") {
+        return { provider: settings.executionGlobalProvider as string, modelId: settings.executionGlobalModelId as string };
+      }
+      if (typeof settings?.defaultProviderOverride === "string" && typeof settings?.defaultModelIdOverride === "string") {
+        return { provider: settings.defaultProviderOverride as string, modelId: settings.defaultModelIdOverride as string };
+      }
+      if (typeof settings?.defaultProvider === "string" && typeof settings?.defaultModelId === "string") {
+        return { provider: settings.defaultProvider as string, modelId: settings.defaultModelId as string };
+      }
+      return { provider: undefined, modelId: undefined };
+    },
+    resolvePlanningSessionModel: (
+      taskPlanningModelProvider: string | undefined,
+      taskPlanningModelId: string | undefined,
+      settings: Record<string, unknown> | undefined,
+      assignedAgentRuntimeConfig?: Record<string, unknown>,
+    ) => {
+      const model = typeof assignedAgentRuntimeConfig?.model === "string" ? assignedAgentRuntimeConfig.model : "";
+      const slash = model.indexOf("/");
+      if (slash > 0 && slash < model.length - 1) {
+        return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+      }
+      if (
+        typeof assignedAgentRuntimeConfig?.modelProvider === "string"
+        && typeof assignedAgentRuntimeConfig?.modelId === "string"
+      ) {
+        return {
+          provider: assignedAgentRuntimeConfig.modelProvider,
+          modelId: assignedAgentRuntimeConfig.modelId,
+        };
+      }
+      if (taskPlanningModelProvider && taskPlanningModelId) {
+        return { provider: taskPlanningModelProvider, modelId: taskPlanningModelId };
+      }
+      if (typeof settings?.planningProvider === "string" && typeof settings?.planningModelId === "string") {
+        return { provider: settings.planningProvider as string, modelId: settings.planningModelId as string };
+      }
+      if (typeof settings?.planningGlobalProvider === "string" && typeof settings?.planningGlobalModelId === "string") {
+        return { provider: settings.planningGlobalProvider as string, modelId: settings.planningGlobalModelId as string };
+      }
+      if (typeof settings?.defaultProviderOverride === "string" && typeof settings?.defaultModelIdOverride === "string") {
+        return { provider: settings.defaultProviderOverride as string, modelId: settings.defaultModelIdOverride as string };
+      }
+      if (typeof settings?.defaultProvider === "string" && typeof settings?.defaultModelId === "string") {
+        return { provider: settings.defaultProvider as string, modelId: settings.defaultModelId as string };
+      }
+      return { provider: undefined, modelId: undefined };
+    },
   };
 });
 vi.mock("node:child_process", () => {
@@ -212,6 +275,7 @@ function createMockStore(overrides: Record<string, any> = {}) {
     parseStepsFromPrompt: vi.fn().mockResolvedValue([]),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     getSettings: vi.fn().mockResolvedValue({ ...DEFAULT_SETTINGS }),
+    setPluginWorkflowStepTemplates: vi.fn(),
     getRootDir: vi.fn().mockReturnValue("/tmp/root"),
     getFusionDir: vi.fn().mockReturnValue("/tmp/root/.fusion"),
     getTasksDir: vi.fn().mockReturnValue("/tmp/root/.fusion/tasks"),
@@ -724,8 +788,14 @@ describe("In-progress task resume after restart", () => {
     // Run any pending microtasks (the async code in setTimeout)
     await vi.runAllTimersAsync();
 
-    // Task should move to todo then in-progress (not in-review)
-    expect(store.moveTask).toHaveBeenCalledWith("FN-963", "todo");
+    // Task should move to todo then in-progress (not in-review). The
+    // workflow-rerun bounce passes `preserveWorktree: true` so the
+    // checkout doesn't briefly disappear during the hop.
+    expect(store.moveTask).toHaveBeenCalledWith(
+      "FN-963",
+      "todo",
+      expect.objectContaining({ preserveWorktree: true }),
+    );
     expect(store.moveTask).toHaveBeenCalledWith("FN-963", "in-progress");
 
     vi.useRealTimers();
@@ -962,7 +1032,7 @@ describe("Scheduler after restart", () => {
     await new Promise((r) => setTimeout(r, 50));
     scheduler.stop();
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-070", "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-070", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     expect(store.updateTask).toHaveBeenCalledWith("FN-070", expect.objectContaining({ status: null, blockedBy: null }));
     expect(onSchedule).toHaveBeenCalledWith(todoTask);
   });
@@ -1032,7 +1102,7 @@ describe("Scheduler after restart", () => {
     await new Promise((r) => setTimeout(r, 50));
     scheduler.stop();
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-081", "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-081", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
 
     // 3. Executor resumes in-progress tasks
     vi.clearAllMocks();
@@ -1548,7 +1618,7 @@ describe("Engine pause/unpause cycle", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     // Scheduler should have moved todo task to in-progress
-    expect(store.moveTask).toHaveBeenCalledWith("FN-EP3", "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-EP3", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
 
     // Now simulate engine pause then unpause
     store.moveTask.mockClear();
@@ -1572,7 +1642,7 @@ describe("Engine pause/unpause cycle", () => {
     scheduler.stop();
 
     // The new task should have been scheduled after unpause
-    expect(store.moveTask).toHaveBeenCalledWith("FN-EP4", "in-progress");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-EP4", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
   });
 
   it("concurrency slots freed after agent completes during enginePaused (soft pause)", async () => {

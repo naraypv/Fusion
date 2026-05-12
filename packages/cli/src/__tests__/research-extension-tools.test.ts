@@ -56,10 +56,10 @@ describe("research extension tools", () => {
     expect(api.tools.has("fn_research_retry")).toBe(true);
   });
 
-  it("returns actionable disabled response when research is off", async () => {
+  it("returns feature-disabled response when experimental research flag is off", async () => {
     const store = new TaskStore(tmpDir);
     await store.init();
-    await store.updateSettings({ researchSettings: { enabled: false } });
+    await store.updateSettings({ researchSettings: { enabled: true }, experimentalFeatures: { researchView: false } as Record<string, boolean> });
 
     const runTool = api.tools.get("fn_research_run")!;
     const result = await runTool.execute("call-1", { query: "fusion" }, undefined, undefined, makeCtx(tmpDir));
@@ -68,13 +68,55 @@ describe("research extension tools", () => {
     expect(result.content[0].text).toContain("disabled");
   });
 
+  it("returns feature-disabled contract for list/get/cancel/retry when flag is off", async () => {
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    await store.updateSettings({ researchSettings: { enabled: true }, experimentalFeatures: { researchView: false } as Record<string, boolean> });
+
+    const listResult = await api.tools.get("fn_research_list")!.execute("call-list", {}, undefined, undefined, makeCtx(tmpDir));
+    expect(listResult.details.setup.code).toBe("feature-disabled");
+
+    const getResult = await api.tools.get("fn_research_get")!.execute("call-get", { id: "RR-1" }, undefined, undefined, makeCtx(tmpDir));
+    expect(getResult.details.setup.code).toBe("feature-disabled");
+
+    const cancelResult = await api.tools.get("fn_research_cancel")!.execute("call-cancel", { id: "RR-1" }, undefined, undefined, makeCtx(tmpDir));
+    expect(cancelResult.isError).toBe(true);
+    expect(cancelResult.details.setup.code).toBe("feature-disabled");
+
+    const retryResult = await api.tools.get("fn_research_retry")!.execute("call-retry", { id: "RR-1" }, undefined, undefined, makeCtx(tmpDir));
+    expect(retryResult.isError).toBe(true);
+    expect(retryResult.details.setup.code).toBe("feature-disabled");
+  });
+
+  it("treats builtin as configured when no provider is explicitly set", async () => {
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+    });
+    await store.updateSettings({
+      researchSettings: { enabled: true },
+    });
+
+    const runTool = api.tools.get("fn_research_run")!;
+    const result = await runTool.execute("call-builtin", { query: "fusion" }, undefined, undefined, makeCtx(tmpDir));
+
+    expect(result.details.setup).toBeNull();
+    expect(result.details.status).toBe("queued");
+  });
+
   it("returns actionable missing-credentials response", async () => {
     const store = new TaskStore(tmpDir);
     await store.init();
-    await store.updateSettings({
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
       researchGlobalWebSearchProvider: "tavily",
-      researchSettings: { enabled: true },
       researchGlobalDefaults: { searchProvider: "tavily" },
+    });
+    await store.updateSettings({
+      researchSettings: { enabled: true },
     });
 
     const runTool = api.tools.get("fn_research_run")!;
@@ -87,11 +129,15 @@ describe("research extension tools", () => {
   it("creates, reads, lists, and cancels runs", async () => {
     const store = new TaskStore(tmpDir);
     await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+      researchGlobalWebSearchProvider: "searxng",
+      researchGlobalSearxngUrl: "http://localhost:8888",
+      researchGlobalDefaults: { searchProvider: "searxng" },
+    });
     await store.updateSettings({
-      researchGlobalWebSearchProvider: "tavily",
-      researchGlobalTavilyApiKey: "test-key",
-      researchSettings: { enabled: true },
-      researchGlobalDefaults: { searchProvider: "tavily" },
+      researchSettings: { enabled: true, searchProvider: "searxng" },
     });
 
     const created = store.getResearchStore().createRun({ query: "fusion architecture", topic: "fusion architecture" });
@@ -113,14 +159,119 @@ describe("research extension tools", () => {
     expect(retryBlocked.isError).toBe(true);
   });
 
+  it("returns structured missing-run details for get and cancel", async () => {
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+      researchGlobalWebSearchProvider: "searxng",
+      researchGlobalSearxngUrl: "http://localhost:8888",
+      researchGlobalDefaults: { searchProvider: "searxng" },
+    });
+    await store.updateSettings({
+      researchSettings: { enabled: true, searchProvider: "searxng" },
+    });
+
+    const getTool = api.tools.get("fn_research_get")!;
+    const getResult = await getTool.execute("call-missing-get", { id: "RR-404" }, undefined, undefined, makeCtx(tmpDir));
+    expect(getResult.details.runId).toBe("RR-404");
+    expect(getResult.details.status).toBe("missing");
+    expect(getResult.details.setup.code).toBe("NOT_FOUND");
+
+    const cancelTool = api.tools.get("fn_research_cancel")!;
+    const cancelResult = await cancelTool.execute("call-missing-cancel", { id: "RR-404" }, undefined, undefined, makeCtx(tmpDir));
+    expect(cancelResult.isError).toBe(true);
+    expect(cancelResult.details.runId).toBe("RR-404");
+    expect(cancelResult.details.setup.code).toBe("NOT_FOUND");
+  });
+
+  it("returns completed-run structured findings and citations", async () => {
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+      researchGlobalWebSearchProvider: "searxng",
+      researchGlobalSearxngUrl: "http://localhost:8888",
+      researchGlobalDefaults: { searchProvider: "searxng" },
+    });
+    await store.updateSettings({
+      researchSettings: { enabled: true, searchProvider: "searxng" },
+    });
+
+    const run = store.getResearchStore().createRun({ query: "fusion", topic: "fusion" });
+    store.getResearchStore().setResults(run.id, {
+      summary: "Summary text",
+      findings: [{ heading: "Finding A", content: "Detail A", sources: ["https://example.com/a"] }],
+      citations: [{ title: "Source A", url: "https://example.com/a" }],
+    } as any);
+    store.getResearchStore().updateStatus(run.id, "running");
+    store.getResearchStore().updateStatus(run.id, "completed");
+
+    const getTool = api.tools.get("fn_research_get")!;
+    const result = await getTool.execute("call-complete", { id: run.id }, undefined, undefined, makeCtx(tmpDir));
+    expect(result.details.runId).toBe(run.id);
+    expect(result.details.status).toBe("completed");
+    expect(result.details.summary).toBe("Summary text");
+    expect(result.details.findings).toHaveLength(1);
+    expect(result.details.findings[0]).toMatchObject({ heading: "Finding A", content: "Detail A" });
+    expect(result.details.citations).toHaveLength(1);
+    expect(result.details.citations[0]).toMatchObject({ title: "Source A", url: "https://example.com/a" });
+  });
+
+  it("retries failed run and returns retry linkage metadata", async () => {
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+      researchGlobalWebSearchProvider: "searxng",
+      researchGlobalSearxngUrl: "http://localhost:8888",
+      researchGlobalDefaults: { searchProvider: "searxng" },
+    });
+    await store.updateSettings({
+      researchSettings: { enabled: true, searchProvider: "searxng" },
+    });
+
+    const run = store.getResearchStore().createRun({
+      query: "fusion",
+      topic: "fusion",
+      lifecycle: { retryable: true, attempt: 1, maxAttempts: 3, failureClass: "retryable_transient" },
+    });
+    store.getResearchStore().updateStatus(run.id, "running", {
+      lifecycle: { retryable: true, attempt: 1, maxAttempts: 3, failureClass: "retryable_transient" },
+    });
+    store.getResearchStore().updateStatus(run.id, "failed", {
+      lifecycle: { retryable: true, attempt: 1, maxAttempts: 3, failureClass: "retryable_transient" },
+    });
+
+    const retryTool = api.tools.get("fn_research_retry")!;
+    const retryResult = await retryTool.execute("call-retry", { id: run.id }, undefined, undefined, makeCtx(tmpDir));
+
+    expect(retryResult.isError).not.toBe(true);
+    expect(["queued", "retry_waiting"]).toContain(retryResult.details.status);
+    expect(retryResult.details.runId).not.toBe(run.id);
+
+    const retried = store.getResearchStore().getRun(retryResult.details.runId);
+    expect(retried?.status).toBe("retry_waiting");
+    expect(retried?.lifecycle?.retryOfRunId).toBe(run.id);
+    expect(retried?.lifecycle?.rootRunId).toBe(run.id);
+    expect(retried?.lifecycle?.attempt).toBe(2);
+  });
+
   it("returns INVALID_TRANSITION for cancel on terminal run", async () => {
     const store = new TaskStore(tmpDir);
     await store.init();
+    await store.updateGlobalSettings({
+      experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      researchGlobalEnabled: true,
+      researchGlobalWebSearchProvider: "searxng",
+      researchGlobalSearxngUrl: "http://localhost:8888",
+      researchGlobalDefaults: { searchProvider: "searxng" },
+    });
     await store.updateSettings({
-      researchGlobalWebSearchProvider: "tavily",
-      researchGlobalTavilyApiKey: "test-key",
-      researchSettings: { enabled: true },
-      researchGlobalDefaults: { searchProvider: "tavily" },
+      researchSettings: { enabled: true, searchProvider: "searxng" },
     });
 
     const run = store.getResearchStore().createRun({ query: "fusion", topic: "fusion" });

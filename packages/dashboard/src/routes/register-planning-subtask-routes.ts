@@ -1,8 +1,32 @@
-import { resolvePlanningSettingsModel, type TaskStore, type PlanningSummary } from "@fusion/core";
+import {
+  DEFAULT_TASK_PRIORITY,
+  resolvePlanningSettingsModel,
+  TASK_PRIORITIES,
+  type PlanningSummary,
+  type TaskPriority,
+  type TaskStore,
+} from "@fusion/core";
 import { ApiError, badRequest, notFound, rateLimited } from "../api-error.js";
+import { maybeCreateTrackingIssue } from "../github-tracking.js";
 import { writeSSEEvent, type SessionBufferedEvent } from "../sse-buffer.js";
 import type { AiSessionStore } from "../ai-session-store.js";
 import type { ApiRoutesContext } from "./types.js";
+import { derivePerTaskBranch, resolveBranchAssignmentContext, resolveBranchSelection } from "./branch-selection.js";
+
+async function maybeCreateTaskTrackingIssue(taskStore: TaskStore, task: import("@fusion/core").Task): Promise<void> {
+  const projectSettings = await taskStore.getSettings();
+  const globalSettings = (await taskStore.getGlobalSettingsStore?.()?.getSettings?.()) ?? {};
+  try {
+    await maybeCreateTrackingIssue(task, {
+      taskStore,
+      projectSettings,
+      globalSettings,
+      logger: console,
+    });
+  } catch {
+    // best-effort only
+  }
+}
 
 interface PlanningSubtaskRouteDeps {
   store: TaskStore;
@@ -163,10 +187,14 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
 
   router.post("/subtasks/create-tasks", async (req, res) => {
     try {
-      const { sessionId, subtasks, parentTaskId } = req.body as {
+      const { sessionId, subtasks, parentTaskId, branch, baseBranch, branchSelection, branchAssignment } = req.body as {
         sessionId?: string;
         subtasks?: Array<{ tempId: string; title: string; description: string; size?: "S" | "M" | "L"; dependsOn?: string[] }>;
         parentTaskId?: string;
+        branch?: unknown;
+        baseBranch?: unknown;
+        branchSelection?: unknown;
+        branchAssignment?: unknown;
       };
 
       if (!sessionId || typeof sessionId !== "string") {
@@ -195,6 +223,16 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         }
       }
 
+      const { branch: resolvedBranch, baseBranch: resolvedBaseBranch } =
+        resolveBranchSelection(branchSelection, branch, baseBranch);
+      const { mode: branchMode } = resolveBranchAssignmentContext(branchAssignment);
+      const planningBranchContext = {
+        groupId: `planning:${sessionId}`,
+        source: "planning" as const,
+        assignmentMode: branchMode,
+        inheritedBaseBranch: resolvedBaseBranch,
+      };
+
       const createdTasks = [] as Awaited<ReturnType<TaskStore["createTask"]>>[];
       const tempIdToTaskId = new Map<string, string>();
 
@@ -202,6 +240,10 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         if (!item || typeof item.tempId !== "string" || typeof item.title !== "string" || !item.title.trim()) {
           throw badRequest("Each subtask must include tempId and title");
         }
+
+        const taskBranch = branchMode === "per-task-derived"
+          ? derivePerTaskBranch(resolvedBranch, item.title || item.tempId)
+          : resolvedBranch;
 
         const task = await scopedStore.createTask({
           title: item.title.trim(),
@@ -214,7 +256,11 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
           validatorModelProvider: parentTask?.validatorModelProvider,
           validatorModelId: parentTask?.validatorModelId,
           source: { sourceType: "api", sourceParentTaskId: typeof parentTaskId === "string" ? parentTaskId : undefined },
+          branch: taskBranch,
+          baseBranch: resolvedBaseBranch,
+          branchContext: planningBranchContext,
         });
+        await maybeCreateTaskTrackingIssue(scopedStore, task);
 
         tempIdToTaskId.set(item.tempId, task.id);
         createdTasks.push(task);
@@ -887,6 +933,9 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
     }
   });
 
+  const isTaskPriority = (value: unknown): value is TaskPriority =>
+    typeof value === "string" && (TASK_PRIORITIES as readonly string[]).includes(value);
+
   const parsePlanningSummaryOverride = (summaryInput: unknown): PlanningSummary | undefined => {
     if (summaryInput === undefined) {
       return undefined;
@@ -913,6 +962,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         summary.suggestedSize === "S" || summary.suggestedSize === "M" || summary.suggestedSize === "L"
           ? summary.suggestedSize
           : "M",
+      priority: isTaskPriority(summary.priority) ? summary.priority : DEFAULT_TASK_PRIORITY,
       suggestedDependencies: Array.isArray(summary.suggestedDependencies)
         ? summary.suggestedDependencies.filter((dep): dep is string => typeof dep === "string" && dep.trim().length > 0)
         : [],
@@ -930,9 +980,12 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
    */
   router.post("/planning/create-task", async (req, res) => {
     try {
-      const { sessionId, summary: summaryInput } = req.body as {
+      const { sessionId, summary: summaryInput, branch, baseBranch, branchSelection } = req.body as {
         sessionId?: unknown;
         summary?: unknown;
+        branch?: unknown;
+        baseBranch?: unknown;
+        branchSelection?: unknown;
       };
 
       if (!sessionId || typeof sessionId !== "string") {
@@ -973,6 +1026,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
               title?: unknown;
               description?: unknown;
               suggestedSize?: unknown;
+              priority?: unknown;
               suggestedDependencies?: unknown;
               keyDeliverables?: unknown;
             };
@@ -992,6 +1046,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
                 parsedSummary.suggestedSize === "L"
                   ? parsedSummary.suggestedSize
                   : "M",
+              priority: isTaskPriority(parsedSummary.priority) ? parsedSummary.priority : DEFAULT_TASK_PRIORITY,
               suggestedDependencies: Array.isArray(parsedSummary.suggestedDependencies)
                 ? parsedSummary.suggestedDependencies.filter((dep): dep is string => typeof dep === "string")
                 : [],
@@ -1024,14 +1079,21 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         throw badRequest("Planning session is not complete");
       }
 
+      const { branch: resolvedBranch, baseBranch: resolvedBaseBranch } =
+        resolveBranchSelection(branchSelection, branch, baseBranch);
+
       // Create the task
       const task = await scopedStore.createTask({
         title: summary.title,
         description: summary.description,
         column: "triage",
         dependencies: summary.suggestedDependencies.length > 0 ? summary.suggestedDependencies : undefined,
+        priority: isTaskPriority(summary.priority) ? summary.priority : DEFAULT_TASK_PRIORITY,
         source: { sourceType: "api" },
+        branch: resolvedBranch,
+        baseBranch: resolvedBaseBranch,
       });
+      await maybeCreateTaskTrackingIssue(scopedStore, task);
 
       // Update task with suggested size if provided
       if (summary.suggestedSize) {
@@ -1115,15 +1177,20 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
    */
   router.post("/planning/create-tasks", async (req, res) => {
     try {
-      const { planningSessionId, subtasks } = req.body as {
+      const { planningSessionId, subtasks, branch, baseBranch, branchSelection, branchAssignment } = req.body as {
         planningSessionId?: string;
         subtasks?: Array<{
           id: string;
           title: string;
           description: string;
           suggestedSize: "S" | "M" | "L";
+          priority?: TaskPriority;
           dependsOn: string[];
         }>;
+        branch?: unknown;
+        baseBranch?: unknown;
+        branchSelection?: unknown;
+        branchAssignment?: unknown;
       };
 
       if (!planningSessionId || typeof planningSessionId !== "string") {
@@ -1156,20 +1223,42 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         if (!item || typeof item.id !== "string" || typeof item.title !== "string" || !item.title.trim()) {
           throw badRequest("Each subtask must include id and title");
         }
+        if (item.priority !== undefined && !isTaskPriority(item.priority)) {
+          throw badRequest("Each subtask priority must be one of low, normal, high, urgent");
+        }
       }
+
+      const { branch: resolvedBranch, baseBranch: resolvedBaseBranch } =
+        resolveBranchSelection(branchSelection, branch, baseBranch);
+      const { mode: branchMode } = resolveBranchAssignmentContext(branchAssignment);
+      const planningBranchContext = {
+        groupId: `planning:${planningSessionId}`,
+        source: "planning" as const,
+        assignmentMode: branchMode,
+        inheritedBaseBranch: resolvedBaseBranch,
+      };
 
       const createdTasks = [] as Awaited<ReturnType<TaskStore["createTask"]>>[];
       const tempIdToTaskId = new Map<string, string>();
 
       // Create tasks
       for (const item of subtasks) {
+        const taskBranch = branchMode === "per-task-derived"
+          ? derivePerTaskBranch(resolvedBranch, item.title || item.id)
+          : resolvedBranch;
+
         const task = await scopedStore.createTask({
           title: item.title.trim(),
           description: typeof item.description === "string" ? item.description.trim() : item.title.trim(),
           column: "triage",
           dependencies: undefined,
+          priority: isTaskPriority(item.priority) ? item.priority : DEFAULT_TASK_PRIORITY,
           source: { sourceType: "api", sourceMetadata: { planningSessionId } },
+          branch: taskBranch,
+          baseBranch: resolvedBaseBranch,
+          branchContext: planningBranchContext,
         });
+        await maybeCreateTaskTrackingIssue(scopedStore, task);
 
         tempIdToTaskId.set(item.id, task.id);
         createdTasks.push(task);

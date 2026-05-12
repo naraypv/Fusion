@@ -5,6 +5,12 @@ import { fileURLToPath } from "node:url";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { PluginLoader } from "../plugin-loader.js";
+import * as loggerModule from "../logger.js";
+
+const scanPluginSecurityMock = vi.fn();
+vi.mock("../plugin-security-scan.js", () => ({
+  scanPluginSecurity: (...args: unknown[]) => scanPluginSecurityMock(...args),
+}));
 
 vi.mock("@mariozechner/pi-ai", () => ({
   AssistantMessageEventStream: class AssistantMessageEventStream {
@@ -123,6 +129,8 @@ function droidPluginModulePath(): string {
 // Mock TaskStore for testing
 const mockTaskStore = {
   logActivity: vi.fn(),
+  getRootDir: () => "/tmp/plugin-loader-test-root",
+  getPluginStore: vi.fn(),
 } as any;
 
 type MockStructuredLogger = {
@@ -131,8 +139,7 @@ type MockStructuredLogger = {
   error: ReturnType<typeof vi.fn>;
 };
 
-async function loadPluginLoaderWithMockedLogger() {
-  vi.resetModules();
+function mockStructuredLoggerFactory() {
   const loggerMap = new Map<string, MockStructuredLogger>();
   const createLoggerMock = vi.fn((prefix: string): MockStructuredLogger => {
     const existing = loggerMap.get(prefix);
@@ -147,12 +154,10 @@ async function loadPluginLoaderWithMockedLogger() {
     return logger;
   });
 
-  vi.doMock("../logger.js", () => ({
-    createLogger: createLoggerMock,
-  }));
-
-  const { PluginLoader: MockedPluginLoader } = await import("../plugin-loader.js");
-  return { MockedPluginLoader, createLoggerMock, loggerMap };
+  // Use a spy instead of resetModules/doMock so this suite cannot corrupt
+  // other modules' live exports (notably plugin-types normalization helpers).
+  vi.spyOn(loggerModule, "createLogger").mockImplementation(createLoggerMock);
+  return { createLoggerMock, loggerMap };
 }
 
 describe("PluginLoader", () => {
@@ -162,7 +167,7 @@ describe("PluginLoader", () => {
 
   beforeEach(() => {
     rootDir = makeTmpDir();
-    pluginStore = new PluginStore(rootDir, { inMemoryDb: true });
+    pluginStore = new PluginStore(rootDir, { inMemoryDb: true, centralGlobalDir: rootDir });
     setCreateAiSessionFactory(undefined);
   });
 
@@ -301,6 +306,16 @@ describe("PluginLoader", () => {
   // ── loadPlugin ─────────────────────────────────────────────────────
 
   describe("loadPlugin", () => {
+    beforeEach(() => {
+      scanPluginSecurityMock.mockReset();
+      scanPluginSecurityMock.mockResolvedValue({
+        verdict: "clean",
+        summary: "clean",
+        findings: [],
+        scannedAt: new Date().toISOString(),
+        scannedFiles: ["manifest.json"],
+      });
+    });
     it("loads a valid plugin from file path", async () => {
       await pluginStore.init();
 
@@ -431,6 +446,50 @@ describe("PluginLoader", () => {
       await expect(loader.loadPlugin("disabled-test")).rejects.toThrow(
         "disabled",
       );
+    });
+
+    it("blocks load when ai scan verdict is blocked", async () => {
+      await pluginStore.init();
+      scanPluginSecurityMock.mockResolvedValueOnce({
+        verdict: "blocked",
+        summary: "blocked by scan",
+        findings: [],
+        scannedAt: new Date().toISOString(),
+        scannedFiles: ["manifest.json"],
+      });
+
+      const plugin = makePlugin(makeManifest({ id: "scan-blocked" }));
+      const pluginDir = join(rootDir, "plugins");
+      const pluginPath = await writePluginModule(pluginDir, "index.js", plugin);
+
+      await pluginStore.registerPlugin({
+        manifest: plugin.manifest,
+        path: pluginPath,
+        aiScanOnLoad: true,
+      });
+
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      await expect(loader.loadPlugin("scan-blocked")).rejects.toThrow("Security scan blocked");
+      expect(loader.isPluginLoaded("scan-blocked")).toBe(false);
+    });
+
+    it("runs ai scan before loading when aiScanOnLoad is enabled", async () => {
+      await pluginStore.init();
+
+      const plugin = makePlugin(makeManifest({ id: "scan-enabled" }));
+      const pluginDir = join(rootDir, "plugins");
+      const pluginPath = await writePluginModule(pluginDir, "index.js", plugin);
+
+      await pluginStore.registerPlugin({
+        manifest: plugin.manifest,
+        path: pluginPath,
+        aiScanOnLoad: true,
+      });
+
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      await loader.loadPlugin("scan-enabled");
+
+      expect(scanPluginSecurityMock).toHaveBeenCalledWith(expect.objectContaining({ pluginId: "scan-enabled" }));
     });
 
     it("loads dependencies before loading dependent", async () => {
@@ -728,6 +787,42 @@ export default plugin;
       expect(loader.isPluginLoaded("remove-test")).toBe(false);
     });
 
+    it("passes plugin context to onUnload", async () => {
+      await pluginStore.init();
+
+      const plugin = makePlugin(makeManifest({ id: "stop-context-test" }));
+      const pluginDir = join(rootDir, "plugins");
+      const pluginPath = await writePluginWithHooks(
+        pluginDir,
+        "stop-context.js",
+        {
+          onUnload:
+            "(ctx => { globalThis.__pluginUnloadCtx = { pluginId: ctx.pluginId, taskStore: ctx.taskStore }; })",
+        },
+        plugin.manifest,
+      );
+
+      await pluginStore.registerPlugin({
+        manifest: plugin.manifest,
+        path: pluginPath,
+      });
+
+      const loader = new PluginLoader({
+        pluginStore,
+        taskStore: mockTaskStore,
+      });
+
+      await loader.loadPlugin("stop-context-test");
+      await loader.stopPlugin("stop-context-test");
+
+      const unloadCtx = (globalThis as { __pluginUnloadCtx?: { pluginId: string; taskStore: unknown } })
+        .__pluginUnloadCtx;
+      expect(unloadCtx).toBeDefined();
+      expect(unloadCtx?.pluginId).toBe("stop-context-test");
+      expect(unloadCtx?.taskStore).toBe(mockTaskStore);
+      delete (globalThis as { __pluginUnloadCtx?: unknown }).__pluginUnloadCtx;
+    });
+
     it("no-ops for non-loaded plugin", async () => {
       await pluginStore.init();
 
@@ -876,8 +971,12 @@ export default plugin;
   // ── structured logging ──────────────────────────────────────────────
 
   describe("structured logging", () => {
-    afterEach(() => {
-      vi.doUnmock("./logger.js");
+
+    it("keeps plugin-types normalization exports callable after logger mocking", async () => {
+      mockStructuredLoggerFactory();
+      const pluginTypes = await import("../plugin-types.js");
+      expect(typeof pluginTypes.normalizePluginUiContributionDefinition).toBe("function");
+      expect(typeof pluginTypes.normalizePluginUiContributionSurface).toBe("function");
     });
 
     it("logs when skipping a disabled plugin", async () => {
@@ -893,8 +992,8 @@ export default plugin;
       });
       await pluginStore.disablePlugin("disabled-log-test");
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await expect(loader.loadPlugin("disabled-log-test")).rejects.toThrow("disabled");
       expect(loggerMap.get("plugin-loader")?.log).toHaveBeenCalledWith(
@@ -914,8 +1013,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin("already-loaded-log");
       await loader.loadPlugin("already-loaded-log");
@@ -937,8 +1036,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin("reload-log-test");
       await loader.reloadPlugin("reload-log-test");
@@ -961,8 +1060,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin(pluginId);
       await writePluginWithHooks(
@@ -1002,8 +1101,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin(pluginId);
       await writePluginWithHooks(
@@ -1041,8 +1140,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin(pluginId);
       await loader.stopPlugin(pluginId);
@@ -1074,8 +1173,8 @@ export default plugin;
         path: badPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadAllPlugins();
 
@@ -1088,8 +1187,8 @@ export default plugin;
     it("logs invokeHook failures", async () => {
       await pluginStore.init();
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       (loader as any).plugins.set("hook-error-log", {
         manifest: makeManifest({ id: "hook-error-log" }),
@@ -1130,8 +1229,8 @@ export default plugin;
         path: pluginPath,
       });
 
-      const { MockedPluginLoader, loggerMap } = await loadPluginLoaderWithMockedLogger();
-      const loader = new MockedPluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const { loggerMap } = mockStructuredLoggerFactory();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
 
       await loader.loadPlugin(pluginId);
 
@@ -1568,6 +1667,56 @@ export default plugin;
 
 
 
+  describe("getPluginUiContributions", () => {
+    it("returns normalized structured contributions and sorts deterministically", async () => {
+      await pluginStore.init();
+
+      const loader = new PluginLoader({
+        pluginStore,
+        taskStore: mockTaskStore,
+      });
+
+      (loader as any).plugins.set("plugin-b", {
+        manifest: makeManifest({ id: "plugin-b" }),
+        state: "started",
+        hooks: {},
+        uiContributions: [
+          {
+            surface: "onboarding-recommendation-card",
+            contributionId: "rec-b",
+            providerId: "openai",
+            title: "OpenAI",
+            reason: "default",
+            order: 10,
+          },
+        ],
+      } as FusionPlugin);
+
+      (loader as any).plugins.set("plugin-a", {
+        manifest: makeManifest({ id: "plugin-a" }),
+        state: "started",
+        hooks: {},
+        uiContributions: [
+          {
+            surface: "settings-integration-card",
+            contributionId: "cfg-a",
+            sectionId: "openai",
+            title: "OpenAI settings",
+            pluginSettingKeys: ["openai.apiKey"],
+            order: 1,
+          },
+        ],
+      } as FusionPlugin);
+
+      const contributions = loader.getPluginUiContributions();
+
+      expect(contributions).toHaveLength(2);
+      expect(contributions[0]?.pluginId).toBe("plugin-a");
+      expect(contributions[0]?.contribution.surface).toBe("settings-config-section");
+      expect(contributions[1]?.contribution.surface).toBe("onboarding-provider-recommendation");
+    });
+  });
+
   describe("getPluginDashboardViews", () => {
     it("returns empty array when no plugins loaded", async () => {
       await pluginStore.init();
@@ -1619,6 +1768,44 @@ export default plugin;
         "views-b:timeline",
       ]);
       expect(loader.getPluginUiSlots()).toHaveLength(1);
+      expect(loader.getPluginTools()).toEqual([]);
+      expect(loader.getPluginRoutes()).toEqual([]);
+    });
+
+    it("returns pluginId and complete view payload for each dashboard view entry", async () => {
+      await pluginStore.init();
+      const loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("views-shape", {
+        manifest: makeManifest({ id: "views-shape" }),
+        state: "started",
+        hooks: {},
+        dashboardViews: [
+          {
+            viewId: "graph",
+            label: "Graph",
+            componentPath: "./graph.js",
+            icon: "Network",
+            placement: "more",
+            description: "Task dependency graph",
+            order: 40,
+          },
+        ],
+      } as FusionPlugin);
+
+      expect(loader.getPluginDashboardViews()).toEqual([
+        {
+          pluginId: "views-shape",
+          view: {
+            viewId: "graph",
+            label: "Graph",
+            componentPath: "./graph.js",
+            icon: "Network",
+            placement: "more",
+            description: "Task dependency graph",
+            order: 40,
+          },
+        },
+      ]);
     });
   });
 
@@ -1893,10 +2080,45 @@ export default plugin;
     it("returns empty arrays when no contribution types are present", async () => {
       await pluginStore.init();
       loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      expect(loader.getCliProviderContributions()).toEqual([]);
       expect(loader.getPluginSkills()).toEqual([]);
       expect(loader.getPluginWorkflowSteps()).toEqual([]);
+      expect(loader.getPluginWorkflowStepTemplates()).toEqual([]);
       expect(loader.getPluginPromptContributions()).toEqual([]);
       expect(loader.getPluginSetupInfo()).toEqual([]);
+    });
+
+    it("getCliProviderContributions returns contributed CLI providers with pluginId", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("cli-provider-plugin", {
+        manifest: makeManifest({ id: "cli-provider-plugin" }),
+        state: "started",
+        hooks: {},
+        cliProviders: [
+          {
+            providerId: "cursor-cli",
+            displayName: "Cursor CLI",
+            binaryName: "cursor-agent",
+            providerType: "cli",
+            statusRoute: "/providers/cursor-cli/status",
+            authRoute: "/auth/cursor-cli",
+          },
+        ],
+      } as FusionPlugin);
+      expect(loader.getCliProviderContributions()).toEqual([
+        {
+          pluginId: "cli-provider-plugin",
+          contribution: {
+            providerId: "cursor-cli",
+            displayName: "Cursor CLI",
+            binaryName: "cursor-agent",
+            providerType: "cli",
+            statusRoute: "/providers/cursor-cli/status",
+            authRoute: "/auth/cursor-cli",
+          },
+        },
+      ]);
     });
 
     it("getPluginSkills returns skills with pluginId", async () => {
@@ -1941,6 +2163,19 @@ export default plugin;
           step: { stepId: "wf", name: "WF", description: "desc", mode: "prompt", prompt: "check" },
         },
       ]);
+      expect(loader.getPluginWorkflowStepTemplates()).toEqual([
+        {
+          pluginId: "contrib-plugin",
+          template: expect.objectContaining({
+            id: "plugin:contrib-plugin:wf",
+            name: "WF",
+            description: "desc",
+            prompt: "check",
+            category: "Plugin",
+            icon: "puzzle",
+          }),
+        },
+      ]);
       expect(loader.getPluginPromptContributions()).toEqual([
         {
           pluginId: "contrib-plugin",
@@ -1956,6 +2191,48 @@ export default plugin;
           pluginId: "contrib-plugin",
           manifest: { binaryName: "agent-browser", description: "Binary" },
           hooks: { checkSetup },
+        },
+      ]);
+    });
+
+    it("getPluginWorkflowStepTemplates maps multiple plugins with prefixed ids", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("alpha", {
+        manifest: makeManifest({ id: "alpha" }),
+        state: "started",
+        hooks: {},
+        workflowSteps: [{ stepId: "one", name: "One", description: "First", mode: "script", scriptName: "check" }],
+      } as FusionPlugin);
+      (loader as any).plugins.set("beta", {
+        manifest: makeManifest({ id: "beta" }),
+        state: "started",
+        hooks: {},
+        workflowSteps: [{ stepId: "two", name: "Two", description: "Second", mode: "prompt" }],
+      } as FusionPlugin);
+
+      expect(loader.getPluginWorkflowStepTemplates()).toEqual([
+        {
+          pluginId: "alpha",
+          template: expect.objectContaining({
+            id: "plugin:alpha:one",
+            name: "One",
+            description: "First",
+            prompt: "",
+            category: "Plugin",
+            icon: "puzzle",
+          }),
+        },
+        {
+          pluginId: "beta",
+          template: expect.objectContaining({
+            id: "plugin:beta:two",
+            name: "Two",
+            description: "Second",
+            prompt: "",
+            category: "Plugin",
+            icon: "puzzle",
+          }),
         },
       ]);
     });
@@ -1985,6 +2262,224 @@ export default plugin;
 
       (loader as any).plugins.delete("stopped-plugin");
       expect(loader.getPluginSkills().map((entry) => entry.pluginId)).toEqual(["started-plugin"]);
+    });
+  });
+
+  describe("plugin setup lifecycle", () => {
+    it("checkPluginSetup returns installed for plugins without setup", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("plain-plugin", {
+        manifest: makeManifest({ id: "plain-plugin" }),
+        state: "started",
+        hooks: {},
+      } as FusionPlugin);
+
+      await expect(loader.checkPluginSetup("plain-plugin")).resolves.toEqual({ status: "installed" });
+    });
+
+    it("checkPluginSetup throws when plugin is not loaded", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      await expect(loader.checkPluginSetup("missing-plugin")).rejects.toThrow('Plugin "missing-plugin" is not loaded');
+    });
+
+    it("checkPluginSetup calls hook and returns result", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const checkSetup = vi.fn().mockResolvedValue({ status: "installed", version: "1.2.3", binaryPath: "/bin/agent-browser" });
+      (loader as any).plugins.set("setup-plugin", {
+        manifest: makeManifest({ id: "setup-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary" },
+          hooks: { checkSetup },
+        },
+      } as FusionPlugin);
+
+      await expect(loader.checkPluginSetup("setup-plugin")).resolves.toEqual({
+        status: "installed",
+        version: "1.2.3",
+        binaryPath: "/bin/agent-browser",
+      });
+      expect(checkSetup).toHaveBeenCalledTimes(1);
+    });
+
+    it("checkPluginSetup returns error status when hook throws", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const checkSetup = vi.fn().mockRejectedValue(new Error("probe failed"));
+      (loader as any).plugins.set("error-setup-plugin", {
+        manifest: makeManifest({ id: "error-setup-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: { manifest: { binaryName: "agent-browser", description: "Binary" }, hooks: { checkSetup } },
+      } as FusionPlugin);
+
+      await expect(loader.checkPluginSetup("error-setup-plugin")).resolves.toEqual({ status: "error", error: "probe failed" });
+    });
+
+    it("checkPluginSetup returns error status when hook times out", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      vi.useFakeTimers();
+      const checkSetup = vi.fn().mockImplementation(() => new Promise(() => undefined));
+      (loader as any).plugins.set("timeout-setup-plugin", {
+        manifest: makeManifest({ id: "timeout-setup-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary", defaultTimeoutMs: 5 },
+          hooks: { checkSetup },
+        },
+      } as FusionPlugin);
+
+      const resultPromise = loader.checkPluginSetup("timeout-setup-plugin");
+      await vi.advanceTimersByTimeAsync(6);
+      await expect(resultPromise).resolves.toEqual({
+        status: "error",
+        error: 'Setup check for "timeout-setup-plugin" timed out after 5ms',
+      });
+      vi.useRealTimers();
+    });
+
+    it("checkPluginSetup respects manifest defaultTimeoutMs", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      vi.useFakeTimers();
+      const checkSetup = vi.fn().mockImplementation(() => new Promise(() => undefined));
+      (loader as any).plugins.set("custom-timeout-setup-plugin", {
+        manifest: makeManifest({ id: "custom-timeout-setup-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary", defaultTimeoutMs: 12 },
+          hooks: { checkSetup },
+        },
+      } as FusionPlugin);
+
+      const resultPromise = loader.checkPluginSetup("custom-timeout-setup-plugin");
+      await vi.advanceTimersByTimeAsync(11);
+      expect(checkSetup).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(resultPromise).resolves.toEqual({
+        status: "error",
+        error: 'Setup check for "custom-timeout-setup-plugin" timed out after 12ms',
+      });
+      vi.useRealTimers();
+    });
+
+    it("installPluginSetup calls install hook", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const install = vi.fn().mockResolvedValue(undefined);
+      (loader as any).plugins.set("install-plugin", {
+        manifest: makeManifest({ id: "install-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary" },
+          hooks: { checkSetup: vi.fn().mockResolvedValue({ status: "installed" }), install },
+        },
+      } as FusionPlugin);
+
+      await expect(loader.installPluginSetup("install-plugin")).resolves.toBeUndefined();
+      expect(install).toHaveBeenCalledTimes(1);
+    });
+
+    it("installPluginSetup throws when plugin has no install hook", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("no-install-plugin", {
+        manifest: makeManifest({ id: "no-install-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: { manifest: { binaryName: "agent-browser", description: "Binary" }, hooks: { checkSetup: vi.fn() } },
+      } as FusionPlugin);
+
+      await expect(loader.installPluginSetup("no-install-plugin")).rejects.toThrow('Plugin "no-install-plugin" has no install hook');
+    });
+
+    it("installPluginSetup throws when plugin is not loaded", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      await expect(loader.installPluginSetup("missing-install-plugin")).rejects.toThrow('Plugin "missing-install-plugin" is not loaded');
+    });
+
+    it("installPluginSetup throws on timeout", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      vi.useFakeTimers();
+      const install = vi.fn().mockImplementation(() => new Promise(() => undefined));
+      (loader as any).plugins.set("timeout-install-plugin", {
+        manifest: makeManifest({ id: "timeout-install-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary", defaultTimeoutMs: 5 },
+          hooks: { checkSetup: vi.fn(), install },
+        },
+      } as FusionPlugin);
+
+      const installPromise = loader.installPluginSetup("timeout-install-plugin");
+      const installAssertion = expect(installPromise).rejects.toThrow('Install command for "timeout-install-plugin" timed out after 5ms');
+      await vi.advanceTimersByTimeAsync(6);
+      await installAssertion;
+      vi.useRealTimers();
+    });
+
+    it("uninstallPluginSetup calls uninstall hook", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      const uninstall = vi.fn().mockResolvedValue(undefined);
+      (loader as any).plugins.set("uninstall-plugin", {
+        manifest: makeManifest({ id: "uninstall-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary" },
+          hooks: { checkSetup: vi.fn().mockResolvedValue({ status: "installed" }), uninstall },
+        },
+      } as FusionPlugin);
+
+      await expect(loader.uninstallPluginSetup("uninstall-plugin")).resolves.toBeUndefined();
+      expect(uninstall).toHaveBeenCalledTimes(1);
+    });
+
+    it("uninstallPluginSetup returns silently when no uninstall hook", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      (loader as any).plugins.set("no-uninstall-plugin", {
+        manifest: makeManifest({ id: "no-uninstall-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: { manifest: { binaryName: "agent-browser", description: "Binary" }, hooks: { checkSetup: vi.fn() } },
+      } as FusionPlugin);
+
+      await expect(loader.uninstallPluginSetup("no-uninstall-plugin")).resolves.toBeUndefined();
+    });
+
+    it("uninstallPluginSetup respects timeout", async () => {
+      await pluginStore.init();
+      loader = new PluginLoader({ pluginStore, taskStore: mockTaskStore });
+      vi.useFakeTimers();
+      const uninstall = vi.fn().mockImplementation(() => new Promise(() => undefined));
+      (loader as any).plugins.set("timeout-uninstall-plugin", {
+        manifest: makeManifest({ id: "timeout-uninstall-plugin" }),
+        state: "started",
+        hooks: {},
+        setup: {
+          manifest: { binaryName: "agent-browser", description: "Binary", defaultTimeoutMs: 5 },
+          hooks: { checkSetup: vi.fn(), uninstall },
+        },
+      } as FusionPlugin);
+
+      const uninstallPromise = loader.uninstallPluginSetup("timeout-uninstall-plugin");
+      const uninstallAssertion = expect(uninstallPromise).rejects.toThrow('Uninstall command for "timeout-uninstall-plugin" timed out after 5ms');
+      await vi.advanceTimersByTimeAsync(6);
+      await uninstallAssertion;
+      vi.useRealTimers();
     });
   });
 

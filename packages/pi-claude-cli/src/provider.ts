@@ -255,7 +255,13 @@ export function streamViaCli(
         if (broken) return; // Break-early kill, expected
         const stderr = getStderr().trim();
         if (stderr) {
-          console.warn(`[pi-claude-cli] Claude CLI stderr on close: ${stderr}`);
+          if (code === 0 || code === null) {
+            // FN-3815: Claude CLI writes benign MCP bring-up diagnostics to stderr
+            // on clean/abort shutdown; keep these debug-only to avoid false TUI warnings.
+            debugLog(`Claude CLI stderr on close (clean exit): ${stderr}`);
+          } else {
+            console.warn(`[pi-claude-cli] Claude CLI stderr on close: ${stderr}`);
+          }
         }
         if (code !== 0 && code !== null) {
           const message = stderr

@@ -368,6 +368,16 @@ describe("MissionStore", () => {
       expect(batchedResult.summary.completedFeatures).toBe(singleSummary.completedFeatures);
       expect(batchedResult.summary.progressPercent).toBe(singleSummary.progressPercent);
     });
+
+    it("preserves persisted interviewState when listing missions with summaries", () => {
+      const interviewMission = store.createMission({ title: "Interview mission" });
+      store.updateMissionInterviewState(interviewMission.id, "in_progress");
+
+      const listed = store.listMissionsWithSummaries().find((mission) => mission.id === interviewMission.id);
+
+      expect(listed).toBeDefined();
+      expect(listed?.interviewState).toBe("in_progress");
+    });
   });
 
   // ── Batched Health Tests ──────────────────────────────────────────────
@@ -2629,7 +2639,7 @@ describe("MissionStore", () => {
 
   describe("Loop State & Validator Run Schema (v31)", () => {
     it("schema version is 40 after migration", () => {
-      expect(db.getSchemaVersion()).toBe(61);
+      expect(db.getSchemaVersion()).toBe(72);
     });
 
     it("mission_features table has loop state columns", () => {
@@ -3034,6 +3044,20 @@ describe("MissionStore", () => {
 
       store.off("validator-run:completed", eventListener);
     });
+  });
+
+  it("exports and applies mission hierarchy snapshots", () => {
+    const mission = store.createMission({ title: "Snapshot Mission" });
+    const milestone = store.addMilestone(mission.id, { title: "MS" });
+    const slice = store.addSlice(milestone.id, { title: "SL" });
+    store.addFeature(slice.id, { title: "F" });
+
+    const snapshot = store.getMissionHierarchySnapshot();
+    const result = store.applyMissionHierarchySnapshot(snapshot);
+    const snapshot2 = store.getMissionHierarchySnapshot();
+
+    expect(result.applied).toBeGreaterThan(0);
+    expect(snapshot2.payload).toEqual(snapshot.payload);
   });
 });
 

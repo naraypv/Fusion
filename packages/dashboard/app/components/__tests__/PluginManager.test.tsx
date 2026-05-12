@@ -91,6 +91,10 @@ vi.mock("../../api", () => ({
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   })),
+  fetchPluginSetupStatus: vi.fn(() => Promise.resolve({ hasSetup: false })),
+  installPluginSetup: vi.fn(() => Promise.resolve({ success: true })),
+  updatePlugin: vi.fn(() => Promise.resolve({})),
+  rescanPlugin: vi.fn(() => Promise.resolve({})),
   browseDirectory: vi.fn(() => Promise.resolve({
     currentPath: "/home",
     parentPath: "/",
@@ -105,7 +109,12 @@ vi.mock("../../hooks/useConfirm", () => ({
 }));
 
 // Import after vi.mock so the mock is in place
-import { PluginManager, STATE_COLORS } from "../PluginManager";
+import {
+  AGENT_BROWSER_SETTINGS_SCHEMA,
+  BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+  PluginManager,
+  STATE_COLORS,
+} from "../PluginManager";
 import {
   fetchPlugins,
   installPlugin,
@@ -114,6 +123,10 @@ import {
   uninstallPlugin,
   fetchPluginSettings,
   updatePluginSettings,
+  fetchPluginSetupStatus,
+  installPluginSetup,
+  updatePlugin,
+  rescanPlugin,
 } from "../../api";
 
 const addToast = vi.fn();
@@ -172,6 +185,10 @@ beforeEach(() => {
   vi.mocked(uninstallPlugin).mockResolvedValue();
   vi.mocked(fetchPluginSettings).mockResolvedValue({ apiKey: "test-key" });
   vi.mocked(updatePluginSettings).mockResolvedValue({ apiKey: "updated-key" });
+  vi.mocked(fetchPluginSetupStatus).mockResolvedValue({ hasSetup: false });
+  vi.mocked(installPluginSetup).mockResolvedValue({ success: true });
+  vi.mocked(updatePlugin).mockResolvedValue({} as never);
+  vi.mocked(rescanPlugin).mockResolvedValue({} as never);
   
   // EventSource mock setup
   const eventSourceInstance = {
@@ -218,6 +235,24 @@ describe("PluginManager", () => {
     expect(screen.getByText("Loading plugins...")).toBeTruthy();
   });
 
+  it("exports AGENT_BROWSER_SETTINGS_SCHEMA with expected grouped keys", () => {
+    expect(Object.keys(AGENT_BROWSER_SETTINGS_SCHEMA)).toEqual([
+      "enabled",
+      "installChannel",
+      "commandTimeoutMs",
+      "headlessMode",
+      "allowedDomains",
+      "promptExecutorSystem",
+      "promptExecutorTask",
+      "promptTriage",
+      "promptReviewer",
+      "promptHeartbeat",
+      "skillExposure",
+    ]);
+    expect(AGENT_BROWSER_SETTINGS_SCHEMA.promptExecutorSystem?.group).toBe("Prompt Contributions");
+    expect(AGENT_BROWSER_SETTINGS_SCHEMA.skillExposure?.group).toBe("Skills");
+  });
+
   it("renders empty state when no plugins are installed", async () => {
     render(<PluginManager addToast={addToast} />);
 
@@ -226,14 +261,133 @@ describe("PluginManager", () => {
     });
 
     expect(screen.getByText("No plugins installed.")).toBeTruthy();
-    expect(screen.getByText("Agent Browser Runtime")).toBeTruthy();
+    expect(screen.getByText("Agent Browser")).toBeTruthy();
     expect(screen.getByText("Hermes Runtime")).toBeTruthy();
     expect(screen.getByText("Paperclip Runtime")).toBeTruthy();
     expect(screen.getByText("OpenClaw Runtime")).toBeTruthy();
     expect(screen.getByText("Droid Runtime")).toBeTruthy();
+    expect(screen.getByText("Dependency Graph")).toBeTruthy();
+    expect(screen.getByText("Reports")).toBeTruthy();
+    expect(screen.getByText("WhatsApp Chat")).toBeTruthy();
+    expect(screen.getByText("CLI Printing Press")).toBeTruthy();
+    expect(screen.getByText(/Pairs to WhatsApp Web \(multi-device\) with QR or pairing code/i)).toBeTruthy();
   });
 
-  it("installs bundled plugins from the bundled plugin section", async () => {
+  it("renders built-in agent browser metadata-only entry when uninstalled", async () => {
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(fetchPlugins).toHaveBeenCalled();
+    });
+
+    const builtInCard = screen.getAllByText("Agent Browser").find((node) => node.closest(".plugin-builtins-item"))?.closest(".plugin-builtins-item");
+    expect(builtInCard).toBeTruthy();
+    expect(within(builtInCard as HTMLElement).getByText("Built-in metadata only")).toBeTruthy();
+  });
+
+  it("shows setup-required action for installed built-in agent browser", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([
+      {
+        ...mockPlugins[0],
+        id: BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+        name: "Agent Browser",
+      },
+    ]);
+    vi.mocked(fetchPluginSetupStatus).mockResolvedValueOnce({ hasSetup: true, status: "not-installed" });
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Setup required")).toBeTruthy();
+    });
+
+    const builtInCard = screen.getAllByText("Agent Browser").find((node) => node.closest(".plugin-builtins-item"))?.closest(".plugin-builtins-item");
+    expect(builtInCard).toBeTruthy();
+    const setupButton = within(builtInCard as HTMLElement).getByRole("button", { name: /Install Setup/i });
+    await userEvent.click(setupButton);
+
+    await waitFor(() => {
+      expect(installPluginSetup).toHaveBeenCalledWith(BUILTIN_AGENT_BROWSER_PLUGIN_ID, undefined);
+    });
+  });
+
+  it("shows manage action when installed built-in agent browser setup is ready", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([
+      {
+        ...mockPlugins[0],
+        id: BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+        name: "Agent Browser",
+        settingsSchema: {},
+      },
+    ]);
+    vi.mocked(fetchPluginSetupStatus).mockResolvedValueOnce({ hasSetup: true, status: "installed", version: "1.0.0" });
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Setup ready")).toBeTruthy();
+    });
+
+    const builtInCard = screen.getAllByText("Agent Browser").find((node) => node.closest(".plugin-builtins-item"))?.closest(".plugin-builtins-item");
+    expect(builtInCard).toBeTruthy();
+    const manageButton = within(builtInCard as HTMLElement).getByRole("button", { name: /^Manage$/i });
+    await userEvent.click(manageButton);
+
+    await waitFor(() => {
+      expect(fetchPluginSettings).toHaveBeenCalledWith(BUILTIN_AGENT_BROWSER_PLUGIN_ID, undefined);
+    });
+    expect(screen.getByText("Enable Agent Browser")).toBeTruthy();
+    expect(screen.getByLabelText("Install Channel")).toBeTruthy();
+    expect(screen.getByLabelText("Command Timeout (ms)")).toBeTruthy();
+  });
+
+  it("does not show setup-required state when built-in setup check is deferred for non-started plugin", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([
+      {
+        ...mockPlugins[0],
+        id: BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+        name: "Agent Browser",
+        state: "installed",
+      },
+    ]);
+    vi.mocked(fetchPluginSetupStatus).mockResolvedValueOnce({
+      hasSetup: true,
+      setupCheckDeferred: true,
+      deferredReason: "plugin-not-started",
+      pluginState: "installed",
+    });
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Start plugin to check setup")).toBeTruthy();
+    });
+    expect(screen.queryByText("Setup required")).toBeNull();
+  });
+
+  it("keeps setup-required state for true setup errors on started built-in plugins", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([
+      {
+        ...mockPlugins[0],
+        id: BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+        name: "Agent Browser",
+        state: "started",
+      },
+    ]);
+    vi.mocked(fetchPluginSetupStatus).mockResolvedValueOnce({
+      hasSetup: true,
+      status: "error",
+      error: "Binary missing",
+    });
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Setup required")).toBeTruthy();
+    });
+  });
+
+  it("installs built-in runtime plugins from the built-in section", async () => {
     render(<PluginManager addToast={addToast} />);
 
     await waitFor(() => {
@@ -241,7 +395,7 @@ describe("PluginManager", () => {
     });
 
     const hermesLabel = await screen.findByText("Hermes Runtime");
-    const hermesCard = hermesLabel.closest(".plugin-bundled-runtime-item");
+    const hermesCard = hermesLabel.closest(".plugin-builtins-item");
     expect(hermesCard).toBeTruthy();
 
     const installButton = within(hermesCard as HTMLElement).getByRole("button", { name: /Install Hermes Runtime/i });
@@ -249,7 +403,67 @@ describe("PluginManager", () => {
 
     await waitFor(() => {
       expect(installPlugin).toHaveBeenCalledWith({ path: "./plugins/fusion-plugin-hermes-runtime" }, undefined);
-      expect(addToast).toHaveBeenCalledWith("Hermes Runtime installed successfully", "success");
+      expect(addToast).toHaveBeenCalledWith("Hermes Runtime installed globally", "success");
+    });
+  });
+
+  it("installs dependency graph from the built-in section", async () => {
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(fetchPlugins).toHaveBeenCalled();
+    });
+
+    const graphLabel = await screen.findByText("Dependency Graph");
+    const graphCard = graphLabel.closest(".plugin-builtins-item");
+    expect(graphCard).toBeTruthy();
+
+    const installButton = within(graphCard as HTMLElement).getByRole("button", { name: /Install Dependency Graph/i });
+    await userEvent.click(installButton);
+
+    await waitFor(() => {
+      expect(installPlugin).toHaveBeenCalledWith({ path: "./plugins/fusion-plugin-dependency-graph" }, undefined);
+      expect(addToast).toHaveBeenCalledWith("Dependency Graph installed globally", "success");
+    });
+  });
+
+  it("installs reports from the built-in section", async () => {
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(fetchPlugins).toHaveBeenCalled();
+    });
+
+    const reportsLabel = await screen.findByText("Reports");
+    const reportsCard = reportsLabel.closest(".plugin-builtins-item");
+    expect(reportsCard).toBeTruthy();
+
+    const installButton = within(reportsCard as HTMLElement).getByRole("button", { name: /Install Reports/i });
+    await userEvent.click(installButton);
+
+    await waitFor(() => {
+      expect(installPlugin).toHaveBeenCalledWith({ path: "./plugins/fusion-plugin-reports" }, undefined);
+      expect(addToast).toHaveBeenCalledWith("Reports installed globally", "success");
+    });
+  });
+
+  it("installs CLI Printing Press from the built-in section", async () => {
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(fetchPlugins).toHaveBeenCalled();
+    });
+
+    const printingPressLabel = await screen.findByText("CLI Printing Press");
+    const printingPressCard = printingPressLabel.closest(".plugin-builtins-item");
+    expect(printingPressCard).toBeTruthy();
+
+    const installButton = within(printingPressCard as HTMLElement).getByRole("button", { name: /Install CLI Printing Press/i });
+    await userEvent.click(installButton);
+
+    await waitFor(() => {
+      expect(installPlugin).toHaveBeenCalledWith({ path: "./plugins/fusion-plugin-cli-printing-press" }, undefined);
+      expect(addToast).toHaveBeenCalledWith("CLI Printing Press installed globally", "success");
     });
   });
 
@@ -265,7 +479,7 @@ describe("PluginManager", () => {
     expect(screen.getByText("Test Plugin B")).toBeTruthy();
     expect(screen.getByText("v1.0.0")).toBeTruthy();
     expect(screen.getByText("v2.0.0")).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "Bundled Plugins" })).toBeTruthy();
+    expect(screen.getByText("Dependency Graph")).toBeTruthy();
     expect(screen.getAllByText("Not installed").length).toBeGreaterThan(0);
   });
 
@@ -345,7 +559,7 @@ describe("PluginManager", () => {
 
   it("enables plugin when toggle is clicked", async () => {
     vi.mocked(fetchPlugins).mockResolvedValueOnce([{ ...mockPlugins[0], enabled: false }]);
-    vi.mocked(enablePlugin).mockResolvedValueOnce({ ...mockPlugins[0], enabled: true });
+    vi.mocked(enablePlugin).mockResolvedValueOnce({ ...mockPlugins[0], enabled: true, state: "started" });
 
     render(<PluginManager addToast={addToast} />);
 
@@ -361,6 +575,53 @@ describe("PluginManager", () => {
 
     await waitFor(() => {
       expect(enablePlugin).toHaveBeenCalledWith("plugin-a", undefined);
+    });
+
+    expect(addToast).toHaveBeenCalledWith("Test Plugin A enabled for this project", "success");
+    expect(addToast).not.toHaveBeenCalledWith(expect.stringContaining("Failed to enable"), "error");
+  });
+
+  it("shows loader error toast when enable returns error state", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([{ ...mockPlugins[0], enabled: false }]);
+    vi.mocked(enablePlugin).mockResolvedValueOnce({
+      ...mockPlugins[0],
+      enabled: true,
+      state: "error",
+      error: "Cannot find module dependency-graph",
+    });
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Test Plugin A")).toBeTruthy();
+    });
+
+    await userEvent.click(screen.getByRole("checkbox"));
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith(
+        expect.stringContaining("Cannot find module dependency-graph"),
+        "error",
+      );
+    });
+
+    expect(addToast).not.toHaveBeenCalledWith("Test Plugin A enabled for this project", "success");
+  });
+
+  it("shows transport error toast when enable request rejects", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([{ ...mockPlugins[0], enabled: false }]);
+    vi.mocked(enablePlugin).mockRejectedValueOnce(new Error("network"));
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Test Plugin A")).toBeTruthy();
+    });
+
+    await userEvent.click(screen.getByRole("checkbox"));
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith("Failed to enable plugin: network", "error");
     });
   });
 
@@ -395,12 +656,12 @@ describe("PluginManager", () => {
       expect(screen.getByText("Test Plugin A")).toBeTruthy();
     });
 
-    const uninstallButtons = screen.getAllByTitle("Uninstall");
+    const uninstallButtons = screen.getAllByTitle("Uninstall globally");
     await userEvent.click(uninstallButtons[0]);
 
     expect(mockConfirm).toHaveBeenCalledWith({
-      title: "Uninstall Plugin",
-      message: 'Are you sure you want to uninstall "Test Plugin A"?',
+      title: "Uninstall Plugin Globally",
+      message: 'Are you sure you want to uninstall "Test Plugin A" globally (all projects)?',
       danger: true,
     });
     expect(uninstallPlugin).not.toHaveBeenCalled();
@@ -416,7 +677,7 @@ describe("PluginManager", () => {
       expect(screen.getByText("Test Plugin A")).toBeTruthy();
     });
 
-    const uninstallButtons = screen.getAllByTitle("Uninstall");
+    const uninstallButtons = screen.getAllByTitle("Uninstall globally");
     await userEvent.click(uninstallButtons[0]);
 
     await waitFor(() => {
@@ -440,6 +701,59 @@ describe("PluginManager", () => {
       expect(screen.getByText("Settings")).toBeTruthy();
       expect(screen.getByDisplayValue("test-key")).toBeTruthy();
     });
+  });
+
+  it("calls updatePlugin when AI scan toggle is changed", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValue([{ ...mockPlugins[0], aiScanOnLoad: false } as PluginInstallation]);
+
+    render(<PluginManager addToast={addToast} />);
+    await waitFor(() => expect(screen.getByText("Test Plugin A")).toBeTruthy());
+    await userEvent.click(screen.getAllByTitle("Settings")[0]);
+
+    const checkbox = await screen.findByLabelText("Enable AI scan before load/reload");
+    await userEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(updatePlugin).toHaveBeenCalledWith("plugin-a", { aiScanOnLoad: true }, undefined);
+    });
+  });
+
+  it("calls rescanPlugin from security card action", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValue([{ ...mockPlugins[0], aiScanOnLoad: true } as PluginInstallation]);
+
+    render(<PluginManager addToast={addToast} />);
+    await waitFor(() => expect(screen.getByText("Test Plugin A")).toBeTruthy());
+    await userEvent.click(screen.getAllByTitle("Settings")[0]);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Rescan and Reload/i }));
+
+    await waitFor(() => {
+      expect(rescanPlugin).toHaveBeenCalledWith("plugin-a", undefined);
+    });
+  });
+
+  it("renders persisted security scan verdict and findings", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValue([{ ...mockPlugins[0], lastSecurityScan: { verdict: "warning", summary: "Suspicious eval usage", findings: [{ category: "exec", severity: "high", file: "src/index.ts", excerpt: "eval(x)", reason: "dynamic execution" }], scannedAt: "2026-05-01T00:00:00.000Z", scannedFiles: ["src/index.ts"] } } as PluginInstallation]);
+
+    render(<PluginManager addToast={addToast} />);
+    await waitFor(() => expect(screen.getByText("Test Plugin A")).toBeTruthy());
+    await userEvent.click(screen.getAllByTitle("Settings")[0]);
+
+    expect(await screen.findByText("warning")).toBeTruthy();
+    expect(screen.getByText("Suspicious eval usage")).toBeTruthy();
+    await userEvent.click(screen.getByText(/Findings \(1\)/));
+    expect(screen.getByText(/dynamic execution/)).toBeTruthy();
+  });
+
+  it("renders blocked verdict in security scan card", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValue([{ ...mockPlugins[0], lastSecurityScan: { verdict: "blocked", summary: "Blocked by scan", findings: [], scannedAt: "2026-05-01T00:00:00.000Z", scannedFiles: [] } } as PluginInstallation]);
+
+    render(<PluginManager addToast={addToast} />);
+    await waitFor(() => expect(screen.getByText("Test Plugin A")).toBeTruthy());
+    await userEvent.click(screen.getAllByTitle("Settings")[0]);
+
+    expect(await screen.findByText("blocked")).toBeTruthy();
+    expect(screen.getByText("Blocked by scan")).toBeTruthy();
   });
 
   it("saves plugin settings", async () => {
@@ -505,32 +819,76 @@ describe("PluginManager", () => {
     });
   });
 
-  it("keeps bundled plugin manageable after install", async () => {
+  it("shows built-in metadata only state for agent browser when not installed", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([]);
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Agent Browser")).toBeTruthy();
+    });
+
+    const agentBrowserCard = screen.getByText("Agent Browser").closest(".plugin-builtins-item");
+    expect(agentBrowserCard).toBeTruthy();
+    expect(within(agentBrowserCard as HTMLElement).getByText("Built-in metadata only")).toBeTruthy();
+  });
+
+  it("shows Manage for installed dependency graph in built-in section", async () => {
     vi.mocked(fetchPlugins).mockResolvedValueOnce([
       {
         ...mockPlugins[0],
-        id: "fusion-plugin-hermes-runtime",
-        name: "Hermes Runtime Plugin",
+        id: "fusion-plugin-dependency-graph",
+        name: "Dependency Graph",
       },
     ]);
 
     render(<PluginManager addToast={addToast} />);
 
     await waitFor(() => {
-      expect(screen.getByText("Hermes Runtime")).toBeTruthy();
+      expect(screen.getAllByText("Dependency Graph").length).toBeGreaterThanOrEqual(2);
     });
 
-    const hermesCard = screen.getByText("Hermes Runtime").closest(".plugin-bundled-runtime-item");
-    expect(hermesCard).toBeTruthy();
+    const graphCard = screen.getAllByText("Dependency Graph")[1]?.closest(".plugin-builtins-item");
+    expect(graphCard).toBeTruthy();
 
-    const manageButton = within(hermesCard as HTMLElement).getByRole("button", { name: /^Manage$/i });
+    const manageButton = within(graphCard as HTMLElement).getByRole("button", { name: /^Manage$/i });
     expect(manageButton).not.toBeDisabled();
-    expect(within(hermesCard as HTMLElement).getAllByText("Installed").length).toBeGreaterThanOrEqual(1);
+    expect(within(graphCard as HTMLElement).getAllByText("Installed").length).toBeGreaterThanOrEqual(1);
 
     await userEvent.click(manageButton);
 
     await waitFor(() => {
-      expect(fetchPluginSettings).toHaveBeenCalledWith("fusion-plugin-hermes-runtime", undefined);
+      expect(fetchPluginSettings).toHaveBeenCalledWith("fusion-plugin-dependency-graph", undefined);
+    });
+
+    expect(screen.getByTestId("plugin-manager-detail")).toBeTruthy();
+  });
+
+  it("shows Manage for installed reports in built-in section", async () => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([
+      {
+        ...mockPlugins[0],
+        id: "fusion-plugin-reports",
+        name: "Reports",
+      },
+    ]);
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Reports").length).toBeGreaterThanOrEqual(2);
+    });
+
+    const reportsCard = screen.getAllByText("Reports")[1]?.closest(".plugin-builtins-item");
+    expect(reportsCard).toBeTruthy();
+
+    const manageButton = within(reportsCard as HTMLElement).getByRole("button", { name: /^Manage$/i });
+    expect(manageButton).not.toBeDisabled();
+    expect(within(reportsCard as HTMLElement).getAllByText("Installed").length).toBeGreaterThanOrEqual(1);
+
+    await userEvent.click(manageButton);
+
+    await waitFor(() => {
+      expect(fetchPluginSettings).toHaveBeenCalledWith("fusion-plugin-reports", undefined);
     });
 
     expect(screen.getByTestId("plugin-manager-detail")).toBeTruthy();
@@ -713,7 +1071,7 @@ describe("PluginManager", () => {
       });
 
       // Verify initial state - toggle should NOT be checked
-      const toggle = screen.getByRole("checkbox");
+      const toggle = screen.getByRole("checkbox", { name: /Test Plugin A/ });
       expect(toggle).not.toBeChecked();
 
       // Now send an SSE event from a DIFFERENT project trying to enable the plugin
@@ -727,6 +1085,7 @@ describe("PluginManager", () => {
             transition: "enabled",
             sourceEvent: "plugin:enabled",
             timestamp: new Date().toISOString(),
+            scope: "project",
             projectId: "other-project", // Different project - this event should be filtered
             enabled: true,
             state: "started",
@@ -737,10 +1096,8 @@ describe("PluginManager", () => {
       });
 
       // Toggle should STILL NOT be checked since event is from different project (filtered)
-      await waitFor(() => {
-        const filteredToggle = screen.getByRole("checkbox");
-        expect(filteredToggle).not.toBeChecked();
-      });
+      const filteredToggle = screen.getByRole("checkbox", { name: /Test Plugin A/ });
+      expect(filteredToggle).not.toBeChecked();
     });
 
     it("cleans up EventSource on unmount", async () => {
@@ -759,6 +1116,35 @@ describe("PluginManager", () => {
       unmount();
 
       expect(eventSourceInstance?.close).toHaveBeenCalled();
+    });
+  });
+
+  describe("grouped settings rendering", () => {
+    it("renders grouped headings and preserves ungrouped settings", async () => {
+      const groupedPlugin: PluginInstallation = {
+        ...mockPlugins[0],
+        id: "plugin-grouped",
+        name: "Grouped Plugin",
+        settingsSchema: {
+          enabled: { type: "boolean", label: "Enabled", group: "General" },
+          prompt: { type: "string", label: "Prompt", multiline: true, group: "Prompt Contributions" },
+          legacySetting: { type: "string", label: "Legacy Setting" },
+        },
+      };
+      vi.mocked(fetchPlugins).mockResolvedValueOnce([groupedPlugin]);
+      vi.mocked(fetchPluginSettings).mockResolvedValueOnce({ enabled: true, prompt: "x", legacySetting: "y" });
+
+      render(<PluginManager addToast={addToast} />);
+
+      await waitFor(() => {
+        expect(screen.getByText("Grouped Plugin")).toBeTruthy();
+      });
+
+      await userEvent.click(screen.getAllByTitle("Settings")[0]);
+
+      expect(await screen.findByRole("heading", { name: "General", level: 6 })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Prompt Contributions", level: 6 })).toBeTruthy();
+      expect(screen.getByLabelText("Legacy Setting")).toBeTruthy();
     });
   });
 

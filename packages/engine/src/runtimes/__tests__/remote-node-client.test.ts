@@ -57,7 +57,7 @@ describe("RemoteNodeClient", () => {
     await expect(client.getMetrics()).resolves.toEqual(metrics);
   });
 
-  it("createTask() sends POST with JSON body", async () => {
+  it("createTask() sends POST with full JSON body including node targeting metadata", async () => {
     const createdTask = {
       id: "KB-001",
       description: "Create me",
@@ -83,7 +83,12 @@ describe("RemoteNodeClient", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const client = new RemoteNodeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
-    await client.createTask({ description: "Create me" });
+    await client.createTask({
+      description: "Create me",
+      title: "Task title",
+      nodeId: "node-exec-1",
+      dependencies: ["KB-010"],
+    });
 
     const options = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(fetchMock).toHaveBeenCalledWith(`${BASE_URL}/api/tasks`, expect.any(Object));
@@ -92,7 +97,12 @@ describe("RemoteNodeClient", () => {
       "Content-Type": "application/json",
       Authorization: `Bearer ${API_KEY}`,
     }));
-    expect(options.body).toBe(JSON.stringify({ description: "Create me" }));
+    expect(options.body).toBe(JSON.stringify({
+      description: "Create me",
+      title: "Task title",
+      nodeId: "node-exec-1",
+      dependencies: ["KB-010"],
+    }));
   });
 
   it("listTasks() sends optional query params", async () => {

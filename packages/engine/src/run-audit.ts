@@ -52,6 +52,8 @@ export interface EngineRunContext {
   agentId: string;
   /** Task ID being operated on (if applicable). */
   taskId?: string;
+  /** Immutable task lineage ID for durable cross-history correlation. */
+  taskLineageId?: string;
   /** Execution phase for disambiguating sub-operations (e.g., "heartbeat", "execute", "merge-attempt-1"). */
   phase?: string;
   /** Invocation source for heartbeat runs (e.g., "timer", "on_demand", "assignment"). */
@@ -91,7 +93,13 @@ export type DatabaseMutationType =
   | "task:unpause"
   | "task:dependency:add"
   | "document:write"
-  | "workflow-step:result";
+  | "workflow-step:result"
+  | "agent:create:requested"
+  | "agent:create:approved"
+  | "agent:create:denied"
+  | "agent:delete:requested"
+  | "agent:delete:approved"
+  | "agent:delete:denied";
 
 // ── Filesystem mutation types ─────────────────────────────────────────────────
 
@@ -187,6 +195,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
         metadata: {
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
+          ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
           ...input.metadata,
         },
       };
@@ -211,6 +220,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
         metadata: {
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
+          ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
           ...input.metadata,
         },
       };
@@ -228,6 +238,7 @@ export function createRunAuditor(store: TaskStore, context: EngineRunContext | n
         metadata: {
           phase: context.phase,
           ...(context.source ? { source: context.source } : {}),
+          ...(context.taskLineageId ? { taskLineageId: context.taskLineageId } : {}),
           ...input.metadata,
         },
       };

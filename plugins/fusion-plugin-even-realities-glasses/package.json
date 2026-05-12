@@ -1,0 +1,33 @@
+{
+  "name": "@fusion-plugin-examples/even-realities-glasses",
+  "version": "0.1.4",
+  "type": "module",
+  "description": "Canonical Even Realities Fusion plugin with board/task cards, actions, notifications, and webhook transport",
+  "keywords": [
+    "fusion-plugin",
+    "even-realities",
+    "glasses",
+    "tasks"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run --silent=passed-only --reporter=dot"
+  },
+  "dependencies": {
+    "@fusion/core": "workspace:*",
+    "@fusion/plugin-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "better-sqlite3": "^12.4.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
+  }
+}

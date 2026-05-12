@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.1.11
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.27.0
+
+## 0.1.10
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.26.0
+
+## 0.1.9
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.25.0
+
+## 0.1.8
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.24.0
+
+## 0.1.7
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.23.0
+
+## 0.1.6
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.22.0
+
+## 0.1.5
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.21.0
+
+## 0.1.4
+
+### Patch Changes
+
+- @fusion/plugin-sdk@0.20.0
+
 ## 0.1.3
 
 ### Patch Changes

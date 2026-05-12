@@ -73,7 +73,6 @@ describe("TodoView", () => {
     mockCreateTask.mockResolvedValue({ id: "FN-999" });
     mockFetchAgents.mockResolvedValue([
       { id: "agent-1", name: "Builder", role: "engineer", state: "active" },
-      { id: "agent-2", name: "Terminated", role: "reviewer", state: "terminated" },
     ]);
     mockUseTodoLists.mockReturnValue(createMockTodoLists());
   });
@@ -82,6 +81,11 @@ describe("TodoView", () => {
     render(<TodoView addToast={addToast} />);
     expect(screen.getByTestId("todo-list-list-1")).toHaveTextContent("My List");
     expect(screen.getByTestId("todo-list-list-2")).toHaveTextContent("Work Tasks");
+  });
+
+  it("applies keyboard-active root class when mobileKeyboardActive is true", () => {
+    render(<TodoView addToast={addToast} mobileKeyboardActive />);
+    expect(screen.getByTestId("todo-view-root")).toHaveClass("todo-view--mobile-keyboard-active");
   });
 
   it("renders only items for the selected list", () => {
@@ -460,7 +464,6 @@ describe("TodoView", () => {
       expect(mockFetchAgents).toHaveBeenCalledWith(undefined, "project-1");
     });
     expect(screen.getByText("Builder")).toBeInTheDocument();
-    expect(screen.queryByText("Terminated")).not.toBeInTheDocument();
   });
 
   it("selecting an agent creates task assigned to that agent", async () => {

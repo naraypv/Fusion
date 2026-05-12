@@ -1,10 +1,84 @@
 #!/usr/bin/env node
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, renameSync, mkdtempSync, rmSync, realpathSync, globSync, existsSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { cpus, tmpdir } from "node:os";
+import { createRequire } from "node:module";
+import { ensureTestArtifacts } from "./ensure-test-artifacts.mjs";
+
+const currentFilePath = fileURLToPath(import.meta.url);
+const scriptDir = path.dirname(currentFilePath);
+const checkIsolationScript = path.join(scriptDir, "check-test-isolation.mjs");
+const require = createRequire(import.meta.url);
+
+function fastGlobSync(patterns, options) {
+  const patternList = Array.isArray(patterns) ? patterns : [patterns];
+  const matches = new Set();
+
+  for (const pattern of patternList) {
+    if (typeof pattern !== "string" || pattern.length === 0) continue;
+    const isNegated = pattern.startsWith("!");
+    const body = isNegated ? pattern.slice(1) : pattern;
+    const resolved = globSync(body, {
+      cwd: options?.cwd,
+      absolute: options?.absolute,
+      dot: options?.dot,
+      nodir: options?.onlyFiles,
+    });
+
+    for (const entry of resolved) {
+      if (isNegated) {
+        matches.delete(entry);
+      } else {
+        matches.add(entry);
+      }
+    }
+  }
+
+  return [...matches];
+}
+
+let fgSync = fastGlobSync;
+try {
+  const loaded = require("fast-glob");
+  if (typeof loaded?.sync === "function") {
+    fgSync = loaded.sync;
+  }
+} catch {
+  // Fallback to node:fs globSync when fast-glob is not installed.
+}
+
+function parseWorkspacePackagesFromYaml(rawYaml) {
+  const lines = rawYaml.split(/\r?\n/);
+  const packages = [];
+  let inPackages = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!inPackages) {
+      if (trimmed === "packages:") {
+        inPackages = true;
+      }
+      continue;
+    }
+
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("-")) {
+      if (!line.startsWith(" ") && !line.startsWith("\t")) {
+        break;
+      }
+      continue;
+    }
+
+    const value = trimmed.slice(1).trim().replace(/^['"]|['"]$/g, "");
+    if (value) packages.push(value);
+  }
+
+  return packages;
+}
 
 const rootDir = process.env.FUSION_PROJECT_DIR
   ? path.resolve(process.env.FUSION_PROJECT_DIR)
@@ -27,7 +101,70 @@ function run(command, commandArgs, options = {}) {
   });
 
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    const error = new Error(`${command} ${commandArgs.join(" ")} failed with exit code ${result.status ?? 1}`);
+    error.exitCode = result.status ?? 1;
+    throw error;
+  }
+}
+
+function runIsolationCheck(before = false, env = process.env) {
+  const args = [checkIsolationScript];
+  if (before) args.push("--before");
+  // Inject the names of every isolated HOME this script created so the check
+  // never reports them as a leak even if the rm-rf in cleanup silently failed
+  // or the baseline file got rotated mid-run. Without this, a transient EBUSY
+  // on /var/folders (SQLite WAL still mmap'd, orphan child holding an fd)
+  // leaks a `fusion-test-home-root-*` dir and trips the guard.
+  const ignoreNames = [...knownIsolatedHomeBasenames].join(",");
+  const checkEnv = ignoreNames
+    ? { ...env, FUSION_TEST_ISOLATION_IGNORE_NAMES: ignoreNames }
+    : env;
+  run(process.execPath, args, { env: checkEnv });
+}
+
+export function shouldRunIsolationGuard(env = process.env) {
+  return env.FUSION_TEST_DISABLE_ISOLATION_GUARD !== "1";
+}
+
+function pruneFusionTestHomes() {
+  let tmpEntries = [];
+  try {
+    tmpEntries = readdirSync(tmpdir(), { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of tmpEntries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("fusion-test-home-root-")) continue;
+    const rawPath = path.join(tmpdir(), entry.name);
+    let resolvedPath = rawPath;
+    try {
+      resolvedPath = realpathSync(rawPath);
+    } catch {
+      // Keep raw path fallback.
+    }
+    try {
+      rmSync(rawPath, { recursive: true, force: true });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[test-changed] failed to prune leftover ${rawPath}: ${message}`);
+    }
+  }
+}
+
+function runMaybeIsolated(command, commandArgs, options = {}) {
+  const enabled = shouldRunIsolationGuard();
+  const env = options.env ?? process.env;
+  const { onBeforeAfterCheck, ...spawnOptions } = options;
+  if (enabled) runIsolationCheck(true, env);
+  try {
+    run(command, commandArgs, spawnOptions);
+  } finally {
+    if (typeof onBeforeAfterCheck === "function") {
+      onBeforeAfterCheck();
+    }
+    pruneFusionTestHomes();
+    if (enabled) runIsolationCheck(false, env);
   }
 }
 
@@ -51,26 +188,139 @@ function getBaseBranch() {
   return changesetConfig.baseBranch || "main";
 }
 
-function listWorkspacePackages() {
-  const packagesDir = path.join(rootDir, "packages");
-  const packageDirs = readdirSync(packagesDir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name);
+function readWorkspacePatterns(projectRoot = rootDir) {
+  try {
+    const workspacePath = path.join(projectRoot, "pnpm-workspace.yaml");
+    return parseWorkspacePackagesFromYaml(readFileSync(workspacePath, "utf8"));
+  } catch {
+    return ["packages/*"];
+  }
+}
 
-  const packageNameByDir = new Map();
-  for (const dir of packageDirs) {
-    try {
-      const packageJsonPath = path.join(packagesDir, dir, "package.json");
-      const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
-      if (typeof pkg.name === "string") {
-        packageNameByDir.set(dir, pkg.name);
+function expandWorkspacePattern(projectRoot, pattern) {
+  if (pattern.trim().startsWith("!")) {
+    return [];
+  }
+
+  return fgSync(workspacePatternToPackageJsonGlob(pattern), {
+    absolute: true,
+    cwd: projectRoot,
+    dot: false,
+    onlyFiles: true,
+    unique: true,
+  });
+}
+
+function expandWorkspacePatterns(projectRoot, patterns) {
+  if (!patterns.some((pattern) => pattern.trim().startsWith("!"))) {
+    return patterns.flatMap((pattern) => expandWorkspacePattern(projectRoot, pattern));
+  }
+
+  return fgSync(patterns.map(workspacePatternToPackageJsonGlob), {
+    absolute: true,
+    cwd: projectRoot,
+    dot: false,
+    onlyFiles: true,
+    unique: true,
+  });
+}
+
+function workspacePatternToPackageJsonGlob(pattern) {
+  const trimmed = pattern.trim();
+  const isNegated = trimmed.startsWith("!");
+  const body = (isNegated ? trimmed.slice(1) : trimmed)
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  const packageJsonGlob = body.endsWith("package.json") ? body : `${body}/package.json`;
+  return isNegated ? `!${packageJsonGlob}` : packageJsonGlob;
+}
+
+function collectWorkspaceDependencyNames(pkg) {
+  return [
+    pkg.dependencies,
+    pkg.devDependencies,
+    pkg.peerDependencies,
+    pkg.optionalDependencies,
+  ].flatMap((deps) => deps && typeof deps === "object" ? Object.keys(deps) : []);
+}
+
+export function listWorkspacePackageInfos({ projectRoot = rootDir } = {}) {
+  const packageJsonPaths = [
+    ...new Set(expandWorkspacePatterns(projectRoot, readWorkspacePatterns(projectRoot))),
+  ];
+
+  return packageJsonPaths
+    .map((packageJsonPath) => {
+      try {
+        const pkg = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+        if (typeof pkg.name !== "string") {
+          return null;
+        }
+
+        const dir = path.relative(projectRoot, path.dirname(packageJsonPath)).split(path.sep).join("/");
+        return {
+          name: pkg.name,
+          dir,
+          hasTestScript: typeof pkg.scripts?.test === "string",
+          dependencyNames: collectWorkspaceDependencyNames(pkg),
+        };
+      } catch {
+        return null;
       }
-    } catch {
-      // ignore directories without package.json
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
+function listWorkspacePackages(workspacePackages = listWorkspacePackageInfos()) {
+  const packageNameByDir = new Map();
+  for (const workspacePackage of workspacePackages) {
+    packageNameByDir.set(workspacePackage.dir, workspacePackage.name);
+    if (workspacePackage.dir.startsWith("packages/")) {
+      packageNameByDir.set(workspacePackage.dir.split("/")[1], workspacePackage.name);
     }
   }
 
   return packageNameByDir;
+}
+
+export function buildPackageDirByName(workspacePackages) {
+  const packageDirByName = new Map();
+  for (const workspacePackage of workspacePackages) {
+    packageDirByName.set(workspacePackage.name, workspacePackage.dir);
+  }
+  return packageDirByName;
+}
+
+export function buildReverseDependencyMap(workspacePackages) {
+  const workspaceNames = new Set(workspacePackages.map((workspacePackage) => workspacePackage.name));
+  const reverseDependencyMap = new Map(workspacePackages.map((workspacePackage) => [workspacePackage.name, []]));
+
+  for (const workspacePackage of workspacePackages) {
+    for (const dependencyName of workspacePackage.dependencyNames ?? []) {
+      if (workspaceNames.has(dependencyName)) {
+        reverseDependencyMap.get(dependencyName)?.push(workspacePackage.name);
+      }
+    }
+  }
+
+  return reverseDependencyMap;
+}
+
+export function expandWithReverseDependents(packageNames, reverseDependencyMap) {
+  const expanded = new Set(packageNames);
+  const queue = [...packageNames];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const dependent of reverseDependencyMap.get(current) ?? []) {
+      if (expanded.has(dependent)) continue;
+      expanded.add(dependent);
+      queue.push(dependent);
+    }
+  }
+
+  return [...expanded];
 }
 
 export function shouldForceFullSuite(changedFiles) {
@@ -95,11 +345,11 @@ export function shouldForceFullSuite(changedFiles) {
       return true;
     }
 
-    if (file.startsWith("packages/") && /vitest|test/.test(path.basename(file))) {
+    if ((file.startsWith("packages/") || file.startsWith("plugins/")) && /vitest|test/.test(path.basename(file))) {
       return false;
     }
 
-    if (!file.startsWith("packages/") && !file.startsWith("docs/")) {
+    if (!file.startsWith("packages/") && !file.startsWith("plugins/") && !file.startsWith("docs/")) {
       return true;
     }
 
@@ -137,17 +387,32 @@ function changedFilesSince(baseSha) {
 
 export function resolveAffectedPackages(changedFiles, packageNameByDir) {
   const affected = new Set();
+  const packageDirs = [...packageNameByDir.keys()]
+    .filter((dir) => dir.includes("/"))
+    .sort((a, b) => b.length - a.length);
 
   for (const file of changedFiles) {
-    if (!file.startsWith("packages/")) {
+    let packageName = null;
+
+    for (const packageDir of packageDirs) {
+      if (file === packageDir || file.startsWith(`${packageDir}/`)) {
+        packageName = packageNameByDir.get(packageDir);
+        break;
+      }
+    }
+
+    if (!packageName && file.startsWith("packages/")) {
+      const [, dir] = file.split("/");
+      packageName = packageNameByDir.get(dir) ?? packageNameByDir.get(`packages/${dir}`) ?? null;
+    }
+
+    if (!packageName) {
+      if (file.startsWith("packages/") || file.startsWith("plugins/")) {
+        return null;
+      }
       continue;
     }
 
-    const [, dir] = file.split("/");
-    const packageName = packageNameByDir.get(dir);
-    if (!packageName) {
-      return null;
-    }
     affected.add(packageName);
   }
 
@@ -170,7 +435,7 @@ export function resolveAffectedPackages(changedFiles, packageNameByDir) {
  * @returns {string}
  */
 export function cacheFilePath() {
-  return path.join(rootDir, ".fusion", "test-cache.json");
+  return path.join(rootDir, "node_modules", ".cache", "fusion", "test-cache.json");
 }
 
 /**
@@ -403,24 +668,133 @@ export function recordCachePass(packages, packageDirByName, options = {}) {
 // Execution plan
 // ---------------------------------------------------------------------------
 
-const workspaceConcurrency =
-  process.env.FUSION_TEST_WORKSPACE_CONCURRENCY || "2";
+const workspaceConcurrency = process.env.FUSION_TEST_WORKSPACE_CONCURRENCY || "2";
+
+function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+export function defaultTestWorkerBudget(env = process.env) {
+  const cpuCap = Math.max(1, cpus().length - 1);
+  const defaultTotal = Math.min(12, Math.max(4, cpuCap));
+  const totalWorkers = parsePositiveInteger(env.FUSION_TEST_TOTAL_WORKERS) ?? defaultTotal;
+  const concurrency = Math.max(
+    1,
+    Math.min(parsePositiveInteger(env.FUSION_TEST_CONCURRENCY) ?? 2, totalWorkers),
+  );
+
+  return {
+    totalWorkers,
+    concurrency,
+  };
+}
+
+const { totalWorkers, concurrency } = defaultTestWorkerBudget(process.env);
+
+const isolatedHomesToCleanup = new Set();
+// Basenames of every fusion-test-home-root-* dir this process has minted.
+// Passed to check-test-isolation.mjs via env so it allow-lists them
+// unconditionally, even if cleanup's rm silently failed.
+export const knownIsolatedHomeBasenames = new Set();
+
+let cleanupRmSync = rmSync;
+
+export function __setCleanupRmSyncForTests(nextRmSync) {
+  cleanupRmSync = typeof nextRmSync === "function" ? nextRmSync : rmSync;
+}
+
+function sleepMsSync(ms) {
+  if (ms <= 0) return;
+  spawnSync("sleep", [String(ms / 1000)], { stdio: "ignore" });
+}
+
+/**
+ * Retry isolated HOME cleanup synchronously to absorb transient EBUSY races
+ * (common on macOS when Vitest workers still hold file descriptors briefly).
+ * If cleanup still fails, check-test-isolation gets an allow-list of every
+ * minted fusion-test-home-root-* basename to avoid false leak failures.
+ */
+export function cleanupIsolatedHomePath(homePath, retries = 3, delayMs = 75) {
+  try {
+    if (!existsSync(homePath)) return;
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        cleanupRmSync(homePath, { recursive: true, force: true });
+        return;
+      } catch (err) {
+        if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") {
+          return;
+        }
+        lastError = err;
+        if (attempt < retries) {
+          sleepMsSync(delayMs);
+        }
+      }
+    }
+
+    const message = lastError instanceof Error ? lastError.message : String(lastError);
+    console.warn(`[test-changed] failed to remove isolated HOME ${homePath} after ${retries} attempts: ${message}`);
+  } finally {
+    isolatedHomesToCleanup.delete(homePath);
+  }
+}
+
+function cleanupIsolatedHomes() {
+  for (const homePath of isolatedHomesToCleanup) {
+    cleanupIsolatedHomePath(homePath);
+  }
+}
+
+process.on("exit", cleanupIsolatedHomes);
+process.on("SIGINT", () => {
+  cleanupIsolatedHomes();
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  cleanupIsolatedHomes();
+  process.exit(143);
+});
+
+export function createIsolatedHomeEnv(env = process.env) {
+  const rawIsolatedHome = mkdtempSync(path.join(tmpdir(), "fusion-test-home-root-"));
+  const isolatedHome = realpathSync(rawIsolatedHome);
+  isolatedHomesToCleanup.add(rawIsolatedHome);
+  isolatedHomesToCleanup.add(isolatedHome);
+  knownIsolatedHomeBasenames.add(path.basename(rawIsolatedHome));
+  knownIsolatedHomeBasenames.add(path.basename(isolatedHome));
+
+  const nextEnv = {
+    ...env,
+    HOME: isolatedHome,
+    USERPROFILE: isolatedHome,
+  };
+
+  if (process.platform === "win32") {
+    const match = isolatedHome.match(/^([A-Za-z]:)(.*)$/);
+    if (match) {
+      nextEnv.HOMEDRIVE = match[1];
+      nextEnv.HOMEPATH = match[2] || "\\";
+    }
+  }
+
+  return { env: nextEnv, isolatedHome };
+}
 
 const fullSuiteEnv = {
   ...process.env,
-  FUSION_TEST_TOTAL_WORKERS: process.env.FUSION_TEST_TOTAL_WORKERS || "4",
-  FUSION_TEST_CONCURRENCY: process.env.FUSION_TEST_CONCURRENCY || "2",
+  FUSION_TEST_TOTAL_WORKERS: process.env.FUSION_TEST_TOTAL_WORKERS || String(totalWorkers),
+  FUSION_TEST_CONCURRENCY: process.env.FUSION_TEST_CONCURRENCY || String(concurrency),
 };
-
-function runFullSuite(forwardedArgs) {
-  run("pnpm", [`-r`, `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], { env: fullSuiteEnv });
-}
 
 export function decideExecutionPlan({
   forceFullSuite,
   comparisonBase,
   changedFiles,
   packageNameByDir,
+  reverseDependencyMap,
 }) {
   if (forceFullSuite) return { mode: "full", reason: "forced" };
   if (!comparisonBase) return { mode: "full", reason: "missing-comparison-base" };
@@ -431,7 +805,24 @@ export function decideExecutionPlan({
   const affectedPackages = resolveAffectedPackages(changedFiles, packageNameByDir);
   if (!affectedPackages || affectedPackages.length === 0) return { mode: "full", reason: "no-affected-package" };
 
-  return { mode: "changed", packages: affectedPackages };
+  return {
+    mode: "changed",
+    packages: reverseDependencyMap
+      ? expandWithReverseDependents(affectedPackages, reverseDependencyMap)
+      : affectedPackages,
+  };
+}
+
+export function normalizeForwardedArgs(argv) {
+  const normalized = [];
+
+  for (const arg of argv) {
+    if (arg === "--full" || arg === "--no-cache") continue;
+    if (arg === "--silent" || arg.startsWith("--silent=")) continue;
+    normalized.push(arg);
+  }
+
+  return normalized;
 }
 
 export function main(argv = process.argv.slice(2)) {
@@ -444,26 +835,33 @@ export function main(argv = process.argv.slice(2)) {
     process.env.FUSION_TEST_NO_CACHE === "1" ||
     argv.includes("--no-cache");
 
-  const forwardedArgs = argv.filter((arg) => arg !== "--full" && arg !== "--no-cache");
+  const forwardedArgs = normalizeForwardedArgs(argv);
 
   run("pnpm", ["sync:fusion-skill:check"]);
+  ensureTestArtifacts(rootDir);
+
+  const { env: isolatedHomeEnv, isolatedHome } = createIsolatedHomeEnv(fullSuiteEnv);
+
+  const cleanupIsolatedHome = () => {
+    cleanupIsolatedHomePath(isolatedHome);
+  };
+
+  try {
 
   const baseBranch = getBaseBranch();
   const comparisonBase = detectComparisonBase(baseBranch);
   const changedFiles = comparisonBase ? changedFilesSince(comparisonBase) : null;
-  const packageNameByDir = listWorkspacePackages();
-
-  // Build reverse map: pkg-name → relative dir (e.g. "packages/engine")
-  const packageDirByName = new Map();
-  for (const [dir, name] of packageNameByDir) {
-    packageDirByName.set(name, `packages/${dir}`);
-  }
+  const workspacePackages = listWorkspacePackageInfos();
+  const packageNameByDir = listWorkspacePackages(workspacePackages);
+  const packageDirByName = buildPackageDirByName(workspacePackages);
+  const reverseDependencyMap = buildReverseDependencyMap(workspacePackages);
 
   const plan = decideExecutionPlan({
     forceFullSuite,
     comparisonBase,
     changedFiles,
     packageNameByDir,
+    reverseDependencyMap,
   });
 
   if (plan.mode === "full") {
@@ -479,7 +877,10 @@ export function main(argv = process.argv.slice(2)) {
       console.log("[test-changed] no affected workspace package resolved; running full suite.");
     }
 
-    runFullSuite(forwardedArgs);
+    runMaybeIsolated("pnpm", [`-r`, `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], {
+      env: isolatedHomeEnv,
+      onBeforeAfterCheck: cleanupIsolatedHome,
+    });
     return;
   }
 
@@ -493,6 +894,11 @@ export function main(argv = process.argv.slice(2)) {
     console.log(
       `[test-changed] all changed packages are cache-fresh (${cachedPackages.join(", ")}); nothing to run.`,
     );
+    if (shouldRunIsolationGuard()) {
+      runIsolationCheck(true, isolatedHomeEnv);
+      cleanupIsolatedHome();
+      runIsolationCheck(false, isolatedHomeEnv);
+    }
     return;
   }
 
@@ -502,13 +908,25 @@ export function main(argv = process.argv.slice(2)) {
     console.log(`[test-changed] skipping cached packages: ${cachedPackages.join(", ")}`);
   }
 
-  run("pnpm", [...filterArgs, `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], { env: fullSuiteEnv });
+  runMaybeIsolated("pnpm", [...filterArgs, `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], {
+    env: isolatedHomeEnv,
+    onBeforeAfterCheck: cleanupIsolatedHome,
+  });
 
   // Tests passed — record in cache (never cache failures; process.exit on failure above).
   recordCachePass(activePackages, packageDirByName, { noCache });
+  } finally {
+    cleanupIsolatedHome();
+  }
 }
 
-const currentFilePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === currentFilePath) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    if (error?.exitCode) {
+      process.exit(error.exitCode);
+    }
+    throw error;
+  }
 }

@@ -79,7 +79,7 @@ export interface ProjectManagerEvents {
  * // Then add runtime
  * const runtime = await manager.addProject({
  *   projectId: project.id,
- *   workingDirectory: project.path,
+ *   workingDirectory: await central.resolveLocalProjectWorkingDirectory(project.id),
  *   isolationMode: "in-process",
  *   maxConcurrent: 2,
  *   maxWorktrees: 4,

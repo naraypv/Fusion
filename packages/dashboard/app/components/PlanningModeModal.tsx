@@ -1,7 +1,7 @@
 import "./PlanningModeModal.css";
-import { useState, useCallback, useEffect, useRef, useMemo, type CSSProperties } from "react";
-import type { Task, PlanningQuestion, PlanningSummary } from "@fusion/core";
-import { getErrorMessage } from "@fusion/core";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import type { Task, PlanningQuestion, PlanningSummary, TaskPriority } from "@fusion/core";
+import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, getErrorMessage } from "@fusion/core";
 import {
   startPlanningStreaming,
   createPlanningDraft,
@@ -79,6 +79,20 @@ const EXAMPLE_PLANS = [
   "Create an API endpoint for exporting tasks as CSV",
   "Refactor the task card component for better performance",
 ];
+
+function normalizeTaskPriority(priority?: TaskPriority): TaskPriority {
+  if (priority && (TASK_PRIORITIES as readonly string[]).includes(priority)) {
+    return priority;
+  }
+  return DEFAULT_TASK_PRIORITY;
+}
+
+function normalizePlanningSummary(summary: PlanningSummary): PlanningSummary {
+  return {
+    ...summary,
+    priority: normalizeTaskPriority(summary.priority),
+  };
+}
 
 function getModelSelectionValue(provider?: string, modelId?: string): string {
   return provider && modelId ? `${provider}/${modelId}` : "";
@@ -193,13 +207,30 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     useMobileKeyboard({ enabled: viewportMode === "mobile" });
   useMobileScrollLock(viewportMode === "mobile" && isOpen);
 
-  const modalKeyboardStyle: CSSProperties = keyboardOpen
-    ? ({
-        "--keyboard-overlap": `${keyboardOverlap}px`,
-        "--vv-offset-top": `${viewportOffsetTop}px`,
-        ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
-      } as CSSProperties)
-    : {};
+  // Drive --vv-height / --keyboard-overlap / --vv-offset-top imperatively
+  // rather than via React's style prop. Reason: when React removes a CSS
+  // custom property between renders it sets it to empty string instead of
+  // calling removeProperty(). On iOS Safari that leaves the variable defined
+  // as "", so `height: var(--vv-height, 100dvh)` resolves to empty (the
+  // fallback only applies when the var is *undefined*) and the modal
+  // collapses to content height after the keyboard is dismissed.
+  useEffect(() => {
+    const node = modalRef.current;
+    if (!node) return;
+    if (keyboardOpen) {
+      node.style.setProperty("--keyboard-overlap", `${keyboardOverlap}px`);
+      node.style.setProperty("--vv-offset-top", `${viewportOffsetTop}px`);
+      if (viewportHeight !== null) {
+        node.style.setProperty("--vv-height", `${viewportHeight}px`);
+      } else {
+        node.style.removeProperty("--vv-height");
+      }
+    } else {
+      node.style.removeProperty("--keyboard-overlap");
+      node.style.removeProperty("--vv-offset-top");
+      node.style.removeProperty("--vv-height");
+    }
+  }, [keyboardOpen, keyboardOverlap, viewportOffsetTop, viewportHeight]);
 
   // Mirror streamingOutput into a ref so SSE handlers can read the latest
   // value without stale closure issues.
@@ -264,7 +295,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           });
           setStreamingOutput("");
         } else if (session.status === "complete" && session.result) {
-          const summary = JSON.parse(session.result) as PlanningSummary;
+          const summary = normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary);
           setView({
             type: "summary",
             session: { sessionId, currentQuestion: null, summary },
@@ -730,7 +761,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           connectToPlanningStream(sessionId);
         } else if (session.status === "complete" && session.result) {
           clearPlanningDescription(projectId);
-          const summary = JSON.parse(session.result);
+          const summary = normalizePlanningSummary(JSON.parse(session.result));
           setView({ type: "summary", session: { sessionId, currentQuestion: null, summary }, summary });
           setEditedSummary(summary);
         } else if (session.status === "generating") {
@@ -1290,6 +1321,33 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     [projectId, sessionTabId, view]
   );
 
+  const handleRefineFurther = useCallback(async () => {
+    if (view.type !== "summary") {
+      return;
+    }
+
+    const { session, summary } = view;
+    const sessionId = session.sessionId;
+    currentSessionIdRef.current = sessionId;
+    setLockSessionId(sessionId);
+
+    setError(null);
+    setIsRetrying(false);
+    setStreamingOutput("");
+    setView({ type: "loading" });
+
+    connectToPlanningStream(sessionId);
+
+    try {
+      await respondToPlanning(sessionId, { refine: true }, projectId, sessionTabId);
+    } catch (err) {
+      streamConnectionRef.current?.close();
+      streamConnectionRef.current = null;
+      setError(getErrorMessage(err) || "Failed to refine plan");
+      setView({ type: "summary", session, summary: editedSummary ?? summary });
+    }
+  }, [connectToPlanningStream, editedSummary, projectId, sessionTabId, view]);
+
   const handleStopGeneration = useCallback(async () => {
     const sessionId = currentSessionIdRef.current;
     if (!sessionId) {
@@ -1375,7 +1433,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
             if (!session.result) {
               throw new Error("Planning session is complete but has no result.");
             }
-            const summary = JSON.parse(session.result) as PlanningSummary;
+            const summary = normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary);
             clearPlanningDescription(projectId);
             setView({
               type: "summary",
@@ -1451,7 +1509,10 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       setView({
         type: "breakdown",
         sessionId: result.sessionId,
-        subtasks: result.subtasks,
+        subtasks: result.subtasks.map((subtask) => ({
+          ...subtask,
+          priority: normalizeTaskPriority(subtask.priority),
+        })),
         dirty: false,
       });
     } catch (err) {
@@ -1468,7 +1529,14 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
     try {
       const completedSessionId = view.sessionId;
-      const result = await createTasksFromPlanning(completedSessionId, view.subtasks, projectId);
+      const result = await createTasksFromPlanning(
+        completedSessionId,
+        view.subtasks.map((subtask) => ({
+          ...subtask,
+          priority: normalizeTaskPriority(subtask.priority),
+        })),
+        projectId,
+      );
       onTasksCreated(result.tasks);
       // Server cleans up the planning session after task creation; mirror that
       // locally so reopen doesn't try to load a 404 and the footer count drops.
@@ -1568,7 +1636,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       role="dialog"
       aria-modal="true"
     >
-      <div className="modal modal-lg planning-modal" ref={modalRef} style={modalKeyboardStyle}>
+      <div className="modal modal-lg planning-modal" ref={modalRef}>
         <div className="modal-header">
           <div className="detail-title-row">
             {mobileShowDetail && (
@@ -1918,8 +1986,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
               onCreateTask={handleCreateTask}
               onBreakIntoTasks={handleStartBreakdown}
               onRefine={() => {
-                // Reset to question mode for more refinement
-                setView({ type: "question", session: view.session });
+                void handleRefineFurther();
               }}
               isLoading={false}
             />
@@ -2215,6 +2282,7 @@ function SummaryView({
   const [selectedDependencies, setSelectedDependencies] = useState<string[]>(
     summary.suggestedDependencies
   );
+  const selectedPriority = normalizeTaskPriority(summary.priority);
 
   const handleDependencyToggle = (taskId: string) => {
     const newDeps = selectedDependencies.includes(taskId)
@@ -2260,23 +2328,48 @@ function SummaryView({
             />
           </div>
 
-          <div className="form-group">
-            <label>Suggested Size</label>
-            <select
-              className="planning-size-select"
-              value={summary.suggestedSize}
-              onChange={(event) =>
-                onSummaryChange({
-                  ...summary,
-                  suggestedSize: event.target.value as "S" | "M" | "L",
-                })
-              }
-              disabled={isLoading}
-            >
-              <option value="S">S (Small)</option>
-              <option value="M">M (Medium)</option>
-              <option value="L">L (Large)</option>
-            </select>
+          <div className="planning-summary-meta-row">
+            <div className="form-group">
+              <label htmlFor="planning-summary-size">Suggested Size</label>
+              <select
+                id="planning-summary-size"
+                className="planning-size-select"
+                value={summary.suggestedSize}
+                onChange={(event) =>
+                  onSummaryChange({
+                    ...summary,
+                    suggestedSize: event.target.value as "S" | "M" | "L",
+                  })
+                }
+                disabled={isLoading}
+              >
+                <option value="S">S (Small)</option>
+                <option value="M">M (Medium)</option>
+                <option value="L">L (Large)</option>
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label htmlFor="planning-summary-priority">Priority</label>
+              <select
+                id="planning-summary-priority"
+                className="planning-size-select"
+                value={selectedPriority}
+                onChange={(event) =>
+                  onSummaryChange({
+                    ...summary,
+                    priority: event.target.value as TaskPriority,
+                  })
+                }
+                disabled={isLoading}
+              >
+                {TASK_PRIORITIES.map((priorityOption) => (
+                  <option key={priorityOption} value={priorityOption}>
+                    {priorityOption[0].toUpperCase() + priorityOption.slice(1)}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           {tasks.length > 0 && (
@@ -2385,6 +2478,7 @@ function createEmptySubtask(index: number): SubtaskItem {
     title: "",
     description: "",
     suggestedSize: "M",
+    priority: DEFAULT_TASK_PRIORITY,
     dependsOn: [],
   };
 }
@@ -2514,7 +2608,7 @@ function BreakdownView({
           <h4>Break into Tasks</h4>
           <p className="text-muted">
             Review and edit the subtasks generated from your plan. Adjust titles,
-            descriptions, sizes, and dependencies before creating.
+            descriptions, sizes, priorities, and dependencies before creating.
           </p>
         </div>
 
@@ -2616,22 +2710,46 @@ function BreakdownView({
                   />
                 </div>
 
-                <div className="form-group">
-                  <label>Size</label>
-                  <select
-                    className="planning-size-select"
-                    value={subtask.suggestedSize}
-                    onChange={(event) =>
-                      updateSubtask(subtask.id, {
-                        suggestedSize: event.target.value as "S" | "M" | "L",
-                      })
-                    }
-                    disabled={isLoading}
-                  >
-                    <option value="S">S</option>
-                    <option value="M">M</option>
-                    <option value="L">L</option>
-                  </select>
+                <div className="planning-summary-meta-row">
+                  <div className="form-group">
+                    <label htmlFor={`${subtask.id}-size`}>Size</label>
+                    <select
+                      id={`${subtask.id}-size`}
+                      className="planning-size-select"
+                      value={subtask.suggestedSize}
+                      onChange={(event) =>
+                        updateSubtask(subtask.id, {
+                          suggestedSize: event.target.value as "S" | "M" | "L",
+                        })
+                      }
+                      disabled={isLoading}
+                    >
+                      <option value="S">S</option>
+                      <option value="M">M</option>
+                      <option value="L">L</option>
+                    </select>
+                  </div>
+
+                  <div className="form-group">
+                    <label htmlFor={`${subtask.id}-priority`}>Priority</label>
+                    <select
+                      id={`${subtask.id}-priority`}
+                      className="planning-size-select"
+                      value={normalizeTaskPriority(subtask.priority)}
+                      onChange={(event) =>
+                        updateSubtask(subtask.id, {
+                          priority: event.target.value as TaskPriority,
+                        })
+                      }
+                      disabled={isLoading}
+                    >
+                      {TASK_PRIORITIES.map((priorityOption) => (
+                        <option key={priorityOption} value={priorityOption}>
+                          {priorityOption[0].toUpperCase() + priorityOption.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
 
                 <div className="form-group">

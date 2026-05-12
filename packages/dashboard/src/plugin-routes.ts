@@ -31,10 +31,24 @@ import {
   internalError,
   notFound,
 } from "./api-error.js";
+import { getOrCreateProjectStore } from "./project-store-resolver.js";
+
 
 // PluginRunner interface for optional plugin runner
+function isPluginRouteResponse(result: unknown): result is import("@fusion/core").PluginRouteResponse {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return false;
+  }
+  const candidate = result as { status?: unknown };
+  return typeof candidate.status === "number";
+}
+
 interface PluginRunner {
   reloadPlugin?(pluginId: string): Promise<void>;
+  checkPluginSetup?(pluginId: string): Promise<import("@fusion/core").PluginSetupCheckResult>;
+  installPluginSetup?(pluginId: string): Promise<{ success: boolean; error?: string }>;
+  uninstallPluginSetup?(pluginId: string): Promise<{ success: boolean; error?: string }>;
+  getPluginSetupInfo?(): Array<{ pluginId: string; manifest: import("@fusion/core").PluginSetupManifest; hooks: import("@fusion/core").PluginSetupHooks }>;
   getPluginRoutes(): Array<{ pluginId: string; route: import("@fusion/core").PluginRouteDefinition }>;
 }
 
@@ -189,12 +203,9 @@ export function createPluginRouter(
   pluginStore: PluginStore,
   pluginLoader: PluginLoader,
   pluginRunner?: PluginRunner,
+  defaultTaskStore?: import("@fusion/core").TaskStore,
 ): Router {
   const router = Router();
-
-  // ── Error Handler ───────────────────────────────────────────────
-
-  router.use(catchHandler);
 
   // ── Management Routes ───────────────────────────────────────────
 
@@ -363,6 +374,90 @@ export function createPluginRouter(
   }));
 
   /**
+   * GET /plugins/:id/setup-status
+   * Check plugin setup status.
+   */
+  router.get("/:id/setup-status", catchHandler(async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+
+    let plugin: import("@fusion/core").PluginInstallation;
+    try {
+      plugin = await pluginStore.getPlugin(id);
+    } catch (err: unknown) {
+      if (
+        (err as NodeJS.ErrnoException).code === "ENOENT"
+        || (err instanceof Error && err.message.includes("not found"))
+      ) {
+        throw notFound(`Plugin "${id}" not found`);
+      }
+      throw internalError(err instanceof Error ? err.message : "Unknown error");
+    }
+
+    if (!pluginRunner?.checkPluginSetup || !pluginRunner.getPluginSetupInfo) {
+      throw internalError("Plugin runner not available");
+    }
+
+    const setupInfo = pluginRunner.getPluginSetupInfo();
+    const hasSetup = setupInfo.some((entry) => entry.pluginId === id);
+
+    if (!hasSetup) {
+      res.json({ hasSetup: false });
+      return;
+    }
+
+    if (plugin.state !== "started") {
+      res.json({
+        hasSetup: true,
+        setupCheckDeferred: true,
+        deferredReason: "plugin-not-started",
+        pluginState: plugin.state,
+      });
+      return;
+    }
+
+    const status = await pluginRunner.checkPluginSetup(id);
+    res.json({ hasSetup: true, ...status });
+  }));
+
+  /**
+   * POST /plugins/:id/setup/install
+   * Trigger plugin setup install hook.
+   */
+  router.post("/:id/setup/install", catchHandler(async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+
+    let plugin: import("@fusion/core").PluginInstallation;
+    try {
+      plugin = await pluginStore.getPlugin(id);
+    } catch (err: unknown) {
+      if (
+        (err as NodeJS.ErrnoException).code === "ENOENT"
+        || (err instanceof Error && err.message.includes("not found"))
+      ) {
+        throw notFound(`Plugin "${id}" not found`);
+      }
+      throw internalError(err instanceof Error ? err.message : "Unknown error");
+    }
+
+    if (!plugin.enabled) {
+      throw badRequest("Plugin must be enabled before setup install");
+    }
+
+    if (!pluginRunner?.installPluginSetup || !pluginRunner.getPluginSetupInfo) {
+      throw internalError("Plugin runner not available");
+    }
+
+    const setupInfo = pluginRunner.getPluginSetupInfo();
+    const setup = setupInfo.find((entry) => entry.pluginId === id);
+    if (!setup?.hooks.install) {
+      throw badRequest("Plugin has no install hook");
+    }
+
+    const result = await pluginRunner.installPluginSetup(id);
+    res.json(result ?? { success: true });
+  }));
+
+  /**
    * DELETE /plugins/:id
    * Uninstall a plugin.
    */
@@ -447,27 +542,72 @@ export function createPluginRouter(
           throw notFound(`Plugin "${pluginId}" not loaded`);
         }
 
-        // Create a minimal context for the handler
-        const ctx: PluginContext = {
-          pluginId,
-          taskStore: {} as import("@fusion/core").TaskStore, // TaskStore is provided by the plugin loader
-          settings: {},
-          logger: {
-            info: (...args: unknown[]) => console.log(`[plugin:${pluginId}]`, ...args),
-            warn: (...args: unknown[]) => console.warn(`[plugin:${pluginId}]`, ...args),
-            error: (...args: unknown[]) => console.error(`[plugin:${pluginId}]`, ...args),
-            debug: (...args: unknown[]) => {
-              if (process.env.DEBUG?.includes("plugins")) {
-                console.log(`[plugin:${pluginId}]`, ...args);
-              }
-            },
-          },
-          emitEvent: () => {},
-        };
+        const projectId = typeof req.query.projectId === "string" && req.query.projectId.trim()
+          ? req.query.projectId
+          : (req.body && typeof req.body === "object" && typeof (req.body as { projectId?: unknown }).projectId === "string" && (req.body as { projectId: string }).projectId.trim()
+            ? (req.body as { projectId: string }).projectId
+            : undefined);
+        const scopedStore = projectId ? await getOrCreateProjectStore(projectId) : null;
+        const taskStore = scopedStore ?? defaultTaskStore ?? ({} as import("@fusion/core").TaskStore);
+
+        let settings: Record<string, unknown> = {};
+        const scopedPluginStore = scopedStore?.getPluginStore?.();
+        if (scopedPluginStore) {
+          try {
+            const scopedPlugin = await scopedPluginStore.getPlugin(pluginId);
+            settings = scopedPlugin.settings;
+          } catch {
+            // Fall back to default store plugin settings when project-scoped plugin record is unavailable.
+          }
+        }
+        if (!scopedPluginStore || Object.keys(settings).length === 0) {
+          try {
+            const pluginRecord = await pluginStore.getPlugin(pluginId);
+            settings = pluginRecord.settings;
+          } catch {
+            // Keep empty settings when plugin store record isn't available.
+          }
+        }
+
+        const ctx: PluginContext = await pluginLoader.createRouteContext(pluginId, {
+          taskStore,
+          settings,
+          resolveProjectTaskStore: getOrCreateProjectStore,
+        });
 
         // Call the route handler with Express Request cast to unknown
         const result = await route.handler(req as unknown, ctx);
-        res.json(result);
+
+        if (isPluginRouteResponse(result)) {
+          if (result.headers) {
+            for (const [name, value] of Object.entries(result.headers)) {
+              res.setHeader(name, value);
+            }
+          }
+          if (result.contentType) {
+            res.setHeader("Content-Type", result.contentType);
+          }
+          if (result.status === 204) {
+            res.status(204).send();
+            return;
+          }
+          if (result.body === undefined) {
+            res.status(result.status).send();
+            return;
+          }
+          if (
+            result.contentType
+            || typeof result.body === "string"
+            || Buffer.isBuffer(result.body)
+          ) {
+            res.status(result.status).send(result.body);
+            return;
+          }
+          res.status(result.status).json(result.body);
+          return;
+        }
+
+        res.status(200).json(result);
       });
 
       switch (route.method) {
@@ -479,6 +619,9 @@ export function createPluginRouter(
           break;
         case "PUT":
           router.put(fullPath, handler);
+          break;
+        case "PATCH":
+          router.patch(fullPath, handler);
           break;
         case "DELETE":
           router.delete(fullPath, handler);

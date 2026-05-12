@@ -3,12 +3,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { SettingsModal } from "../SettingsModal";
 import { __test_clearCache as clearPluginUiSlotsCache } from "../../hooks/usePluginUiSlots";
-import type { SettingsExportData, UpdateCheckResponse } from "../../api";
-import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
-import {
-  clearPendingAuthLoginUiState,
-  savePendingAuthLoginUiState,
-} from "../../utils/pendingAuthLoginUiState";
+import type { PluginUiContributionEntry, SettingsExportData, UpdateCheckResponse } from "../../api";
 
 // --- API mocks ---
 const mockFetchSettings = vi.fn();
@@ -17,13 +12,11 @@ const mockExportSettings = vi.fn();
 const mockUpdateSettings = vi.fn();
 const mockUpdateGlobalSettings = vi.fn();
 const mockFetchAuthStatus = vi.fn();
-const mockFetchClaudeCliStatus = vi.fn();
 const mockLoginProvider = vi.fn();
 const mockLogoutProvider = vi.fn();
 const mockCancelProviderLogin = vi.fn();
-const mockSubmitProviderManualCode = vi.fn();
 const mockSaveApiKey = vi.fn();
-const mockAddCliAccountProvider = vi.fn();
+const mockSubmitProviderManualCode = vi.fn();
 const mockFetchModels = vi.fn();
 const mockFetchCustomProviders = vi.fn();
 const mockCreateCustomProvider = vi.fn();
@@ -61,6 +54,8 @@ const mockTriggerMemoryDreams = vi.fn();
 const mockFetchPluginUiSlots = vi.fn();
 const mockFetchDroidCliStatus = vi.fn();
 const mockSetDroidCliEnabled = vi.fn();
+const mockFetchCursorCliStatus = vi.fn();
+const mockSetCursorCliEnabled = vi.fn();
 const mockUseWorkspaceFileBrowser = vi.fn();
 
 vi.mock("../../api", async (importOriginal) => {
@@ -73,13 +68,11 @@ vi.mock("../../api", async (importOriginal) => {
     exportSettings: (...args: unknown[]) => mockExportSettings(...args),
     importSettings: (...args: unknown[]) => mockImportSettings(...args),
     fetchAuthStatus: (...args: unknown[]) => mockFetchAuthStatus(...args),
-    fetchClaudeCliStatus: (...args: unknown[]) => mockFetchClaudeCliStatus(...args),
     loginProvider: (...args: unknown[]) => mockLoginProvider(...args),
     logoutProvider: (...args: unknown[]) => mockLogoutProvider(...args),
     cancelProviderLogin: (...args: unknown[]) => mockCancelProviderLogin(...args),
-    submitProviderManualCode: (...args: unknown[]) => mockSubmitProviderManualCode(...args),
     saveApiKey: (...args: unknown[]) => mockSaveApiKey(...args),
-    addCliAccountProvider: (...args: unknown[]) => mockAddCliAccountProvider(...args),
+    submitProviderManualCode: (...args: unknown[]) => mockSubmitProviderManualCode(...args),
     fetchModels: (...args: unknown[]) => mockFetchModels(...args),
     fetchCustomProviders: (...args: unknown[]) => mockFetchCustomProviders(...args),
     createCustomProvider: (...args: unknown[]) => mockCreateCustomProvider(...args),
@@ -116,6 +109,8 @@ vi.mock("../../api", async (importOriginal) => {
     fetchPluginUiSlots: (...args: unknown[]) => mockFetchPluginUiSlots(...args),
     fetchDroidCliStatus: (...args: unknown[]) => mockFetchDroidCliStatus(...args),
     setDroidCliEnabled: (...args: unknown[]) => mockSetDroidCliEnabled(...args),
+    fetchCursorCliStatus: (...args: unknown[]) => mockFetchCursorCliStatus(...args),
+    setCursorCliEnabled: (...args: unknown[]) => mockSetCursorCliEnabled(...args),
   });
 });
 
@@ -179,6 +174,7 @@ const defaultSettings = {
   mergeStrategy: "direct",
   pushAfterMerge: false,
   pushRemote: "origin",
+  verificationFixRetries: 2,
   recycleWorktrees: false,
   worktreeNaming: "random",
   includeTaskIdInCommit: true,
@@ -245,24 +241,9 @@ describe("SettingsModal", () => {
     expect(container.querySelectorAll(".settings-section-heading").length).toBeGreaterThan(0);
   });
 
-  it("keeps authentication account action rows from clipping add-account controls", () => {
-    const css = loadAllAppCssBaseOnly();
-    const oauthActions = css.match(/\.auth-provider-actions-row\s*\{([^}]+)\}/)?.[1] ?? "";
-    const apiKeyActions = css.match(/\.auth-apikey-input-row\s*\{([^}]+)\}/)?.[1] ?? "";
-
-    expect(oauthActions).toContain("flex-wrap: wrap");
-    expect(oauthActions).toContain("flex: 0 0 auto");
-    expect(apiKeyActions).toContain("flex-wrap: wrap");
-    expect(apiKeyActions).toContain("justify-content: flex-end");
-  });
-
   beforeEach(() => {
     vi.clearAllMocks();
     clearPluginUiSlotsCache();
-    clearPendingAuthLoginUiState("anthropic");
-    clearPendingAuthLoginUiState("claude-cli");
-    clearPendingAuthLoginUiState("cursor");
-    clearPendingAuthLoginUiState("google-gemini-cli");
     mockUseMobileKeyboard.mockReturnValue({
       keyboardOpen: false,
       keyboardOverlap: 0,
@@ -285,20 +266,14 @@ describe("SettingsModal", () => {
     mockFetchSettings.mockResolvedValue(defaultSettings);
     mockFetchSettingsByScope.mockResolvedValue({ global: defaultSettings, project: {} });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
-    mockFetchClaudeCliStatus.mockResolvedValue({
-      binary: { available: true, version: "1.0.0", probeDurationMs: 1 },
-      enabled: false,
-      extension: null,
-      ready: false,
-    });
     mockFetchModels.mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] });
     mockFetchCustomProviders.mockResolvedValue({ providers: [] });
     mockCreateCustomProvider.mockResolvedValue({ provider: {} });
     mockUpdateCustomProvider.mockResolvedValue({ provider: {} });
     mockDeleteCustomProvider.mockResolvedValue(undefined);
     mockCancelProviderLogin.mockResolvedValue({ success: true, cancelled: true });
-    mockSubmitProviderManualCode.mockResolvedValue({ success: true, submitted: true });
     mockSaveApiKey.mockResolvedValue(undefined);
+    mockSubmitProviderManualCode.mockResolvedValue({ success: true, submitted: true });
     mockTestNotification.mockResolvedValue({ success: true });
     mockFetchBackups.mockResolvedValue({ backups: [], totalSize: 0 });
     mockFetchMemoryFiles.mockResolvedValue({
@@ -407,6 +382,13 @@ describe("SettingsModal", () => {
       ready: false,
     });
     mockSetDroidCliEnabled.mockResolvedValue({ enabled: true, restartRequired: true });
+    mockFetchCursorCliStatus.mockResolvedValue({
+      binary: { available: true, version: "0.1.0", binaryPath: "/usr/local/bin/cursor-agent", probeDurationMs: 8 },
+      enabled: false,
+      extension: null,
+      ready: false,
+    });
+    mockSetCursorCliEnabled.mockResolvedValue({ enabled: true, restartRequired: false });
     mockUseWorkspaceFileBrowser.mockReturnValue({
       entries: [],
       currentPath: ".",
@@ -531,6 +513,29 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("checkbox", { name: "Save tool output in agent logs" })).not.toBeChecked();
     });
 
+    it("defaults persistAgentThinkingLog checkbox to unchecked", async () => {
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" })).not.toBeChecked();
+    });
+
+    it("reflects persisted checked thinking-log value from global settings", async () => {
+      mockFetchSettings.mockResolvedValue({
+        ...defaultSettings,
+        persistAgentThinkingLog: true,
+      });
+      mockFetchSettingsByScope.mockResolvedValue({
+        global: { ...defaultSettings, persistAgentThinkingLog: true },
+        project: {},
+      });
+
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" })).toBeChecked();
+    });
+
     it("saves persistAgentToolOutput only via global settings payload", async () => {
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
@@ -547,6 +552,54 @@ describe("SettingsModal", () => {
       if (mockUpdateSettings.mock.calls.length > 0) {
         const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
         expect(projectPayload.persistAgentToolOutput).toBeUndefined();
+      }
+    });
+
+    it("saves persistAgentThinkingLog only via global settings payload", async () => {
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      await userEvent.click(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" }));
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateGlobalSettings).toHaveBeenCalled();
+      });
+
+      const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(globalPayload.persistAgentThinkingLog).toBe(true);
+      if (mockUpdateSettings.mock.calls.length > 0) {
+        const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(projectPayload.persistAgentThinkingLog).toBeUndefined();
+      }
+    });
+
+    it("renders global default tracking repo control", async () => {
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      const input = screen.getByLabelText("Global default tracking repo") as HTMLInputElement;
+      expect(input.value).toBe("");
+      expect(screen.getByText(/Projects inherit this value when they do not set a project default tracking repo/i)).toBeInTheDocument();
+    });
+
+    it("saves global default tracking repo via global settings payload only", async () => {
+      renderModal({ initialSection: "global-general" });
+      await waitForSettingsModalReady();
+
+      await userEvent.type(screen.getByLabelText("Global default tracking repo"), "octo/global-default");
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateGlobalSettings).toHaveBeenCalled();
+      });
+
+      const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(globalPayload.githubTrackingDefaultRepo).toBe("octo/global-default");
+
+      if (mockUpdateSettings.mock.calls.length > 0) {
+        const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(projectPayload.githubTrackingDefaultRepo).toBeUndefined();
       }
     });
   });
@@ -723,6 +776,23 @@ describe("SettingsModal", () => {
         expect(globalPayload).not.toHaveProperty("defaultProviderOverride");
         expect(globalPayload).not.toHaveProperty("defaultModelIdOverride");
       }
+    });
+  });
+
+  describe("settings header actions", () => {
+    it("renders Help and GitHub star controls with shared header sizing contract class hooks", async () => {
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const headerActions = document.querySelector(".settings-header-actions");
+      expect(headerActions).toBeInTheDocument();
+
+      const starLink = within(headerActions as HTMLElement).getByRole("link", { name: "Star Fusion on GitHub" });
+      const helpLink = within(headerActions as HTMLElement).getByRole("link", { name: "Help and discussions" });
+
+      expect(starLink).toHaveClass("settings-github-star-btn");
+      expect(helpLink).toHaveClass("settings-header-help-btn");
+      expect(helpLink).toHaveClass("btn", "btn-sm");
     });
   });
 
@@ -1012,6 +1082,7 @@ describe("SettingsModal", () => {
         providers: [
           { id: "github", name: "GitHub", authenticated: true, type: "oauth" },
           { id: "openai", name: "OpenAI", authenticated: false, type: "api_key" },
+          { id: "cloudflare", name: "Cloudflare", authenticated: false, type: "api_key" },
         ],
       });
 
@@ -1020,11 +1091,13 @@ describe("SettingsModal", () => {
 
       expect(screen.getByTestId("auth-provider-icon-github")).toBeInTheDocument();
       expect(screen.getByTestId("auth-provider-icon-openai")).toBeInTheDocument();
+      expect(screen.getByTestId("auth-provider-icon-cloudflare")).toBeInTheDocument();
+      expect(within(screen.getByTestId("auth-provider-icon-cloudflare")).getByTestId("cloudflare-icon")).toBeInTheDocument();
       expect(screen.getByTestId("auth-status-github")).toHaveTextContent("✓ Active");
       expect(screen.getByTestId("auth-status-openai")).toHaveTextContent("✗ Not connected");
     });
 
-    it("hides deprecated antigravity auth providers while keeping Gemini CLI", async () => {
+    it("hides deprecated Google CLI and antigravity auth providers", async () => {
       mockFetchAuthStatus.mockResolvedValueOnce({
         providers: [
           { id: "google", name: "Google", authenticated: false, type: "api_key" },
@@ -1042,7 +1115,7 @@ describe("SettingsModal", () => {
       expect(screen.getByTestId("auth-provider-icon-gemini")).toBeInTheDocument();
       expect(screen.queryByTestId("auth-provider-icon-google-antigravity")).not.toBeInTheDocument();
       expect(screen.queryByTestId("auth-provider-icon-antigravity")).not.toBeInTheDocument();
-      expect(screen.getByText("Google Gemini CLI")).toBeInTheDocument();
+      expect(screen.queryByText("Google Gemini CLI")).not.toBeInTheDocument();
     });
 
     it("scrolls settings content to top after OAuth login succeeds", async () => {
@@ -1081,6 +1154,88 @@ describe("SettingsModal", () => {
       expect(openSpy).toHaveBeenCalled();
     });
 
+    it("renders Anthropic pasted-code form when login response includes manualCode", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth" }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({
+        url: "https://claude.ai/oauth/authorize",
+        manualCode: {
+          prompt: "Paste the final redirect URL or authorization code",
+          placeholder: "http://localhost:*/callback?code=...&state=... or just the code",
+          helpText: "After Claude sign-in, copy the full browser URL (or just the code) and paste it here to finish login from this dashboard host.",
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
+
+      expect(await within(anthropicCard).findByText("Paste the final redirect URL or authorization code")).toBeInTheDocument();
+      await userEvent.type(within(anthropicCard).getByRole("textbox"), "anthropic-code");
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Submit code" }));
+
+      await waitFor(() => {
+        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("anthropic", "anthropic-code");
+      });
+      expect(openSpy).toHaveBeenCalled();
+    });
+
+    it("scrolls the manual-code input into view on mobile focus", async () => {
+      Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: vi.fn().mockImplementation((query: string) => ({
+          matches: query === "(max-width: 768px)" || query === "(pointer: coarse)",
+          media: query,
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })),
+      });
+
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback: FrameRequestCallback) => {
+        callback(0);
+        return 1;
+      });
+
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth" }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({
+        url: "https://claude.ai/oauth/authorize",
+        manualCode: {
+          prompt: "Paste the final redirect URL or authorization code",
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
+
+      const textarea = await within(anthropicCard).findByRole("textbox");
+      const scrollIntoView = vi.fn();
+      Object.defineProperty(textarea, "scrollIntoView", {
+        value: scrollIntoView,
+        writable: true,
+      });
+
+      fireEvent.focus(textarea);
+
+      await waitFor(() => {
+        expect(scrollIntoView).toHaveBeenCalled();
+      });
+      expect(openSpy).toHaveBeenCalled();
+    });
+
     it("shows cancel action for server-reported pending oauth login", async () => {
       mockFetchAuthStatus.mockResolvedValue({
         providers: [{ id: "github-copilot", name: "GitHub Copilot", authenticated: false, type: "oauth", loginInProgress: true }],
@@ -1095,201 +1250,6 @@ describe("SettingsModal", () => {
 
       await waitFor(() => {
         expect(mockCancelProviderLogin).toHaveBeenCalledWith("github-copilot");
-      });
-    });
-
-    it("shows add another account for authenticated Codex OAuth even when no account rows exist yet", async () => {
-      mockFetchAuthStatus.mockResolvedValue({
-        providers: [
-          {
-            id: "openai-codex",
-            name: "ChatGPT Plus/Pro (Codex Subscription)",
-            authenticated: true,
-            type: "oauth",
-            accountCount: 0,
-            accounts: [],
-          },
-        ],
-      });
-
-      renderModal();
-      await waitForSettingsModalReady();
-
-      const codexCard = screen.getByTestId("auth-provider-icon-openai-codex").closest(".auth-provider-card") as HTMLElement;
-      expect(within(codexCard).getByRole("button", { name: "Add another account" })).toBeInTheDocument();
-      expect(within(codexCard).getByRole("button", { name: "Logout" })).toBeInTheDocument();
-    });
-
-    it("shows the Anthropic manual-code box during OAuth login", async () => {
-      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
-      mockFetchAuthStatus.mockResolvedValue({
-        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth" }],
-      });
-      mockLoginProvider.mockResolvedValue({
-        url: "https://claude.com/cai/oauth/authorize?code=true",
-        instructions: "Finish Anthropic sign-in in the browser.",
-        manualCode: {
-          prompt: "Paste the Anthropic authorization code",
-          placeholder: "code...",
-          helpText: "Submit the code here.",
-        },
-      });
-
-      renderModal();
-      await waitForSettingsModalReady();
-
-      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
-      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
-
-      expect(openSpy).toHaveBeenCalledWith("https://claude.com/cai/oauth/authorize?code=true", "_blank");
-      const manualCodeForm = await screen.findByTestId("auth-manual-code-anthropic");
-      expect(manualCodeForm).toHaveTextContent("Paste the Anthropic authorization code");
-
-      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "anthropic-code-123");
-      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
-
-      await waitFor(() => {
-        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("anthropic", "anthropic-code-123");
-      });
-    });
-
-    it("shows the Claude CLI manual-code box during add-account login", async () => {
-      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
-      mockFetchAuthStatus.mockResolvedValue({
-        providers: [{
-          id: "claude-cli",
-          name: "Anthropic — via Claude CLI",
-          authenticated: true,
-          type: "cli",
-          loginInProgress: false,
-          accounts: [],
-          accountCount: 0,
-        }],
-      });
-      mockAddCliAccountProvider.mockResolvedValue({
-        success: true,
-        provider: "claude-cli",
-        url: "https://claude.com/cai/oauth/authorize?code=true",
-        instructions: "Finish Claude sign-in in the browser.",
-        manualCode: {
-          prompt: "Paste the Claude authorization code",
-          placeholder: "code...",
-          helpText: "Submit the code here.",
-        },
-      });
-
-      renderModal();
-      await waitForSettingsModalReady();
-
-      const claudeCard = screen.getByTestId("claude-cli-provider-card");
-      await waitFor(() => {
-        expect(within(claudeCard).getByRole("button", { name: "Add another account" })).toBeEnabled();
-      });
-      await userEvent.click(within(claudeCard).getByRole("button", { name: "Add another account" }));
-
-      expect(openSpy).toHaveBeenCalledWith("https://claude.com/cai/oauth/authorize?code=true", "_blank");
-      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
-      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
-
-      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "claude-code-123");
-      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
-
-      await waitFor(() => {
-        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "claude-code-123");
-      });
-    });
-
-    it("restores the Claude CLI manual-code box from an in-progress status refresh", async () => {
-      mockFetchClaudeCliStatus.mockResolvedValue({
-        binary: { available: true, version: "claude 1.0.0", probeDurationMs: 1 },
-        enabled: true,
-        extension: null,
-        ready: true,
-      });
-      mockFetchAuthStatus.mockResolvedValue({
-        providers: [{
-          id: "claude-cli",
-          name: "Anthropic — via Claude CLI",
-          authenticated: true,
-          type: "cli",
-          loginInProgress: true,
-          supportsMultipleAccounts: true,
-          accountCount: 1,
-          accounts: [{
-            id: "claude-cli-account-1",
-            providerId: "claude-cli",
-            label: "Claude account 1",
-            credentialKind: "cli_oauth_home",
-            accountDisplayHint: "user@example.com",
-            priority: 100,
-            status: "active",
-            createdAt: "2026-05-05T00:00:00.000Z",
-            updatedAt: "2026-05-05T00:00:00.000Z",
-          }],
-          loginInstructions: "Finish Claude sign-in in the browser, then paste the code below.",
-          manualCode: {
-            prompt: "Paste the Claude authorization code",
-            placeholder: "code...",
-            helpText: "Submit the code here.",
-          },
-        }],
-      });
-
-      renderModal();
-      await waitForSettingsModalReady();
-
-      const claudeCard = await screen.findByTestId("claude-cli-provider-card");
-      expect(within(claudeCard).getByRole("button", { name: "Waiting for login…" })).toBeInTheDocument();
-      expect(within(claudeCard).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
-      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
-      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
-
-      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "resumed-claude-code");
-      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
-
-      await waitFor(() => {
-        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "resumed-claude-code");
-      });
-    });
-
-    it("restores the Claude CLI manual-code box from browser cache when the server status omits it", async () => {
-      savePendingAuthLoginUiState("claude-cli", {
-        instructions: "Finish Claude sign-in from the restored browser prompt.",
-        manualCode: {
-          prompt: "Paste the Claude authorization code",
-          placeholder: "code...",
-          helpText: "Submit the code here.",
-        },
-      });
-      mockFetchClaudeCliStatus.mockResolvedValue({
-        binary: { available: true, version: "claude 1.0.0", probeDurationMs: 1 },
-        enabled: true,
-        extension: null,
-        ready: true,
-      });
-      mockFetchAuthStatus.mockResolvedValue({
-        providers: [{
-          id: "claude-cli",
-          name: "Anthropic — via Claude CLI",
-          authenticated: true,
-          type: "cli",
-          loginInProgress: true,
-          supportsMultipleAccounts: true,
-          accountCount: 0,
-          accounts: [],
-        }],
-      });
-
-      renderModal();
-      await waitForSettingsModalReady();
-
-      const manualCodeForm = await screen.findByTestId("auth-manual-code-claude-cli");
-      expect(manualCodeForm).toHaveTextContent("Paste the Claude authorization code");
-      await userEvent.type(within(manualCodeForm).getByRole("textbox"), "cached-claude-code");
-      await userEvent.click(within(manualCodeForm).getByRole("button", { name: "Submit code" }));
-
-      await waitFor(() => {
-        expect(mockSubmitProviderManualCode).toHaveBeenCalledWith("claude-cli", "cached-claude-code");
       });
     });
 
@@ -1378,6 +1338,37 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
       expect(await screen.findByTestId("droid-cli-provider-card")).toBeInTheDocument();
       expect(screen.getAllByTestId("droid-cli-provider-card")).toHaveLength(1);
+    });
+
+    it("renders cursor cli auth card in authentication group", async () => {
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "cursor-cli", name: "Cursor — via Cursor CLI", authenticated: false, type: "cli" }],
+      });
+      mockFetchPluginUiSlots.mockResolvedValueOnce([]);
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByTestId("cursor-cli-provider-card")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Enable" })).toBeInTheDocument();
+    });
+
+    it("disables cursor enable action when binary is unavailable", async () => {
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "cursor-cli", name: "Cursor — via Cursor CLI", authenticated: false, type: "cli" }],
+      });
+      mockFetchCursorCliStatus.mockResolvedValueOnce({
+        binary: { available: false, reason: "cursor-agent not found", probeDurationMs: 8 },
+        enabled: false,
+        extension: null,
+        ready: false,
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      expect(await screen.findByText("cursor-agent not found")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Enable" })).toBeDisabled();
     });
 
     it("does not render droid auth card when plugin slot is not present", async () => {
@@ -1538,6 +1529,19 @@ describe("SettingsModal", () => {
       // Clear the input - the input should be empty, not show "0"
       await userEvent.clear(input);
       expect(input.value).toBe("");
+    });
+
+    it("allows configuring stale high fan-out escalation threshold in hours", async () => {
+      renderModal();
+      await waitFor(() => expect(mockFetchSettings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByText("Scheduling"));
+
+      const input = screen.getByLabelText("Stale High Fan-out Escalation (hours)") as HTMLInputElement;
+      expect(input).toBeDefined();
+      await userEvent.clear(input);
+      await userEvent.type(input, "3");
+      expect(input.value).toBe("3");
     });
 
     it("allows clearing maxWorktrees without leaving a stuck zero", async () => {
@@ -2005,6 +2009,101 @@ describe("SettingsModal", () => {
       expect(payload.pushAfterMerge).toBe(true);
       expect(payload.pushRemote).toBe("upstream main");
     });
+
+    describe("verificationFixRetries", () => {
+      it("shows default value 3 when verificationFixRetries is not set", async () => {
+        mockFetchSettings.mockResolvedValueOnce({
+          ...defaultSettings,
+          verificationFixRetries: undefined,
+        });
+
+        renderModal({ initialSection: "merge" });
+        await waitForSettingsModalReady();
+
+        const retriesInput = screen.getByLabelText("Verification auto-fix retries") as HTMLInputElement;
+        expect(retriesInput.value).toBe("3");
+      });
+
+      it.each([0, 1, 2, 3])("persists valid value %i", async (value) => {
+        renderModal({ initialSection: "merge" });
+        await waitForSettingsModalReady();
+
+        const retriesInput = screen.getByLabelText("Verification auto-fix retries") as HTMLInputElement;
+        fireEvent.change(retriesInput, { target: { value: String(value) } });
+        await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+        await waitFor(() => {
+          expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
+        });
+
+        const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+        expect(payload.verificationFixRetries).toBe(value);
+      });
+
+      it("clamps out-of-range values", async () => {
+        renderModal({ initialSection: "merge" });
+        await waitForSettingsModalReady();
+
+        const retriesInput = screen.getByLabelText("Verification auto-fix retries") as HTMLInputElement;
+
+        fireEvent.change(retriesInput, { target: { value: "5" } });
+        expect(retriesInput.value).toBe("3");
+
+        fireEvent.change(retriesInput, { target: { value: "-1" } });
+        expect(retriesInput.value).toBe("0");
+      });
+
+      it("saving after clearing input persists undefined and falls back to visible default 3", async () => {
+        renderModal({ initialSection: "merge" });
+        await waitForSettingsModalReady();
+
+        const retriesInput = screen.getByLabelText("Verification auto-fix retries") as HTMLInputElement;
+        await userEvent.clear(retriesInput);
+        await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+        await waitFor(() => {
+          expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
+        });
+
+        const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+        expect(payload.verificationFixRetries).toBeUndefined();
+        expect(retriesInput.value).toBe("3");
+      });
+    });
+
+    it("renders and saves github issue tracking controls", async () => {
+      renderModal({ initialSection: "merge" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("heading", { name: "GitHub Issue Tracking" })).toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Default GitHub tracking ON for new tasks" })).not.toBeChecked();
+      expect(screen.getByLabelText("Project default tracking repo")).toBeInTheDocument();
+
+      const authModeSelect = screen.getByLabelText("GitHub auth mode") as HTMLSelectElement;
+      expect(authModeSelect.value).toBe("gh-cli");
+      expect(screen.queryByLabelText("GitHub personal access token")).not.toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("checkbox", { name: "Default GitHub tracking ON for new tasks" }));
+      await userEvent.type(screen.getByLabelText("Project default tracking repo"), "octo/repo");
+      await userEvent.selectOptions(authModeSelect, "token");
+      await userEvent.type(screen.getByLabelText("GitHub personal access token"), "ghp_test_token");
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalled();
+      });
+
+      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+      expect(payload.githubTrackingEnabledByDefault).toBe(true);
+      expect(payload.githubTrackingDefaultRepo).toBe("octo/repo");
+      expect(payload.githubAuthMode).toBe("token");
+      expect(payload.githubAuthToken).toBe("ghp_test_token");
+
+      if (mockUpdateGlobalSettings.mock.calls.length > 0) {
+        const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(globalPayload.githubTrackingDefaultRepo).toBeUndefined();
+      }
+    });
   });
 
   describe("Experimental Features section", () => {
@@ -2035,6 +2134,22 @@ describe("SettingsModal", () => {
       await openExperimentalFeaturesSection();
 
       expect(screen.getByLabelText("Research View")).toBeInTheDocument();
+    });
+
+    it("shows evalsView in the Experimental Features list", async () => {
+      renderModal();
+
+      await openExperimentalFeaturesSection();
+
+      expect(screen.getByLabelText("Evals View")).toBeInTheDocument();
+    });
+
+    it("shows chatRooms in the Experimental Features list", async () => {
+      renderModal();
+
+      await openExperimentalFeaturesSection();
+
+      expect(screen.getByLabelText("Chat Rooms")).toBeInTheDocument();
     });
 
     it("shows agentOnboarding in the Experimental Features list", async () => {
@@ -2155,6 +2270,43 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Research Defaults/i })).not.toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+      });
+
+      it("hides scheduled evals nav item when experimentalFeatures.evalsView is disabled", async () => {
+        mockFetchSettings.mockResolvedValue({
+          ...defaultSettings,
+          experimentalFeatures: {},
+        });
+
+        renderModal();
+        await waitForSettingsModalReady();
+
+        expect(screen.queryByRole("button", { name: /Scheduled Evals/i })).not.toBeInTheDocument();
+      });
+
+      it("shows scheduled evals nav item when experimentalFeatures.evalsView is enabled", async () => {
+        mockFetchSettings.mockResolvedValue({
+          ...defaultSettings,
+          experimentalFeatures: { evalsView: true },
+        });
+
+        renderModal();
+        await waitForSettingsModalReady();
+
+        expect(screen.getByRole("button", { name: /Scheduled Evals/i })).toBeInTheDocument();
+      });
+
+      it("falls back to the first selectable section when opening scheduled evals while evalsView is disabled", async () => {
+        mockFetchSettings.mockResolvedValue({
+          ...defaultSettings,
+          experimentalFeatures: {},
+        });
+
+        renderModal({ initialSection: "scheduled-evals" });
+        await waitForSettingsModalReady();
+
+        expect(screen.queryByRole("button", { name: /Scheduled Evals/i })).not.toBeInTheDocument();
         expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
       });
     });
@@ -2484,6 +2636,15 @@ describe("SettingsModal", () => {
       expect(screen.queryByRole("button", { name: "Install cloudflared" })).not.toBeInTheDocument();
     });
 
+    it("renders branded Cloudflare icon in Remote provider selector", async () => {
+      renderModal();
+      await waitForSettingsModalReady();
+      await openRemoteSection();
+
+      const cloudflareSlot = screen.getByTestId("remote-provider-icon-cloudflare");
+      expect(within(cloudflareSlot).getByTestId("remote-cloudflare-option-icon")).toBeInTheDocument();
+    });
+
     it("shows install button when Cloudflare is selected and cloudflared is not available", async () => {
       mockFetchRemoteStatus.mockResolvedValue({ provider: "cloudflare", state: "stopped", url: null, lastError: null, cloudflaredAvailable: false });
 
@@ -2806,16 +2967,26 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("button", { name: /Test notification/ })).toBeInTheDocument();
     });
 
-    it("shows fallback-used event option for both providers", async () => {
+    it("shows fallback, dreams, and mailbox message events for both providers", async () => {
       mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
       renderModal();
       await waitForSettingsModalReady();
       await openNotificationsSection();
 
       expect(screen.getByLabelText("Fallback model used (recovered)")).toBeInTheDocument();
+      expect(screen.getByLabelText("DREAMS.md entry added")).toBeInTheDocument();
+      const agentToUserNtfy = screen.getByLabelText("Agent → user message") as HTMLInputElement;
+      const agentToAgentNtfy = screen.getByLabelText("Agent → agent message") as HTMLInputElement;
+      expect(agentToUserNtfy.checked).toBe(true);
+      expect(agentToAgentNtfy.checked).toBe(true);
 
       await userEvent.click(screen.getByLabelText("Webhook notifications"));
       expect(screen.getAllByLabelText("Fallback model used (recovered)").length).toBeGreaterThan(0);
+      expect(screen.getAllByLabelText("DREAMS.md entry added").length).toBeGreaterThan(0);
+      const [agentToUserWebhook] = screen.getAllByLabelText("Agent → user message") as HTMLInputElement[];
+      const [agentToAgentWebhook] = screen.getAllByLabelText("Agent → agent message") as HTMLInputElement[];
+      expect(agentToUserWebhook.checked).toBe(true);
+      expect(agentToAgentWebhook.checked).toBe(true);
     });
 
     it("shows webhook fields when webhook provider is enabled", async () => {
@@ -2860,6 +3031,30 @@ describe("SettingsModal", () => {
       });
     });
 
+    it("calls testNotification with ntfy message-event config when message test button clicked", async () => {
+      const addToast = vi.fn();
+      mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
+      renderModal({ addToast });
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+
+      await userEvent.click(screen.getByRole("button", { name: /Test message notification/ }));
+
+      await waitFor(() => {
+        expect(mockTestNotification).toHaveBeenCalledWith(
+          "ntfy",
+          { messageEventType: "message:agent-to-user" },
+          undefined,
+        );
+      });
+      expect(addToast).toHaveBeenCalledWith(
+        "Test notification sent — check your ntfy app inbox!",
+        "success",
+      );
+      expect(screen.getByText("Test notification sent — check your ntfy app inbox!")).toBeInTheDocument();
+      expect(screen.getAllByText("Test notification sent — check your ntfy app inbox!")[0].closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
+    });
+
     it("calls testNotification with webhook provider ID when webhook test button clicked", async () => {
       renderModal();
       await waitForSettingsModalReady();
@@ -2877,6 +3072,8 @@ describe("SettingsModal", () => {
           undefined,
         );
       });
+      expect(within(webhookCard).getByText("Test notification sent — check your webhook endpoint!")).toBeInTheDocument();
+      expect(within(webhookCard).getByText("Test notification sent — check your webhook endpoint!").closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
     });
 
     it("preserves existing ntfy settings in backward compat", async () => {
@@ -2896,10 +3093,150 @@ describe("SettingsModal", () => {
       const failed = screen.getByLabelText("Task failed") as HTMLInputElement;
       const merged = screen.getByLabelText("Task merged") as HTMLInputElement;
       const fallbackUsed = screen.getByLabelText("Fallback model used (recovered)") as HTMLInputElement;
+      const dreamsProcessed = screen.getByLabelText("DREAMS.md entry added") as HTMLInputElement;
       expect(inReview.checked).toBe(true);
       expect(failed.checked).toBe(true);
       expect(merged.checked).toBe(false);
       expect(fallbackUsed.checked).toBe(false);
+      expect(dreamsProcessed.checked).toBe(false);
+    });
+  });
+
+  describe("scheduled eval settings section", () => {
+    const openScheduledEvalsSection = async () => {
+      await userEvent.click(await screen.findByRole("button", { name: /Scheduled Evals/i }));
+    };
+
+    it("renders controls and disables interval controls when evals are disabled", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { evalsView: true },
+        evalSettings: {
+          enabled: false,
+          intervalMs: 86_400_000,
+          followUpPolicy: "suggest-only",
+          retentionDays: 30,
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openScheduledEvalsSection();
+
+      expect(await screen.findByRole("heading", { name: "Scheduled Evals" })).toBeInTheDocument();
+      expect(screen.getByLabelText("Enable scheduled eval runs for this project")).toBeInTheDocument();
+      expect(screen.getByLabelText("Interval (ms)")).toBeDisabled();
+      expect(screen.getByLabelText("Follow-up Policy")).toBeDisabled();
+      expect(screen.getByLabelText("Retention (days)")).toBeDisabled();
+      expect(screen.getByText(/inherit the project validator lane model settings/i)).toBeInTheDocument();
+    });
+
+    it("saves edited project eval settings payload", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { evalsView: true },
+        evalSettings: {
+          enabled: true,
+          intervalMs: 86_400_000,
+          followUpPolicy: "suggest-only",
+          retentionDays: 30,
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openScheduledEvalsSection();
+
+      fireEvent.change(screen.getByLabelText("Interval (ms)"), { target: { value: "120000" } });
+      await userEvent.type(screen.getByLabelText("Evaluator Provider"), "openai");
+      await userEvent.type(screen.getByLabelText("Evaluator Model"), "gpt-5");
+      await userEvent.selectOptions(screen.getByLabelText("Follow-up Policy"), "auto-create");
+      fireEvent.change(screen.getByLabelText("Retention (days)"), { target: { value: "14" } });
+      await userEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            evalSettings: expect.objectContaining({
+              enabled: true,
+              intervalMs: 120000,
+              evaluatorProvider: "openai",
+              evaluatorModelId: "gpt-5",
+              followUpPolicy: "auto-create",
+              retentionDays: 14,
+            }),
+          }),
+          undefined,
+        );
+      });
+    });
+
+    it("clears evaluator provider and model as unset when left blank", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { evalsView: true },
+        evalSettings: {
+          enabled: true,
+          intervalMs: 86_400_000,
+          evaluatorProvider: "openai",
+          evaluatorModelId: "gpt-5",
+          followUpPolicy: "suggest-only",
+          retentionDays: 30,
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openScheduledEvalsSection();
+
+      await userEvent.clear(screen.getByLabelText("Evaluator Provider"));
+      await userEvent.clear(screen.getByLabelText("Evaluator Model"));
+      await userEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            evalSettings: expect.objectContaining({
+              evaluatorProvider: undefined,
+              evaluatorModelId: undefined,
+            }),
+          }),
+          undefined,
+        );
+      });
+    });
+  });
+
+  describe("memory backups settings", () => {
+    it("renders memory backup fields with defaults and saves changes", async () => {
+      renderModal({ initialSection: "backups" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("heading", { name: "Memory Backups" })).toBeInTheDocument();
+      expect(screen.getByLabelText("Memory Backup Schedule (Cron)")).toHaveValue("0 3 * * *");
+      expect(screen.getByLabelText("Memory Retention Count")).toHaveValue(null);
+      expect(screen.getByLabelText("Memory Backup Directory")).toHaveValue(".fusion/backups/memory");
+      expect(screen.getByLabelText("Memory Backup Scope")).toHaveValue("all");
+
+      await userEvent.click(screen.getByLabelText("Enable automatic memory backups"));
+      fireEvent.change(screen.getByLabelText("Memory Backup Schedule (Cron)"), { target: { value: "0 5 * * *" } });
+      fireEvent.change(screen.getByLabelText("Memory Retention Count"), { target: { value: "21" } });
+      fireEvent.change(screen.getByLabelText("Memory Backup Directory"), { target: { value: ".fusion/backups/custom-memory" } });
+      await userEvent.selectOptions(screen.getByLabelText("Memory Backup Scope"), "agents");
+      await userEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            memoryBackupEnabled: true,
+            memoryBackupSchedule: "0 5 * * *",
+            memoryBackupRetention: 21,
+            memoryBackupDir: ".fusion/backups/custom-memory",
+            memoryBackupScope: "agents",
+          }),
+          undefined,
+        );
+      });
     });
   });
 
@@ -2924,9 +3261,9 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openResearchGlobalSection();
 
-      const searchInput = await screen.findByLabelText("Default Search Provider");
-      await userEvent.clear(searchInput);
-      await userEvent.type(searchInput, "tavily");
+      await userEvent.click(screen.getByText(/Advanced — external search providers/i));
+      const providerSelect = await screen.findByLabelText("Search Provider");
+      fireEvent.change(providerSelect, { target: { value: "tavily" } });
       await userEvent.click(screen.getByText("Save"));
 
       await waitFor(() => {
@@ -2980,7 +3317,7 @@ describe("SettingsModal", () => {
       expect(await screen.findByText("Research max concurrent runs must be at least 1.")).toBeInTheDocument();
     });
 
-    it("shows incomplete research defaults guidance when no search provider is set", async () => {
+    it("shows builtin research provider guidance by default", async () => {
       mockFetchSettings.mockResolvedValueOnce({
         ...defaultSettings,
         experimentalFeatures: { researchView: true },
@@ -2991,7 +3328,27 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openResearchGlobalSection();
 
-      expect(await screen.findByText(/Research defaults are incomplete/i)).toBeInTheDocument();
+      expect(await screen.findByText(/Built-in \(uses agent web tools\)/i)).toBeInTheDocument();
+      expect(screen.queryByText(/Research defaults are incomplete/i)).not.toBeInTheDocument();
+    });
+
+    it("keeps external provider settings collapsed by default and reveals on expand", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { researchView: true },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchGlobalSection();
+
+      const details = screen.getByText(/Advanced — external search providers/i).closest("details");
+      expect(details).not.toHaveAttribute("open");
+
+      await userEvent.click(screen.getByText(/Advanced — external search providers/i));
+      expect(details).toHaveAttribute("open");
+      expect(await screen.findByLabelText("SearXNG URL")).toBeInTheDocument();
+      expect(screen.getByText(/Open Authentication Settings/i)).toBeInTheDocument();
     });
 
     it("shows missing credentials warning and routes CTA to Authentication", async () => {
@@ -3013,7 +3370,7 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openResearchGlobalSection();
 
-      expect(await screen.findByText(/Missing credentials for one or more research providers/i)).toBeInTheDocument();
+      expect(await screen.findByText(/Missing credentials for the selected research provider/i)).toBeInTheDocument();
       await userEvent.click(screen.getByRole("button", { name: "Open Authentication" }));
       expect(await screen.findByRole("heading", { name: "Authentication" })).toBeInTheDocument();
     });
@@ -3074,5 +3431,24 @@ describe("SettingsModal", () => {
 
       expect(screen.queryByRole("button", { name: "Dream Now" })).not.toBeInTheDocument();
     });
+  });
+});
+
+
+describe("plugin structured contribution contract fixtures", () => {
+  it("represents all required structured surfaces without componentPath", () => {
+    const contributions: PluginUiContributionEntry[] = [
+      { pluginId: "plugin-a", contribution: { surface: "settings-provider-card", contributionId: "a", providerId: "openai", title: "OpenAI", providerType: "api_key" } },
+      { pluginId: "plugin-a", contribution: { surface: "settings-config-section", contributionId: "b", sectionId: "openai", title: "OpenAI config", pluginSettingKeys: ["openai.apiKey"] } },
+      { pluginId: "plugin-a", contribution: { surface: "onboarding-provider-card", contributionId: "c", providerId: "openai", title: "OpenAI", providerType: "api_key" } },
+      { pluginId: "plugin-a", contribution: { surface: "onboarding-setup-help", contributionId: "d", title: "Help", body: "Use API key", bodyFormat: "text" } },
+      { pluginId: "plugin-a", contribution: { surface: "onboarding-provider-recommendation", contributionId: "e", providerId: "openai", title: "Recommended", reason: "Fast setup" } },
+      { pluginId: "plugin-a", contribution: { surface: "post-onboarding-recommendation", contributionId: "f", title: "Next step", description: "Enable memory" } },
+    ];
+
+    expect(contributions).toHaveLength(6);
+    for (const entry of contributions) {
+      expect("componentPath" in entry.contribution).toBe(false);
+    }
   });
 });

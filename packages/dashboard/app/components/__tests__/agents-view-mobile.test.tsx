@@ -59,6 +59,34 @@ import {
   fetchOrgTree,
 } from "../../api";
 
+const mockOrgTree = [
+  {
+    agent: {
+      id: "agent-root-mobile",
+      name: "Mobile Root",
+      role: "scheduler" as AgentCapability,
+      state: "active" as AgentState,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      metadata: {},
+    },
+    children: [
+      {
+        agent: {
+          id: "agent-child-mobile",
+          name: "Mobile Child",
+          role: "executor" as AgentCapability,
+          state: "running" as AgentState,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          metadata: {},
+        },
+        children: [],
+      },
+    ],
+  },
+];
+
 const mockAgents: Agent[] = [
   {
     id: "agent-001",
@@ -170,6 +198,7 @@ describe("AgentsView mobile adaptations", () => {
   });
 
   it("switches between board, list, and org views", async () => {
+    vi.mocked(fetchOrgTree).mockResolvedValue(mockOrgTree);
     const { container } = render(<AgentsView addToast={vi.fn()} />);
     await waitFor(() => expect(screen.getByText("Agents")).toBeTruthy());
 
@@ -193,7 +222,7 @@ describe("AgentsView mobile adaptations", () => {
     expect(select).toBeTruthy();
 
     const optionValues = Array.from(select.options).map((option) => option.value);
-    expect(optionValues).toEqual(["all", "idle", "active", "running", "paused", "error", "terminated"]);
+    expect(optionValues).toEqual(["all", "idle", "active", "running", "paused", "error"]);
   });
 });
 
@@ -241,16 +270,15 @@ describe("agents-view mobile CSS", () => {
     expect(contentBlock).toContain("overflow-y: auto");
     expect(contentBlock).toContain("-webkit-overflow-scrolling: touch");
     expect(contentBlock).toContain("overscroll-behavior: contain");
-    expect(contentBlock).toContain("var(--mobile-nav-height)");
+    expect(contentBlock).not.toContain("var(--mobile-nav-height)");
     expect(contentBlock).toContain("env(safe-area-inset-bottom, 0px)");
     expect(contentBlock).toContain("var(--standalone-bottom-gap)");
   });
 
-  it("stacks grouped filter controls on mobile", () => {
-    expect(mobileMediaBlock).toContain(".agent-controls-filters");
-    const block = extractRuleBlock(mobileMediaBlock, ".agent-controls-filters");
-    expect(block).toContain("flex-direction: column");
-    expect(block).toContain("width: 100%");
+  it("keeps grouped filter controls token-driven", () => {
+    const block = extractRuleBlock(cssContent, ".agent-controls-filters");
+    expect(block).toContain("display: flex");
+    expect(block).toContain("gap: var(--space-sm)");
   });
 
   it("defines .agents-view-title with flex-wrap on mobile", () => {
@@ -262,12 +290,48 @@ describe("agents-view mobile CSS", () => {
   it("defines mobile org chart sizing and pan/zoom controls rules", () => {
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-controls")).toContain("display: flex");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-controls")).toContain("gap: var(--space-sm)");
-    expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-viewport")).toContain("min-height: calc(var(--space-2xl) * 4)");
+    const viewportBlock = extractRuleBlock(mobileMediaBlock, ".agent-org-chart-viewport");
+    expect(viewportBlock).toContain("min-height: calc(var(--space-2xl) * 4)");
+    expect(viewportBlock).toContain("overflow: auto");
+    expect(viewportBlock).toContain("overscroll-behavior: contain");
+    expect(viewportBlock).toContain("-webkit-overflow-scrolling: touch");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("gap: var(--space-sm)");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("--org-chart-node-width: calc(var(--space-2xl) * 5)");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("--org-chart-sibling-gap: var(--space-sm)");
     expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart")).toContain("--org-chart-children-offset: var(--space-lg)");
+    const childrenConnectorBlock = extractRuleBlock(cssContent, ".org-chart-children::before");
+    expect(childrenConnectorBlock).toContain("left: var(--org-chart-first-child-center-offset)");
+    expect(childrenConnectorBlock).toContain("right: var(--org-chart-last-child-center-offset)");
+    expect(childrenConnectorBlock).not.toContain("rgba(");
+    const verticalConnectorBlock = extractRuleBlock(cssContent, ".agent-org-chart--vertical .org-chart-children::before");
+    expect(verticalConnectorBlock).toContain("left: var(--space-sm)");
+    expect(verticalConnectorBlock).not.toContain("rgba(");
     expect(extractRuleBlock(mobileMediaBlock, ".org-chart-node-card")).toContain("padding: var(--space-sm)");
     expect(extractRuleBlock(mobileMediaBlock, ".org-chart-node__badge")).toContain("font-size: calc(var(--space-sm) + var(--space-xs) * 0.625)");
+    expect(extractRuleBlock(mobileMediaBlock, ".agent-org-chart-shell")).toContain("overflow: hidden");
+  });
+
+  it("keeps org chart viewport as scroll owner while mobile zoom and selection work", async () => {
+    vi.mocked(fetchOrgTree).mockResolvedValue(mockOrgTree);
+    const { container } = render(<AgentsView addToast={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("Agents")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+    const shell = await screen.findByTestId("agent-org-chart-shell");
+    expect(shell.className).toContain("agent-org-chart-shell");
+
+    const viewport = await screen.findByTestId("agent-org-chart-viewport");
+    expect(viewport.className).toContain("agent-org-chart-viewport");
+
+    const chart = await screen.findByTestId("agent-org-chart");
+    expect(chart.getAttribute("data-layout-mode")).toBeTruthy();
+
+    expect(container.querySelector(".agent-org-chart-canvas")?.className).toContain("agent-org-chart-canvas--zoom-100");
+
+    fireEvent.click(screen.getByText("Mobile Child"));
+    await waitFor(() => {
+      expect(container.querySelector(".org-chart-node-card--running.agent-card--selected")).toBeTruthy();
+    });
   });
 });

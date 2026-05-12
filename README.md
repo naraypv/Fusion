@@ -75,7 +75,7 @@ Every task shows its plan, its reviews, its diffs, and its file changes in real 
 | 🏢 **Agent companies** | Import pre-built teams — 440+ agents across 16 companies — and run them autonomously for weeks. |
 | 📬 **Inter-agent messaging** | Built-in mailbox between agents. Delegate, clarify, coordinate. |
 | 🗺️ **Missions** | Hierarchical planning (Mission → Milestone → Slice → Feature → Task) with autopilot and validation contracts. |
-| 🔬 **Research** | Bounded research runs with web search, GitHub, local docs, and LLM synthesis. Turn findings into tasks. ([Docs](./docs/research.md)) |
+| 🔬 **Research** | Bounded research runs with web search, GitHub, local docs, and LLM synthesis (plus runtime builtin WebSearch/WebFetch support in planning + synthesis flows when available). Turn findings into tasks. ([Docs](./docs/research.md)) |
 | 🧪 **Self-improvement** | Agents reflect on their own output and update their prompts as they learn your codebase. |
 | 🔓 **Open source. MIT.** | No vendor lock-in. Run it on your own hardware. Shipping weekly. |
 
@@ -304,13 +304,13 @@ For Capacitor + PWA workflow, see [MOBILE.md](./MOBILE.md).
 
 ### Provider authentication
 
-Fusion supports OAuth-based authentication for AI providers configured via **Settings → Authentication**. When the dashboard is accessed via a non-localhost host (remote node, LAN host/IP, or reverse proxy), provider login URLs are automatically rewritten to route OAuth callbacks through a bridge endpoint (`/api/auth/openai-codex/callback`), ensuring the redirect reaches the active browser session.
+Fusion supports OAuth-based authentication for AI providers configured via **Settings → Authentication**. For most OAuth providers, when the dashboard is accessed via a non-localhost host (remote node, LAN host/IP, or reverse proxy), provider login URLs are rewritten to route OAuth callbacks through a bridge endpoint (`/api/auth/oauth-callback`) so redirects reach the active browser session.
 
-- **OpenAI Codex** — Authenticates via Settings OAuth flow with secure state validation
-- **Factory AI — via Droid CLI** *(optional)* — requires local `droid` install + `droid auth login`, then enable the provider in **Settings → Authentication** and restart Fusion
+- **Anthropic (Claude)** — Uses a pasted authorization-code flow in Settings/onboarding: sign in, then paste the final redirect URL (or code) back into Fusion to complete login
+- **OpenAI Codex** — Uses the same pasted authorization-code flow with secure state validation
+- **Factory AI — via Droid CLI** *(optional)* — requires local Droid CLI install + `droid auth login`; detection follows the effective runtime binary path (default `droid`, or plugin `droidBinaryPath` when configured), then enable in **Settings → Authentication** and restart Fusion
 - **llama.cpp — via HTTP server** *(optional)* — configure your llama.cpp server URL (default `http://127.0.0.1:8080`) and optional API key, then enable in **Settings → Authentication**
 - **Other providers** — Authenticate via API key entry in Settings (including Google/Gemini API key, Google Generative AI, Vertex, and Cloud Code aliases)
-- **Anthropic** — Authenticate via `ANTHROPIC_API_KEY` environment variable
 
 ### Model system
 
@@ -428,6 +428,8 @@ fn skills install firebase/agent-skills               # Install agent skills
 
 ```bash
 pnpm install                  # Install dependencies
+pnpm local                    # Start local dashboard/API on a non-4040 port
+pnpm local -- --engine        # Start local dashboard with the AI engine
 pnpm build                    # Build default workspace packages (excludes desktop/mobile)
 pnpm build:all                # Build all packages (including desktop/mobile)
 pnpm dev dashboard            # Run dashboard + AI engine

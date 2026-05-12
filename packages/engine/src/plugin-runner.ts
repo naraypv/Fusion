@@ -5,7 +5,7 @@
  * and provides plugin tools to agent sessions.
  */
 
-import type { TaskStore, Task } from "@fusion/core";
+import type { TaskStore, Task, WorkflowStepTemplate } from "@fusion/core";
 import type {
   PluginLoader,
   PluginStore,
@@ -15,7 +15,9 @@ import type {
   PluginToolDefinition,
   PluginRouteDefinition,
   PluginUiSlotDefinition,
+  PluginUiContributionDefinition,
   PluginRuntimeRegistration,
+  CliProviderContribution,
   PluginContext,
   PluginSkillContribution,
   PluginWorkflowStepContribution,
@@ -24,9 +26,12 @@ import type {
   PluginPromptSurface,
   PluginSetupManifest,
   PluginSetupHooks,
+  PluginSetupCheckResult,
+  ExecutorRuntimeTaskContext,
 } from "@fusion/core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "@mariozechner/pi-ai";
+import { isAbsolute } from "node:path";
 import { createLogger, executorLog } from "./logger.js";
 
 // Type for the task store's event data
@@ -68,11 +73,21 @@ interface CachedUiSlots {
   version: number;
 }
 
+interface CachedUiContributions {
+  contributions: Array<{ pluginId: string; contribution: PluginUiContributionDefinition }>;
+  version: number;
+}
+
 /**
  * Cached runtimes - rebuilt when plugin state changes
  */
 interface CachedRuntimes {
   runtimes: Array<{ pluginId: string; runtime: PluginRuntimeRegistration }>;
+  version: number;
+}
+
+interface CachedCliProviderContributions {
+  contributions: Array<{ pluginId: string; contribution: CliProviderContribution }>;
   version: number;
 }
 
@@ -83,6 +98,11 @@ interface CachedSkills {
 
 interface CachedWorkflowSteps {
   steps: Array<{ pluginId: string; step: PluginWorkflowStepContribution }>;
+  version: number;
+}
+
+interface CachedWorkflowStepTemplates {
+  templates: Array<{ pluginId: string; template: WorkflowStepTemplate }>;
   version: number;
 }
 
@@ -107,17 +127,23 @@ export class PluginRunner {
   private cachedTools: CachedTools | null = null;
   private cachedRoutes: CachedRoutes | null = null;
   private cachedUiSlots: CachedUiSlots | null = null;
+  private cachedUiContributions: CachedUiContributions | null = null;
   private cachedRuntimes: CachedRuntimes | null = null;
+  private cachedCliProviderContributions: CachedCliProviderContributions | null = null;
   private cachedSkills: CachedSkills | null = null;
   private cachedWorkflowSteps: CachedWorkflowSteps | null = null;
+  private cachedWorkflowStepTemplates: CachedWorkflowStepTemplates | null = null;
   private cachedPromptContributions: CachedPromptContributions | null = null;
   private cachedSetupInfo: CachedSetupInfo | null = null;
   private toolsCacheVersion = 0;
   private routesCacheVersion = 0;
   private uiSlotsCacheVersion = 0;
+  private uiContributionsCacheVersion = 0;
   private runtimesCacheVersion = 0;
+  private cliProviderContributionsCacheVersion = 0;
   private skillsCacheVersion = 0;
   private workflowStepsCacheVersion = 0;
+  private workflowStepTemplatesCacheVersion = 0;
   private promptContributionsCacheVersion = 0;
   private setupCacheVersion = 0;
   private hookTimeoutMs: number;
@@ -189,9 +215,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -276,6 +305,16 @@ export class PluginRunner {
     return this.cachedUiSlots.slots;
   }
 
+  getPluginUiContributions(): Array<{ pluginId: string; contribution: PluginUiContributionDefinition }> {
+    if (!this.cachedUiContributions || this.cachedUiContributions.version !== this.uiContributionsCacheVersion) {
+      this.cachedUiContributions = {
+        contributions: this.options.pluginLoader.getPluginUiContributions(),
+        version: this.uiContributionsCacheVersion,
+      };
+    }
+    return this.cachedUiContributions.contributions;
+  }
+
   /**
    * Get all runtime registrations from loaded plugins.
    * Runtimes are cached and only rebuilt when plugin state changes.
@@ -288,6 +327,16 @@ export class PluginRunner {
       };
     }
     return this.cachedRuntimes.runtimes;
+  }
+
+  getCliProviderContributions(): Array<{ pluginId: string; contribution: CliProviderContribution }> {
+    if (!this.cachedCliProviderContributions || this.cachedCliProviderContributions.version !== this.cliProviderContributionsCacheVersion) {
+      this.cachedCliProviderContributions = {
+        contributions: this.options.pluginLoader.getCliProviderContributions(),
+        version: this.cliProviderContributionsCacheVersion,
+      };
+    }
+    return this.cachedCliProviderContributions.contributions;
   }
 
   getPluginSkills(): Array<{ pluginId: string; skill: PluginSkillContribution }> {
@@ -308,6 +357,16 @@ export class PluginRunner {
       };
     }
     return this.cachedWorkflowSteps.steps;
+  }
+
+  getPluginWorkflowStepTemplates(): Array<{ pluginId: string; template: WorkflowStepTemplate }> {
+    if (!this.cachedWorkflowStepTemplates || this.cachedWorkflowStepTemplates.version !== this.workflowStepTemplatesCacheVersion) {
+      this.cachedWorkflowStepTemplates = {
+        templates: this.options.pluginLoader.getPluginWorkflowStepTemplates(),
+        version: this.workflowStepTemplatesCacheVersion,
+      };
+    }
+    return this.cachedWorkflowStepTemplates.templates;
   }
 
   getPluginPromptContributions(): Array<{
@@ -332,6 +391,127 @@ export class PluginRunner {
       };
     }
     return this.cachedSetupInfo.setups;
+  }
+
+  async checkPluginSetup(pluginId: string): Promise<PluginSetupCheckResult> {
+    try {
+      return await this.withTimeout(
+        this.options.pluginLoader.checkPluginSetup(pluginId),
+        this.hookTimeoutMs,
+        `Setup check for plugin ${pluginId} timed out`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log.warn(`Setup check failed for plugin ${pluginId}: ${message}`);
+      return { status: "error", error: message };
+    }
+  }
+
+  async installPluginSetup(pluginId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      await this.options.pluginLoader.installPluginSetup(pluginId);
+      this.invalidateSetupCache();
+      return { success: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log.warn(`Setup install failed for plugin ${pluginId}: ${message}`);
+      return { success: false, error: message };
+    }
+  }
+
+  async uninstallPluginSetup(pluginId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      await this.options.pluginLoader.uninstallPluginSetup(pluginId);
+      this.invalidateSetupCache();
+      return { success: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.log.warn(`Setup uninstall failed for plugin ${pluginId}: ${message}`);
+      return { success: false, error: message };
+    }
+  }
+
+  async getSetupStatuses(): Promise<Array<{ pluginId: string; manifest: PluginSetupManifest; status?: PluginSetupCheckResult }>> {
+    const setupInfo = this.getPluginSetupInfo();
+    return Promise.all(
+      setupInfo.map(async ({ pluginId, manifest }) => ({
+        pluginId,
+        manifest,
+        status: await this.checkPluginSetup(pluginId),
+      })),
+    );
+  }
+
+  async collectExecutorRuntimeEnv(taskCtx: ExecutorRuntimeTaskContext): Promise<{
+    env: Record<string, string>;
+    pathPrepend: string[];
+    perPluginErrors: Array<{ pluginId: string; error: Error }>;
+  }> {
+    const loadedPlugins = this.options.pluginLoader.getLoadedPlugins();
+    const pluginResults: Array<{ pluginId: string; env: Record<string, string>; pathPrepend: string[] }> = [];
+    const perPluginErrors: Array<{ pluginId: string; error: Error }> = [];
+
+    for (const plugin of loadedPlugins) {
+      if (!plugin.executorRuntimeEnv) {
+        continue;
+      }
+
+      const pluginId = plugin.manifest.id;
+      try {
+        const settings = await this.getPluginSettings(pluginId);
+        const context: PluginContext = {
+          pluginId,
+          taskStore: this.options.taskStore,
+          settings,
+          logger: this.createPluginLogger(pluginId),
+          emitEvent: (event: string, data: unknown) => {
+            this.log.log(`[plugin:${pluginId}] Event: ${event}`, data);
+          },
+        };
+
+        const contribution = await plugin.executorRuntimeEnv(taskCtx, context);
+        const env = contribution.env ?? {};
+        const pathPrepend = contribution.pathPrepend ?? [];
+
+        if (!Array.isArray(pathPrepend) || pathPrepend.some((entry) => typeof entry !== "string" || !isAbsolute(entry))) {
+          throw new Error("executorRuntimeEnv.pathPrepend must be an array of absolute path strings");
+        }
+
+        for (const [key, value] of Object.entries(env)) {
+          if (key === "PATH") {
+            throw new Error("executorRuntimeEnv.env must not contain PATH; use pathPrepend instead");
+          }
+          if (typeof value !== "string") {
+            throw new Error(`executorRuntimeEnv.env.${key} must be a string`);
+          }
+        }
+
+        pluginResults.push({ pluginId, env, pathPrepend });
+      } catch (error) {
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        perPluginErrors.push({ pluginId, error: normalizedError });
+        this.log.warn(`executorRuntimeEnv failed for plugin ${pluginId}: ${normalizedError.message}`);
+      }
+    }
+
+    const mergedEnv: Record<string, string> = {};
+    const mergedPathPrepend: string[] = [];
+
+    for (const result of pluginResults) {
+      for (const [key, value] of Object.entries(result.env)) {
+        if (Object.prototype.hasOwnProperty.call(mergedEnv, key)) {
+          this.log.warn(`executorRuntimeEnv key override: ${key} overwritten by plugin ${result.pluginId}`);
+        }
+        mergedEnv[key] = value;
+      }
+      mergedPathPrepend.unshift(...result.pathPrepend);
+    }
+
+    return {
+      env: mergedEnv,
+      pathPrepend: mergedPathPrepend,
+      perPluginErrors,
+    };
   }
 
   getPromptContributionsForSurface(surface: PluginPromptSurface): Array<{
@@ -386,9 +566,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
     executorLog.log(`Plugin ${pluginId} reloaded`);
@@ -404,9 +587,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
 
@@ -427,9 +613,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
 
@@ -450,9 +639,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
 
@@ -472,9 +664,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -486,9 +681,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -500,9 +698,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -514,9 +715,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -528,9 +732,12 @@ export class PluginRunner {
     this.invalidateToolsCache();
     this.invalidateRoutesCache();
     this.invalidateUiSlotsCache();
+    this.invalidateUiContributionsCache();
     this.invalidateRuntimesCache();
+    this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
     this.invalidateWorkflowStepsCache();
+    this.invalidateWorkflowStepTemplatesCache();
     this.invalidatePromptContributionsCache();
     this.invalidateSetupCache();
   }
@@ -730,12 +937,22 @@ export class PluginRunner {
     this.log.log(`UI slots cache invalidated (version: ${this.uiSlotsCacheVersion})`);
   }
 
+  private invalidateUiContributionsCache(): void {
+    this.uiContributionsCacheVersion++;
+    this.log.log(`UI contributions cache invalidated (version: ${this.uiContributionsCacheVersion})`);
+  }
+
   /**
    * Invalidate the runtimes cache, forcing rebuild on next access.
    */
   private invalidateRuntimesCache(): void {
     this.runtimesCacheVersion++;
     this.log.log(`Runtimes cache invalidated (version: ${this.runtimesCacheVersion})`);
+  }
+
+  private invalidateCliProviderContributionsCache(): void {
+    this.cliProviderContributionsCacheVersion++;
+    this.log.log(`CLI provider contributions cache invalidated (version: ${this.cliProviderContributionsCacheVersion})`);
   }
 
   private invalidateSkillsCache(): void {
@@ -746,6 +963,11 @@ export class PluginRunner {
   private invalidateWorkflowStepsCache(): void {
     this.workflowStepsCacheVersion++;
     this.log.log(`Workflow steps cache invalidated (version: ${this.workflowStepsCacheVersion})`);
+  }
+
+  private invalidateWorkflowStepTemplatesCache(): void {
+    this.workflowStepTemplatesCacheVersion++;
+    this.log.log(`Workflow step templates cache invalidated (version: ${this.workflowStepTemplatesCacheVersion})`);
   }
 
   private invalidatePromptContributionsCache(): void {

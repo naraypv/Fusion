@@ -12,18 +12,20 @@
 
 import "./PluginManager.css";
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Package, Settings, Trash2, Plus, X, RefreshCw, RotateCcw, ExternalLink } from "lucide-react";
-import { fetchPlugins, installPlugin, enablePlugin, disablePlugin, uninstallPlugin, fetchPluginSettings, updatePluginSettings, reloadPlugin } from "../api";
+import { Package, Settings, Trash2, Plus, X, RefreshCw, RotateCcw, ExternalLink, Shield } from "lucide-react";
+import { fetchPlugins, installPlugin, enablePlugin, disablePlugin, uninstallPlugin, fetchPluginSettings, updatePluginSettings, reloadPlugin, fetchPluginSetupStatus, installPluginSetup, updatePlugin, rescanPlugin } from "../api";
 import { DirectoryPicker } from "./DirectoryPicker";
-import type { PluginInstallation, PluginState } from "@fusion/core";
+import type { PluginInstallation, PluginState, PluginSettingSchema } from "@fusion/core";
+import type { PluginSetupStatusResponse } from "../api";
 import type { ToastType } from "../hooks/useToast";
 import { useConfirm } from "../hooks/useConfirm";
 import { subscribeSse } from "../sse-bus";
 
 /** Normalized plugin lifecycle payload from SSE plugin:lifecycle events */
 interface PluginLifecyclePayload {
+  scope: "global" | "project";
   pluginId: string;
-  transition: "installing" | "enabled" | "disabled" | "error" | "uninstalled" | "settings-updated";
+  transition: "installing" | "enabled" | "disabled" | "error" | "state-changed" | "uninstalled" | "settings-updated";
   sourceEvent: string;
   timestamp: string;
   projectId?: string;
@@ -39,42 +41,115 @@ interface PluginManagerProps {
   projectId?: string;
 }
 
-interface BundledPlugin {
+interface BuiltinPlugin {
   id: string;
   name: string;
-  path: string;
+  description: string;
+  category: "runtime" | "integration";
+  path?: string;
   experimental?: boolean;
+  hasSetup?: boolean;
 }
 
-const BUNDLED_PLUGINS: BundledPlugin[] = [
-  {
-    id: "fusion-plugin-agent-browser-runtime",
-    name: "Agent Browser Runtime",
-    path: "./plugins/fusion-plugin-agent-browser-runtime",
-    experimental: true,
+export const BUILTIN_AGENT_BROWSER_PLUGIN_ID = "fusion-plugin-agent-browser";
+
+export const AGENT_BROWSER_SETTINGS_SCHEMA: Record<string, PluginSettingSchema> = {
+  enabled: { type: "boolean", label: "Enable Agent Browser", group: "General" },
+  installChannel: {
+    type: "enum",
+    label: "Install Channel",
+    enumValues: ["stable", "beta", "nightly"],
+    defaultValue: "stable",
+    group: "General",
   },
+  commandTimeoutMs: {
+    type: "number",
+    label: "Command Timeout (ms)",
+    defaultValue: 120000,
+    group: "General",
+  },
+  headlessMode: { type: "boolean", label: "Headless Mode", defaultValue: true, group: "Browser" },
+  allowedDomains: { type: "array", label: "Allowed Domains", itemType: "string", group: "Browser" },
+  promptExecutorSystem: { type: "string", label: "Executor System Prompt", multiline: true, group: "Prompt Contributions" },
+  promptExecutorTask: { type: "string", label: "Executor Task Prompt", multiline: true, group: "Prompt Contributions" },
+  promptTriage: { type: "string", label: "Triage Prompt", multiline: true, group: "Prompt Contributions" },
+  promptReviewer: { type: "string", label: "Reviewer Prompt", multiline: true, group: "Prompt Contributions" },
+  promptHeartbeat: { type: "string", label: "Heartbeat Prompt", multiline: true, group: "Prompt Contributions" },
+  skillExposure: {
+    type: "enum",
+    label: "Skill Exposure",
+    enumValues: ["none", "selected", "all"],
+    defaultValue: "selected",
+    group: "Skills",
+  },
+};
+
+const BUILTIN_PLUGINS: BuiltinPlugin[] = [
   {
     id: "fusion-plugin-hermes-runtime",
     name: "Hermes Runtime",
+    description: "Runtime provider for Hermes CLI-backed execution.",
+    category: "runtime",
     path: "./plugins/fusion-plugin-hermes-runtime",
     experimental: true,
   },
   {
     id: "fusion-plugin-paperclip-runtime",
     name: "Paperclip Runtime",
+    description: "Runtime provider for Paperclip agent connections.",
+    category: "runtime",
     path: "./plugins/fusion-plugin-paperclip-runtime",
   },
   {
     id: "fusion-plugin-openclaw-runtime",
     name: "OpenClaw Runtime",
+    description: "Runtime provider for OpenClaw execution.",
+    category: "runtime",
     path: "./plugins/fusion-plugin-openclaw-runtime",
     experimental: true,
   },
   {
     id: "fusion-plugin-droid-runtime",
     name: "Droid Runtime",
+    description: "Runtime provider for Droid CLI execution.",
+    category: "runtime",
     path: "./plugins/fusion-plugin-droid-runtime",
     experimental: true,
+  },
+  {
+    id: "fusion-plugin-dependency-graph",
+    name: "Dependency Graph",
+    description: "Dashboard plugin for task dependency graph visualization.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-dependency-graph",
+  },
+  {
+    id: "fusion-plugin-reports",
+    name: "Reports",
+    description: "View report history, compare runs side-by-side, and export standalone HTML summaries.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-reports",
+  },
+  {
+    id: "fusion-plugin-whatsapp-chat",
+    name: "WhatsApp Chat",
+    description: "Pairs to WhatsApp Web (multi-device) with QR or pairing code, then bridges direct chats to a Fusion agent.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-whatsapp-chat",
+  },
+  {
+    id: "fusion-plugin-cli-printing-press",
+    name: "CLI Printing Press",
+    description: "Guided wizard for drafting external service CLI definitions.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-cli-printing-press",
+  },
+  {
+    id: BUILTIN_AGENT_BROWSER_PLUGIN_ID,
+    name: "Agent Browser",
+    description: "Built-in integration metadata. Package install support lands in FN-3101.",
+    category: "integration",
+    hasSetup: true,
   },
 ];
 
@@ -86,17 +161,58 @@ export const STATE_COLORS: Record<string, string> = {
   installed: "var(--color-info)",
 };
 
+function resolveSettingsSchema(plugin: PluginInstallation): Record<string, PluginSettingSchema> | undefined {
+  const pluginSchema = plugin.settingsSchema;
+  const hasPluginSchema = pluginSchema && Object.keys(pluginSchema).length > 0;
+
+  if (plugin.id !== BUILTIN_AGENT_BROWSER_PLUGIN_ID) {
+    return hasPluginSchema ? pluginSchema : undefined;
+  }
+
+  if (!hasPluginSchema) {
+    return AGENT_BROWSER_SETTINGS_SCHEMA;
+  }
+
+  return {
+    ...AGENT_BROWSER_SETTINGS_SCHEMA,
+    ...pluginSchema,
+  };
+}
+
+function groupSettingsSchema(settingsSchema: Record<string, PluginSettingSchema>) {
+  const grouped = new Map<string, Array<[string, PluginSettingSchema]>>();
+  const ungrouped: Array<[string, PluginSettingSchema]> = [];
+
+  for (const [key, schema] of Object.entries(settingsSchema)) {
+    if (schema.group) {
+      const groupItems = grouped.get(schema.group) ?? [];
+      groupItems.push([key, schema]);
+      grouped.set(schema.group, groupItems);
+    } else {
+      ungrouped.push([key, schema]);
+    }
+  }
+
+  return { grouped, ungrouped };
+}
+
+
+
 export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   const [plugins, setPlugins] = useState<PluginInstallation[]>([]);
   const [loading, setLoading] = useState(true);
   const [showInstall, setShowInstall] = useState(false);
   const [installPath, setInstallPath] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [installAiScanOnLoad, setInstallAiScanOnLoad] = useState(false);
   const [reloadingPluginId, setReloadingPluginId] = useState<string | null>(null);
   const [selectedPlugin, setSelectedPlugin] = useState<PluginInstallation | null>(null);
   const [pluginSettings, setPluginSettings] = useState<Record<string, unknown>>({});
   const [settingsLoading, setSettingsLoading] = useState(false);
-  const [installingBundledPluginId, setInstallingBundledPluginId] = useState<string | null>(null);
+  const [installingBuiltinPluginId, setInstallingBuiltinPluginId] = useState<string | null>(null);
+  const [builtinSetupStatusById, setBuiltinSetupStatusById] = useState<Record<string, PluginSetupStatusResponse>>({});
+  const [loadingBuiltinSetupId, setLoadingBuiltinSetupId] = useState<string | null>(null);
+  const [installingBuiltinSetupId, setInstallingBuiltinSetupId] = useState<string | null>(null);
   const { confirm } = useConfirm();
 
   const loadPlugins = useCallback(async () => {
@@ -115,6 +231,45 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
     loadPlugins();
   }, [loadPlugins]);
 
+  useEffect(() => {
+    const installedBuiltinsWithSetup = BUILTIN_PLUGINS.filter((builtinPlugin) => (
+      builtinPlugin.hasSetup && plugins.some((plugin) => plugin.id === builtinPlugin.id)
+    ));
+
+    if (installedBuiltinsWithSetup.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void Promise.all(installedBuiltinsWithSetup.map(async (builtinPlugin) => {
+      try {
+        const response = await fetchPluginSetupStatus(builtinPlugin.id, projectId);
+        if (cancelled) {
+          return;
+        }
+        setBuiltinSetupStatusById((prev) => ({ ...prev, [builtinPlugin.id]: response }));
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        setBuiltinSetupStatusById((prev) => ({
+          ...prev,
+          [builtinPlugin.id]: {
+            hasSetup: true,
+            setupCheckDeferred: true,
+            deferredReason: "plugin-not-started",
+            pluginState: "installed",
+          },
+        }));
+      }
+    }));
+
+    return () => {
+      cancelled = true;
+    };
+  }, [plugins, projectId]);
+
   // SSE live updates for plugin lifecycle events
   const pluginsRef = useRef<PluginInstallation[]>([]);
   pluginsRef.current = plugins;
@@ -126,9 +281,10 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
       try {
         const payload: PluginLifecyclePayload = JSON.parse(e.data);
         
-        // Filter by projectId if in project-scoped mode
-        if (projectId && payload.projectId && payload.projectId !== projectId) {
-          return;
+        if (payload.scope === "project") {
+          if ((payload.projectId ?? projectId) !== projectId) {
+            return;
+          }
         }
 
         switch (payload.transition) {
@@ -155,6 +311,22 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                 void loadPlugins();
                 return prev;
               }
+            });
+            break;
+
+          case "state-changed":
+            setPlugins((prev) => {
+              const existingIndex = prev.findIndex((p) => p.id === payload.pluginId);
+              if (existingIndex >= 0) {
+                const updated = [...prev];
+                updated[existingIndex] = {
+                  ...updated[existingIndex],
+                  state: payload.state,
+                  error: payload.error,
+                };
+                return updated;
+              }
+              return prev;
             });
             break;
 
@@ -203,10 +375,11 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
 
     try {
       setInstalling(true);
-      await installPlugin({ path: installPath }, projectId);
-      addToast("Plugin installed successfully", "success");
+      await installPlugin({ path: installPath, ...(installAiScanOnLoad ? { aiScanOnLoad: true } : {}) }, projectId);
+      addToast("Plugin installed globally", "success");
       setShowInstall(false);
       setInstallPath("");
+      setInstallAiScanOnLoad(false);
       await loadPlugins();
     } catch (err) {
       addToast(`Failed to install plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -215,23 +388,54 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
     }
   };
 
-  const handleInstallBundledPlugin = async (plugin: BundledPlugin) => {
+  const handleInstallBuiltinPlugin = async (plugin: BuiltinPlugin) => {
+    if (!plugin.path) {
+      addToast(`${plugin.name} is built in and does not have an installable package yet`, "warning");
+      return;
+    }
+
     try {
-      setInstallingBundledPluginId(plugin.id);
+      setInstallingBuiltinPluginId(plugin.id);
       await installPlugin({ path: plugin.path }, projectId);
-      addToast(`${plugin.name} installed successfully`, "success");
+      addToast(`${plugin.name} installed globally`, "success");
       await loadPlugins();
     } catch (err) {
       addToast(`Failed to install ${plugin.name}: ${err instanceof Error ? err.message : String(err)}`, "error");
     } finally {
-      setInstallingBundledPluginId(null);
+      setInstallingBuiltinPluginId(null);
+    }
+  };
+
+  const handleInstallBuiltinSetup = async (plugin: BuiltinPlugin) => {
+    try {
+      setInstallingBuiltinSetupId(plugin.id);
+      const result = await installPluginSetup(plugin.id, projectId);
+      if (!result.success) {
+        addToast(`Failed to install ${plugin.name} setup: ${result.error ?? "unknown error"}`, "error");
+        return;
+      }
+      addToast(`${plugin.name} setup installed`, "success");
+      setLoadingBuiltinSetupId(plugin.id);
+      const setupStatus = await fetchPluginSetupStatus(plugin.id, projectId);
+      setBuiltinSetupStatusById((prev) => ({ ...prev, [plugin.id]: setupStatus }));
+    } catch (err) {
+      addToast(`Failed to install ${plugin.name} setup: ${err instanceof Error ? err.message : String(err)}`, "error");
+    } finally {
+      setInstallingBuiltinSetupId(null);
+      setLoadingBuiltinSetupId(null);
     }
   };
 
   const handleEnable = async (plugin: PluginInstallation) => {
     try {
-      await enablePlugin(plugin.id, projectId);
-      addToast(`${plugin.name} enabled`, "success");
+      const enabledPlugin = await enablePlugin(plugin.id, projectId);
+      if (enabledPlugin.state === "error") {
+        addToast(`Failed to enable ${plugin.name}: ${enabledPlugin.error ?? "Unknown error"}`, "error");
+        await loadPlugins();
+        return;
+      }
+
+      addToast(`${plugin.name} enabled for this project`, "success");
       await loadPlugins();
     } catch (err) {
       addToast(`Failed to enable plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -241,7 +445,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
   const handleDisable = async (plugin: PluginInstallation) => {
     try {
       await disablePlugin(plugin.id, projectId);
-      addToast(`${plugin.name} disabled`, "success");
+      addToast(`${plugin.name} disabled for this project`, "success");
       await loadPlugins();
     } catch (err) {
       addToast(`Failed to disable plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -263,8 +467,8 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
 
   const handleUninstall = async (plugin: PluginInstallation) => {
     const shouldUninstall = await confirm({
-      title: "Uninstall Plugin",
-      message: `Are you sure you want to uninstall "${plugin.name}"?`,
+      title: "Uninstall Plugin Globally",
+      message: `Are you sure you want to uninstall "${plugin.name}" globally (all projects)?`,
       danger: true,
     });
     if (!shouldUninstall) {
@@ -273,11 +477,31 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
 
     try {
       await uninstallPlugin(plugin.id, projectId);
-      addToast(`${plugin.name} uninstalled`, "success");
+      addToast(`${plugin.name} uninstalled globally`, "success");
       await loadPlugins();
       setSelectedPlugin(null);
     } catch (err) {
       addToast(`Failed to uninstall plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  };
+
+  const handleToggleAiScanOnLoad = async (plugin: PluginInstallation, aiScanOnLoad: boolean) => {
+    try {
+      await updatePlugin(plugin.id, { aiScanOnLoad }, projectId);
+      addToast(`AI scan on load ${aiScanOnLoad ? "enabled" : "disabled"}`, "success");
+      await loadPlugins();
+    } catch (err) {
+      addToast(`Failed to update plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  };
+
+  const handleRescan = async (plugin: PluginInstallation) => {
+    try {
+      await rescanPlugin(plugin.id, projectId);
+      addToast(`${plugin.name} rescanned`, "success");
+      await loadPlugins();
+    } catch (err) {
+      addToast(`Failed to rescan plugin: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
   };
 
@@ -348,14 +572,78 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
           </div>
 
           <div className="plugin-detail-card">
+            <h5 className="plugin-detail-section-heading">Security Scan</h5>
+            <div className="plugin-security-row">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={Boolean(selectedPlugin.aiScanOnLoad)}
+                  onChange={(e) => void handleToggleAiScanOnLoad(selectedPlugin, e.target.checked)}
+                />
+                Enable AI scan before load/reload
+              </label>
+              <button className="btn btn-secondary btn-sm" onClick={() => void handleRescan(selectedPlugin)}>
+                <Shield size={14} /> Rescan and Reload
+              </button>
+            </div>
+            <p className="text-muted">Turning this on only updates configuration. Use Rescan and Reload to run it now.</p>
+            {selectedPlugin.lastSecurityScan ? (
+              <div className="plugin-security-results">
+                <div className="plugin-security-header">
+                  <span className={`plugin-state-badge plugin-security-badge plugin-security-badge--${selectedPlugin.lastSecurityScan.verdict}`}>
+                    {selectedPlugin.lastSecurityScan.verdict}
+                  </span>
+                  <span className="text-muted">{selectedPlugin.lastSecurityScan.scannedAt}</span>
+                </div>
+                <p className="plugin-security-summary">{selectedPlugin.lastSecurityScan.summary}</p>
+                <details>
+                  <summary>Findings ({selectedPlugin.lastSecurityScan.findings.length})</summary>
+                  <ul className="plugin-security-findings">
+                    {selectedPlugin.lastSecurityScan.findings.map((finding, index) => (
+                      <li key={`${finding.file}-${index}`}>
+                        <strong>{finding.severity}</strong> {finding.category} — {finding.file}: {finding.reason}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              </div>
+            ) : (
+              <p className="text-muted">No security scan has been run yet.</p>
+            )}
+          </div>
+
+          <div className="plugin-detail-card">
             <h5 className="plugin-detail-section-heading">Settings</h5>
             {settingsLoading ? (
               <p className="text-muted">Loading...</p>
-            ) : selectedPlugin.settingsSchema && Object.keys(selectedPlugin.settingsSchema).length > 0 ? (
+            ) : (() => {
+              const effectiveSettingsSchema = resolveSettingsSchema(selectedPlugin);
+
+              return effectiveSettingsSchema && Object.keys(effectiveSettingsSchema).length > 0 ? (
               <div className="plugin-settings-form">
-                {Object.entries(selectedPlugin.settingsSchema).map(([key, schema]) => {
-                  const helpId = `setting-${key}-help`;
-                  return (
+                {(() => {
+                  const { grouped, ungrouped } = groupSettingsSchema(effectiveSettingsSchema);
+                  const sections: Array<{ title: string | null; entries: Array<[string, PluginSettingSchema]> }> = [];
+
+                  if (ungrouped.length > 0) {
+                    sections.push({ title: null, entries: ungrouped });
+                  }
+
+                  for (const [groupName, entries] of grouped.entries()) {
+                    sections.push({ title: groupName, entries });
+                  }
+
+                  return sections.map((section) => (
+                    <div
+                      key={section.title ?? "ungrouped"}
+                      className={section.title ? "plugin-settings-group" : undefined}
+                    >
+                      {section.title && (
+                        <h6 className="plugin-settings-group-heading">{section.title}</h6>
+                      )}
+                      {section.entries.map(([key, schema]) => {
+                        const helpId = `setting-${key}-help`;
+                        return (
                     <div key={key} className="form-group">
                       <label htmlFor={`setting-${key}`}>
                         {schema.label || key}
@@ -474,15 +762,19 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                         <span id={helpId} className="form-help">{schema.description}</span>
                       )}
                     </div>
-                  );
-                })}
+                        );
+                      })}
+                    </div>
+                  ));
+                })()}
                 <button className="btn btn-primary" onClick={handleSaveSettings}>
                   Save Settings
                 </button>
               </div>
-            ) : (
-              <p className="text-muted">No configurable settings.</p>
-            )}
+              ) : (
+                <p className="text-muted">No configurable settings.</p>
+              );
+            })()}
           </div>
 
           <div className="plugin-detail-actions">
@@ -498,15 +790,15 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
             )}
             {selectedPlugin.enabled ? (
               <button className="btn btn-secondary" onClick={() => handleDisable(selectedPlugin)}>
-                Disable
+                Disable in Project
               </button>
             ) : (
               <button className="btn btn-primary" onClick={() => handleEnable(selectedPlugin)}>
-                Enable
+                Enable in Project
               </button>
             )}
             <button className="btn btn-danger" onClick={() => handleUninstall(selectedPlugin)}>
-              <Trash2 size={14} /> Uninstall
+              <Trash2 size={14} /> Uninstall Globally
             </button>
           </div>
         </div>
@@ -514,57 +806,109 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
     );
   }
 
-  const installedPluginIds = new Set(plugins.map((plugin) => plugin.id));
   const installedPluginsById = new Map(plugins.map((plugin) => [plugin.id, plugin]));
-
-  // Keep bundled plugins in the main list once installed so users can always
-  // access enable/disable, settings, and uninstall controls.
   const installedPlugins = plugins;
 
-  const renderBundledRuntimeSection = () => (
-    <section className="plugin-bundled-runtime-section" aria-label="Bundled Plugins">
-      <div className="plugin-bundled-runtime-header">
-        <h4 className="plugin-bundled-runtime-heading">Bundled Plugins</h4>
-        <p className="plugin-bundled-runtime-description">
-          Install Fusion&apos;s bundled plugins directly from this screen.
+  const renderBuiltinPluginSection = () => (
+    <section className="plugin-builtins-section" aria-label="Built-in Plugins">
+      <div className="plugin-builtins-header">
+        <h4 className="plugin-builtins-heading">Built-in Plugins</h4>
+        <p className="plugin-builtins-description">
+          Built-in plugin catalog for runtimes and integrations.
         </p>
       </div>
-      <div className="plugin-bundled-runtime-list" aria-label="Bundled plugin recommendations">
-        {BUNDLED_PLUGINS.map((bundledPlugin) => {
-          const isInstalled = installedPluginIds.has(bundledPlugin.id);
+      <div className="plugin-builtins-list" aria-label="Built-in plugin recommendations">
+        {BUILTIN_PLUGINS.map((builtinPlugin) => {
+          const installedPlugin = installedPluginsById.get(builtinPlugin.id);
+          const isInstalled = Boolean(installedPlugin);
+          const setupStatus = builtinSetupStatusById[builtinPlugin.id];
+          const setupStatusDeferred = Boolean(
+            setupStatus
+            && "setupCheckDeferred" in setupStatus
+            && setupStatus.setupCheckDeferred,
+          );
+          const pluginSetupState = setupStatus && "status" in setupStatus ? setupStatus.status : undefined;
+          const requiresSetupAction =
+            isInstalled
+            && builtinPlugin.hasSetup
+            && setupStatus?.hasSetup
+            && !setupStatusDeferred
+            && installedPlugin?.state === "started"
+            && (pluginSetupState === "not-installed" || pluginSetupState === "error");
+          const setupReady = isInstalled && setupStatus?.hasSetup && pluginSetupState === "installed";
+          const setupCheckInFlight = loadingBuiltinSetupId === builtinPlugin.id;
+          const metadataOnly = !builtinPlugin.path;
+
           return (
-            <div key={bundledPlugin.id} className="plugin-bundled-runtime-item">
-              <div className="plugin-bundled-runtime-meta">
-                <span className="plugin-bundled-runtime-name">{bundledPlugin.name}</span>
-                {bundledPlugin.experimental && (
-                  <span className="plugin-bundled-runtime-badge">Experimental</span>
-                )}
-                <span
-                  className={`plugin-bundled-runtime-status ${isInstalled ? "plugin-bundled-runtime-status--installed" : "plugin-bundled-runtime-status--available"}`}
-                >
-                  {isInstalled ? "Installed" : "Not installed"}
+            <div key={builtinPlugin.id} className="plugin-builtins-item">
+              <div className="plugin-builtins-meta">
+                <span className="plugin-builtins-name">{builtinPlugin.name}</span>
+                {builtinPlugin.experimental && <span className="plugin-builtins-runtime-badge">Experimental</span>}
+                <span className="plugin-builtins-runtime-badge">{builtinPlugin.category}</span>
+                <span className={`plugin-builtins-status ${isInstalled ? "plugin-builtins-status--installed" : "plugin-builtins-status--available"}`}>
+                  {isInstalled ? "Installed" : metadataOnly ? "Built in" : "Not installed"}
                 </span>
+                {requiresSetupAction && (
+                  <span className="plugin-builtins-setup-status plugin-builtins-setup-status--warning">Setup required</span>
+                )}
+                {setupReady && (
+                  <span className="plugin-builtins-setup-status plugin-builtins-setup-status--ready">Setup ready</span>
+                )}
+                {setupCheckInFlight && (
+                  <span className="plugin-builtins-setup-status plugin-builtins-setup-status--pending">Checking setup...</span>
+                )}
+                {setupStatusDeferred && (
+                  <span className="plugin-builtins-setup-status plugin-builtins-setup-status--deferred">Start plugin to check setup</span>
+                )}
+                <span className="plugin-builtins-description-text">{builtinPlugin.description}</span>
               </div>
-              <button
-                className={`btn ${isInstalled ? "btn-secondary" : "btn-primary"} btn-sm`}
-                onClick={() => {
-                  if (isInstalled) {
-                    const installedPlugin = installedPluginsById.get(bundledPlugin.id);
+              {metadataOnly ? (
+                isInstalled && requiresSetupAction ? (
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => void handleInstallBuiltinSetup(builtinPlugin)}
+                    disabled={installingBuiltinSetupId === builtinPlugin.id || setupCheckInFlight}
+                  >
+                    {installingBuiltinSetupId === builtinPlugin.id ? "Setting up..." : "Install Setup"}
+                  </button>
+                ) : isInstalled && installedPlugin ? (
+                  <button className="btn btn-secondary btn-sm" onClick={() => void handleSelectPlugin(installedPlugin)}>
+                    Manage
+                  </button>
+                ) : (
+                  <span className="plugin-builtins-metadata-only">Built-in metadata only</span>
+                )
+              ) : (
+                <button
+                  className={`btn ${(isInstalled && !requiresSetupAction) ? "btn-secondary" : "btn-primary"} btn-sm`}
+                  onClick={() => {
+                    if (!isInstalled) {
+                      void handleInstallBuiltinPlugin(builtinPlugin);
+                      return;
+                    }
+
+                    if (requiresSetupAction) {
+                      void handleInstallBuiltinSetup(builtinPlugin);
+                      return;
+                    }
+
                     if (installedPlugin) {
                       void handleSelectPlugin(installedPlugin);
                     }
-                    return;
+                  }}
+                  disabled={
+                    installingBuiltinPluginId === builtinPlugin.id
+                    || installingBuiltinSetupId === builtinPlugin.id
+                    || setupCheckInFlight
                   }
-                  void handleInstallBundledPlugin(bundledPlugin);
-                }}
-                disabled={installingBundledPluginId === bundledPlugin.id}
-              >
-                {isInstalled
-                  ? "Manage"
-                  : installingBundledPluginId === bundledPlugin.id
-                    ? "Installing..."
-                    : `Install ${bundledPlugin.name}`}
-              </button>
+                >
+                  {!isInstalled
+                    ? (installingBuiltinPluginId === builtinPlugin.id ? "Installing..." : `Install ${builtinPlugin.name}`)
+                    : requiresSetupAction
+                      ? (installingBuiltinSetupId === builtinPlugin.id ? "Setting up..." : "Install Setup")
+                      : "Manage"}
+                </button>
+              )}
             </div>
           );
         })}
@@ -604,9 +948,17 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
               }
             }}
           />
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={installAiScanOnLoad}
+              onChange={(e) => setInstallAiScanOnLoad(e.target.checked)}
+            />
+            Enable AI security scan on load
+          </label>
           <div className="plugin-install-actions">
             <button className="btn btn-primary" onClick={handleInstall} disabled={installing || !installPath.trim()}>
-              {installing ? "Installing..." : "Install Plugin"}
+              {installing ? "Installing..." : "Install Plugin Globally"}
             </button>
             <button className="btn btn-secondary" onClick={() => { setShowInstall(false); setInstallPath(""); }}>
               Cancel
@@ -623,7 +975,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
             <div className="settings-empty-state">
               <Package size={32} className="text-muted" />
               <p>No plugins installed.</p>
-              <p className="text-muted">Install a plugin to get started, or use a bundled plugin below.</p>
+              <p className="text-muted">Install a plugin to get started, or use the built-in catalog below.</p>
             </div>
           ) : (
             <div className="plugin-list">
@@ -652,6 +1004,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                         type="checkbox"
                         checked={plugin.enabled}
                         onChange={() => plugin.enabled ? handleDisable(plugin) : handleEnable(plugin)}
+                        aria-label={`${plugin.enabled ? "Disable" : "Enable"} ${plugin.name}`}
                       />
                       <span className="toggle-slider"></span>
                     </label>
@@ -665,7 +1018,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
                     <button
                       className="btn-icon"
                       onClick={() => handleUninstall(plugin)}
-                      title="Uninstall"
+                      title="Uninstall globally"
                     >
                       <Trash2 size={14} />
                     </button>
@@ -674,7 +1027,7 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
               ))}
             </div>
           )}
-          {renderBundledRuntimeSection()}
+          {renderBuiltinPluginSection()}
         </>
       )}
     </div>

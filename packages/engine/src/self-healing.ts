@@ -13,13 +13,16 @@
  *    by cleaning oldest idle worktrees when count exceeds 2× maxWorktrees.
  */
 
-import { exec } from "node:child_process";
+import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { getTaskMergeBlocker, isEphemeralAgent, type AgentStore, type TaskStore, type Settings, type Task, type MergeDetails } from "@fusion/core";
+import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 import { createLogger } from "./logger.js";
 import { getRegisteredWorktreePaths, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
+import { isRecoverableMissingWorktreeReviewFailure } from "./restart-recovery-coordinator.js";
+import { classifyError, extractMissingModulePath, isOperatorActionableAgentError, isStaleWorktreeModuleResolutionError } from "./transient-error-detector.js";
 
 const log = createLogger("self-healing");
 const execAsync = promisify(exec);
@@ -29,6 +32,8 @@ export interface SelfHealingOptions {
   rootDir: string;
   /** Optional AgentStore for agent-level self-healing checks. */
   agentStore?: AgentStore;
+  /** Canonical stale-lease recovery manager. */
+  leaseManager?: MeshLeaseManager;
   /**
    * Callback to recover a completed task that is stuck in in-progress.
    * Called by the periodic maintenance cycle when it detects a task whose
@@ -77,6 +82,18 @@ export interface SelfHealingOptions {
    * the polling sweep's enqueue to silently no-op).
    */
   enqueueMerge?: (taskId: string) => void;
+  /**
+   * Minimum age before a transient merge status is considered stale when no
+   * active merge session is associated with that task.
+   */
+  staleMergingStatusMinAgeMs?: number;
+  /**
+   * Returns the task ID actively merging in this engine process, if any.
+   * Used to avoid clearing a transient merge status mid-merge.
+   */
+  getActiveMergeTaskId?: () => string | null;
+  hasActiveAgentExecution?: (agentId: string) => boolean;
+  restartDurableAgentHeartbeat?: (agentId: string, context: { reason: string; attempt: number }) => Promise<boolean>;
 }
 
 const APPROVED_TRIAGE_RECOVERY_GRACE_MS = 60_000;
@@ -103,11 +120,16 @@ const ORPHANED_WITH_WORKTREE_GRACE_MS = 300_000;
 
 /**
  * Maximum times a task can be auto-requeued after the agent exits without
- * calling `task_done`. Bounded so a persistently-broken task cannot loop
+ * calling `fn_task_done`. Bounded so a persistently-broken task cannot loop
  * forever; when exhausted the task stays in `in-review` for human inspection.
  */
 const MAX_TASK_DONE_RETRIES = 3;
 const MAX_AUTO_MERGE_RETRIES = 3;
+const DEADLOCK_RECOVERY_COOLDOWN_MS = 15 * 60_000;
+const DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS = 5 * 60_000;
+const DURABLE_ERROR_RECOVERY_MAX_RETRIES = 5;
+const DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS = 30_000;
+const DURABLE_ERROR_RECOVERY_MAX_COOLDOWN_MS = 15 * 60_000;
 
 interface LandedTaskCommit {
   sha: string;
@@ -117,8 +139,87 @@ interface LandedTaskCommit {
   deletions?: number;
 }
 
+type AlreadyMergedDetectionStrategy = "trailer" | "ancestry" | "patch-id";
+
+interface AlreadyMergedLookupInput {
+  taskId: string;
+  lineageId?: string;
+  repoDir: string;
+  baseBranch: string;
+  taskBranch?: string;
+  baseCommitSha?: string;
+}
+
+interface AlreadyMergedLookupResult {
+  sha: string;
+  strategy: AlreadyMergedDetectionStrategy;
+}
+
+function commitOwnedByTask(taskId: string, lineageId: string | undefined, subject: string, body: string): boolean {
+  if (lineageId && body.includes(`Fusion-Task-Lineage: ${lineageId}`)) {
+    return true;
+  }
+  return body.includes(`Fusion-Task-Id: ${taskId}`) || subject.includes(taskId);
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export async function isBranchAheadOfBase(
+  task: Task,
+  rootDir: string,
+  preferredBaseRef?: string,
+): Promise<{ aheadCount: number; baseRef: string } | null> {
+  const branchName = task.branch || `fusion/${task.id.toLowerCase()}`;
+
+  try {
+    await execAsync(`git rev-parse --verify ${shellQuote(branchName)}`, {
+      cwd: rootDir,
+      timeout: 30_000,
+    });
+  } catch {
+    return null;
+  }
+
+  const requestedBaseRef = preferredBaseRef || task.mergeDetails?.mergeTargetBranch || "main";
+  let resolvedBaseRef = requestedBaseRef;
+
+  try {
+    await execAsync(`git rev-parse --verify ${shellQuote(requestedBaseRef)}`, {
+      cwd: rootDir,
+      timeout: 30_000,
+    });
+  } catch {
+    const remoteRef = `origin/${requestedBaseRef}`;
+    try {
+      await execAsync(`git rev-parse --verify ${shellQuote(remoteRef)}`, {
+        cwd: rootDir,
+        timeout: 30_000,
+      });
+      resolvedBaseRef = remoteRef;
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    const { stdout } = await execAsync(
+      `git rev-list --count ${shellQuote(resolvedBaseRef)}..${shellQuote(branchName)}`,
+      { cwd: rootDir, timeout: 30_000 },
+    );
+    const aheadCount = Number.parseInt(stdout.trim(), 10);
+    if (!Number.isFinite(aheadCount)) {
+      return null;
+    }
+    return { aheadCount, baseRef: resolvedBaseRef };
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `Failed to compare ${branchName} against ${resolvedBaseRef} for ${task.id}: ${errorMessage}`,
+    );
+    return null;
+  }
 }
 
 function parseShortstat(output: string): Pick<LandedTaskCommit, "filesChanged" | "insertions" | "deletions"> {
@@ -134,6 +235,11 @@ function parseShortstat(output: string): Pick<LandedTaskCommit, "filesChanged" |
   };
 }
 
+function hasTerminalInvalidDoneTransition(task: Pick<Task, "error">): boolean {
+  const error = task.error ?? "";
+  return error.includes("Invalid transition:") && error.includes("→ 'done'");
+}
+
 export class SelfHealingManager {
   // ── Auto-unpause state ──────────────────────────────────────────────
   private unpauseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -147,6 +253,9 @@ export class SelfHealingManager {
 
   // ── Event listener cleanup ──────────────────────────────────────────
   private settingsListener: ((data: { settings: Settings; previous: Settings }) => void) | null = null;
+
+  // ── Per-task deadlock recovery cooldown ─────────────────────────────
+  private deadlockRecoveryCooldown: Map<string, number> = new Map();
 
   constructor(
     private store: TaskStore,
@@ -193,12 +302,18 @@ export class SelfHealingManager {
       { name: "stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks().then(() => undefined) },
       { name: "failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps().then(() => undefined) },
       { name: "interrupted-merging", fn: () => this.recoverInterruptedMergingTasks().then(() => undefined) },
+      { name: "done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata().then(() => undefined) },
+      { name: "recover-already-merged-review", fn: () => this.recoverAlreadyMergedReviewTasks().then(() => undefined) },
+      { name: "recover-stuck-merge-deadlocks", fn: () => this.recoverStuckMergeDeadlocks().then(() => undefined) },
       { name: "misclassified-failures", fn: () => this.recoverMisclassifiedFailures().then(() => undefined) },
+      { name: "missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures().then(() => undefined) },
       { name: "partial-progress-no-task-done", fn: () => this.recoverPartialProgressNoTaskDoneFailures().then(() => undefined) },
       { name: "orphaned-executions", fn: () => this.recoverOrphanedExecutions().then(() => undefined) },
       { name: "approved-triage", fn: () => this.recoverApprovedTriageTasks().then(() => undefined) },
       { name: "orphaned-planning", fn: () => this.recoverOrphanedPlanningTasks().then(() => undefined) },
       { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents().then(() => undefined) },
+      { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns().then(() => undefined) },
+      { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy().then(() => undefined) },
     ];
 
     for (const step of steps) {
@@ -450,13 +565,16 @@ export class SelfHealingManager {
     return Date.now() - updatedAt >= timeoutMs;
   }
 
-  private async findLandedTaskCommit(task: Task): Promise<LandedTaskCommit | null> {
+  private async findLandedTaskCommit(
+    task: Task,
+    options?: { preferEarliestOwnedCommit?: boolean },
+  ): Promise<LandedTaskCommit | null> {
     // Search strategies, tried in order of reliability:
     //   1. mergeDetails.commitSha — already stored by the merger; verify it's
     //      reachable from HEAD before trusting it.
-    //   2. Fusion-Task-Id trailer — emitted into every Fusion-managed merge
-    //      commit body; survives `includeTaskIdInCommit: false`.
-    //   3. Subject grep — legacy/AI commits where the task ID lives in the
+    //   2. Fusion-Task-Lineage trailer — canonical immutable lineage marker.
+    //   3. Fusion-Task-Id trailer — legacy human task-id marker.
+    //   4. Subject grep — legacy/AI commits where the task ID lives in the
     //      subject line (e.g. `feat(FN-123): …`).
     //
     // (1) gives us the right sha even if the commit subject is exotic; (2)
@@ -467,18 +585,16 @@ export class SelfHealingManager {
     const storedSha = task.mergeDetails?.commitSha;
     if (storedSha) {
       try {
-        // Reachable from HEAD? Use --quiet --exit-code on rev-list.
         await execAsync(
           `git merge-base --is-ancestor ${shellQuote(storedSha)} HEAD`,
           { cwd: this.options.rootDir },
         );
-        // Yes — fetch its subject + stats.
         const { stdout } = await execAsync(
-          `git log -1 --format=%H%x1f%s ${shellQuote(storedSha)}`,
+          `git log -1 --format=%H%x1f%s%x1f%b ${shellQuote(storedSha)}`,
           { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
         );
-        const [sha, subject] = stdout.trim().split("\x1f");
-        if (sha) {
+        const [sha, subject = "", body = ""] = stdout.trim().split("\x1f");
+        if (sha && commitOwnedByTask(task.id, task.lineageId, subject, body)) {
           const commit: LandedTaskCommit = { sha, subject };
           try {
             const stats = await execAsync(`git show --shortstat --format= ${shellQuote(sha)}`, {
@@ -499,6 +615,7 @@ export class SelfHealingManager {
         "git log",
         "--format=%H%x1f%s",
         "--max-count=20",
+        ...(options?.preferEarliestOwnedCommit ? ["--reverse"] : []),
         ...(fixedStrings ? ["--fixed-strings"] : ["-E"]),
         `--grep=${grepArg}`,
         shellQuote(range),
@@ -510,8 +627,8 @@ export class SelfHealingManager {
       });
     };
 
-    // Search (2) trailer first, then (3) subject as fallback. Both share the
-    // same range-resolution logic (bounded, then full HEAD if empty).
+    // Search canonical lineage trailer, then legacy task-id trailer, then
+    // legacy subject fallback. All share bounded/full HEAD range resolution.
     const search = async (grepArg: string, fixedStrings: boolean): Promise<string> => {
       let out: string;
       try {
@@ -539,11 +656,20 @@ export class SelfHealingManager {
       return out;
     };
 
-    // (2) Trailer — anchored regex so we don't false-match ID substrings.
-    const trailerPattern = `^Fusion-Task-Id: ${task.id}$`;
-    let stdout = await search(shellQuote(trailerPattern), false);
+    // (2) Canonical lineage trailer.
+    let stdout = "";
+    if (task.lineageId) {
+      const lineagePattern = `^Fusion-Task-Lineage: ${task.lineageId}$`;
+      stdout = await search(shellQuote(lineagePattern), false);
+    }
 
-    // (3) Subject grep fallback (legacy commits).
+    // (3) Legacy task-id trailer.
+    if (!stdout.trim()) {
+      const trailerPattern = `^Fusion-Task-Id: ${task.id}$`;
+      stdout = await search(shellQuote(trailerPattern), false);
+    }
+
+    // (4) Subject grep fallback (legacy commits).
     if (!stdout.trim()) {
       stdout = await search(shellQuote(task.id), true);
     }
@@ -570,6 +696,174 @@ export class SelfHealingManager {
     }
 
     return commit;
+  }
+
+  private async findAlreadyMergedTaskCommit(
+    input: AlreadyMergedLookupInput,
+  ): Promise<AlreadyMergedLookupResult | null> {
+    const { taskId, lineageId, repoDir, baseBranch, taskBranch, baseCommitSha } = input;
+
+    try {
+      if (lineageId) {
+        const lineagePattern = `^Fusion-Task-Lineage: ${lineageId}$`;
+        const lineageCommand = [
+          "git log",
+          `--grep=${shellQuote(lineagePattern)}`,
+          "-E",
+          "--max-count=1",
+          "--format=%H",
+          shellQuote(baseBranch),
+        ].join(" ");
+        const lineage = await execAsync(lineageCommand, {
+          cwd: repoDir,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        });
+        const lineageSha = lineage.stdout.trim();
+        if (lineageSha) {
+          return { sha: lineageSha, strategy: "trailer" };
+        }
+      }
+
+      const trailerPattern = `^Fusion-Task-Id: ${taskId}$`;
+      const trailerCommand = [
+        "git log",
+        `--grep=${shellQuote(trailerPattern)}`,
+        "-E",
+        "--max-count=1",
+        "--format=%H",
+        shellQuote(baseBranch),
+      ].join(" ");
+      const { stdout } = await execAsync(trailerCommand, {
+        cwd: repoDir,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const sha = stdout.trim();
+      if (sha) {
+        return { sha, strategy: "trailer" };
+      }
+    } catch {
+      // Fall through to ancestry/patch-id checks.
+    }
+
+    let branchTip: string | null = null;
+    const branchName = taskBranch || `fusion/${taskId.toLowerCase()}`;
+    try {
+      branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+
+      execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, {
+        cwd: repoDir,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      const ancestryCommand = [
+        "git log",
+        "--first-parent",
+        "--format=%H",
+        `--grep=${shellQuote(taskId)}`,
+        "--max-count=1",
+        shellQuote(baseBranch),
+      ].join(" ");
+      const { stdout } = await execAsync(ancestryCommand, {
+        cwd: repoDir,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const sha = stdout.trim();
+      if (sha) {
+        return { sha, strategy: "ancestry" };
+      }
+    } catch {
+      // Fall through to patch-id checks.
+    }
+
+    try {
+      if (!branchTip) {
+        branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+          stdio: ["pipe", "pipe", "pipe"],
+        }).trim();
+      }
+
+      let branchBase = baseCommitSha?.trim();
+      if (!branchBase) {
+        const { stdout: mergeBaseStdout } = await execAsync(
+          `git merge-base ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`,
+          {
+            cwd: repoDir,
+            timeout: 30_000,
+            maxBuffer: 1024 * 1024,
+          },
+        );
+        branchBase = mergeBaseStdout.trim();
+      }
+
+      if (!branchBase) {
+        return null;
+      }
+
+      const branchPatchIdCommand = `git diff ${shellQuote(branchBase)}..${shellQuote(branchTip)} | git patch-id`;
+      const { stdout: branchPatchIdOut } = await execAsync(branchPatchIdCommand, {
+        cwd: repoDir,
+        shell: "/bin/sh",
+        timeout: 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+      const branchPatchIdLine = branchPatchIdOut
+        .trim()
+        .split("\n")
+        .find((line) => line.trim().length > 0);
+      const branchPatchId = branchPatchIdLine?.trim().split(/\s+/)[0];
+      if (!branchPatchId) {
+        return null;
+      }
+
+      const basePatchMapCommand = `git log -n 200 -p --format='%H' ${shellQuote(baseBranch)} | git patch-id`;
+      const { stdout: basePatchIdsOut } = await execAsync(basePatchMapCommand, {
+        cwd: repoDir,
+        shell: "/bin/sh",
+        timeout: 60_000,
+        maxBuffer: 32 * 1024 * 1024,
+      });
+
+      const basePatchMap = new Map<string, string>();
+      for (const line of basePatchIdsOut.split("\n")) {
+        const [patchId, sha] = line.trim().split(/\s+/);
+        if (!patchId || !sha) continue;
+        basePatchMap.set(patchId, sha);
+      }
+
+      const matchedSha = basePatchMap.get(branchPatchId);
+      if (matchedSha) {
+        return { sha: matchedSha, strategy: "patch-id" };
+      }
+    } catch {
+      // Fall through to null when patch-id detection fails.
+    }
+
+    return null;
+  }
+
+  private async cleanupWorktreeOnly(task: Task): Promise<void> {
+    if (task.worktree && existsSync(task.worktree)) {
+      try {
+        await execAsync(`git worktree remove ${shellQuote(task.worktree)} --force`, {
+          cwd: this.options.rootDir,
+          timeout: 120_000,
+        });
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        log.warn(
+          `Failed to remove worktree ${task.worktree} for ${task.id}: ${errorMessage} — non-fatal, cleanup can retry later`,
+        );
+      }
+    }
   }
 
   private async cleanupInterruptedMergeArtifacts(task: Task): Promise<void> {
@@ -644,9 +938,15 @@ export class SelfHealingManager {
           { name: "recover-stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks() },
           { name: "recover-failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps() },
           { name: "recover-interrupted-merging", fn: () => this.recoverInterruptedMergingTasks() },
+          { name: "recover-done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata() },
+          { name: "recover-stale-merging-status", fn: () => this.recoverStaleMergingStatus() },
+          { name: "finalize-noop-review", fn: () => this.finalizeNoOpReviewTasks() },
           { name: "recover-mergeable-review", fn: () => this.recoverMergeableReviewTasks() },
           { name: "recover-merged-review", fn: () => this.recoverMergedReviewTasks() },
+          { name: "recover-already-merged-review", fn: () => this.recoverAlreadyMergedReviewTasks() },
+          { name: "recover-stuck-merge-deadlocks", fn: () => this.recoverStuckMergeDeadlocks() },
           { name: "recover-misclassified-failures", fn: () => this.recoverMisclassifiedFailures() },
+          { name: "recover-missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures() },
           { name: "recover-no-progress-no-task-done", fn: () => this.recoverNoProgressNoTaskDoneFailures() },
           { name: "recover-partial-progress-no-task-done", fn: () => this.recoverPartialProgressNoTaskDoneFailures() },
           { name: "recover-orphaned-executions", fn: () => this.recoverOrphanedExecutions() },
@@ -654,6 +954,8 @@ export class SelfHealingManager {
           { name: "recover-orphaned-planning", fn: () => this.recoverOrphanedPlanningTasks() },
           { name: "recover-ghost-review", fn: () => this.recoverGhostReviewTasks() },
           { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents() },
+          { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns() },
+          { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy() },
         ];
         for (const fn of batch2Fns) {
           try {
@@ -712,6 +1014,20 @@ export class SelfHealingManager {
       const tasks = await this.store.listTasks({ slim: true, includeArchived: false });
       const cutoff = Date.now() - archiveAfterMs;
 
+      // Build a set of task IDs that have at least one *active* dependent —
+      // i.e., another task in triage/todo/in-progress/in-review that lists
+      // this ID in its `dependencies`. Archiving such a task wipes
+      // `.fusion/tasks/{id}/` on disk, which downstream agents are told they
+      // may read for sibling-spec context (executor prompt). Done/archived
+      // dependents have already consumed the spec and don't block.
+      const tasksWithActiveDependents = new Set<string>();
+      for (const t of tasks) {
+        if (t.column === "done" || t.column === "archived") continue;
+        for (const depId of t.dependencies ?? []) {
+          tasksWithActiveDependents.add(depId);
+        }
+      }
+
       const stale = tasks.filter((t) => {
         if (t.column !== "done") return false;
         // Prefer columnMovedAt (when the task entered done); fall back to updatedAt
@@ -719,7 +1035,12 @@ export class SelfHealingManager {
         const ts = t.columnMovedAt || t.updatedAt;
         const movedAt = ts ? Date.parse(ts) : NaN;
         if (!Number.isFinite(movedAt)) return false;
-        return movedAt < cutoff;
+        if (movedAt >= cutoff) return false;
+        if (tasksWithActiveDependents.has(t.id)) {
+          log.log(`Skipping auto-archive of ${t.id}: has active dependents`);
+          return false;
+        }
+        return true;
       });
 
       if (stale.length === 0) return 0;
@@ -804,6 +1125,240 @@ export class SelfHealingManager {
   }
 
   /**
+   * Clear stale transient merge statuses when no active merger owns the task.
+   *
+   * @returns Number of tasks unblocked by clearing stale status
+   */
+  async recoverStaleMergingStatus(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const minAgeMs = this.options.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS;
+      if (!Number.isFinite(minAgeMs) || minAgeMs <= 0) return 0;
+
+      const now = Date.now();
+      const activeMergeTaskId = this.options.getActiveMergeTaskId?.() ?? null;
+      const tasks = await this.store.listTasks({ column: "in-review", slim: true });
+      const stale = tasks.filter((task) => {
+        if (task.column !== "in-review" || task.paused) return false;
+        if (!task.status || (task.status !== "merging" && task.status !== "merging-pr")) return false;
+        if (activeMergeTaskId && activeMergeTaskId === task.id) return false;
+
+        const updatedAtMs = task.updatedAt ? Date.parse(task.updatedAt) : Number.NaN;
+        if (!Number.isFinite(updatedAtMs)) return false;
+        return now - updatedAtMs >= minAgeMs;
+      });
+
+      if (stale.length === 0) return 0;
+
+      let recovered = 0;
+      for (const task of stale) {
+        const previousStatus = task.status;
+        try {
+          log.warn(`Clearing stale merge status for ${task.id}: ${previousStatus}`);
+          await this.store.updateTask(task.id, { status: null });
+          await this.store.logEntry(
+            task.id,
+            `Auto-recovered: cleared stale '${previousStatus}' status (no active merger)`,
+          );
+          recovered++;
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.error(`Failed to clear stale merge status for ${task.id}: ${errorMessage}`);
+        }
+      }
+
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Stale merging status recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Clear `blockedBy` on todo tasks whose blocker has reached a terminal or
+   * stuck state.
+   *
+   * Stale-blocker conditions (clear if ANY apply):
+   * 1. Blocker task does not exist (id missing entirely)
+   * 2. Blocker `column === "done"` or `column === "archived"`
+   * 3. Blocker `column === "in-review"` and `paused === true`
+   * 4. Blocker `column === "in-review"` and `status === "failed"`
+   *    and `(mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES`
+   *
+   * @returns Number of tasks unblocked
+   */
+  async clearStaleBlockedBy(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
+      const blockedTasks = todoTasks.filter(
+        (task) => typeof task.blockedBy === "string" && task.blockedBy.trim().length > 0,
+      );
+      const queuedDependencyTasks = todoTasks.filter(
+        (task) => task.status === "queued" && task.dependencies.length > 0,
+      );
+
+      if (blockedTasks.length === 0 && queuedDependencyTasks.length === 0) return 0;
+
+      const allTasks = await this.store.listTasks({ slim: true, includeArchived: true });
+      const taskById = new Map(allTasks.map((task) => [task.id, task]));
+
+      let recovered = 0;
+      const blockedTaskIds = new Set(blockedTasks.map((task) => task.id));
+      const queuedDependencyTaskIds = new Set(queuedDependencyTasks.map((task) => task.id));
+      const candidates = new Map<string, typeof todoTasks[number]>();
+      for (const task of blockedTasks) candidates.set(task.id, task);
+      for (const task of queuedDependencyTasks) candidates.set(task.id, task);
+
+      for (const task of candidates.values()) {
+        const blockerId = task.blockedBy;
+
+        const unresolvedDeps = task.dependencies.filter((depId) => {
+          const dep = taskById.get(depId);
+          return dep && dep.column !== "done" && dep.column !== "in-review" && dep.column !== "archived";
+        });
+
+        if (blockedTaskIds.has(task.id)) {
+          if (!blockerId) continue;
+
+          const blocker = taskById.get(blockerId);
+          let reason: string | null = null;
+
+          if (!blocker) {
+            reason = `blocker ${blockerId} missing`;
+          } else if (blocker.column === "done") {
+            reason = `blocker ${blockerId} is done`;
+          } else if (blocker.column === "archived") {
+            reason = `blocker ${blockerId} is archived`;
+          } else if (blocker.column === "in-review" && blocker.paused) {
+            reason = `blocker ${blockerId} in-review + paused`;
+          } else if (
+            blocker.column === "in-review" &&
+            blocker.status === "failed" &&
+            (blocker.mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES
+          ) {
+            reason = `blocker ${blockerId} in-review + failed (mergeRetries ${blocker.mergeRetries ?? 0}/${MAX_AUTO_MERGE_RETRIES})`;
+          } else if (task.dependencies.length > 0 && !unresolvedDeps.includes(blockerId)) {
+            reason = `blocker ${blockerId} not among unresolved dependencies`;
+          }
+
+          if (reason) {
+            try {
+              if (unresolvedDeps.length > 0) {
+                const nextBlocker = unresolvedDeps[0]!;
+                await this.store.updateTask(task.id, { blockedBy: nextBlocker, status: "queued" });
+                await this.store.logEntry(task.id, `Auto-recovered: refreshed stale blockedBy — ${reason}; now blocked by ${nextBlocker}`);
+              } else {
+                await this.store.updateTask(task.id, { blockedBy: null, status: null });
+                await this.store.logEntry(task.id, `Auto-recovered: cleared stale blockedBy — ${reason}`);
+              }
+              recovered++;
+            } catch (err: unknown) {
+              const errorMessage = err instanceof Error ? err.message : String(err);
+              log.error(`Failed to clear stale blockedBy for ${task.id}: ${errorMessage}`);
+            }
+            continue;
+          }
+        }
+
+        if (unresolvedDeps.length === 0) {
+          if (queuedDependencyTaskIds.has(task.id)) {
+            try {
+              await this.store.updateTask(task.id, { blockedBy: null, status: null });
+              await this.store.logEntry(task.id, "Auto-recovered: cleared stale queued status — all dependencies satisfied");
+              recovered++;
+            } catch (err: unknown) {
+              const errorMessage = err instanceof Error ? err.message : String(err);
+              log.error(`Failed to clear stale queued status for ${task.id}: ${errorMessage}`);
+            }
+          }
+          continue;
+        }
+
+        const nextBlocker = unresolvedDeps[0] ?? null;
+        if (nextBlocker && task.blockedBy !== nextBlocker) {
+          try {
+            await this.store.updateTask(task.id, { blockedBy: nextBlocker, status: "queued" });
+          } catch (err: unknown) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            log.error(`Failed to refresh blockedBy for ${task.id}: ${errorMessage}`);
+          }
+        }
+      }
+
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Stale blockedBy sweep failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  async finalizeNoOpReviewTasks(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (!settings.autoMerge) return 0;
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const tasks = await this.store.listTasks({ column: "in-review", slim: true });
+      const candidates = tasks.filter((t) =>
+        t.column === "in-review" &&
+        !t.paused &&
+        Boolean(t.worktree) &&
+        t.mergeDetails?.mergeConfirmed !== true &&
+        t.status !== "merging" &&
+        t.status !== "merging-pr" &&
+        t.status !== "awaiting-user-review" &&
+        t.status !== "failed" &&
+        getTaskMergeBlocker(t) === undefined,
+      );
+
+      if (candidates.length === 0) return 0;
+
+      let recovered = 0;
+      for (const task of candidates) {
+        const ahead = await this.isBranchAheadOfBase(task, task.mergeDetails?.mergeTargetBranch || "main");
+        if (!ahead || ahead.aheadCount !== 0) {
+          continue;
+        }
+
+        const noOpReason = `branch has zero commits ahead of ${ahead.baseRef}`;
+        // Reaching in-review means executor/spec gates already passed. If there
+        // are no commits ahead of base, treat this as a successful no-op merge.
+        const mergeDetails: MergeDetails = {
+          ...(task.mergeDetails || {}),
+          mergeConfirmed: true,
+          noOpMerge: true,
+          noOpReason,
+          mergedAt: new Date().toISOString(),
+        };
+
+        await this.store.updateTask(task.id, { mergeDetails });
+        await this.store.logEntry(
+          task.id,
+          `Auto-finalized: ${noOpReason}; treating as no-op merge and moving to done`,
+        );
+        await this.store.moveTask(task.id, "done");
+        recovered++;
+      }
+
+      if (recovered > 0) {
+        log.log(`Recovered ${recovered} no-op review task(s) → done`);
+      }
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`No-op review finalization failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
    * Recover `in-review` tasks that are fully mergeable but never had
    * `mergeTask()` invoked.
    *
@@ -827,12 +1382,19 @@ export class SelfHealingManager {
       const mergeable = tasks.filter((t) =>
         t.column === "in-review" &&
         !t.paused &&
+        // Exclude transient merge statuses. Active merges should be left alone;
+        // stale ones are handled by recoverStaleMergingStatus().
+        t.status !== "merging" &&
+        t.status !== "merging-pr" &&
         Boolean(t.worktree) &&
         t.mergeDetails?.mergeConfirmed !== true &&
+        t.mergeDetails?.noOpMerge !== true &&
+        !hasTerminalInvalidDoneTransition(t) &&
         // Mirror ProjectEngine.canMergeTask retry gate. If retries are already
         // exhausted, re-enqueueing here is a no-op and each recovery log write
         // refreshes updatedAt, preventing cooldown-based retries from ever
-        // becoming eligible.
+        // becoming eligible. Also skip tasks explicitly tagged as no-op merges
+        // in case updateTask(moveTask) is briefly out-of-order during recovery.
         (t.mergeRetries ?? 0) < MAX_AUTO_MERGE_RETRIES &&
         getTaskMergeBlocker(t) === undefined,
       );
@@ -999,7 +1561,7 @@ export class SelfHealingManager {
         !task.status &&
         task.steps.length > 0 &&
         task.steps.some((step) => NON_TERMINAL_STEP_STATUSES.has(step.status)) &&
-        now - new Date(task.updatedAt).getTime() >= timeoutMs
+        now - new Date(task.columnMovedAt ?? task.updatedAt).getTime() >= timeoutMs
       );
 
       if (staleIncomplete.length === 0) return 0;
@@ -1070,7 +1632,7 @@ export class SelfHealingManager {
         !(task.status && GHOST_REVIEW_PRESERVED_STATUSES.has(task.status)) &&
         // Confirmed merges belong in `done` (handled by `recoverMergedReviewTasks`).
         task.mergeDetails?.mergeConfirmed !== true &&
-        now - new Date(task.updatedAt).getTime() >= timeoutMs
+        now - new Date(task.columnMovedAt ?? task.updatedAt).getTime() >= timeoutMs
       );
 
       if (ghosts.length === 0) return 0;
@@ -1199,6 +1761,92 @@ export class SelfHealingManager {
     }
   }
 
+  async recoverDoneTaskMergeMetadata(): Promise<number> {
+    try {
+      const tasks = await this.store.listTasks({ column: "done", slim: true });
+      const candidates = tasks.filter((task) => task.column === "done" && !task.paused && Boolean(task.mergeDetails?.commitSha));
+      if (candidates.length === 0) return 0;
+
+      let repaired = 0;
+      for (const task of candidates) {
+        try {
+          const storedSha = task.mergeDetails?.commitSha;
+          if (!storedSha) continue;
+
+          if (task.mergeDetails?.mergeConfirmed === true) {
+            const landed = await this.findLandedTaskCommit(task);
+            if (!landed || landed.sha !== storedSha) {
+              log.warn(
+                `Refusing to overwrite confirmed mergeDetails.commitSha for ${task.id} — stored SHA ${storedSha.slice(0, 8)} no longer reachable; preserving canonical attribution`,
+              );
+              continue;
+            }
+
+            const needsMetadataRepair =
+              task.mergeDetails?.filesChanged === undefined ||
+              task.mergeDetails?.insertions === undefined ||
+              task.mergeDetails?.deletions === undefined ||
+              task.mergeDetails?.mergeCommitMessage === undefined;
+
+            if (!needsMetadataRepair) continue;
+
+            await this.store.updateTask(task.id, {
+              mergeDetails: {
+                ...task.mergeDetails,
+                filesChanged: task.mergeDetails?.filesChanged ?? landed.filesChanged,
+                insertions: task.mergeDetails?.insertions ?? landed.insertions,
+                deletions: task.mergeDetails?.deletions ?? landed.deletions,
+                mergeCommitMessage: task.mergeDetails?.mergeCommitMessage ?? landed.subject,
+                mergedAt: task.mergeDetails?.mergedAt ?? new Date().toISOString(),
+                prNumber: task.prInfo?.number,
+              },
+            });
+            await this.store.logEntry(task.id, `Auto-recovered: reconciled done-task mergeDetails to owned commit ${landed.sha.slice(0, 8)}`);
+            repaired++;
+            continue;
+          }
+
+          const landed = await this.findLandedTaskCommit(task, { preferEarliestOwnedCommit: true });
+          if (!landed) {
+            await this.store.updateTask(task.id, { mergeDetails: undefined });
+            await this.store.logEntry(task.id, "Auto-recovered: cleared unowned done-task mergeDetails commitSha");
+            repaired++;
+            continue;
+          }
+
+          const needsRepair =
+            task.mergeDetails?.commitSha !== landed.sha ||
+            task.mergeDetails?.filesChanged === undefined;
+
+          if (!needsRepair) continue;
+
+          await this.store.updateTask(task.id, {
+            mergeDetails: {
+              ...task.mergeDetails,
+              commitSha: landed.sha,
+              filesChanged: landed.filesChanged,
+              insertions: landed.insertions,
+              deletions: landed.deletions,
+              mergeCommitMessage: landed.subject,
+              mergedAt: task.mergeDetails?.mergedAt ?? new Date().toISOString(),
+              mergeConfirmed: true,
+              prNumber: task.prInfo?.number,
+            },
+          });
+          await this.store.logEntry(task.id, `Auto-recovered: reconciled done-task mergeDetails to owned commit ${landed.sha.slice(0, 8)}`);
+          repaired++;
+        } catch (err: unknown) {
+          log.error(`Failed done-task merge metadata recovery for ${task.id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      return repaired;
+    } catch (err: unknown) {
+      log.error(`Done-task merge metadata recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+      return 0;
+    }
+  }
+
   // ── Misclassified failure recovery ───────────────────────────────
 
   /**
@@ -1227,6 +1875,25 @@ export class SelfHealingManager {
       let recovered = 0;
       for (const task of mergedButNotDone) {
         try {
+          const blocker = getTaskMergeBlocker({
+            ...task,
+            status: undefined,
+            error: undefined,
+            steps: task.steps ?? [],
+            workflowStepResults: task.workflowStepResults,
+          });
+          if (blocker) {
+            await this.store.updateTask(task.id, {
+              status: "failed",
+              error: `Merge confirmed but finalization blocked: ${blocker}`,
+            });
+            await this.store.logEntry(
+              task.id,
+              `Auto-recovery skipped: merge confirmed but finalization blocked — ${blocker}`,
+            );
+            continue;
+          }
+
           await this.store.updateTask(task.id, {
             status: null,
             error: null,
@@ -1255,9 +1922,227 @@ export class SelfHealingManager {
   }
 
   /**
+   * Recover deadlocked retry-exhausted merge failures that are still blocking
+   * dispatch via `blockedBy` or retained worktree ownership.
+   */
+  async recoverStuckMergeDeadlocks(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const now = Date.now();
+      const inReview = await this.store.listTasks({ column: "in-review", slim: true });
+      const triage = await this.store.listTasks({ column: "triage", slim: true });
+      const todo = await this.store.listTasks({ column: "todo", slim: true });
+      const inProgress = await this.store.listTasks({ column: "in-progress", slim: true });
+
+      const dependentsByBlocker = new Map<string, Task[]>();
+      for (const task of [...triage, ...todo, ...inProgress]) {
+        if (!task.blockedBy) continue;
+        const dependents = dependentsByBlocker.get(task.blockedBy) ?? [];
+        dependents.push(task);
+        dependentsByBlocker.set(task.blockedBy, dependents);
+      }
+
+      const candidates = inReview.filter((task) => {
+        const cooldownStart = this.deadlockRecoveryCooldown.get(task.id) ?? 0;
+        const cooldownElapsed = now - cooldownStart;
+        const hasBlockedDependents = (dependentsByBlocker.get(task.id) ?? []).some(
+          (dep) => dep.column === "triage" || dep.column === "todo",
+        );
+        return task.column === "in-review" &&
+          !task.paused &&
+          task.status === "failed" &&
+          (task.mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES &&
+          task.mergeDetails?.mergeConfirmed !== true &&
+          (hasBlockedDependents || Boolean(task.worktree)) &&
+          cooldownElapsed >= DEADLOCK_RECOVERY_COOLDOWN_MS;
+      });
+
+      if (candidates.length === 0) return 0;
+
+      let recovered = 0;
+      for (const task of candidates) {
+        const blockedDependents = dependentsByBlocker.get(task.id) ?? [];
+        const blockedTaskIds = blockedDependents.map((dep) => dep.id);
+        try {
+          const landedCommit = await this.findLandedTaskCommit(task);
+          if (landedCommit) {
+            const mergeDetails: MergeDetails = {
+              commitSha: landedCommit.sha,
+              filesChanged: landedCommit.filesChanged,
+              insertions: landedCommit.insertions,
+              deletions: landedCommit.deletions,
+              mergeCommitMessage: landedCommit.subject,
+              mergedAt: new Date().toISOString(),
+              mergeConfirmed: true,
+              prNumber: task.prInfo?.number,
+            };
+
+            await this.store.updateTask(task.id, {
+              status: null,
+              error: null,
+              mergeRetries: 0,
+              worktree: null,
+              branch: null,
+              mergeDetails,
+            });
+            await this.store.moveTask(task.id, "done");
+            await this.cleanupInterruptedMergeArtifacts(task);
+
+            const clearedDependents: string[] = [];
+            for (const dep of blockedDependents) {
+              try {
+                await this.store.updateTask(dep.id, { blockedBy: null });
+                await this.store.logEntry(dep.id, `Auto-recovered: cleared stale blockedBy ${task.id} after deadlock recovery`);
+                clearedDependents.push(dep.id);
+              } catch (depErr: unknown) {
+                const depErrMessage = depErr instanceof Error ? depErr.message : String(depErr);
+                log.warn(`self-heal:deadlock-recovery-dependent-error ${JSON.stringify({ blockerTaskId: task.id, dependentTaskId: dep.id, error: depErrMessage })}`);
+              }
+            }
+
+            await this.store.logEntry(
+              task.id,
+              `Auto-recovered: merge deadlock resolved via landed commit ${landedCommit.sha.slice(0, 8)}${clearedDependents.length > 0 ? `; cleared blockedBy on ${clearedDependents.join(", ")}` : ""}`,
+            );
+            log.log(`self-heal:deadlock-recovered ${JSON.stringify({ stuckTaskId: task.id, blockedTaskIds, attributedSha: landedCommit.sha, action: "reattributed" })}`);
+            recovered++;
+          } else {
+            await this.store.updateTask(task.id, { paused: true });
+            await this.store.logEntry(task.id, "merge-deadlock-detected: requires manual intervention — verified content not on main");
+            log.warn(`self-heal:deadlock-recovered ${JSON.stringify({ stuckTaskId: task.id, blockedTaskIds, attributedSha: null, action: "paused-for-manual" })}`);
+            recovered++;
+          }
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.warn(`self-heal:deadlock-recovery-error ${JSON.stringify({ stuckTaskId: task.id, blockedTaskIds, error: errorMessage })}`);
+        } finally {
+          this.deadlockRecoveryCooldown.set(task.id, Date.now());
+        }
+      }
+
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Stuck merge deadlock recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Recover retry-exhausted failed review tasks whose content already landed on
+   * the integration branch via a non-canonical merge lineage.
+   *
+   * Candidate filter:
+   * - `column === "in-review"`
+   * - `status === "failed"`
+   * - `(mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES`
+   * - `mergeDetails.mergeConfirmed !== true`
+   * - not actively executing
+   *
+   * Detection order (first match wins):
+   * 1. Fusion-Task-Id trailer lookup on the base branch
+   * 2. Task branch ancestry + task-id grep on first-parent base lineage
+   * 3. Patch-id match between task branch diff and recent base-branch commits
+   *
+   * Idempotency: recovered tasks are moved to `done`, status/error are cleared,
+   * and mergeRetries reset to 0, so subsequent sweeps will not match them.
+   */
+  async recoverAlreadyMergedReviewTasks(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
+      const tasks = await this.store.listTasks({ column: "in-review", slim: true });
+      const candidates = tasks.filter((task) =>
+        task.column === "in-review" &&
+        task.status === "failed" &&
+        (task.mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES &&
+        task.mergeDetails?.mergeConfirmed !== true &&
+        !executingIds.has(task.id),
+      );
+
+      if (candidates.length === 0) return 0;
+
+      let recovered = 0;
+      for (const task of candidates) {
+        try {
+          const baseBranch = task.baseBranch || task.executionStartBranch || "main";
+          if (!baseBranch) continue;
+
+          const landed = await this.findAlreadyMergedTaskCommit({
+            taskId: task.id,
+            lineageId: task.lineageId,
+            repoDir: this.options.rootDir,
+            baseBranch,
+            taskBranch: task.branch,
+            baseCommitSha: task.baseCommitSha,
+          });
+          if (!landed) continue;
+
+          const mergeDetails: MergeDetails = {
+            commitSha: landed.sha,
+            mergedAt: new Date().toISOString(),
+            mergeConfirmed: true,
+            prNumber: task.prInfo?.number,
+          };
+
+          const blocker = getTaskMergeBlocker({
+            ...task,
+            status: undefined,
+            error: undefined,
+            steps: task.steps ?? [],
+            workflowStepResults: task.workflowStepResults,
+          });
+          if (blocker) {
+            await this.store.updateTask(task.id, {
+              status: "failed",
+              error: `Merge confirmed but finalization blocked: ${blocker}`,
+              mergeDetails,
+            });
+            await this.store.logEntry(
+              task.id,
+              `Auto-recovery parked task in in-review: merged content found on ${baseBranch} (${landed.sha.slice(0, 8)}) but finalization blocked — ${blocker}`,
+            );
+            continue;
+          }
+
+          await this.store.updateTask(task.id, {
+            status: null,
+            error: null,
+            mergeRetries: 0,
+            mergeDetails,
+          });
+          await this.store.moveTask(task.id, "done");
+          await this.store.logEntry(
+            task.id,
+            `Auto-recovered: phantom-merge-guard false positive — content found on ${baseBranch} at ${landed.sha.slice(0, 8)} via ${landed.strategy}`,
+          );
+          await this.cleanupWorktreeOnly(task);
+          recovered++;
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.warn(`recoverAlreadyMergedReviewTasks: failed for ${task.id}: ${errorMessage}`);
+        }
+      }
+
+      if (recovered > 0) {
+        log.log(`Recovered ${recovered} already-merged retry-exhausted review task(s) → done`);
+      }
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Already-merged review recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
    * Recover tasks in `in-review` marked as `failed` where all steps are
    * actually done. This catches the case where an agent completed all work
-   * but the session ended without calling `task_done` (e.g., context
+   * but the session ended without calling `fn_task_done` (e.g., context
    * overflow, compaction losing tool awareness). The executor marks these
    * as failed, but the work is complete — clear the error so the normal
    * review flow can proceed.
@@ -1272,7 +2157,7 @@ export class SelfHealingManager {
         t.column === "in-review" &&
         !t.paused &&
         t.status === "failed" &&
-        t.error?.includes("without calling task_done") &&
+        isNoTaskDoneFailure(t) &&
         t.steps.length > 0 &&
         t.steps.every((s) => s.status === "done" || s.status === "skipped"),
       );
@@ -1290,7 +2175,7 @@ export class SelfHealingManager {
           });
           await this.store.logEntry(
             task.id,
-            "Auto-recovered: all steps complete despite 'no task_done' failure — cleared error for normal review",
+            "Auto-recovered: all steps complete despite 'no fn_task_done' failure — cleared error for normal review",
           );
           log.log(`Recovered misclassified failure ${task.id}: ${task.title || task.description?.slice(0, 60) || "(untitled)"}`);
           recovered++;
@@ -1344,6 +2229,18 @@ export class SelfHealingManager {
             ? "worktree exists but no active session"
             : "missing worktree/session";
 
+          if (this.options.leaseManager && task.checkedOutBy) {
+            const leaseRecovered = await this.options.leaseManager.recoverAbandonedLease(
+              task.id,
+              `orphaned execution: ${reason}`,
+              { preserveProgress: true },
+            );
+            if (leaseRecovered) {
+              recovered++;
+              continue;
+            }
+          }
+
           // Reset steps whose work was never committed before clearing the worktree
           await this.resetStepsIfWorkLost(task);
 
@@ -1371,6 +2268,41 @@ export class SelfHealingManager {
       log.error(`Orphaned executor recovery failed: ${errorMessage}`);
       return 0;
     }
+  }
+
+  private getDurableAgentRecoveryState(agent: { metadata?: Record<string, unknown> | null }): {
+    attempts: number;
+    nextRetryAt?: string;
+    exhausted?: boolean;
+    lastMissingModulePath?: string;
+    consecutiveMissingModulePathCount: number;
+  } {
+    const metadata = agent.metadata ?? {};
+    const raw = metadata.durableErrorRecovery;
+    if (!raw || typeof raw !== "object") {
+      return { attempts: 0, consecutiveMissingModulePathCount: 0 };
+    }
+    const record = raw as Record<string, unknown>;
+    const attempts = typeof record.attempts === "number" && Number.isFinite(record.attempts)
+      ? Math.max(0, Math.floor(record.attempts))
+      : 0;
+    const consecutiveMissingModulePathCount =
+      typeof record.consecutiveMissingModulePathCount === "number" && Number.isFinite(record.consecutiveMissingModulePathCount)
+        ? Math.max(0, Math.floor(record.consecutiveMissingModulePathCount))
+        : 0;
+    return {
+      attempts,
+      nextRetryAt: typeof record.nextRetryAt === "string" ? record.nextRetryAt : undefined,
+      exhausted: record.exhausted === true,
+      lastMissingModulePath: typeof record.lastMissingModulePath === "string" ? record.lastMissingModulePath : undefined,
+      consecutiveMissingModulePathCount,
+    };
+  }
+
+  private computeDurableAgentRecoveryCooldownMs(attempts: number): number {
+    const clampedAttempts = Math.max(1, attempts);
+    const exponential = DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS * Math.pow(2, clampedAttempts - 1);
+    return Math.min(exponential, DURABLE_ERROR_RECOVERY_MAX_COOLDOWN_MS);
   }
 
   async recoverOrphanedAgents(): Promise<number> {
@@ -1403,10 +2335,39 @@ export class SelfHealingManager {
           return false;
         }
         const updatedAt = Date.parse(agent.updatedAt ?? "");
-        if (!Number.isFinite(updatedAt)) {
+        if (!Number.isFinite(updatedAt) || now - updatedAt < recoveryTimeoutMs) {
           return false;
         }
-        return now - updatedAt >= recoveryTimeoutMs;
+
+        if (agent.state === "error") {
+          const runtimeConfig = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
+          if (runtimeConfig.enabled === false) {
+            return false;
+          }
+          if (this.options.hasActiveAgentExecution?.(agent.id) === true) {
+            return false;
+          }
+          if (classifyError(agent.lastError ?? "") !== "transient" && !isStaleWorktreeModuleResolutionError(agent.lastError ?? "")) {
+            return false;
+          }
+          if (isOperatorActionableAgentError(agent.lastError ?? "")) {
+            return false;
+          }
+
+          const recoveryState = this.getDurableAgentRecoveryState(agent);
+          if (recoveryState.exhausted) {
+            return false;
+          }
+          if (recoveryState.nextRetryAt) {
+            const nextRetryMs = Date.parse(recoveryState.nextRetryAt);
+            if (Number.isFinite(nextRetryMs) && nextRetryMs > now) {
+              log.log(`Durable agent ${agent.id} transient recovery delayed until ${recoveryState.nextRetryAt}`);
+              return false;
+            }
+          }
+        }
+
+        return true;
       });
 
       if (orphaned.length === 0) {
@@ -1418,10 +2379,75 @@ export class SelfHealingManager {
         const updatedAt = Date.parse(agent.updatedAt ?? "");
         const stuckForMs = Math.max(0, now - updatedAt);
         try {
+          if (agent.state === "error") {
+            const recoveryState = this.getDurableAgentRecoveryState(agent);
+            const isStaleMissingModule = isStaleWorktreeModuleResolutionError(agent.lastError ?? "");
+            if (isStaleMissingModule) {
+              const missingModulePath = extractMissingModulePath(agent.lastError ?? "");
+              const repeatedPath =
+                missingModulePath && recoveryState.lastMissingModulePath === missingModulePath
+                  ? recoveryState.consecutiveMissingModulePathCount + 1
+                  : 1;
+              await agentStore.updateAgent(agent.id, {
+                metadata: {
+                  ...(agent.metadata ?? {}),
+                  durableErrorRecovery: {
+                    attempts: recoveryState.attempts,
+                    nextRetryAt: recoveryState.nextRetryAt,
+                    exhausted: recoveryState.exhausted,
+                    lastReason: "stale-path-module-resolution",
+                    lastMissingModulePath: missingModulePath ?? recoveryState.lastMissingModulePath,
+                    consecutiveMissingModulePathCount: repeatedPath,
+                    lastObservedAt: new Date().toISOString(),
+                  },
+                },
+              });
+              log.warn(`Suppressed durable-agent auto-restart for ${agent.id}: stale module-resolution failure indicates stale host process/worktree path`);
+              if (missingModulePath && repeatedPath >= 3) {
+                log.warn(
+                  `Durable agent ${agent.id} repeated missing-module path ${repeatedPath} times (${missingModulePath}). Hosting dashboard/engine process is likely stale (for example, zombie process from a deleted worktree); clean up stale process/worktree. FN-4013 tracks systemic prevention.`,
+                );
+              }
+              continue;
+            }
+            const nextAttempts = recoveryState.attempts + 1;
+            const exhausted = nextAttempts >= DURABLE_ERROR_RECOVERY_MAX_RETRIES;
+            const nextRetryAt = new Date(Date.now() + this.computeDurableAgentRecoveryCooldownMs(nextAttempts)).toISOString();
+            await agentStore.updateAgent(agent.id, {
+              metadata: {
+                ...(agent.metadata ?? {}),
+                durableErrorRecovery: {
+                  attempts: nextAttempts,
+                  lastAttemptAt: new Date().toISOString(),
+                  nextRetryAt,
+                  exhausted,
+                  lastReason: exhausted ? "retry-budget-exhausted" : "transient-error",
+                  lastMissingModulePath: undefined,
+                  consecutiveMissingModulePathCount: 0,
+                },
+              },
+            });
+            if (exhausted) {
+              log.warn(`Suppressed durable-agent auto-restart for ${agent.id}: retry budget exhausted`);
+              continue;
+            }
+          }
+
           await agentStore.updateAgentState(agent.id, "active");
           await agentStore.updateAgent(agent.id, {
             lastError: undefined,
           });
+
+          if (agent.state === "error" && this.options.restartDurableAgentHeartbeat) {
+            const restartOk = await this.options.restartDurableAgentHeartbeat(agent.id, {
+              reason: "transient-error",
+              attempt: this.getDurableAgentRecoveryState(agent).attempts + 1,
+            });
+            if (!restartOk) {
+              log.warn(`Durable-agent transient recovery heartbeat restart skipped for ${agent.id}`);
+            }
+          }
+
           log.log(
             `Auto-recovered: orphaned agent ${agent.id} stuck in ${agent.state} for ${Math.round(stuckForMs / 1000)}s — reset to active`,
           );
@@ -1444,8 +2470,106 @@ export class SelfHealingManager {
   }
 
   /**
+   * Default cap (in ms) on how long an active heartbeat run from the current
+   * process is allowed to remain open before self-healing will terminate it.
+   * Six hours is well past any legitimate heartbeat tick (default 1 h
+   * interval, configurable up to a few hours) so reaching this threshold
+   * means the run record was never closed — typically a process that died
+   * without our watchdog catching it.
+   */
+  private static readonly STALE_ACTIVE_RUN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+  /**
+   * Terminate orphaned `agentRuns` rows left in `status = 'active'` by a
+   * process that crashed before calling endHeartbeatRun(). These rows
+   * silently break heartbeat scheduling: HeartbeatTriggerScheduler.onTimerTick
+   * skips every tick that finds an active run, so the agent never gets called
+   * again until something cleans up.
+   *
+   * A run is considered stale when:
+   *  - `processPid` was recorded and does not match the current `process.pid`
+   *    (i.e., the writer process is gone — guaranteed orphan), or
+   *  - `processPid` is missing (legacy data), or
+   *  - the run has been active for longer than STALE_ACTIVE_RUN_MAX_AGE_MS,
+   *    even from the current process (defense in depth against a writer that
+   *    leaks the row without crashing the whole runtime).
+   *
+   * The matching `processPid` + young run case is left alone — that is a
+   * legitimately in-flight heartbeat.
+   */
+  async recoverStaleHeartbeatRuns(): Promise<number> {
+    const agentStore = this.options.agentStore;
+    if (!agentStore) {
+      return 0;
+    }
+
+    let activeRuns;
+    try {
+      activeRuns = await agentStore.listActiveHeartbeatRuns();
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Stale heartbeat run recovery — listing failed: ${errorMessage}`);
+      return 0;
+    }
+
+    if (activeRuns.length === 0) {
+      return 0;
+    }
+
+    const now = Date.now();
+    const currentPid = process.pid;
+    const maxAgeMs = SelfHealingManager.STALE_ACTIVE_RUN_MAX_AGE_MS;
+    let recovered = 0;
+
+    for (const run of activeRuns) {
+      const startedMs = Date.parse(run.startedAt);
+      const ageMs = Number.isFinite(startedMs) ? Math.max(0, now - startedMs) : Infinity;
+      const recordedPid = run.processPid;
+
+      const pidMismatch = typeof recordedPid === "number" && recordedPid !== currentPid;
+      const pidMissing = typeof recordedPid !== "number";
+      const tooOld = ageMs >= maxAgeMs;
+
+      if (!pidMismatch && !pidMissing && !tooOld) {
+        continue;
+      }
+
+      const reason = pidMismatch
+        ? `writer pid ${recordedPid} is no longer this process (current pid ${currentPid})`
+        : pidMissing
+          ? `no processPid recorded`
+          : `active for ${Math.round(ageMs / 1000)}s (>= ${Math.round(maxAgeMs / 1000)}s threshold)`;
+
+      try {
+        const detail = await agentStore.getRunDetail(run.agentId, run.id);
+        if (detail) {
+          await agentStore.saveRun({
+            ...detail,
+            endedAt: new Date().toISOString(),
+            status: "terminated",
+            stderrExcerpt: `Auto-recovered orphaned heartbeat run: ${reason}`,
+          });
+        }
+        await agentStore.endHeartbeatRun(run.id, "terminated");
+        log.log(
+          `Auto-recovered: orphan heartbeat run ${run.id} for ${run.agentId} (${reason})`,
+        );
+        recovered++;
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        log.error(`Failed to recover stale heartbeat run ${run.id} for ${run.agentId}: ${errorMessage}`);
+      }
+    }
+
+    if (recovered > 0) {
+      log.log(`Recovered ${recovered} stale heartbeat run(s)`);
+    }
+    return recovered;
+  }
+
+  /**
    * Recover `in-progress` tasks that failed only because the agent exited
-   * without calling task_done, and where there is no sign of work to preserve.
+   * without calling fn_task_done, and where there is no sign of work to preserve.
    *
    * These are safe to requeue automatically when no steps progressed and git
    * has neither worktree changes nor branch commits. Cases with any evidence
@@ -1506,8 +2630,59 @@ export class SelfHealingManager {
   }
 
   /**
+   * Recover failed `in-review` retries that point at a missing worktree path.
+   *
+   * This is a narrow guard for session-start failures thrown by
+   * assertValidWorktreeSession() (`Refusing to start coding agent in missing worktree:`).
+   * We clear stale worktree metadata and failure state, keep step progress and
+   * retry counters, then requeue to todo for a clean retry.
+   */
+  async recoverMissingWorktreeReviewFailures(): Promise<number> {
+    try {
+      const tasks = await this.store.listTasks({ column: "in-review", slim: true });
+      const candidates = tasks.filter((task) => isRecoverableMissingWorktreeReviewFailure(task));
+
+      if (candidates.length === 0) return 0;
+
+      log.warn(`Found ${candidates.length} in-review task(s) failed by missing-worktree session start`);
+
+      let recovered = 0;
+      for (const task of candidates) {
+        try {
+          const staleWorktree = task.worktree;
+          await this.store.updateTask(task.id, {
+            status: null,
+            error: null,
+            worktree: null,
+            branch: null,
+            sessionFile: null,
+          });
+          await this.store.logEntry(
+            task.id,
+            `Auto-recovered: retry/verification session targeted missing worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo`,
+          );
+          await this.store.moveTask(task.id, "todo", { preserveProgress: true });
+          recovered++;
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.error(`Failed to recover missing-worktree review failure ${task.id}: ${errorMessage}`);
+        }
+      }
+
+      if (recovered > 0) {
+        log.log(`Recovered ${recovered} missing-worktree review failure(s) → todo`);
+      }
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Missing-worktree review recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
    * Recover `in-review` tasks marked as `failed` because the agent exited
-   * without calling `task_done` *with partial step progress* (some steps done,
+   * without calling `fn_task_done` *with partial step progress* (some steps done,
    * some still pending). The work-in-progress is valuable but incomplete —
    * the existing worktree and branch are preserved and the task is moved back
    * to `todo` so the scheduler re-dispatches it for a fresh execution that
@@ -1557,7 +2732,7 @@ export class SelfHealingManager {
           });
           await this.store.logEntry(
             task.id,
-            `Auto-retry ${nextCount}/${MAX_TASK_DONE_RETRIES}: agent finished without task_done — requeuing to todo to resume partial work`,
+            `Auto-retry ${nextCount}/${MAX_TASK_DONE_RETRIES}: agent finished without fn_task_done — requeuing to todo to resume partial work`,
           );
           await this.store.moveTask(task.id, "todo", { preserveProgress: true });
           recovered++;
@@ -1580,6 +2755,13 @@ export class SelfHealingManager {
       log.error(`Partial-progress no-task_done recovery failed: ${errorMessage}`);
       return 0;
     }
+  }
+
+  private async isBranchAheadOfBase(
+    task: Task,
+    baseRef?: string,
+  ): Promise<{ aheadCount: number; baseRef: string } | null> {
+    return isBranchAheadOfBase(task, this.options.rootDir, baseRef);
   }
 
   private async hasRecoverableGitWork(task: Task): Promise<boolean> {
@@ -1903,7 +3085,7 @@ export class SelfHealingManager {
         // FN-2165 regression guard: if any dependent task stored one of these
         // now-gone branches as its baseBranch, null it so the task doesn't
         // hard-fail at worktree creation time.
-        const cleared = this.store.clearStaleBaseBranchReferences(deletedBranches);
+        const cleared = this.store.clearStaleExecutionStartBranchReferences(deletedBranches);
         if (cleared.length > 0) {
           log.log(`Cleared stale baseBranch on ${cleared.length} task(s): ${cleared.join(", ")}`);
         }
@@ -2005,7 +3187,8 @@ function isTaskWorkComplete(task: Task): boolean {
 }
 
 function isNoTaskDoneFailure(task: Task): boolean {
-  return task.error?.includes("without calling task_done") === true;
+  const error = task.error?.toLowerCase() ?? "";
+  return error.includes("without calling fn_task_done") || error.includes("without calling task_done");
 }
 
 function hasStepProgress(task: Task): boolean {

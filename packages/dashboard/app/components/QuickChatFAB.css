@@ -247,7 +247,10 @@
 /* Icon-only fallback when the model name is too long for the header. */
 .quick-chat-model-tag--icon {
   max-width: none;
-  padding: var(--space-xs);
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
   justify-content: center;
 }
 
@@ -405,6 +408,14 @@
   font-size: calc(var(--space-sm) + var(--space-xs) * 1.25);
   line-height: 1.45;
   word-break: break-word;
+}
+
+.quick-chat-jump-to-latest {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--space-xl) * 3);
+  transform: translateX(-50%);
+  z-index: 2;
 }
 
 .quick-chat-panel-message p {
@@ -784,6 +795,11 @@
     padding-bottom: calc(var(--space-sm) + var(--space-xs) + env(safe-area-inset-bottom, 0px));
   }
 
+  .quick-chat-panel.quick-chat-panel--keyboard-open .quick-chat-panel-input {
+    /* When keyboard is open, do not add home-indicator inset gap above it. */
+    padding-bottom: calc(var(--space-sm) + var(--space-xs));
+  }
+
   .quick-chat-attachment-previews {
     padding: var(--space-sm) max(var(--space-md), env(safe-area-inset-left, 0px));
   }
@@ -876,6 +892,14 @@
   .quick-chat-panel .chat-tool-calls-group-status {
     justify-content: flex-end;
     margin-left: auto;
+  }
+
+  .quick-chat-panel-message {
+    max-width: 90%;
+  }
+
+  .quick-chat-jump-to-latest {
+    bottom: calc(var(--space-xl) * 4 + env(safe-area-inset-bottom, 0px));
   }
 }
 
@@ -1185,6 +1209,12 @@
   font-size: calc(var(--space-sm) + var(--space-xs) * 0.5);
   font-weight: 500;
   white-space: nowrap;
+}
+
+.quick-chat-panel .chat-mention-chip--non-member {
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  color: var(--text-muted);
+  border-color: color-mix(in srgb, var(--color-warning) 35%, transparent);
 }
 
 .quick-chat-panel-message--streaming {

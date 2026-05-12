@@ -1,6 +1,6 @@
 {
   "name": "@fusion/dashboard",
-  "version": "0.19.0",
+  "version": "0.27.0",
   "license": "MIT",
   "description": "Fusion dashboard: React UI and HTTP API server for monitoring and controlling the Fusion AI coding agent.",
   "homepage": "https://github.com/Runfusion/Fusion#readme",
@@ -22,6 +22,26 @@
     "./planning": {
       "types": "./src/planning.ts",
       "import": "./src/planning.ts"
+    },
+    "./app/components/TaskCard": {
+      "types": "./app/components/TaskCard.tsx",
+      "import": "./app/components/TaskCard.tsx"
+    },
+    "./app/utils/taskStuck": {
+      "types": "./app/utils/taskStuck.ts",
+      "import": "./app/utils/taskStuck.ts"
+    },
+    "./app/utils/projectStorage": {
+      "types": "./app/utils/projectStorage.ts",
+      "import": "./app/utils/projectStorage.ts"
+    },
+    "./app/plugins/pluginViewRegistry": {
+      "types": "./app/plugins/pluginViewRegistry.tsx",
+      "import": "./app/plugins/pluginViewRegistry.tsx"
+    },
+    "./app/plugins/types": {
+      "types": "./app/plugins/types.ts",
+      "import": "./app/plugins/types.ts"
     }
   },
   "publishConfig": {
@@ -36,8 +56,12 @@
     "build:client": "vite build",
     "dev": "pnpm build && pnpm typecheck && pnpm dev:serve",
     "dev:serve": "vite dev",
-    "test": "vitest run --silent=passed-only --reporter=dot --exclude '**/build-output.test.ts'",
-    "test:build": "vitest run --silent=passed-only --reporter=dot app/__tests__/build-output.test.ts",
+    "test": "vitest run --project dashboard-app-quality --project dashboard-api-quality --silent=passed-only --reporter=dot --exclude '**/build-output.test.ts'",
+    "test:app": "vitest run --project dashboard-app --silent=passed-only --reporter=dot --exclude '**/build-output.test.ts'",
+    "test:api": "vitest run --project dashboard-api --silent=passed-only --reporter=dot",
+    "test:deep": "vitest run --project dashboard-app --project dashboard-api --silent=passed-only --reporter=dot --exclude '**/build-output.test.ts'",
+    "test:browser-smoke": "node scripts/browser-layout-smoke.mjs",
+    "test:build": "vitest run --project dashboard-app --silent=passed-only --reporter=dot app/__tests__/build-output.test.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.app.json"
   },
   "dependencies": {
@@ -50,13 +74,16 @@
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.36.4",
     "@fusion-plugin-examples/dependency-graph": "workspace:*",
+    "@fusion-plugin-examples/roadmap": "workspace:*",
     "@fusion-plugin-examples/hermes-runtime": "workspace:*",
     "@fusion-plugin-examples/openclaw-runtime": "workspace:*",
     "@fusion-plugin-examples/droid-runtime": "workspace:*",
+    "@fusion-plugin-examples/cursor-runtime": "workspace:*",
+    "@fusion-plugin-examples/cli-printing-press": "workspace:*",
     "@fusion-plugin-examples/paperclip-runtime": "workspace:*",
     "@fusion/core": "workspace:*",
     "@fusion/engine": "workspace:*",
-    "@mariozechner/pi-coding-agent": "^0.72.1",
+    "@mariozechner/pi-coding-agent": "^0.73.0",
     "@types/multer": "^2.1.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-search": "^0.15.0",

@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   decideExecutionPlan,
+  normalizeForwardedArgs,
   resolveAffectedPackages,
   shouldForceFullSuite,
 } from "../../../../scripts/test-changed.mjs";
-import { parseShardArgs, selectShardPackages } from "../../../../scripts/ci-test-shard.mjs";
+import { parseShardArgs, planShardAssignments, selectShardPackages } from "../../../../scripts/ci-test-shard.mjs";
 
 describe("root test command changed-only planning", () => {
   it("uses changed mode when package-only changes are detected", () => {
     const packageMap = new Map([
-      ["core", "@fusion/core"],
-      ["engine", "@fusion/engine"],
+      ["packages/core", "@fusion/core"],
+      ["packages/engine", "@fusion/engine"],
     ]);
 
     const plan = decideExecutionPlan({
@@ -28,7 +29,7 @@ describe("root test command changed-only planning", () => {
       forceFullSuite: false,
       comparisonBase: "abc123",
       changedFiles: ["scripts/test-with-lock.mjs"],
-      packageNameByDir: new Map([["core", "@fusion/core"]]),
+      packageNameByDir: new Map([["packages/core", "@fusion/core"]]),
     });
 
     expect(plan).toEqual({ mode: "full", reason: "shared-infra-changed" });
@@ -55,6 +56,12 @@ describe("root test command changed-only planning", () => {
     expect(shouldForceFullSuite(["package.json"])).toBe(true);
     expect(shouldForceFullSuite(["packages/core/src/store.ts"])).toBe(false);
   });
+
+  it("strips forwarded silent flags so package vitest scripts do not receive duplicates", () => {
+    expect(
+      normalizeForwardedArgs(["--full", "--silent", "--silent=passed-only", "--reporter=dot"]),
+    ).toEqual(["--reporter=dot"]);
+  });
 });
 
 describe("CI shard test planner", () => {
@@ -71,10 +78,43 @@ describe("CI shard test planner", () => {
     );
   });
 
-  it("selects deterministic package partitions", () => {
-    const packages = ["a", "b", "c", "d", "e"];
-    expect(selectShardPackages(packages, 1, 3)).toEqual(["a", "d"]);
-    expect(selectShardPackages(packages, 2, 3)).toEqual(["b", "e"]);
-    expect(selectShardPackages(packages, 3, 3)).toEqual(["c"]);
+  it("deterministically balances weighted packages across shards", () => {
+    const weightedPackages = [
+      { name: "@fusion/dashboard", testFileCount: 140 },
+      { name: "@fusion/engine", testFileCount: 120 },
+      { name: "@fusion/core", testFileCount: 60 },
+      { name: "@runfusion/fusion", testFileCount: 40 },
+      { name: "@fusion/plugin-sdk", testFileCount: 18 },
+      { name: "@fusion/mobile", testFileCount: 12 },
+      { name: "@fusion/desktop", testFileCount: 8 },
+      { name: "@fusion/dashboard-utils", testFileCount: 4 },
+      { name: "@fusion/no-tests-yet", testFileCount: 0 },
+    ];
+
+    const shardAssignments = planShardAssignments(weightedPackages, 3);
+    expect(shardAssignments).toEqual([
+      ["@fusion/dashboard"],
+      ["@fusion/engine", "@fusion/desktop", "@fusion/dashboard-utils"],
+      ["@fusion/core", "@runfusion/fusion", "@fusion/plugin-sdk", "@fusion/mobile", "@fusion/no-tests-yet"],
+    ]);
+
+    expect(selectShardPackages(weightedPackages, 1, 3)).toEqual(shardAssignments[0]);
+    expect(selectShardPackages(weightedPackages, 2, 3)).toEqual(shardAssignments[1]);
+    expect(selectShardPackages(weightedPackages, 3, 3)).toEqual(shardAssignments[2]);
+
+    const weightsByName = new Map(weightedPackages.map((pkg) => [pkg.name, pkg.testFileCount]));
+    const shardWeights = shardAssignments.map((shardPackages) =>
+      shardPackages.reduce((sum, pkgName) => sum + (weightsByName.get(pkgName) ?? 0), 0),
+    );
+
+    const totalWeight = weightedPackages.reduce((sum, pkg) => sum + pkg.testFileCount, 0);
+    const mean = totalWeight / 3;
+
+    expect(Math.max(...shardWeights)).toBeLessThanOrEqual(mean * 1.15);
+    expect(Math.min(...shardWeights)).toBeGreaterThanOrEqual(mean * 0.85);
+
+    const dashboardShard = shardAssignments.findIndex((pkgs) => pkgs.includes("@fusion/dashboard"));
+    const engineShard = shardAssignments.findIndex((pkgs) => pkgs.includes("@fusion/engine"));
+    expect(dashboardShard).not.toBe(engineShard);
   });
 });

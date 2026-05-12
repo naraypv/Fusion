@@ -1,0 +1,127 @@
+import { badRequest } from "../api-error.js";
+
+export type BranchSelectionMode =
+  | "project-default"
+  | "auto-new"
+  | "existing"
+  | "custom-new";
+
+export interface BranchSelectionPayload {
+  mode?: unknown;
+  branchName?: unknown;
+  baseBranch?: unknown;
+}
+
+export type PlanningBranchMode = "shared" | "per-task-derived";
+
+export interface ResolvedBranchSelection {
+  branch?: string;
+  baseBranch?: string;
+}
+
+export interface BranchAssignmentContext {
+  mode?: unknown;
+}
+
+export interface ResolvedBranchAssignmentContext {
+  mode: PlanningBranchMode;
+}
+
+function normalizeOptionalBranch(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw badRequest(`${fieldName} must be a string`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function resolveBranchSelection(
+  selectionInput: unknown,
+  fallbackBranch: unknown,
+  fallbackBaseBranch: unknown,
+): ResolvedBranchSelection {
+  const fallback = {
+    branch: normalizeOptionalBranch(fallbackBranch, "branch"),
+    baseBranch: normalizeOptionalBranch(fallbackBaseBranch, "baseBranch"),
+  };
+
+  if (selectionInput === undefined || selectionInput === null) {
+    return fallback;
+  }
+
+  if (typeof selectionInput !== "object" || Array.isArray(selectionInput)) {
+    throw badRequest("branchSelection must be an object");
+  }
+
+  const selection = selectionInput as BranchSelectionPayload;
+  const mode = typeof selection.mode === "string" ? selection.mode : undefined;
+  if (!mode) {
+    throw badRequest("branchSelection.mode is required");
+  }
+
+  if (![
+    "project-default",
+    "auto-new",
+    "existing",
+    "custom-new",
+  ].includes(mode)) {
+    throw badRequest("branchSelection.mode must be one of: project-default, auto-new, existing, custom-new");
+  }
+
+  const baseBranch = normalizeOptionalBranch(selection.baseBranch, "branchSelection.baseBranch");
+
+  if (mode === "project-default") {
+    return { branch: undefined, baseBranch };
+  }
+
+  if (mode === "auto-new") {
+    // Auto-named branch is derived later by existing task-id based flow.
+    return { branch: undefined, baseBranch };
+  }
+
+  const branchName = normalizeOptionalBranch(selection.branchName, "branchSelection.branchName");
+  if (!branchName) {
+    throw badRequest("branchSelection.branchName is required for existing/custom-new modes");
+  }
+
+  return {
+    branch: branchName,
+    baseBranch,
+  };
+}
+
+export function resolveBranchAssignmentContext(input: unknown): ResolvedBranchAssignmentContext {
+  if (input === undefined || input === null) {
+    return { mode: "shared" };
+  }
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw badRequest("branchAssignment must be an object");
+  }
+  const payload = input as BranchAssignmentContext;
+  const mode = payload.mode;
+  if (mode !== undefined && mode !== "shared" && mode !== "per-task-derived") {
+    throw badRequest("branchAssignment.mode must be one of: shared, per-task-derived");
+  }
+  return {
+    mode: mode === "per-task-derived" ? "per-task-derived" : "shared",
+  };
+}
+
+function sanitizeSegment(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._/-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-/.]+|[-/.]+$/g, "")
+    .slice(0, 48);
+}
+
+export function derivePerTaskBranch(sharedBranch: string | undefined, taskSegment: string): string | undefined {
+  const base = normalizeOptionalBranch(sharedBranch, "sharedBranch");
+  if (!base) return undefined;
+  const segment = sanitizeSegment(taskSegment);
+  if (!segment) return base;
+  return `${base}/${segment}`;
+}

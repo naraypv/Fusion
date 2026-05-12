@@ -10,10 +10,9 @@
  */
 
 import type { AddressInfo } from "node:net";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   CentralCore,
-  PluginStore,
   PluginLoader,
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
@@ -41,7 +40,7 @@ import {
 import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getClaudeCodeCredentialPaths, getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
@@ -65,7 +64,7 @@ import {
 import { resolveSelfExtension } from "./self-extension.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { syncStartupModels } from "./startup-model-sync.js";
-import { ensureBundledDependencyGraphPluginInstalled } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledDependencyGraphPluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let diagnosticIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -425,11 +424,7 @@ export async function runServe(
   // internally for task-execution plugin hooks. These instances here serve the
   // HTTP plugin-management API routes and are intentionally separate.
   //
-  const pluginStoreRootDir =
-    typeof (store as { getRootDir?: () => string }).getRootDir === "function"
-      ? store.getRootDir()
-      : dirname(store.getFusionDir());
-  const pluginStore = new PluginStore(pluginStoreRootDir);
+  const pluginStore = store.getPluginStore();
   await pluginStore.init();
 
   // ── PluginLoader: plugin lifecycle management ───────────────────────
@@ -454,6 +449,30 @@ export async function runServe(
   } catch (err) {
     console.warn(`[plugins] Failed to auto-install bundled Dependency Graph plugin: ${err instanceof Error ? err.message : err}`);
   }
+
+  // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip).
+  const ensureBundledPluginInstalledCallback = async (pluginId: string): Promise<boolean> => {
+    if (!isBundledPluginId(pluginId)) {
+      console.warn(`[plugins] ensureBundledPluginInstalled: unknown bundled plugin id "${pluginId}"`);
+      return false;
+    }
+    try {
+      const status = await ensureBundledPluginInstalled(pluginStore, pluginLoader, pluginId);
+      if (status === "missing-bundle") {
+        console.warn(`[plugins] Bundled plugin "${pluginId}" was not found in this build`);
+        return false;
+      }
+      if (status === "installed") {
+        console.log(`[plugins] Installed bundled plugin "${pluginId}"`);
+      } else if (status === "updated") {
+        console.log(`[plugins] Updated bundled plugin "${pluginId}"`);
+      }
+      return true;
+    } catch (err) {
+      console.warn(`[plugins] Failed to auto-install bundled plugin "${pluginId}": ${err instanceof Error ? err.message : err}`);
+      throw err;
+    }
+  };
 
   // Auto-load all enabled plugins so runtime UI (NewAgentDialog, AgentDetailView)
   // can discover installed runtimes like Hermes and OpenClaw.
@@ -487,6 +506,7 @@ export async function runServe(
   const supplementalAuthStorage = createReadOnlyAuthFileStorage([
     ...getLegacyAuthPaths(),
     getCodexCliAuthPath(),
+    ...getClaudeCodeCredentialPaths(),
   ]);
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, [supplementalAuthStorage]);
   const modelRegistry = ModelRegistry.create(mergedAuthStorage, getModelRegistryModelsPath());
@@ -708,6 +728,7 @@ export async function runServe(
     pluginStore,
     pluginLoader,
     pluginRunner: pluginLoader,
+    ensureBundledPluginInstalled: ensureBundledPluginInstalledCallback,
     onProjectFirstAccessed: (projectId: string) => engineManager.onProjectAccessed(projectId),
     onProjectRegistered: ({ path }) => {
       // Fire-and-forget: install the fusion Claude-skill when pi-claude-cli

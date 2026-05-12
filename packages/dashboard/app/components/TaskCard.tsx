@@ -1,8 +1,15 @@
 import "./TaskCard.css";
 import { memo, useCallback, useState, useRef, useEffect, useMemo } from "react";
-import { Link, Clock, Layers, Pencil, ChevronDown, Folder, Target, Bot, Trash2, RotateCw, Zap } from "lucide-react";
+import { Link, Clock, Layers, Pencil, ChevronDown, Folder, Target, Bot, Trash2, RotateCw, Zap, GitBranch } from "lucide-react";
 import type { Task, TaskDetail, Column, PrInfo, IssueInfo, TaskPriority } from "@fusion/core";
-import { COLUMN_LABELS, DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, VALID_TRANSITIONS, getErrorMessage } from "@fusion/core";
+import {
+  COLUMN_LABELS,
+  DEFAULT_TASK_PRIORITY,
+  HIGH_FANOUT_BLOCKER_TODO_THRESHOLD,
+  TASK_PRIORITIES,
+  VALID_TRANSITIONS,
+  getErrorMessage,
+} from "@fusion/core";
 import { fetchTaskDetail, uploadAttachment, fetchMission, fetchAgent } from "../api";
 import { GitHubBadge } from "./GitHubBadge";
 import { pickPreferredBadge } from "./TaskCardBadge";
@@ -13,9 +20,11 @@ import { getFreshBatchData } from "../hooks/useBatchBadgeFetch";
 import { useTaskDiffStats } from "../hooks/useTaskDiffStats";
 import { isTaskStuck } from "../utils/taskStuck";
 import { getUnifiedTaskProgress } from "../utils/taskProgress";
-import { getTimedDurationMs } from "../utils/taskTiming";
+import { getEndToEndDurationMs, getTimedDurationMs, getWorkflowRuntimeMs, parseTimestampToMs } from "../utils/taskTiming";
 import type { ToastType } from "../hooks/useToast";
 import { useConfirm } from "../hooks/useConfirm";
+import { extractDependencyDeleteConflict } from "../utils/taskDelete";
+import type { BlockerFanoutEntry } from "../hooks/useBlockerFanout";
 
 // ── Mission title caching ───────────────────────────────────────────────────
 
@@ -124,12 +133,6 @@ function getTaskStatusLabel(status: string): string {
   return status;
 }
 
-function parseTimestampToMs(value?: string): number | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function getDoneCompletionMs(task: Task): number | null {
   const completionMs = parseTimestampToMs(task.columnMovedAt ?? task.updatedAt);
   if (completionMs == null) return null;
@@ -153,13 +156,8 @@ function getInProgressElapsedMs(task: Task, nowMs: number): number | null {
 // timer reflects how long the task actually took, not just the time spent
 // inside instrumented code paths. Returns null on legacy tasks that completed
 // before `executionStartedAt` was tracked, so callers can fall back.
-function getEndToEndDurationMs(task: Task, nowMs: number): number | null {
-  const startedMs = parseTimestampToMs(task.executionStartedAt);
-  if (startedMs == null) return null;
-
-  const completedMs = parseTimestampToMs(task.executionCompletedAt);
-  const endMs = completedMs != null && completedMs >= startedMs ? completedMs : nowMs;
-  return Math.max(0, endMs - startedMs);
+function getTaskEndToEndDurationMs(task: Task, nowMs: number): number | null {
+  return getEndToEndDurationMs(task.executionStartedAt, task.executionCompletedAt, nowMs);
 }
 
 function getInReviewCompletionMs(task: Task): number | null {
@@ -176,7 +174,7 @@ function getMergeElapsedMs(task: Task, nowMs: number): number | null {
 }
 
 function getActiveMergeTotalMs(task: Task, nowMs: number): number | null {
-  const endToEndMs = getEndToEndDurationMs(task, nowMs);
+  const endToEndMs = getTaskEndToEndDurationMs(task, nowMs);
   if (endToEndMs != null) {
     return endToEndMs;
   }
@@ -190,43 +188,17 @@ function getActiveMergeTotalMs(task: Task, nowMs: number): number | null {
   return mergeElapsedMs;
 }
 
-// Mirrors summarizeWorkflowTiming in TaskTokenStatsPanel: completed steps use
-// completedAt-startedAt; in-progress steps contribute live elapsed (now-startedAt).
-function getWorkflowRuntimeMs(task: Task, nowMs: number): number | null {
-  const results = task.workflowStepResults;
-  if (!results || results.length === 0) return null;
-
-  let total = 0;
-  let counted = 0;
-  for (const step of results) {
-    if (!step.startedAt) continue;
-    const startedMs = parseTimestampToMs(step.startedAt);
-    if (startedMs == null) continue;
-
-    let endMs: number;
-    if (step.completedAt) {
-      const completedMs = parseTimestampToMs(step.completedAt);
-      if (completedMs == null || completedMs < startedMs) continue;
-      endMs = completedMs;
-    } else {
-      endMs = Math.max(startedMs, nowMs);
-    }
-    total += endMs - startedMs;
-    counted += 1;
-  }
-  return counted > 0 ? total : null;
-}
 
 function getInstrumentedDurationMs(task: Task, nowMs: number): number | null {
-  // Prefer the server-aggregated `timedExecutionMs` (populated for slim board
-  // listings, where `task.log` is stripped to keep the wire payload small).
-  // Fall back to client-side parsing of the full log for the detail-modal
-  // path where the slim aggregate is absent but the log is loaded.
-  const timed =
-    typeof task.timedExecutionMs === "number"
-      ? task.timedExecutionMs
-      : getTimedDurationMs(task.log);
-  const workflow = getWorkflowRuntimeMs(task, nowMs);
+  // Prefer server aggregate when present: it is the canonical persisted runtime
+  // and may already include workflow execution. Avoid adding workflow runtime
+  // again in that case.
+  if (typeof task.timedExecutionMs === "number") {
+    return task.timedExecutionMs;
+  }
+
+  const timed = getTimedDurationMs(task.log);
+  const workflow = getWorkflowRuntimeMs(task.workflowStepResults, nowMs);
   if (timed == null && workflow == null) return null;
   return (timed ?? 0) + (workflow ?? 0);
 }
@@ -244,6 +216,30 @@ function formatElapsedDuration(elapsedMs: number): string {
 
   const elapsedDays = Math.floor(elapsedHours / 24);
   return `${elapsedDays}d`;
+}
+
+function normalizeBranchValue(value: string | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function getVisibleTaskCardBranches(task: Task): { branch: string | null; baseBranch: string | null } {
+  const branch = normalizeBranchValue(task.branch);
+  const baseBranch = normalizeBranchValue(task.baseBranch);
+  const defaultBranchPrefix = `fusion/${task.id.toLowerCase()}`;
+
+  const visibleBranch =
+    branch && (branch === defaultBranchPrefix || branch.startsWith(`${defaultBranchPrefix}-`))
+      ? null
+      : branch;
+
+  const visibleBaseBranch = baseBranch?.toLowerCase() === "main" ? null : baseBranch;
+
+  return {
+    branch: visibleBranch,
+    baseBranch: visibleBaseBranch ?? null,
+  };
 }
 
 export function formatElapsedDurationDone(elapsedMs: number): string {
@@ -287,6 +283,10 @@ interface TaskCardProps {
   lastFetchTimeMs?: number;
   /** Lookup of workflow step IDs to display names, fetched once at board level. */
   workflowStepNameLookup?: ReadonlyMap<string, string>;
+  /** Disable card drag semantics when embedding in custom draggable containers (e.g. dependency graph). */
+  disableDrag?: boolean;
+  /** Downstream fan-out entry for this task, computed at board-level. */
+  fanout?: BlockerFanoutEntry;
 }
 
 function areTaskBadgeInfosEqual(
@@ -324,24 +324,6 @@ function areTaskWorkflowStepIdsEqual(previous?: string[], next?: string[]): bool
 function getIssueUrlFromMetadata(metadata: Task["sourceMetadata"]): string | undefined {
   const issueUrl = metadata?.issueUrl;
   return typeof issueUrl === "string" && issueUrl.length > 0 ? issueUrl : undefined;
-}
-
-function extractDependencyDeleteConflict(err: unknown): { dependentIds: string[] } | null {
-  if (!(err instanceof Error)) {
-    return null;
-  }
-
-  const details = (err as { details?: { code?: string; dependentIds?: unknown } }).details;
-  if (details?.code === "TASK_HAS_DEPENDENTS" && Array.isArray(details.dependentIds)) {
-    return { dependentIds: details.dependentIds.filter((id): id is string => typeof id === "string") };
-  }
-
-  const idsInMessage = err.message.match(/[A-Z]+-\d+/g) ?? [];
-  if (idsInMessage.length > 1) {
-    return { dependentIds: [...new Set(idsInMessage.slice(1))] };
-  }
-
-  return null;
 }
 
 function areTaskWorkflowResultsEqual(previous?: Task["workflowStepResults"], next?: Task["workflowStepResults"]): boolean {
@@ -428,6 +410,13 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previous.onOpenMission === next.onOpenMission &&
     previous.onMoveTask === next.onMoveTask &&
     previous.workflowStepNameLookup === next.workflowStepNameLookup &&
+    previous.disableDrag === next.disableDrag &&
+    previous.fanout?.totalCount === next.fanout?.totalCount &&
+    previous.fanout?.activeTodoCount === next.fanout?.activeTodoCount &&
+    previous.fanout?.isHighFanout === next.fanout?.isHighFanout &&
+    previous.fanout?.escalation?.blockingAgeMs === next.fanout?.escalation?.blockingAgeMs &&
+    areTaskDependenciesEqual(previous.fanout?.dependentIds ?? [], next.fanout?.dependentIds ?? []) &&
+    areTaskDependenciesEqual(previous.fanout?.staleBlockedByDependentIds ?? [], next.fanout?.staleBlockedByDependentIds ?? []) &&
     previousTask.id === nextTask.id &&
     previousTask.title === nextTask.title &&
     previousTask.description === nextTask.description &&
@@ -444,6 +433,7 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previousTask.size === nextTask.size &&
     previousTask.blockedBy === nextTask.blockedBy &&
     previousTask.worktree === nextTask.worktree &&
+    previousTask.branch === nextTask.branch &&
     previousTask.baseBranch === nextTask.baseBranch &&
     previousTask.breakIntoSubtasks === nextTask.breakIntoSubtasks &&
     previousTask.currentStep === nextTask.currentStep &&
@@ -490,6 +480,8 @@ function TaskCardComponent({
   onMoveTask,
   lastFetchTimeMs,
   workflowStepNameLookup,
+  disableDrag,
+  fanout,
 }: TaskCardProps) {
   const [dragging, setDragging] = useState(false);
   const [fileDragOver, setFileDragOver] = useState(false);
@@ -740,12 +732,14 @@ function TaskCardComponent({
   const isAwaitingApproval = task.column === "triage" && task.status === "awaiting-approval";
   const isArchived = task.column === "archived";
   const isAgentActive = !globalPaused && !queued && !isFailed && !isPaused && !isStuck && !isAwaitingApproval && (task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string));
-  const isDraggable = !queued && !isPaused && !isEditing && !isArchived; // Disable drag during edit or if archived
+  const isDraggable = !disableDrag && !queued && !isPaused && !isEditing && !isArchived; // Disable drag during edit/archived or host embedding
 
   // Check if this card can be edited inline
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isAgentActive && !isPaused && !queued && onUpdateTask;
   const hasGitHubBadge = Boolean(task.prInfo || task.issueInfo);
   const isGitHubImportedTask = task.sourceType === "github_import";
+  const branchMetadata = useMemo(() => getVisibleTaskCardBranches(task), [task.id, task.branch, task.baseBranch]);
+  const hasBranchMetadata = Boolean(branchMetadata.branch || branchMetadata.baseBranch);
   const sourceIssueUrl = getIssueUrlFromMetadata(task.sourceMetadata);
   const isAgentCreated = isAgentCreatedTask(task);
   const sourceAgentName = getSourceAgentName(task);
@@ -777,7 +771,7 @@ function TaskCardComponent({
     const merging = task.status != null && ACTIVE_MERGE_STATUSES.has(task.status);
 
     if (task.column === "in-progress") {
-      const endToEndMs = getEndToEndDurationMs(task, Date.now());
+      const endToEndMs = getTaskEndToEndDurationMs(task, Date.now());
       const elapsedMs = getInProgressElapsedMs(task, Date.now());
       const instrumentedMs = getInstrumentedDurationMs(task, Date.now());
       if (endToEndMs == null && elapsedMs == null && instrumentedMs == null) {
@@ -786,7 +780,7 @@ function TaskCardComponent({
     }
 
     if (!merging && task.column === "in-review") {
-      const endToEndMs = getEndToEndDurationMs(task, Date.now());
+      const endToEndMs = getTaskEndToEndDurationMs(task, Date.now());
       const instrumentedMs = getInstrumentedDurationMs(task, Date.now());
       if (endToEndMs == null && instrumentedMs == null) {
         return;
@@ -833,7 +827,7 @@ function TaskCardComponent({
       // in-progress, never reset on retry-loop bounces). Fall back to the
       // columnMovedAt heuristic for legacy tasks predating the new field.
       const elapsedMs =
-        getEndToEndDurationMs(task, timeIndicatorNowMs)
+        getTaskEndToEndDurationMs(task, timeIndicatorNowMs)
         ?? getInProgressElapsedMs(task, timeIndicatorNowMs)
         ?? getInstrumentedDurationMs(task, timeIndicatorNowMs);
       if (elapsedMs == null) {
@@ -855,7 +849,7 @@ function TaskCardComponent({
     // in-review and done: show wall-clock end-to-end runtime. Falls back to
     // the instrumented `[timing]` aggregate for tasks completed before
     // `executionStartedAt`/`executionCompletedAt` were tracked.
-    const endToEndMs = getEndToEndDurationMs(task, timeIndicatorNowMs);
+    const endToEndMs = getTaskEndToEndDurationMs(task, timeIndicatorNowMs);
     const totalMs = endToEndMs ?? getInstrumentedDurationMs(task, timeIndicatorNowMs);
     if (totalMs == null) {
       return null;
@@ -1295,6 +1289,7 @@ function TaskCardComponent({
         ref={cardRef}
         className={cardClass}
         data-id={task.id}
+        data-column={task.column}
         onDoubleClick={handleDoubleClick}
       >
         <div className="card-editing-content">
@@ -1325,6 +1320,7 @@ function TaskCardComponent({
       ref={cardRef}
       className={cardClass}
       data-id={task.id}
+      data-column={task.column}
       draggable={isDraggable}
       onDragStart={isDraggable ? handleDragStart : undefined}
       onDragEnd={isDraggable ? handleDragEnd : undefined}
@@ -1531,6 +1527,22 @@ function TaskCardComponent({
       <div className="card-title" title={task.title || task.description || undefined}>
         {truncate(task.title, MAX_TITLE_LENGTH) || truncate(task.description, MAX_TITLE_LENGTH) || task.id}
       </div>
+      {hasBranchMetadata && (
+        <div className="card-branch-row" aria-label="Branch metadata">
+          {branchMetadata.branch && (
+            <span className="card-branch-chip" title={branchMetadata.branch}>
+              <span className="card-branch-label">Branch</span>
+              <span className="card-branch-value">{branchMetadata.branch}</span>
+            </span>
+          )}
+          {branchMetadata.baseBranch && (
+            <span className="card-branch-chip" title={branchMetadata.baseBranch}>
+              <span className="card-branch-label">Base</span>
+              <span className="card-branch-value">{branchMetadata.baseBranch}</span>
+            </span>
+          )}
+        </div>
+      )}
       {showProgressSection && (() => {
         const progressPercent = (unifiedProgress.completed / unifiedProgress.total) * 100;
         return (
@@ -1614,7 +1626,7 @@ function TaskCardComponent({
           )}
         </div>
       )}
-      {((task.dependencies && task.dependencies.length > 0) || queued || task.status === "queued" || task.blockedBy) && (
+      {((task.dependencies && task.dependencies.length > 0) || queued || task.status === "queued" || task.blockedBy || (fanout && fanout.totalCount > 0)) && (
         <div className="card-meta">
           {task.dependencies && task.dependencies.length > 0 && (
             <div className="card-dep-list">
@@ -1635,6 +1647,20 @@ function TaskCardComponent({
               <Layers size={12} style={{ verticalAlign: "middle" }} /> {task.blockedBy}
             </span>
           )}
+          {fanout && fanout.totalCount > 0 && (
+            <span
+              className={`card-fanout-badge${fanout.staleBlockedByDependentIds.length > 0 ? " card-fanout-badge--stale" : ""}${fanout.isHighFanout ? " card-fanout-badge--high-impact" : ""}${fanout.escalation ? " card-fanout-badge--escalated" : ""}`}
+              data-tooltip={`Blocking ${fanout.totalCount} active task(s); ${fanout.activeTodoCount} waiting in todo${fanout.isHighFanout ? ` (high fan-out threshold: ${HIGH_FANOUT_BLOCKER_TODO_THRESHOLD})` : ""}${fanout.escalation ? ` · escalated after ${Math.floor(fanout.escalation.blockingAgeMs / 60000)}m in blocking column` : ""}`}
+            >
+              <GitBranch size={12} style={{ verticalAlign: "middle" }} />
+              <span>
+                {fanout.escalation ? "Escalated" : fanout.isHighFanout ? "High fan-out" : "Blocks"}{" "}
+                <span className="card-fanout-count">{fanout.totalCount}</span>
+                {fanout.isHighFanout ? ` (${fanout.activeTodoCount} todo)` : ""}
+                {fanout.staleBlockedByDependentIds.length > 0 ? ` (${fanout.staleBlockedByDependentIds.length} stale)` : ""}
+              </span>
+            </span>
+          )}
           {(queued || task.status === "queued") && task.column !== "in-progress" && <span className="queued-badge"><Clock size={12} style={{ verticalAlign: "middle" }} /> Queued</span>}
         </div>
       )}
@@ -1653,9 +1679,10 @@ function TaskCardComponent({
               title={`Assigned to ${agentName ?? task.assignedAgentId}`}
             >
               <Bot size={11} />
-              <span className="card-agent-badge-text">
+              <span className="card-agent-badge-text" aria-hidden="true">
                 {abbreviateBadge(agentName ?? task.assignedAgentId, 15)}
               </span>
+              <span className="visually-hidden">Assigned to {agentName ?? task.assignedAgentId}</span>
             </span>
           )}
         </div>

@@ -65,11 +65,13 @@ class MockTaskStore extends EventEmitter<MockTaskStoreEvents> {
 }
 
 describe("Ntfy notifier helpers", () => {
-  it("includes planning-awaiting-input in default events", () => {
+  it("includes mailbox message events in default events", () => {
     expect(DEFAULT_NTFY_EVENTS).toContain("planning-awaiting-input");
     expect(resolveNtfyEvents(undefined)).toContain("planning-awaiting-input");
     expect(DEFAULT_NTFY_EVENTS).toContain("gridlock");
     expect(DEFAULT_NTFY_EVENTS).toContain("fallback-used");
+    expect(DEFAULT_NTFY_EVENTS).toContain("message:agent-to-user");
+    expect(DEFAULT_NTFY_EVENTS).toContain("message:agent-to-agent");
   });
 
   it("checks planning-awaiting-input event enablement", () => {
@@ -81,6 +83,27 @@ describe("Ntfy notifier helpers", () => {
     expect(buildNtfyClickUrl({ dashboardHost: "http://localhost:4040/", projectId: "proj-1" })).toBe(
       "http://localhost:4040/?project=proj-1",
     );
+  });
+
+  it("builds task message deep links", () => {
+    expect(
+      buildNtfyClickUrl({
+        dashboardHost: "http://localhost:4040/",
+        projectId: "proj-1",
+        taskId: "FN-1",
+        messageId: "msg-1",
+      }),
+    ).toBe("http://localhost:4040/?project=proj-1&task=FN-1#message-msg-1");
+  });
+
+  it("builds standalone mailbox message deep links", () => {
+    expect(
+      buildNtfyClickUrl({
+        dashboardHost: "http://localhost:4040/",
+        projectId: "proj-1",
+        messageId: "msg-1",
+      }),
+    ).toBe("http://localhost:4040/?project=proj-1&view=mailbox&mailbox-message=msg-1#message-msg-1");
   });
 });
 
@@ -1093,7 +1116,7 @@ describe("NtfyNotifier", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it("emits a single merged notification when notifier shares an already-started NotificationService", async () => {
+    it("emits a single merged notification when notifier shares the same already-started NotificationService (ProjectEngine wiring)", async () => {
       const sharedService = new NotificationService(store, { projectId: "proj-1" });
       await sharedService.start();
 

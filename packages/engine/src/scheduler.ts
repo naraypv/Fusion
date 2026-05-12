@@ -10,15 +10,17 @@ import {
 } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { AgentSemaphore } from "./concurrency.js";
-import { generateReservedWorktreeName, slugify } from "./worktree-names.js";
+import { planTaskWorktreePath } from "./worktree-names.js";
 import { schedulerLog } from "./logger.js";
 import { type PrMonitor, type PrComment } from "./pr-monitor.js";
 import { reconcileMissionFeatureState } from "./mission-feature-sync.js";
 import { evaluateSpecStaleness, getPromptPath } from "./spec-staleness.js";
 import { resolveEffectiveNode } from "./effective-node.js";
 import { applyUnavailableNodePolicy } from "./node-routing-policy.js";
+import type { NodeDispatchValidationResult } from "./node-dispatch-validation.js";
+import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 
 /**
  * Check whether two sets of file scope paths overlap.
@@ -116,6 +118,8 @@ export interface SchedulerOptions {
   prMonitor?: PrMonitor;
   /** Optional MissionStore for slice activation and auto-advance */
   missionStore?: MissionStore;
+  /** Optional lease manager used to recover stale checkout leases before scheduling. */
+  leaseManager?: MeshLeaseManager;
   /** Optional MissionAutopilot for autonomous mission progression */
   missionAutopilot?: import("./mission-autopilot.js").MissionAutopilot;
   /**
@@ -135,6 +139,8 @@ export interface SchedulerOptions {
    *  Reserved for FN-2722-C (unavailable node policy enforcement).
    *  Accepted here so the option can be wired at construction time. */
   nodeHealthMonitor?: import("./node-health-monitor.js").NodeHealthMonitor;
+  /** Optional dispatch validator used to block dispatch on configuration issues before health policy checks. */
+  validateNodeDispatch?: (nodeId: string) => Promise<NodeDispatchValidationResult>;
 }
 
 /**
@@ -168,6 +174,10 @@ export class Scheduler {
   private failedTaskIds = new Set<string>();
   /** Tracks tasks blocked by unavailable-node policy to deduplicate block log entries. */
   private wasNodeBlocked = new Set<string>();
+  /** Tracks tasks blocked by missing project-node mapping to deduplicate block log entries. */
+  private wasNodeDispatchValidationBlocked = new Set<string>();
+  /** Tracks dispatch-queued reason signatures to avoid per-tick log spam. */
+  private wasDispatchQueuedReasonLogged = new Set<string>();
 
   /**
    * Async listener guard convention:
@@ -224,7 +234,7 @@ export class Scheduler {
      * Also handles mission auto-advance: when a linked task completes,
      * update feature status and potentially activate next pending slice.
      */
-    this.store.on("task:moved", ({ task, from, to }) => {
+    this.store.on("task:moved", async ({ task, from, to }) => {
       // PR Monitoring
       if (this.options.prMonitor) {
         if (to === "in-review" && task.prInfo) {
@@ -268,6 +278,56 @@ export class Scheduler {
           void Promise.resolve(this.options.onTaskFailed(task.id)).catch((err) => {
             schedulerLog.error(`Error in onTaskFailed for ${task.id}:`, err);
           });
+        }
+      }
+
+      // FN-3895/FN-3924: complement periodic stale-blockedBy self-healing with immediate
+      // blocker reconciliation when a potential blocker reaches a terminal completion column.
+      // Invariant: blockedBy must reference a *current* unresolved blocker, else be null.
+      if (to === "done" || to === "archived") {
+        try {
+          const settings = await this.store.getSettings();
+          if (!settings.globalPause && !settings.enginePaused) {
+            const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
+            const allTasks = await this.store.listTasks({ slim: true, includeArchived: true });
+            const taskById = new Map(allTasks.map((candidate) => [candidate.id, candidate]));
+            for (const dependent of todoTasks) {
+              const mentionsCompletedTask = dependent.dependencies.includes(task.id);
+              const currentlyBlockedByCompletedTask = dependent.blockedBy === task.id;
+              if (!mentionsCompletedTask && !currentlyBlockedByCompletedTask) continue;
+
+              const unresolvedDeps = dependent.dependencies.filter((depId) => {
+                const dep = taskById.get(depId);
+                return dep && dep.column !== "done" && dep.column !== "in-review" && dep.column !== "archived";
+              });
+
+              try {
+                if (unresolvedDeps.length > 0) {
+                  await this.store.updateTask(dependent.id, {
+                    status: "queued",
+                    blockedBy: unresolvedDeps[0],
+                  });
+                  await this.store.logEntry(
+                    dependent.id,
+                    `Auto-reblocked: unresolved dependency ${unresolvedDeps[0]} remains after ${task.id} reached ${to}`,
+                  );
+                } else {
+                  await this.store.updateTask(dependent.id, { blockedBy: null, status: null });
+                  const unblockMessage = currentlyBlockedByCompletedTask
+                    ? `Auto-unblocked: blocker ${task.id} reached ${to}`
+                    : `Auto-unblocked: blocker ${task.id} reached ${to} — all dependencies satisfied`;
+                  await this.store.logEntry(dependent.id, unblockMessage);
+                }
+              } catch (error) {
+                schedulerLog.error(
+                  `Failed to reconcile dependent ${dependent.id} for blocker ${task.id}`,
+                  error,
+                );
+              }
+            }
+          }
+        } catch (error) {
+          schedulerLog.error(`Failed event-driven blocker reconciliation for ${task.id}`, error);
         }
       }
 
@@ -401,7 +461,28 @@ export class Scheduler {
     }
     this.failedTaskIds.clear();
     this.wasNodeBlocked.clear();
+    this.wasNodeDispatchValidationBlocked.clear();
+    this.wasDispatchQueuedReasonLogged.clear();
     schedulerLog.log("Stopped");
+  }
+
+  private clearDispatchQueuedReasonMemo(taskId: string): void {
+    for (const key of this.wasDispatchQueuedReasonLogged) {
+      if (key.startsWith(`${taskId}:`)) {
+        this.wasDispatchQueuedReasonLogged.delete(key);
+      }
+    }
+  }
+
+  private async logDispatchQueuedReason(taskId: string, reason: string): Promise<void> {
+    const key = `${taskId}:${reason}`;
+    if (this.wasDispatchQueuedReasonLogged.has(key)) {
+      return;
+    }
+
+    this.clearDispatchQueuedReasonMemo(taskId);
+    this.wasDispatchQueuedReasonLogged.add(key);
+    await this.store.logEntry(taskId, reason);
   }
 
   /**
@@ -435,7 +516,7 @@ export class Scheduler {
       return;
     }
 
-    void this.store.listTasks({ slim: true, includeArchived: false })
+    void this.store.listTasks({ slim: true, includeArchived: false, startupMemo: true })
       .then((tasks) => {
         const repo = getCurrentRepo(this.store.getRootDir());
         if (!repo) return;
@@ -495,28 +576,7 @@ export class Scheduler {
     naming: string | undefined,
     reservedNames: Set<string>,
   ): string {
-    if (task.worktree) {
-      const existingName = basename(task.worktree);
-      if (existingName) reservedNames.add(existingName);
-      return task.worktree;
-    }
-
-    let worktreeName: string;
-    switch (naming || "random") {
-      case "task-id":
-        worktreeName = task.id.toLowerCase();
-        break;
-      case "task-title":
-        worktreeName = slugify(task.title || task.description.slice(0, 60));
-        break;
-      case "random":
-      default:
-        worktreeName = generateReservedWorktreeName(this.store.getRootDir(), reservedNames);
-        break;
-    }
-
-    reservedNames.add(worktreeName);
-    return join(this.store.getRootDir(), ".worktrees", worktreeName);
+    return planTaskWorktreePath(task, this.store.getRootDir(), naming, reservedNames);
   }
 
   /**
@@ -673,9 +733,12 @@ export class Scheduler {
           const filteredScope = filterPathsByIgnoreList(scope, overlapIgnorePaths);
           if (filteredScope.length > 0) activeScopes.set(t.id, filteredScope);
         }
-        // In-review tasks with unmerged worktrees
+        // Paused in-review tasks (e.g., failed-merge tasks awaiting human triage) cannot
+        // make progress, so they must not contribute to activeScopes. Including them
+        // caused a deadlock pattern where a paused task indefinitely re-stamped
+        // `blockedBy` on overlapping todo tasks every scheduler tick. (FN-3867 / FN-3857)
         const inReviewWithWorktree = tasks.filter(
-          (t) => t.column === "in-review" && t.worktree,
+          (t) => t.column === "in-review" && t.worktree && !t.paused,
         );
         for (const t of inReviewWithWorktree) {
           const scope = await this.store.parseFileScopeFromPrompt(t.id);
@@ -687,14 +750,22 @@ export class Scheduler {
       // Resolve dependency order among todo tasks
       const ordered = resolveDependencyOrder(todo);
       let started = 0;
-      const reservedWorktreeNames = new Set(
-        tasks
-          .map((task) => (task.worktree ? basename(task.worktree) : undefined))
-          .filter((name): name is string => Boolean(name)),
-      );
 
       for (const taskId of ordered) {
         const task = tasks.find((t) => t.id === taskId)!;
+
+        if (task.checkedOutBy && this.options.leaseManager) {
+          const recovered = await this.options.leaseManager.recoverAbandonedLease(
+            task.id,
+            "scheduler detected stale todo lease",
+            { preserveProgress: true },
+          );
+          if (!recovered) {
+            await this.store.updateTask(task.id, { status: "queued" });
+            await this.logDispatchQueuedReason(task.id, "queued — checkout lease recovery blocked dispatch");
+            continue;
+          }
+        }
 
         // Check all deps are satisfied (done, in-review, or archived)
         const unmetDeps = task.dependencies.filter((depId) => {
@@ -703,7 +774,11 @@ export class Scheduler {
         });
 
         if (unmetDeps.length > 0) {
-          await this.store.updateTask(task.id, { status: "queued" });
+          await this.store.updateTask(task.id, {
+            status: "queued",
+            blockedBy: unmetDeps[0],
+          });
+          await this.logDispatchQueuedReason(task.id, `queued — unmet dependencies: ${unmetDeps.join(", ")}`);
           this.options.onBlocked?.(task, unmetDeps);
           continue;
         }
@@ -741,15 +816,33 @@ export class Scheduler {
             overlapIgnorePaths,
           );
           if (taskScope.length > 0) {
-            let overlappingTaskId: string | null = null;
-            for (const [ipId, ipScope] of activeScopes) {
-              if (this.pathsOverlap(taskScope, ipScope)) {
-                overlappingTaskId = ipId;
-                break;
-              }
-            }
+            const activeScopeEntries = Array.from(activeScopes.entries()).sort(([aId], [bId]) => aId.localeCompare(bId));
+            const currentBlockerScope = task.blockedBy ? activeScopes.get(task.blockedBy) : undefined;
+            const hasValidCurrentBlocker =
+              Boolean(task.blockedBy)
+              && Boolean(currentBlockerScope)
+              && this.pathsOverlap(taskScope, currentBlockerScope!);
+
+            /**
+             * blockedBy stamping invariants:
+             * - sticky when still valid: preserve an existing active overlapping blocker
+             * - deterministic when changing: pick the first overlapping active task by sorted taskId
+             * - idempotent writes only: update DB only when blockedBy/status must change
+             */
+            const overlappingTaskId = hasValidCurrentBlocker
+              ? task.blockedBy
+              : activeScopeEntries.find(([, ipScope]) => this.pathsOverlap(taskScope, ipScope))?.[0] ?? null;
+
             if (overlappingTaskId) {
-              await this.store.updateTask(task.id, { status: "queued", blockedBy: overlappingTaskId });
+              // Keep blockedBy tied to explicit unresolved dependencies when a task has
+              // dependency edges; avoid repointing dependency-unblocked tasks to unrelated
+              // overlap ids (FN-3924). For dependency-free tasks, blockedBy may reference
+              // the active overlap blocker.
+              const targetBlockedBy = task.dependencies.length > 0 ? null : overlappingTaskId;
+              if (task.status !== "queued" || task.blockedBy !== targetBlockedBy) {
+                await this.store.updateTask(task.id, { status: "queued", blockedBy: targetBlockedBy });
+              }
+              await this.logDispatchQueuedReason(task.id, `queued — file scope overlap with ${overlappingTaskId}`);
               continue;
             }
           }
@@ -757,16 +850,15 @@ export class Scheduler {
 
         // Dependencies met — check concurrency
         if (started >= available) {
+          await this.logDispatchQueuedReason(task.id, `queued — concurrency limit reached (${available} available)`);
           continue;
         }
 
-        // Dependencies met — resolve base branch from in-review deps
+        // Dependencies met — resolve base branch from in-review deps.
+        // Worktree allocation is deferred to moveTask below, where it
+        // runs under TaskStore's cross-task allocation lock so it can't
+        // race against a concurrent manual-move.
         const baseBranch = this.resolveBaseBranch(task, tasks);
-        const plannedWorktree = this.planWorktreePath(
-          task,
-          settings.worktreeNaming,
-          reservedWorktreeNames,
-        );
 
         // Compare-and-swap: re-read the task to verify it's still in "todo" before dispatching.
         // This prevents dispatching a task twice if another schedule() call or user action
@@ -796,6 +888,21 @@ export class Scheduler {
         // Resolve effective node for routing
         let effectiveNode = resolveEffectiveNode(freshTask, settings);
         schedulerLog.log(`Task ${task.id} routed to node=${effectiveNode.nodeId ?? "local"} (source=${effectiveNode.source})`);
+
+        // Enforce dispatch configuration validation before node-health fallback logic.
+        if (effectiveNode.nodeId !== undefined && this.options.validateNodeDispatch) {
+          const validation = await this.options.validateNodeDispatch(effectiveNode.nodeId);
+          if (!validation.allowed) {
+            if (!this.wasNodeDispatchValidationBlocked.has(task.id)) {
+              this.wasNodeDispatchValidationBlocked.add(task.id);
+              schedulerLog.log(`Task ${task.id} dispatch blocked — ${validation.reason}`);
+              await this.store.logEntry(task.id, validation.reason);
+            }
+            continue;
+          }
+
+          this.wasNodeDispatchValidationBlocked.delete(task.id);
+        }
 
         // Enforce unavailable-node policy
         if (effectiveNode.nodeId !== undefined && this.options.nodeHealthMonitor) {
@@ -835,14 +942,18 @@ export class Scheduler {
         await this.store.updateTask(task.id, {
           status: null,
           blockedBy: null,
-          baseBranch: baseBranch ?? undefined,
-          worktree: plannedWorktree,
+          executionStartBranch: baseBranch ?? undefined,
           effectiveNodeId: effectiveNode.nodeId ?? null,
           effectiveNodeSource: effectiveNode.source,
           mergeRetries: 0,
         });
-        await this.store.moveTask(task.id, "in-progress");
+        await this.store.moveTask(task.id, "in-progress", {
+          allocateWorktree: (reservedNames) =>
+            this.planWorktreePath(task, settings.worktreeNaming, reservedNames),
+        });
         this.wasNodeBlocked.delete(task.id);
+        this.wasNodeDispatchValidationBlocked.delete(task.id);
+        this.clearDispatchQueuedReasonMemo(task.id);
         await this.store.logEntry(task.id, `Node routing resolved: ${effectiveNode.nodeId ?? "local"} (source: ${effectiveNode.source})`);
         this.options.onSchedule?.(task);
         started++;

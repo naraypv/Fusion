@@ -93,6 +93,16 @@ const mocks = vi.hoisted(() => {
     return null;
   });
 
+  const loadDesktopLaunchMode = vi.fn(async () => {
+    callLog.push("loadDesktopLaunchMode");
+    return "choose";
+  });
+
+  const saveDesktopLaunchMode = vi.fn(async () => undefined);
+  const startLocal = vi.fn(async () => ({ source: "embedded-local", state: "running", port: 4545 }));
+  const stopLocal = vi.fn(async () => ({ source: "none", state: "stopped" }));
+  const getStatus = vi.fn(() => ({ source: "none", state: "stopped" }));
+
   const saveWindowState = vi.fn();
 
   const DEFAULT_WINDOW_STATE = {
@@ -117,7 +127,12 @@ const mocks = vi.hoisted(() => {
     setupDeepLinkHandler,
     setupAutoUpdater,
     loadWindowState,
+    loadDesktopLaunchMode,
+    saveDesktopLaunchMode,
     saveWindowState,
+    startLocal,
+    stopLocal,
+    getStatus,
     DEFAULT_WINDOW_STATE,
   };
 });
@@ -148,12 +163,36 @@ vi.mock("../deep-link.js", () => ({
 
 vi.mock("../native.js", () => ({
   loadWindowState: mocks.loadWindowState,
+  loadDesktopLaunchMode: mocks.loadDesktopLaunchMode,
+  saveDesktopLaunchMode: mocks.saveDesktopLaunchMode,
   saveWindowState: mocks.saveWindowState,
   setupAutoUpdater: mocks.setupAutoUpdater,
   DEFAULT_WINDOW_STATE: mocks.DEFAULT_WINDOW_STATE,
+  normalizeDesktopRemoteLaunch: vi.fn((settings) => {
+    const active = settings.profiles.find((profile: { id: string }) => profile.id === settings.activeProfileId);
+    return active ? { mode: "remote", profileId: active.id, serverBaseUrl: active.serverUrl.replace(/\/$/, ""), serverLabel: active.name, authToken: active.authToken ?? undefined } : null;
+  }),
+  buildRemoteShellHandoffUrl: vi.fn((launch) => `https://remote.example.com?shellMode=remote&profileId=${launch.profileId}`),
+}));
+
+vi.mock("../local-runtime.js", () => ({
+  LocalRuntimeManager: vi.fn(() => ({
+    startLocal: mocks.startLocal,
+    stopLocal: mocks.stopLocal,
+    getStatus: mocks.getStatus,
+    getServerPort: vi.fn(() => 0),
+  })),
 }));
 
 // Mock renderer module
+vi.mock("../shell-settings.js", () => ({
+  readShellSettings: vi.fn(async () => ({
+    desktopMode: "remote",
+    activeProfileId: "profile_1",
+    profiles: [{ id: "profile_1", name: "Remote", serverUrl: "https://remote.example.com", authToken: "token" }],
+  })),
+}));
+
 vi.mock("../renderer.js", () => ({
   isDevelopmentMode: vi.fn(() => false),
   getRendererUrl: vi.fn(() => "file:///path/to/dist/client/index.html"),
@@ -187,6 +226,10 @@ describe("main integration", () => {
       mocks.callLog.push("loadWindowState");
       return null;
     });
+    mocks.loadDesktopLaunchMode.mockImplementation(async () => {
+      mocks.callLog.push("loadDesktopLaunchMode");
+      return "choose";
+    });
   });
 
   it("initializeApp calls modules in the expected order", async () => {
@@ -196,6 +239,7 @@ describe("main integration", () => {
 
     expect(mocks.callLog).toEqual([
       "loadWindowState",
+      "loadDesktopLaunchMode",
       "createMainWindow",
       "buildAppMenu",
       "setupTray",
@@ -280,7 +324,7 @@ describe("main integration", () => {
 
     const [{ instance }] = mocks.windowInstances;
     const [trayInstance] = mocks.trayInstances;
-    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, trayInstance);
+    expect(mocks.registerIpcHandlers).toHaveBeenCalledWith(instance, trayInstance, expect.any(Object));
   });
 
   it("window close hides to tray when app is not quitting", async () => {
@@ -342,6 +386,38 @@ describe("main integration", () => {
     if (platformDescriptor) {
       Object.defineProperty(process, "platform", platformDescriptor);
     }
+  });
+
+  it("loads remote handoff URL when remembered mode is remote", async () => {
+    mocks.loadDesktopLaunchMode.mockResolvedValueOnce("remote");
+    const { initializeApp } = await importMainModule();
+
+    await initializeApp();
+
+    const [{ instance }] = mocks.windowInstances;
+    expect(instance.loadURL).toHaveBeenCalledWith(expect.stringContaining("shellMode=remote"));
+    expect(mocks.startLocal).not.toHaveBeenCalled();
+  });
+
+  it("starts local runtime when remembered mode is local", async () => {
+    mocks.loadDesktopLaunchMode.mockResolvedValueOnce("local");
+    const { initializeApp } = await importMainModule();
+
+    await initializeApp();
+
+    expect(mocks.startLocal).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to choose and persists fallback when local restore fails", async () => {
+    mocks.loadDesktopLaunchMode.mockResolvedValueOnce("local");
+    mocks.startLocal.mockRejectedValueOnce(new Error("start failed"));
+    const { initializeApp, getCurrentDesktopLaunchMode } = await importMainModule();
+
+    await initializeApp();
+
+    expect(mocks.saveDesktopLaunchMode).toHaveBeenCalledWith("choose");
+    expect(getCurrentDesktopLaunchMode()).toBe("choose");
+    expect(mocks.stopLocal).toHaveBeenCalledTimes(1);
   });
 
   it("importing main module does not auto-start app lifecycle", async () => {

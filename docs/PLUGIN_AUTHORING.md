@@ -11,16 +11,17 @@ A comprehensive guide to creating Fusion plugins that extend the task board with
 5. [Registering Tools](#5-registering-tools)
 6. [Registering Routes](#6-registering-routes)
 7. [Registering UI Slots](#7-registering-ui-slots)
-8. [Registering Agent Runtimes](#8-registering-agent-runtimes)
-9. [Plugin Context API Reference](#9-plugin-context-api-reference)
-10. [Plugin Lifecycle States](#10-plugin-lifecycle-states)
-11. [Testing Plugins](#11-testing-plugins)
-12. [Publishing Plugins](#12-publishing-plugins)
-13. [Example Plugins](#13-example-plugins)
-14. [Registering Skills](#14-registering-skills)
-15. [Registering Workflow Steps](#15-registering-workflow-steps)
-16. [Plugin Prompt Contributions](#16-plugin-prompt-contributions)
-17. [Plugin Binary Setup Hooks](#17-plugin-binary-setup-hooks)
+8. [Registering Top-Level Dashboard Views](#8-registering-top-level-dashboard-views)
+9. [Registering Agent Runtimes](#9-registering-agent-runtimes)
+10. [Plugin Context API Reference](#10-plugin-context-api-reference)
+11. [Plugin Lifecycle States](#11-plugin-lifecycle-states)
+12. [Testing Plugins](#12-testing-plugins)
+13. [Publishing Plugins](#13-publishing-plugins)
+14. [Example Plugins](#14-example-plugins)
+15. [Registering Skills](#15-registering-skills)
+16. [Registering Workflow Steps](#16-registering-workflow-steps)
+17. [Contributing Prompt Modifications](#17-contributing-prompt-modifications)
+18. [Plugin Binary Setup Hooks](#18-plugin-binary-setup-hooks)
 
 ---
 
@@ -51,6 +52,64 @@ cd my-first-plugin
 pnpm install
 pnpm test
 ```
+
+### Optional AI Security Scan (Opt-in)
+
+Plugin installs now support an opt-in `aiScanOnLoad` flag. When enabled, Fusion runs an AI security review before loading plugin code.
+
+- **Opt-in:** disabled by default (`aiScanOnLoad: false`)
+- **When it runs:** on plugin load/reload and explicit rescan
+- **Scan inputs (deterministic order):** `manifest.json`, optional `package.json`, optional `README.md`, entry module, then prioritized source files
+- **Boundaries:** excludes `node_modules`, `dist`, lockfiles, binary assets, files over 20 KB each, and enforces a 120 KB total raw-content cap
+
+### Scan Verdicts
+
+- `clean` — no concerning patterns found
+- `warning` — suspicious patterns found; plugin may still load
+- `blocked` — dangerous patterns found; plugin is blocked before import
+- `error` — scan failed to produce a valid decision
+- `unavailable` — AI scan service unavailable
+
+When a plugin is blocked (`blocked`/`error`/`unavailable`), Fusion does **not** execute plugin code for that load attempt and stores the scan result on plugin metadata (`lastSecurityScan`) for operator visibility.
+
+### Author Guidance for Blocked Plugins
+
+If your plugin is blocked:
+- remove dynamic execution patterns (`eval`, shell-outs, hidden network exfiltration behavior)
+- keep behavior explicit in source and manifest
+- document external calls and sensitive operations in README
+- ask operators to run `fn plugin rescan <id>` after publishing fixes
+
+### Signature Verification and Publisher Trust
+
+Fusion supports deterministic detached-signature verification for plugin provenance before plugin code is loaded.
+
+Expected plugin files at the plugin root:
+- `manifest.json`
+- `plugin-publisher.json` (publisher identity + public key metadata)
+- `plugin-signature.json` (detached signature over canonical payload)
+
+Canonical payload inputs (sorted, deterministic):
+- normalized `manifest.json`
+- publisher metadata from `plugin-publisher.json`
+- declared file digest map (sorted by relative path)
+
+Verification statuses:
+- `trusted-local` — bundled/in-repo plugin path trusted by local policy exception
+- `verified-trusted` — signature verifies and publisher key is trusted
+- `verified-untrusted` — signature verifies but publisher/key is not trusted yet
+- `unsigned` — no signature bundle present
+- `invalid` — signature or digest validation failed (tampered/corrupt)
+
+Trust decisions are explicit and keyed by publisher ID + key fingerprint. Manifest author/homepage strings are informational only and are never used as trust proof.
+
+### Plugin Author Checklist for Signed Releases
+
+1. Produce deterministic file digests for distributed plugin files
+2. Publish `plugin-publisher.json` with stable publisher ID and key fingerprint
+3. Sign the canonical payload and ship `plugin-signature.json`
+4. Keep digest/signature files in source control and release artifacts
+5. In release notes, include publisher ID + key fingerprint so operators can verify trust prompts
 
 ### Plugin Project Structure
 
@@ -148,6 +207,13 @@ const settingsSchema: Record<string, PluginSettingSchema> = {
 
 ### Setting Types
 
+Common optional fields on all setting types:
+
+- `group?: string` — Optional heading used by the dashboard to render settings in grouped sections (for example: `"General"`, `"Browser"`, `"Prompt Contributions"`, `"Skills"`). Ungrouped settings still render first in their existing flat order, then grouped sections render under stable headings.
+- `description?: string` — Helper text shown below the setting label.
+- `required?: boolean` — Marks the field as required.
+- `defaultValue?: unknown` — Default value used when no user value is provided.
+
 | Type | Description | Extra Fields |
 |------|-------------|--------------|
 | `"string"` | Text input | `multiline?: boolean` (renders textarea) |
@@ -195,6 +261,7 @@ const settingsSchema: Record<string, PluginSettingSchema> = {
   enabled: {
     type: "boolean",
     label: "Enable Feature",
+    group: "General",
     defaultValue: true,
   },
   
@@ -211,6 +278,7 @@ const settingsSchema: Record<string, PluginSettingSchema> = {
     type: "array",
     label: "Tags",
     description: "Tags to track",
+    group: "Skills",
     itemType: "string",
     defaultValue: ["bug", "feature"],
   },
@@ -269,21 +337,24 @@ const plugin: FusionPlugin = {
 | Hook | Signature | When It Fires |
 |------|-----------|---------------|
 | `onLoad` | `(ctx: PluginContext) => Promise<void> \| void` | Plugin first loaded and started |
-| `onUnload` | `() => Promise<void> \| void` | Plugin stopped/shutdown |
+| `onUnload` | `(ctx: PluginContext) => Promise<void> \| void` | Plugin stopped/shutdown |
 | `onTaskCreated` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | New task created |
 | `onTaskMoved` | `(task: Task, fromColumn: string, toColumn: string, ctx: PluginContext) => Promise<void> \| void` | Task moved between columns |
 | `onTaskCompleted` | `(task: Task, ctx: PluginContext) => Promise<void> \| void` | Task reached "done" |
 | `onError` | `(error: Error, ctx: PluginContext) => Promise<void> \| void` | Error occurred in plugin execution |
 | `onSchemaInit` | `(db: Database) => Promise<void> \| void` | After enabled plugins are loaded at startup (engine/daemon/dashboard/serve) |
+| `executorRuntimeEnv` | `(taskCtx: ExecutorRuntimeTaskContext, ctx: PluginContext) => Promise<ExecutorRuntimeEnvContribution> \| ExecutorRuntimeEnvContribution` | Before executor-spawned task commands run, to contribute task-scoped env and PATH prepends |
 
 ### Hook Behavior
 
+- **Context parity**: `onUnload` receives the same `PluginContext` shape as `onLoad`.
 - **Timeout**: 5 seconds per invocation (logged and skipped if exceeded)
 - **Error Isolation**: Hook failures never block other hooks or abort startup
 - **Optional**: Only define the hooks you need
 - **Schema hook execution**: `onSchemaInit` hooks run sequentially in plugin dependency order (from `resolveLoadOrder`) after `loadAllPlugins()`.
 - **Schema hook database API**: The hook receives the runtime `Database` instance, including `db.exec()` and `db.prepare()` for SQL DDL.
 - **Schema hook constraints**: `onSchemaInit` is intended for idempotent DDL only (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`). Avoid data backfills or long-running logic.
+- **Bundled plugin pattern**: Keep DDL in a plugin-local schema module (for example `src/<plugin>-schema.ts`) and call it from `hooks.onSchemaInit` so schema ownership stays with the plugin package instead of `@fusion/core` bootstrap SQL.
 
 ### Example: Schema initialization hook
 
@@ -302,6 +373,85 @@ hooks: {
   },
 },
 ```
+
+### `executorRuntimeEnv`: task-scoped executor subprocess environment
+
+Use `executorRuntimeEnv` when your plugin needs to provide runtime environment values for **executor-spawned user commands** tied to a specific task.
+
+This hook runs when Fusion prepares subprocess environments for executor command surfaces such as configured commands, verification commands, and step-session subprocesses.
+
+It does **not** apply to internal git plumbing subprocesses used by worktree/branch management.
+
+```typescript
+import type {
+  ExecutorRuntimeEnvContribution,
+  ExecutorRuntimeTaskContext,
+  PluginContext,
+} from "@fusion/plugin-sdk";
+
+function executorRuntimeEnv(
+  taskCtx: ExecutorRuntimeTaskContext,
+  ctx: PluginContext,
+): ExecutorRuntimeEnvContribution {
+  ctx.logger.info(`Preparing env for task ${taskCtx.taskId}`);
+  return {
+    pathPrepend: ["/absolute/path/to/tools"],
+    env: {
+      MY_PLUGIN_TASK_ID: taskCtx.taskId,
+    },
+  };
+}
+```
+
+`ExecutorRuntimeTaskContext` fields:
+
+- `taskId`: Fusion task ID
+- `worktreePath`: absolute path to the task worktree
+- `rootDir`: project root directory
+- `branch?`: task branch name when available
+
+`ExecutorRuntimeEnvContribution` fields:
+
+- `pathPrepend?`: array of **absolute** path strings prepended to `PATH` for executor-spawned commands
+- `env?`: key/value string map merged into the subprocess environment
+- `description?`: optional human-readable note for debugging/telemetry
+
+Validation and merge behavior (from engine runtime collection):
+
+- `pathPrepend` must be an array of absolute path strings; non-absolute entries are rejected.
+- `env` values must be strings.
+- `env` must not include `PATH`; use `pathPrepend` instead.
+- When multiple plugins set the same `env` key, later plugins override earlier values and the engine logs a warning.
+- `pathPrepend` entries from later plugins are placed earlier in the final prepend list.
+
+### Example: prepend a generated tool directory for executor commands
+
+```typescript
+import { definePlugin } from "@fusion/plugin-sdk";
+import path from "node:path";
+
+export default definePlugin({
+  manifest: {
+    id: "fusion-plugin-tooling-example",
+    name: "Tooling Example",
+    version: "1.0.0",
+  },
+  state: "installed",
+  hooks: {},
+  executorRuntimeEnv: (taskCtx) => {
+    const toolDir = path.resolve(taskCtx.rootDir, ".fusion/tools/my-plugin/bin");
+
+    return {
+      pathPrepend: [toolDir],
+      env: {
+        MY_PLUGIN_TOOL_HOME: toolDir,
+      },
+    };
+  },
+});
+```
+
+With this hook enabled, executor-spawned commands (for example verification commands or `bash` tool subprocesses in the task session) can resolve binaries from `toolDir` without mutating global process environment.
 
 ### Example: Notification on Task Completion
 
@@ -416,9 +566,16 @@ const plugin: FusionPlugin = {
 };
 ```
 
+Route handlers may return either plain JSON values or a `PluginRouteResponse` envelope. `PluginRouteResponse` now supports optional `headers` and `contentType` fields so plugins can serve non-JSON payloads like downloadable HTML. Example: return `{ status: 200, body: html, contentType: "text/html; charset=utf-8", headers: { "Content-Disposition": "attachment; filename=\"report.html\"" } }` to send an attachment response directly from a plugin route.
+
 ### Route Mounting
 
-Routes are mounted at `/api/plugins/{pluginId}/{path}`:
+Routes are mounted at `/api/plugins/{pluginId}/{path}`.
+Route handlers receive the same loader-built `PluginContext` used by hooks/tools, including real `taskStore`, plugin `settings`, `logger`, `emitEvent`, and engine-injected `createAiSession` (when available):
+
+- Example roadmap plugin route: `path: "/roadmaps"` in plugin `fusion-plugin-roadmap` resolves to `/api/plugins/fusion-plugin-roadmap/roadmaps`
+- Roadmap suggestion endpoints follow the same namespace (for example `/api/plugins/fusion-plugin-roadmap/roadmaps/:roadmapId/suggestions/milestones`)
+- Do not document or depend on legacy host-owned `/api/roadmaps` routes unless your current source still ships them
 
 - Plugin ID: `fusion-plugin-notification`
 - Route path: `/status`
@@ -449,11 +606,11 @@ Plugins declare `uiSlots` in their `FusionPlugin` definition. The dashboard disc
 | `header-action` | Dashboard header | Action button in the header toolbar | Available |
 | `settings-section` | Settings modal | Section added to the settings panel | Available |
 | `settings-provider-card` | Settings → Authentication | Provider card contribution in Authentication section | Available |
-| `settings-integration-card` | Settings → Authentication | Integration/help card contribution in Authentication section | Available |
 | `onboarding-provider-card` | Onboarding modal → AI setup | Provider card content rendered before host fallback cards | Available |
-| `onboarding-recommendation-card` | Onboarding modal → AI setup | Recommendation/help content rendered near setup intro | Available |
 | `onboarding-setup-help` | Onboarding modal → AI setup | Additional setup-help content rendered below provider sections | Available |
 | `post-onboarding-recommendation` | Dashboard post-onboarding card | Recommendation item rendered in host-owned next-steps container | Available |
+| `settings-integration-card` | Legacy structured name | Compatibility alias now normalized to `settings-config-section` in structured API | Compatibility only |
+| `onboarding-recommendation-card` | Legacy structured name | Compatibility alias now normalized to `onboarding-provider-recommendation` in structured API | Compatibility only |
 | `task-card-badge` | Task card on the board | Small badge displayed on task cards (e.g., CI status indicator) | Planned |
 | `board-column-footer` | Board column | Footer area below the last card in a column | Planned |
 
@@ -509,6 +666,32 @@ Important implications:
 
 For this reason, plugin authors should still provide stable `componentPath` values in manifests, but coordinate with dashboard host maintainers when adding new UI surfaces or module paths that need mapping.
 
+### Structured UI Contributions (data-only, parallel to `uiSlots`)
+
+For Settings/onboarding/post-onboarding flows, use structured `uiContributions` instead of legacy placeholder slots.
+
+- Discovery API: `GET /api/plugins/ui-contributions`
+- Type surface: `PluginUiContributionDefinition` (`@fusion/plugin-sdk`)
+- Structured surfaces:
+  - `settings-provider-card`
+  - `settings-config-section`
+  - `onboarding-provider-card`
+  - `onboarding-setup-help`
+  - `onboarding-provider-recommendation`
+  - `post-onboarding-recommendation`
+
+Rules:
+- Structured contributions are **data-only JSON payloads**.
+- Do **not** include `componentPath`.
+- Do **not** send live callbacks/functions through REST.
+- Use `actions: PluginUiActionDescriptor[]` so host-owned renderers bind behavior.
+
+Compatibility normalization:
+- `settings-integration-card` → `settings-config-section`
+- `onboarding-recommendation-card` → `onboarding-provider-recommendation`
+
+The API only returns normalized surface names.
+
 ---
 
 ## 8. Registering Top-Level Dashboard Views
@@ -516,7 +699,8 @@ For this reason, plugin authors should still provide stable `componentPath` valu
 Top-level views are a **sibling contribution type** to `uiSlots`.
 
 - `uiSlots` are embedded surfaces (task detail tab, header action, etc.)
-- `dashboardViews` are full-screen destinations in dashboard navigation
+- `dashboardViews` is the shipped top-level plugin field for full-screen dashboard destinations
+- Earlier planning language may say `views`; the implemented API in `FusionPlugin` is `dashboardViews`
 
 Register `dashboardViews` on the plugin definition:
 
@@ -553,6 +737,44 @@ Current host constraints:
 - The dashboard **does not eval or filesystem-load plugin code in-browser**
 - `componentPath` is stored for authoring symmetry/future expansion, but render resolution is currently done through a host-side static registry (`pluginId + viewId`)
 - Use stable IDs; runtime view key format is `plugin:${pluginId}:${viewId}`
+
+### Static host registry model
+
+Dashboard view components are resolved from a host-side registry and must be explicitly registered:
+
+```ts
+import { lazy } from "react";
+import { registerPluginView } from "../app/plugins/pluginViewRegistry";
+
+registerPluginView(
+  "fusion-plugin-dependency-graph",
+  "graph",
+  lazy(() => import("@fusion-plugin-examples/dependency-graph/dashboard-view")),
+);
+```
+
+The host then renders plugin views via `PluginDashboardViewHost` using the composite ID.
+
+Bundled workspace plugin pattern:
+- Keep plugin package under `plugins/` (for example `plugins/fusion-plugin-roadmap`)
+- Export backend/plugin entry from `src/index.ts` and keep dashboard view exports in the plugin package (for example `./dashboard-view`)
+- Register the lazy dashboard component in host code (currently `packages/dashboard/app/plugins/registerBundledPluginViews.ts`)
+- CLI bundling inlines backend plugin code from workspace packages; dashboard view modules are imported by the dashboard build via the host registry
+
+Runtime host context contract:
+- Registered views receive a `context` object from the dashboard host (`PluginDashboardViewContext`).
+- Context includes the active `projectId`, current visible `tasks`, optional `workflowSteps`, and `openTaskDetail` for launching the native task detail flow.
+- Keep view-specific UI behavior in the plugin; treat host context as service/data injection only.
+
+Placement guidance:
+- `primary`: top-level nav tab (host may limit count on mobile)
+- `overflow`: desktop header overflow menu
+- `more`: mobile More sheet / secondary nav surfaces
+
+Project-scoped UI state guidance:
+- Persist plugin view layout/state in browser storage using a plugin-owned base key and the shared project-scoped pattern (`kb:${projectId}:${baseKey}`).
+- For dependency graph layout, the canonical base key is `fusion-plugin-dependency-graph:positions`.
+- Do not persist plugin UI state in task metadata or server-side task records.
 
 ---
 
@@ -711,7 +933,7 @@ export default definePlugin({
 
 ---
 
-## 9. Plugin Context API Reference
+## 10. Plugin Context API Reference
 
 The context object is passed to hooks, tools, and route handlers:
 
@@ -776,6 +998,8 @@ The factory is dependency-injected by the engine at runtime. In test-only or cor
 
 ### Example: Using `ctx.createAiSession()`
 
+Use this context factory for plugin AI features (for example roadmap milestone/feature suggestion generation). Avoid direct `@fusion/engine` imports from plugin code; engine wiring is injected by the host through `PluginContext`.
+
 ```typescript
 hooks: {
   onLoad: async (ctx) => {
@@ -815,7 +1039,7 @@ hooks: {
 
 ---
 
-## 10. Plugin Lifecycle States
+## 11. Plugin Lifecycle States
 
 Plugins transition through these states:
 
@@ -852,7 +1076,7 @@ Any state can transition to:
 
 ---
 
-## 11. Testing Plugins
+## 12. Testing Plugins
 
 Use Vitest for unit testing your plugins:
 
@@ -950,7 +1174,7 @@ This keeps regressions durable while preserving clear ownership boundaries acros
 
 ---
 
-## 12. Publishing Plugins
+## 13. Publishing Plugins
 
 ### Package Requirements
 
@@ -988,6 +1212,10 @@ This keeps regressions durable while preserving clear ownership boundaries acros
    npm publish --access public
    ```
 
+### Signed plugin recommendation
+
+For production distribution, publish signed artifacts (`plugin-publisher.json` + `plugin-signature.json`) alongside your compiled plugin output so operators can verify provenance under warn/enforce trust policy modes.
+
 ### Installation
 
 Users can install your plugin via CLI:
@@ -1006,7 +1234,7 @@ cp -r fusion-plugin-my-plugin ~/.fusion/plugins/
 
 ---
 
-## 13. Example Plugins
+## 14. Example Plugins
 
 Explore these reference implementations:
 
@@ -1031,12 +1259,21 @@ Polls CI status for branches and provides custom API endpoints.
 - Demonstrates: Custom routes, periodic background work, route handlers, UI slot registration
 - Features: `onLoad`/`onUnload` lifecycle, `setInterval` polling, REST API, UI slots for task cards and task detail tabs
 
+### [Roadmap Planner Plugin](../../plugins/fusion-plugin-roadmap/)
+
+Standalone roadmap planning plugin extracted from dashboard host code.
+
+- Demonstrates: `hooks.onSchemaInit` for plugin-owned schema DDL (`ensureRoadmapSchema`)
+- Demonstrates: plugin-scoped route namespace under `/api/plugins/fusion-plugin-roadmap/*`
+- Demonstrates: top-level navigation registration through `dashboardViews` (`viewId: "roadmaps"`) and host static view registration
+- Demonstrates: AI suggestion flows that consume `ctx.createAiSession` through plugin route handlers
+
 ### [Droid Runtime Plugin](../../plugins/fusion-plugin-droid-runtime/)
 
 Reference runtime plugin that migrates a CLI-backed provider into the plugin system.
 
 - Demonstrates: runtime adapter pattern (`runtime-adapter.ts`) and plugin-owned streaming/provider orchestration (`provider.ts`, `process-manager.ts`)
-- Demonstrates UI slot registration for `settings-provider-card`, `settings-integration-card`, `onboarding-provider-card`, `onboarding-setup-help`, and `post-onboarding-recommendation`
+- Demonstrates structured contribution registration for `settings-provider-card`, `settings-config-section`, `onboarding-provider-card`, `onboarding-setup-help`, `onboarding-provider-recommendation`, and `post-onboarding-recommendation`
 - Demonstrates dashboard probe delegation through plugin-owned `probeDroidBinary`
 - Preserves provider id `droid-cli` via `@fusion/droid-cli` compatibility shim
 
@@ -1047,6 +1284,18 @@ Example plugin demonstrating settings schema and runtime configuration with all 
 - Demonstrates: Settings schema (string, number, boolean, enum), hooks that read settings, tools with settings-driven output
 - Features: Configurable greeting message, tag limit, logging toggle, log level selector
 - **Install from Settings**: Designed to be installed via the dashboard Settings → Plugins UI
+
+### [Even Realities Glasses Plugin](../../plugins/fusion-plugin-even-realities-glasses/)
+
+Task-focused card bridge plugin for Even Realities glasses companion flows.
+
+- Features: quick capture text into new tasks via the plugin route
+- Features: polling-based task transition notifications on configured columns (default `in-review`)
+- Features: board/task card endpoints (`GET /board/cards`, `GET /board`, `GET /tasks/:id/cards`)
+- Features: agent actions for start work (`in-progress`) and request review (`in-review`), gated by `enableAgentActions`
+- Features: webhook transport bridge with companion action ingestion (`POST /transport/actions`) and reconnect/status endpoints
+- Demonstrates: settings schema for `fusionApiBaseUrl`, `fusionApiToken`, `apiKey`, `glassesDeviceId`, `companionWebhookUrl`, `pollingIntervalSeconds`, `notifyOnColumns`, `quickCaptureDefaultColumn`, and `enableAgentActions`
+- Demonstrates FN-3737-aligned display limits: `EVEN_CARD_MAX_CHARS_PER_LINE = 28`, `EVEN_CARD_MAX_LINES_PER_CARD = 8`, `EVEN_CARD_MAX_DECK_SIZE = 12`
 
 ### Installing Example Plugins from Settings
 
@@ -1152,8 +1401,9 @@ export default definePlugin({
     onTaskCreated: (task, ctx) => {
       ctx.logger.info(`Task created: ${task.id}`);
     },
-    onUnload: () => {
-      // Cleanup
+    onUnload: (ctx) => {
+      // Cleanup with the same context shape passed to onLoad
+      ctx.logger.info("Shutting down plugin");
     },
   },
 } satisfies FusionPlugin);
@@ -1165,7 +1415,7 @@ For more information, see the [Plugin SDK Reference](../packages/plugin-sdk/src/
 
 ---
 
-## 14. Registering Skills
+## 15. Registering Skills
 
 Plugins can contribute reusable skills that are surfaced in agent sessions through Fusion's skill-selection flow.
 
@@ -1186,7 +1436,7 @@ const skills: PluginSkillContribution[] = [
 
 `skillFiles` are relative to the plugin root. `skillId` must be kebab-case.
 
-## 15. Registering Workflow Steps
+## 16. Registering Workflow Steps
 
 Plugins can ship workflow step templates that users can enable like built-in quality gates.
 
@@ -1217,7 +1467,7 @@ const workflowSteps: PluginWorkflowStepContribution[] = [
 
 Use `mode: "prompt" | "script"` and `toolMode: "readonly" | "coding"`.
 
-## 16. Plugin Prompt Contributions
+## 17. Contributing Prompt Modifications
 
 Prompt contributions let a plugin inject additional instructions into specific prompt surfaces.
 
@@ -1228,6 +1478,12 @@ Supported surfaces:
 - `reviewer`
 - `heartbeat`
 
+Each contribution uses the `PluginPromptContribution` shape:
+- `surface`: one of the five supported surfaces
+- `content`: prompt text to inject
+- `position?`: `"append"` (default) or `"prepend"`
+- `condition?`: optional human-readable condition note
+
 ```typescript
 import type { PluginPromptContributions } from "@fusion/plugin-sdk";
 
@@ -1235,10 +1491,10 @@ const promptContributions: PluginPromptContributions = {
   enabledByDefault: false,
   contributions: [
     {
-      surface: "reviewer",
+      surface: "executor-system",
       position: "append",
-      content: "Always call out missing tests and unsafe assumptions.",
-      condition: "Only for backend code changes",
+      content: "Always summarize browser-derived evidence with source URLs.",
+      condition: "When browser tooling is available",
     },
   ],
 };
@@ -1246,7 +1502,7 @@ const promptContributions: PluginPromptContributions = {
 
 Use `enabledByDefault: false` when contributions should require explicit opt-in.
 
-## 17. Plugin Binary Setup Hooks
+## 18. Plugin Binary Setup Hooks
 
 Plugins can expose setup metadata and lifecycle hooks for optional binaries or runtimes.
 

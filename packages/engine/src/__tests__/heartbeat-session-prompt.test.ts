@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import {
   HeartbeatMonitor,
   HeartbeatTriggerScheduler,
-  isBlockedStateDuplicate,
   type AgentSession,
   type HeartbeatExecutionOptions,
   HEARTBEAT_SYSTEM_PROMPT,
@@ -88,10 +87,10 @@ describe("createHeartbeatTools", () => {
     mockTaskStore = createMockTaskStoreForTools();
   });
 
-  it("heartbeat task-scoped system prompt documents coding-capable workspace access", () => {
-    expect(HEARTBEAT_SYSTEM_PROMPT).toContain("coding-capable workspace tools");
+  it("heartbeat task-scoped system prompt documents ambient coordination scope", () => {
     expect(HEARTBEAT_SYSTEM_PROMPT).toContain("fn_task_log");
     expect(HEARTBEAT_SYSTEM_PROMPT).toContain("fn_task_document_write");
+    expect(HEARTBEAT_SYSTEM_PROMPT).toContain("executor");
   });
 
   it("heartbeat no-task system prompt documents coding-capable workspace access without task-scoped tools", () => {
@@ -107,7 +106,7 @@ describe("createHeartbeatTools", () => {
 
     const tools = monitor.createHeartbeatTools("agent-001", mockTaskStore, "FN-001");
 
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(12);
     expect(tools[0]!.name).toBe("fn_task_create");
     expect(tools[1]!.name).toBe("fn_task_log");
     expect(tools[2]!.name).toBe("fn_task_document_write");
@@ -116,6 +115,10 @@ describe("createHeartbeatTools", () => {
     expect(tools[5]!.name).toBe("fn_delegate_task");
     expect(tools[6]!.name).toBe("fn_get_agent_config");
     expect(tools[7]!.name).toBe("fn_update_agent_config");
+    expect(tools[8]!.name).toBe("fn_agent_create");
+    expect(tools[9]!.name).toBe("fn_agent_delete");
+    expect(tools[10]!.name).toBe("fn_read_evaluations");
+    expect(tools[11]!.name).toBe("fn_update_identity");
   });
 
   it("fn_task_create tool creates a task in triage via TaskStore", async () => {
@@ -559,7 +562,7 @@ describe("Budget Governance", () => {
     expect(store.updateAgent).not.toHaveBeenCalledWith("agent-001", { pauseReason: "budget-exhausted" });
   });
 
-  it("does not pause agent when run is terminated", async () => {
+  it("keeps terminated as a run status while pausing the agent", async () => {
     const store = createCompleteRunBudgetStore({
       budgetStatus: createBudgetStatus({ isOverBudget: true, isOverThreshold: true }),
     });
@@ -571,7 +574,7 @@ describe("Budget Governance", () => {
     });
 
     expect(store.getBudgetStatus).not.toHaveBeenCalled();
-    expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "terminated");
+    expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
     expect(store.updateAgent).not.toHaveBeenCalledWith("agent-001", { pauseReason: "budget-exhausted" });
   });
 

@@ -23,7 +23,7 @@ export { toJson, toJsonNullable, fromJson };
 
 // ── Schema Definition ───────────────────────────────────────────────────
 
-const CENTRAL_SCHEMA_VERSION = 7;
+const CENTRAL_SCHEMA_VERSION = 10;
 
 const CENTRAL_SCHEMA_SQL = `
 -- Projects table (project registry)
@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE INDEX IF NOT EXISTS idxProjectsPath ON projects(path);
 CREATE INDEX IF NOT EXISTS idxProjectsStatus ON projects(status);
+
+-- Per-project, per-node working directory mappings
+CREATE TABLE IF NOT EXISTS projectNodePathMappings (
+  projectId TEXT NOT NULL,
+  nodeId TEXT NOT NULL,
+  path TEXT NOT NULL,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (projectId, nodeId),
+  FOREIGN KEY (projectId) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (nodeId) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxProjectNodePathMappingsProjectId ON projectNodePathMappings(projectId);
+CREATE INDEX IF NOT EXISTS idxProjectNodePathMappingsNodeId ON projectNodePathMappings(nodeId);
 
 -- Project health table (mutable state, updated frequently)
 CREATE TABLE IF NOT EXISTS projectHealth (
@@ -163,6 +177,77 @@ CREATE TABLE IF NOT EXISTS managedDockerNodes (
 CREATE INDEX IF NOT EXISTS idxManagedDockerNodesStatus ON managedDockerNodes(status);
 CREATE INDEX IF NOT EXISTS idxManagedDockerNodesNodeId ON managedDockerNodes(nodeId);
 
+-- Global plugin install registry
+CREATE TABLE IF NOT EXISTS plugin_installs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  description TEXT,
+  author TEXT,
+  homepage TEXT,
+  path TEXT NOT NULL,
+  settings TEXT DEFAULT '{}',
+  settingsSchema TEXT,
+  dependencies TEXT DEFAULT '[]',
+  aiScanOnLoad INTEGER NOT NULL DEFAULT 0,
+  lastSecurityScan TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+
+-- Per-project plugin state
+CREATE TABLE IF NOT EXISTS project_plugin_states (
+  projectPath TEXT NOT NULL,
+  pluginId TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'installed',
+  error TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (projectPath, pluginId),
+  FOREIGN KEY (pluginId) REFERENCES plugin_installs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxProjectPluginStatesProjectPath ON project_plugin_states(projectPath);
+CREATE INDEX IF NOT EXISTS idxProjectPluginStatesPluginId ON project_plugin_states(pluginId);
+
+-- Durable mesh shared-state snapshots
+CREATE TABLE IF NOT EXISTS meshSharedSnapshots (
+  nodeId TEXT NOT NULL,
+  projectId TEXT,
+  scope TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  snapshotVersion TEXT NOT NULL,
+  capturedAt TEXT NOT NULL,
+  sourceNodeId TEXT,
+  sourceRunId TEXT,
+  staleAfter TEXT,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (nodeId, projectId, scope)
+);
+CREATE INDEX IF NOT EXISTS idxMeshSharedSnapshotsLookup ON meshSharedSnapshots(nodeId, projectId, scope);
+
+-- Durable offline write queue + history
+CREATE TABLE IF NOT EXISTS meshWriteQueue (
+  id TEXT PRIMARY KEY,
+  originNodeId TEXT NOT NULL,
+  targetNodeId TEXT NOT NULL,
+  projectId TEXT,
+  scope TEXT NOT NULL,
+  entityType TEXT NOT NULL,
+  entityId TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  intentVersion TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'replaying', 'applied', 'failed')),
+  attemptCount INTEGER NOT NULL DEFAULT 0,
+  lastAttemptAt TEXT,
+  lastError TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  appliedAt TEXT
+);
+CREATE INDEX IF NOT EXISTS idxMeshWriteQueueReplay ON meshWriteQueue(targetNodeId, status, createdAt, id);
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS __meta (
   key TEXT PRIMARY KEY,
@@ -256,6 +341,92 @@ CREATE INDEX IF NOT EXISTS idxManagedDockerNodesNodeId ON managedDockerNodes(nod
 
 // V7 migration adds dockerConfig persistence to nodes for Docker-managed runtime config updates.
 
+const CENTRAL_SCHEMA_V8_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS projectNodePathMappings (
+  projectId TEXT NOT NULL,
+  nodeId TEXT NOT NULL,
+  path TEXT NOT NULL,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (projectId, nodeId),
+  FOREIGN KEY (projectId) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (nodeId) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxProjectNodePathMappingsProjectId ON projectNodePathMappings(projectId);
+CREATE INDEX IF NOT EXISTS idxProjectNodePathMappingsNodeId ON projectNodePathMappings(nodeId);
+`;
+
+const CENTRAL_SCHEMA_V9_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS plugin_installs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  version TEXT NOT NULL,
+  description TEXT,
+  author TEXT,
+  homepage TEXT,
+  path TEXT NOT NULL,
+  settings TEXT DEFAULT '{}',
+  settingsSchema TEXT,
+  dependencies TEXT DEFAULT '[]',
+  aiScanOnLoad INTEGER NOT NULL DEFAULT 0,
+  lastSecurityScan TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_plugin_states (
+  projectPath TEXT NOT NULL,
+  pluginId TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'installed',
+  error TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (projectPath, pluginId),
+  FOREIGN KEY (pluginId) REFERENCES plugin_installs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idxProjectPluginStatesProjectPath ON project_plugin_states(projectPath);
+CREATE INDEX IF NOT EXISTS idxProjectPluginStatesPluginId ON project_plugin_states(pluginId);
+`;
+
+const CENTRAL_SCHEMA_V10_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS meshSharedSnapshots (
+  nodeId TEXT NOT NULL,
+  projectId TEXT,
+  scope TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  snapshotVersion TEXT NOT NULL,
+  capturedAt TEXT NOT NULL,
+  sourceNodeId TEXT,
+  sourceRunId TEXT,
+  staleAfter TEXT,
+  updatedAt TEXT NOT NULL,
+  PRIMARY KEY (nodeId, projectId, scope)
+);
+CREATE INDEX IF NOT EXISTS idxMeshSharedSnapshotsLookup ON meshSharedSnapshots(nodeId, projectId, scope);
+
+CREATE TABLE IF NOT EXISTS meshWriteQueue (
+  id TEXT PRIMARY KEY,
+  originNodeId TEXT NOT NULL,
+  targetNodeId TEXT NOT NULL,
+  projectId TEXT,
+  scope TEXT NOT NULL,
+  entityType TEXT NOT NULL,
+  entityId TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  intentVersion TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'replaying', 'applied', 'failed')),
+  attemptCount INTEGER NOT NULL DEFAULT 0,
+  lastAttemptAt TEXT,
+  lastError TEXT,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  appliedAt TEXT
+);
+CREATE INDEX IF NOT EXISTS idxMeshWriteQueueReplay ON meshWriteQueue(targetNodeId, status, createdAt, id);
+`;
+
 // ── Central Database Class ────────────────────────────────────────────────
 
 export class CentralDatabase {
@@ -342,6 +513,49 @@ export class CentralDatabase {
       if (!this.hasColumn("nodes", "dockerConfig")) {
         this.db.exec("ALTER TABLE nodes ADD COLUMN dockerConfig TEXT");
       }
+      migrated = true;
+    }
+
+    if (currentVersion < 8) {
+      this.db.exec(CENTRAL_SCHEMA_V8_MIGRATION_SQL);
+
+      const localNodeRow = this.db
+        .prepare("SELECT id FROM nodes WHERE type = 'local' ORDER BY createdAt ASC LIMIT 1")
+        .get() as { id: string } | undefined;
+
+      if (localNodeRow) {
+        this.db.prepare(
+          `INSERT OR IGNORE INTO projectNodePathMappings (projectId, nodeId, path, createdAt, updatedAt)
+           SELECT id, ?, path, createdAt, updatedAt
+           FROM projects`
+        ).run(localNodeRow.id);
+
+        this.db.prepare(
+          `UPDATE projectNodePathMappings
+           SET path = (
+             SELECT projects.path
+             FROM projects
+             WHERE projects.id = projectNodePathMappings.projectId
+           ),
+           updatedAt = (
+             SELECT projects.updatedAt
+             FROM projects
+             WHERE projects.id = projectNodePathMappings.projectId
+           )
+           WHERE nodeId = ?`
+        ).run(localNodeRow.id);
+      }
+
+      migrated = true;
+    }
+
+    if (currentVersion < 9) {
+      this.db.exec(CENTRAL_SCHEMA_V9_MIGRATION_SQL);
+      migrated = true;
+    }
+
+    if (currentVersion < 10) {
+      this.db.exec(CENTRAL_SCHEMA_V10_MIGRATION_SQL);
       migrated = true;
     }
 

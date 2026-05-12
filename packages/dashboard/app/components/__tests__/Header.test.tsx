@@ -63,10 +63,35 @@ describe("Header", () => {
     expect(screen.getByText("Fusion")).toBeDefined();
   });
 
+  it("applies shell host metadata on the header root", () => {
+    const { container } = renderHeader({ shellHost: { kind: "desktop-shell", mode: "remote", canOpenConnectionManager: true } });
+    expect(container.querySelector("header.header")?.getAttribute("data-shell-kind")).toBe("desktop-shell");
+  });
+
+  it("renders shell connection control when provided", () => {
+    renderHeader({ shellConnectionControl: <button type="button">Manage connections</button> });
+    expect(screen.getByRole("button", { name: "Manage connections" })).toBeInTheDocument();
+  });
+
+  it("does not render shell connection control when omitted", () => {
+    const { container } = renderHeader({ shellConnectionControl: undefined });
+    expect(container.querySelector(".shell-connection-status")).toBeNull();
+  });
+
   it("renders action buttons", () => {
     renderHeader();
     expect(screen.getByTitle("Import from GitHub")).toBeDefined();
     expect(screen.getByTitle("Settings")).toBeDefined();
+  });
+
+  it("hides GitHub import for desktop shell host", () => {
+    renderHeader({ shellHost: { kind: "desktop-shell" } });
+    expect(screen.queryByTitle("Import from GitHub")).toBeNull();
+  });
+
+  it("keeps GitHub import for mobile shell host", () => {
+    renderHeader({ shellHost: { kind: "mobile-shell" } });
+    expect(screen.getByTitle("Import from GitHub")).toBeDefined();
   });
 
   it("renders system stats button on desktop when handler is provided", () => {
@@ -138,6 +163,26 @@ describe("Header", () => {
       expect(onChangeView).toHaveBeenCalledWith("list");
     });
 
+    it("shows chat unread indicator when chatHasUnreadResponse is true and chat is not active", () => {
+      renderHeader({ onChangeView: noop, view: "board", chatHasUnreadResponse: true });
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+
+    it("shows mailbox pending-approval indicator when mailbox is not active", () => {
+      renderHeader({ onChangeView: noop, view: "board", mailboxPendingApprovalCount: 2 });
+      expect(screen.getByLabelText("Pending approvals")).toBeInTheDocument();
+    });
+
+    it("hides mailbox pending-approval indicator when mailbox view is active", () => {
+      renderHeader({ onChangeView: noop, view: "mailbox", mailboxPendingApprovalCount: 2 });
+      expect(screen.queryByLabelText("Pending approvals")).toBeNull();
+    });
+
+    it("hides chat unread indicator when chat view is active", () => {
+      renderHeader({ onChangeView: noop, view: "chat", chatHasUnreadResponse: true });
+      expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+    });
+
     it("has correct aria attributes for accessibility", () => {
       renderHeader({ onChangeView: noop, view: "board" });
       const boardBtn = screen.getByTitle("Board view");
@@ -157,14 +202,14 @@ describe("Header", () => {
       expect(screen.getByTestId("view-overflow-todos")).toBeInTheDocument();
     });
 
-    it("renders plugin dashboard views by placement and uses manifest icon metadata", () => {
+    it("renders dependency graph in overflow and uses canonical graph task view", () => {
       const onChangeView = vi.fn();
       renderHeader({
         onChangeView,
         pluginDashboardViews: [
           {
             pluginId: "fusion-plugin-dependency-graph",
-            view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", icon: "Map", placement: "primary" },
+            view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", icon: "Map", placement: "more" },
           },
           {
             pluginId: "fusion-plugin-dependency-graph",
@@ -173,10 +218,13 @@ describe("Header", () => {
         ],
       });
 
-      const graphPrimary = screen.getByTestId("view-toggle-plugin-fusion-plugin-dependency-graph-graph");
-      expect(graphPrimary.querySelector(".lucide-map")).toBeTruthy();
-      fireEvent.click(graphPrimary);
-      expect(onChangeView).toHaveBeenCalledWith("plugin:fusion-plugin-dependency-graph:graph");
+      expect(screen.queryByTestId("view-toggle-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      const graphItem = screen.getByTestId("view-overflow-plugin-fusion-plugin-dependency-graph-graph");
+      expect(graphItem.querySelector(".lucide-map")).toBeTruthy();
+      fireEvent.click(graphItem);
+      expect(onChangeView).toHaveBeenCalledWith("graph");
 
       fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
       const queueItem = screen.getByTestId("view-overflow-plugin-fusion-plugin-dependency-graph-queue");
@@ -188,7 +236,7 @@ describe("Header", () => {
     it("hides legacy roadmaps overflow item when roadmap plugin view is present", () => {
       renderHeader({
         onChangeView: noop,
-        experimentalFeatures: { roadmap: true },
+        experimentalFeatures: {},
         pluginDashboardViews: [
           {
             pluginId: "fusion-plugin-roadmap",
@@ -215,7 +263,7 @@ describe("Header", () => {
       renderHeader({
         onChangeView: noop,
         showSkillsTab: false,
-        experimentalFeatures: { insights: false, roadmap: false, memoryView: false, devServerView: false, researchView: false },
+        experimentalFeatures: { insights: false, memoryView: false, devServerView: false, researchView: false },
       });
 
       fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
@@ -234,6 +282,24 @@ describe("Header", () => {
 
       expect(onChangeView).toHaveBeenCalledWith("research");
       expect(screen.queryByTestId("view-overflow-research")).toBeNull();
+    });
+
+    it("hides evals in the desktop view overflow when evalsView is disabled", () => {
+      renderHeader({ onChangeView: noop, experimentalFeatures: { evalsView: false } });
+
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      expect(screen.queryByTestId("view-overflow-evals")).toBeNull();
+    });
+
+    it("routes to evals from the desktop view overflow when evalsView is enabled", () => {
+      const onChangeView = vi.fn();
+      renderHeader({ onChangeView, experimentalFeatures: { evalsView: true } });
+
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      fireEvent.click(screen.getByTestId("view-overflow-evals"));
+
+      expect(onChangeView).toHaveBeenCalledWith("evals");
+      expect(screen.queryByTestId("view-overflow-evals")).toBeNull();
     });
   });
 
@@ -381,21 +447,27 @@ describe("Header", () => {
     });
   });
 
-  describe("todos button", () => {
-    it("renders todos button on desktop when enabled", () => {
-      renderHeader({ onOpenTodos: vi.fn(), todosEnabled: true }, "desktop");
-      expect(screen.getByTitle("Open todos")).toBeDefined();
+  describe("todos navigation", () => {
+    it("shows Todos only in More views on desktop when enabled", () => {
+      renderHeader({ onChangeView: noop, onOpenTodos: vi.fn(), todosEnabled: true }, "desktop");
+      expect(screen.queryByTestId("todos-toggle-btn")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      expect(screen.getAllByText("Todos")).toHaveLength(1);
+      expect(screen.getByTestId("view-overflow-todos")).toBeInTheDocument();
     });
 
-    it("does not render todos button when disabled", () => {
-      renderHeader({ onOpenTodos: vi.fn(), todosEnabled: false }, "desktop");
-      expect(screen.queryByTitle("Open todos")).toBeNull();
+    it("does not show Todos entry in More views when disabled", () => {
+      renderHeader({ onChangeView: noop, onOpenTodos: vi.fn(), todosEnabled: false }, "desktop");
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      expect(screen.queryByTestId("view-overflow-todos")).toBeNull();
     });
 
-    it("calls onOpenTodos when clicked", () => {
+    it("calls onOpenTodos from More views", () => {
       const onOpenTodos = vi.fn();
-      renderHeader({ onOpenTodos, todosEnabled: true }, "desktop");
-      fireEvent.click(screen.getByTitle("Open todos"));
+      renderHeader({ onChangeView: noop, onOpenTodos, todosEnabled: true }, "desktop");
+      fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+      fireEvent.click(screen.getByTestId("view-overflow-todos"));
       expect(onOpenTodos).toHaveBeenCalled();
     });
   });
@@ -1035,6 +1107,66 @@ describe("Header", () => {
       // Close and clear
       fireEvent.click(screen.getByLabelText("Close search"));
       expect(onSearchChange).toHaveBeenCalledWith("");
+    });
+
+    it("renders branch filters in desktop board search panel only", () => {
+      renderHeader({
+        onSearchChange: vi.fn(),
+        view: "board",
+        branchOptions: ["feature/a"],
+        baseBranchOptions: ["main"],
+      });
+      fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+      expect(screen.getByTestId("header-branch-filters-desktop")).toBeInTheDocument();
+      expect(screen.getByTestId("working-branch-filter")).toBeInTheDocument();
+      expect(screen.getByTestId("target-branch-filter")).toBeInTheDocument();
+      expect(screen.getByRole("option", { name: "All working branches" })).toHaveValue("");
+      expect(screen.getByRole("option", { name: "No working branch" })).toHaveValue("__fusion:no-branch__");
+      expect(screen.getByRole("option", { name: "All base branches" })).toHaveValue("");
+      expect(screen.getByRole("option", { name: "No base branch" })).toHaveValue("__fusion:no-branch__");
+    });
+
+    it("does not render branch filters in list view", () => {
+      renderHeader({ onSearchChange: vi.fn(), view: "list" });
+      fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+      expect(screen.queryByTestId("header-branch-filters-desktop")).toBeNull();
+    });
+
+    it("calls branch filter callbacks with selected values, unassigned sentinel, and reset", () => {
+      const onBranchFilterChange = vi.fn();
+      const onBaseBranchFilterChange = vi.fn();
+      renderHeader({
+        onSearchChange: vi.fn(),
+        view: "board",
+        branchOptions: ["feature/a"],
+        baseBranchOptions: ["release"],
+        onBranchFilterChange,
+        onBaseBranchFilterChange,
+      });
+      fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+      fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "feature/a" } });
+      fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__fusion:no-branch__" } });
+      fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "release" } });
+      fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "__fusion:no-branch__" } });
+      fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "" } });
+      expect(onBranchFilterChange).toHaveBeenCalledWith("feature/a");
+      expect(onBranchFilterChange).toHaveBeenCalledWith("__fusion:no-branch__");
+      expect(onBranchFilterChange).toHaveBeenCalledWith("");
+      expect(onBaseBranchFilterChange).toHaveBeenCalledWith("release");
+      expect(onBaseBranchFilterChange).toHaveBeenCalledWith("__fusion:no-branch__");
+    });
+
+    it("renders branch filters in mobile expanded search for board view", () => {
+      renderHeader({
+        onSearchChange: vi.fn(),
+        view: "board",
+        branchOptions: ["feature/mobile"],
+        baseBranchOptions: ["main"],
+      }, "mobile");
+      fireEvent.click(screen.getByTestId("mobile-header-search-btn"));
+      expect(screen.getByTestId("header-branch-filters-mobile")).toBeInTheDocument();
+      expect(screen.getByTestId("working-branch-filter-mobile")).toBeInTheDocument();
+      expect(screen.getByTestId("target-branch-filter-mobile")).toBeInTheDocument();
     });
   });
 

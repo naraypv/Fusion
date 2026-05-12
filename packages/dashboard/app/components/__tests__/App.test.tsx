@@ -16,7 +16,7 @@ const defaultSettings: Settings = {
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
-  experimentalFeatures: { insights: true, roadmap: true, skillsView: true, agentsView: true, memoryView: true },
+  experimentalFeatures: { insights: true, skillsView: true, agentsView: true, memoryView: true, evalsView: true },
 };
 
  
@@ -155,6 +155,44 @@ vi.mock("../../context/NodeContext", () => ({
   useNodeContext: vi.fn(() => mockNodeContextValue),
 }));
 
+const mockShellHostContextValue = {
+  host: { kind: "browser" as const },
+  isNativeShell: false,
+  kind: "browser" as const,
+};
+
+vi.mock("../../context/ShellHostContext", () => ({
+  ShellHostProvider: ({ children }: { children: React.ReactNode }) => children,
+  useShellHostContext: vi.fn(() => mockShellHostContextValue),
+}));
+
+const mockShellConnectionState = {
+  host: "web" as const,
+  desktopMode: "local" as const,
+  profiles: [],
+  activeProfileId: null,
+  localServer: null,
+};
+
+const mockGetShellConnectionNativeResult = vi.fn(async () => ({
+  hostKind: "browser" as const,
+  available: false,
+  openConnectionManager: async () => ({ ok: false as const, reason: "unsupported" as const }),
+}));
+
+vi.mock("../../hooks/useShellConnection", () => ({
+  useShellConnection: vi.fn(() => ({
+    shellApi: null,
+    state: mockShellConnectionState,
+    ready: true,
+    openConnectionManagerSignal: 0,
+  })),
+}));
+
+vi.mock("../../shell-native", () => ({
+  getShellConnectionNativeResult: (...args: unknown[]) => mockGetShellConnectionNativeResult(...args),
+}));
+
 // Mock model-onboarding-state
 const mockIsOnboardingResumable = vi.fn();
 const mockGetOnboardingResumeStep = vi.fn();
@@ -275,6 +313,10 @@ vi.mock("../../components/AgentsView", () => ({
   AgentsView: () => <div className="agents-view">Agents view</div>,
 }));
 
+vi.mock("@fusion-plugin-examples/dependency-graph/dashboard-view", () => ({
+  DependencyGraphDashboardView: () => <div data-testid="dependency-graph">No active tasks to display in graph view.</div>,
+}));
+
 vi.mock("../../components/ResearchView", () => ({
   ResearchView: ({ addToast }: { addToast?: (message: string, type?: "success" | "error" | "info") => void }) => (
     <div data-testid="research-view">
@@ -283,6 +325,10 @@ vi.mock("../../components/ResearchView", () => ({
       <button type="button" onClick={() => addToast?.("Task created from research", "success")}>Create Task</button>
     </div>
   ),
+}));
+
+vi.mock("../../components/EvalsView", () => ({
+  EvalsView: () => <div data-testid="evals-view">Evals</div>,
 }));
 
 vi.mock("../../components/TodoView", () => ({
@@ -491,9 +537,10 @@ vi.mock("../../hooks/useViewportMode", () => ({
   getViewportMode: () => "desktop",
 }));
 
-import { App } from "../../App";
+import { App, didEnterAwaitingApproval } from "../../App";
 import { AUTH_TOKEN_RECOVERY_REQUIRED_EVENT } from "../../auth";
 import { fetchAuthStatus, fetchSettings, fetchGlobalSettings, fetchTaskDetail, fetchUnreadCount, updateSettings, runScript, fetchScripts, fetchModels, fetchPluginDashboardViews } from "../../api";
+import { __resetShellHostContextForTests } from "../../shell-host";
 import * as apiNodeModule from "../../hooks/useRemoteNodeData";
 
 async function waitForAppShell(): Promise<void> {
@@ -505,6 +552,8 @@ async function waitForAppShell(): Promise<void> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __resetShellHostContextForTests();
+  localStorage.clear();
   mockSubscribeSse.mockReset();
   mockSubscribeSse.mockReturnValue(vi.fn());
   mockCreateTask.mockReset();
@@ -539,8 +588,9 @@ beforeEach(() => {
   mockNodeContextValue.clearCurrentNode.mockClear();
   // Clear node selection from localStorage to avoid cross-test leakage
   localStorage.removeItem("fusion-dashboard-current-node");
-  // Clear onboarding state from localStorage
+  // Clear onboarding/chat state from localStorage
   localStorage.removeItem("kb-onboarding-state");
+  localStorage.removeItem(scopedKey("kb-chat-active-session", "proj_123"));
   // Reset onboarding state mocks
   mockIsOnboardingResumable.mockReset();
   mockIsOnboardingResumable.mockReturnValue(false);
@@ -634,6 +684,14 @@ describe("App backend-unreachable first-run flow", () => {
   });
 });
 
+describe("didEnterAwaitingApproval", () => {
+  it("returns true only when status newly enters awaiting-approval", () => {
+    expect(didEnterAwaitingApproval("awaiting-approval", "in-progress")).toBe(true);
+    expect(didEnterAwaitingApproval("awaiting-approval", "awaiting-approval")).toBe(false);
+    expect(didEnterAwaitingApproval("done", "in-progress")).toBe(false);
+  });
+});
+
 describe("App mailbox unread count", () => {
   it("logs a warning when unread count fetch fails and keeps the zero-count fallback", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -685,6 +743,264 @@ describe("App mailbox unread count", () => {
       expect(fetchUnreadCount).toHaveBeenCalledTimes(2);
       expect(fetchUnreadCount).toHaveBeenLastCalledWith("proj_123");
     });
+  });
+});
+
+describe("App approval notification banner", () => {
+  it("shows banner when a task newly enters awaiting-approval", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [{ id: "FN-1", title: "Task", description: "x", status: "in-progress", column: "in-progress", dependencies: [], steps: [], currentStep: 0, log: [], createdAt: "", updatedAt: "" }],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+      pauseTask: vi.fn(),
+      resetTask: vi.fn(),
+      loadArchivedTasks: vi.fn(),
+      ingestCreatedTasks: vi.fn(),
+      lastFetchTimeMs: Date.now(),
+    }));
+
+    render(<App />);
+
+    await waitFor(() => expect(mockSubscribeSse).toHaveBeenCalled());
+
+    const mailboxSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["task:updated"] === "function",
+    );
+    const subscriptionConfig = mailboxSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["task:updated"](
+        new MessageEvent("task:updated", {
+          data: JSON.stringify({ id: "FN-1", status: "awaiting-approval", updatedAt: "2026-05-05T10:00:00.000Z" }),
+        }),
+      );
+    });
+
+    expect(screen.getByLabelText("Approval requests")).toBeInTheDocument();
+  });
+
+  it("persists dismissals and suppresses repeat alerts for the same approval item", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [{ id: "FN-4", title: "Task", description: "x", status: "in-progress", column: "in-progress", dependencies: [], steps: [], currentStep: 0, log: [], createdAt: "", updatedAt: "" }],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+      pauseTask: vi.fn(),
+      resetTask: vi.fn(),
+      loadArchivedTasks: vi.fn(),
+      ingestCreatedTasks: vi.fn(),
+      lastFetchTimeMs: Date.now(),
+    }));
+
+    const { unmount } = render(<App />);
+
+    await waitFor(() => expect(mockSubscribeSse).toHaveBeenCalled());
+
+    const mailboxSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["task:updated"] === "function",
+    );
+    const subscriptionConfig = mailboxSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["task:updated"](
+        new MessageEvent("task:updated", {
+          data: JSON.stringify({ id: "FN-4", status: "awaiting-approval", updatedAt: "2026-05-05T10:00:00.000Z" }),
+        }),
+      );
+    });
+
+    fireEvent.click(screen.getByLabelText("Dismiss approval notification banner"));
+    expect(screen.queryByLabelText("Approval requests")).toBeNull();
+
+    unmount();
+    render(<App />);
+
+    const latestSubscription = mockSubscribeSse.mock.calls
+      .slice()
+      .reverse()
+      .find(([, sub]) => typeof (sub as { events?: Record<string, unknown> })?.events?.["task:updated"] === "function");
+    const latestConfig = latestSubscription?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      latestConfig.events["task:updated"](
+        new MessageEvent("task:updated", {
+          data: JSON.stringify({ id: "FN-4", status: "awaiting-approval", updatedAt: "2026-05-05T10:00:00.000Z" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Approval requests")).toBeNull();
+  });
+
+  it("does not show banner for already-awaiting tasks", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [{ id: "FN-2", title: "Task", description: "x", status: "awaiting-approval", column: "triage", dependencies: [], steps: [], currentStep: 0, log: [], createdAt: "", updatedAt: "" }],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+      pauseTask: vi.fn(),
+      resetTask: vi.fn(),
+      loadArchivedTasks: vi.fn(),
+      ingestCreatedTasks: vi.fn(),
+      lastFetchTimeMs: Date.now(),
+    }));
+
+    render(<App />);
+
+    await waitFor(() => expect(mockSubscribeSse).toHaveBeenCalled());
+
+    const mailboxSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["task:updated"] === "function",
+    );
+    const subscriptionConfig = mailboxSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["task:updated"](
+        new MessageEvent("task:updated", {
+          data: JSON.stringify({ id: "FN-2", status: "awaiting-approval", updatedAt: "2026-05-05T10:00:00.000Z" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Approval requests")).toBeNull();
+  });
+});
+
+describe("App chat unread response indicator", () => {
+  it("shows unread indicator when assistant message arrives for active session after leaving chat", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+  });
+
+  it("does not show unread indicator for non-qualifying chat events", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "user", sessionId: "sess-active" }),
+        }),
+      );
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-other" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+  });
+
+  it("clears unread indicator when returning to chat and does not mark while in chat", async () => {
+    localStorage.setItem(scopedKey("kb-chat-active-session", "proj_123"), "sess-active");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+
+    const chatSubscriptionCall = mockSubscribeSse.mock.calls.find(
+      ([url, sub]) => String(url).startsWith("/api/events") && typeof (sub as { events?: Record<string, unknown> })?.events?.["chat:message:added"] === "function",
+    );
+    const subscriptionConfig = chatSubscriptionCall?.[1] as {
+      events: Record<string, (event: MessageEvent) => void>;
+    };
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId("header-chat-view-btn"));
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+    });
+
+    await act(async () => {
+      subscriptionConfig.events["chat:message:added"](
+        new MessageEvent("chat:message:added", {
+          data: JSON.stringify({ role: "assistant", sessionId: "sess-active" }),
+        }),
+      );
+    });
+
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
   });
 });
 
@@ -1453,6 +1769,48 @@ describe("App view switching", () => {
     localStorage.removeItem(taskViewStorageKey());
   });
 
+  it("opens evals view from overflow and persists view selection", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("view-toggle-overflow-trigger")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+    fireEvent.click(await screen.findByTestId("view-overflow-evals"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("evals-view")).toBeInTheDocument();
+      expect(localStorage.getItem(taskViewStorageKey())).toBe("evals");
+    });
+
+    localStorage.removeItem("kb-dashboard-view-mode");
+    localStorage.removeItem(taskViewStorageKey());
+  });
+
+  it("does not expose research navigation when research feature is disabled", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+    (fetchSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...defaultSettings,
+      experimentalFeatures: {
+        ...defaultSettings.experimentalFeatures,
+        researchView: false,
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("view-toggle-overflow-trigger")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+    expect(screen.queryByTestId("view-overflow-research")).not.toBeInTheDocument();
+
+    localStorage.removeItem("kb-dashboard-view-mode");
+  });
+
   it("initializes research view from persisted task-view when feature-enabled", async () => {
     localStorage.setItem("kb-dashboard-view-mode", "project");
     localStorage.setItem(taskViewStorageKey(), "research");
@@ -1495,6 +1853,29 @@ describe("App view switching", () => {
     localStorage.removeItem("kb-dashboard-view-mode");
     localStorage.removeItem(taskViewStorageKey());
   });
+
+  it("falls back to board when evals view is feature-disabled", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+    localStorage.setItem(taskViewStorageKey(), "evals");
+    (fetchSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...defaultSettings,
+      experimentalFeatures: {
+        ...defaultSettings.experimentalFeatures,
+        evalsView: false,
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(document.querySelector(".board")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("evals-view")).not.toBeInTheDocument();
+
+    localStorage.removeItem("kb-dashboard-view-mode");
+    localStorage.removeItem(taskViewStorageKey());
+  });
+
   it("renders Board view by default", async () => {
     // Set project mode so board view is available
     localStorage.setItem("kb-dashboard-view-mode", "project");
@@ -1645,13 +2026,73 @@ describe("App view switching", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText("Zoom In")).toBeInTheDocument();
-      expect(screen.getByText("Zoom Out")).toBeInTheDocument();
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
+      expect(screen.getByText("No active tasks to display in graph view.")).toBeInTheDocument();
     });
 
     localStorage.removeItem(taskViewStorageKey());
     localStorage.removeItem("kb-dashboard-view-mode");
   });
+
+  // FN-3916 regression: graph view must render via bundled static registration
+  // even when the API reports no plugin dashboard views (e.g. fresh DB).
+  it("renders graph view from bundled static registration when API returns no views", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+    localStorage.setItem(taskViewStorageKey(), "graph");
+    // API returns empty — plugin not installed/loaded
+    (fetchPluginDashboardViews as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
+    });
+
+    localStorage.removeItem(taskViewStorageKey());
+    localStorage.removeItem("kb-dashboard-view-mode");
+  });
+
+  it("restores board and plugin routes when persisted taskView changes across remounts", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+
+    localStorage.setItem(taskViewStorageKey(), "plugin:fusion-plugin-dependency-graph:graph");
+    (fetchPluginDashboardViews as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      {
+        pluginId: "fusion-plugin-dependency-graph",
+        view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", placement: "more" },
+      },
+    ]);
+
+    const first = render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
+    });
+    first.unmount();
+
+    localStorage.setItem(taskViewStorageKey(), "board");
+    const second = render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTitle("Board view").className).toContain("active");
+    });
+    second.unmount();
+
+    localStorage.setItem(taskViewStorageKey(), "plugin:fusion-plugin-dependency-graph:graph");
+    (fetchPluginDashboardViews as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      {
+        pluginId: "fusion-plugin-dependency-graph",
+        view: { viewId: "graph", label: "Graph", componentPath: "./GraphView", placement: "more" },
+      },
+    ]);
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("dependency-graph")).toBeInTheDocument();
+    });
+
+    localStorage.removeItem(taskViewStorageKey());
+    localStorage.removeItem("kb-dashboard-view-mode");
+  });
+
 
   it("opens planning mode when TodoView triggers planning from todo item", async () => {
     localStorage.setItem("kb-dashboard-view-mode", "project");
@@ -1666,10 +2107,11 @@ describe("App view switching", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("todos-toggle-btn")).toBeInTheDocument();
+      expect(screen.getByTestId("view-toggle-overflow-trigger")).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByTestId("todos-toggle-btn"));
+    fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
+    fireEvent.click(screen.getByTestId("view-overflow-todos"));
 
     await waitFor(() => {
       expect(screen.getByTestId("todo-view")).toBeInTheDocument();
@@ -1759,7 +2201,7 @@ describe("App view switching", () => {
     // Override the default mock to exclude agentsView
     vi.mocked(fetchSettings).mockResolvedValue({
       ...defaultSettings,
-      experimentalFeatures: { insights: true, roadmap: true, skillsView: true }, // no agentsView
+      experimentalFeatures: { insights: true, skillsView: true }, // no agentsView
     });
 
     render(<App />);
@@ -1935,7 +2377,7 @@ describe("App view switching", () => {
     // Keep at least one overflow item enabled so the overflow trigger still renders.
     (fetchSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ...defaultSettings,
-      experimentalFeatures: { insights: false, roadmap: true },
+      experimentalFeatures: { insights: false },
     });
 
     render(<App />);
@@ -3125,5 +3567,367 @@ describe("FN-3290: modal keyboard isolation for mobile dashboard layout", () => 
       wrapper = document.querySelector(".project-content");
       expect(wrapper?.classList.contains("project-content--with-mobile-nav")).toBe(false);
     });
+  });
+});
+
+describe("App board branch filters", () => {
+  const WORKING_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-working-branch-filter";
+  const BASE_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-base-branch-filter";
+
+  function scopedProjectKey(baseKey: string, projectId: string) {
+    return `kb:${projectId}:${baseKey}`;
+  }
+
+  function makeTask(id: string, title: string, branch?: string, baseBranch?: string) {
+    return {
+      id,
+      title,
+      description: title,
+      column: "todo",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      ...(branch ? { branch } : {}),
+      ...(baseBranch ? { baseBranch } : {}),
+    };
+  }
+
+  it("filters board tasks by working and target branch in local mode", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-1", "Task Alpha", "feature/a", "main"),
+        makeTask("FN-2", "Task Beta", "feature/b", "release"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "feature/a" } });
+    fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "main" } });
+
+    await waitFor(() => {
+      expect(screen.getByText("Task Alpha")).toBeTruthy();
+      expect(screen.queryByText("Task Beta")).toBeNull();
+    });
+  });
+
+  it("supports filtering for tasks without working branch values", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-1", "Unassigned Task"),
+        makeTask("FN-2", "Assigned Task", "feature/a", "main"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "__fusion:no-branch__" } });
+
+    await waitFor(() => {
+      expect(screen.getByText("Unassigned Task")).toBeTruthy();
+      expect(screen.queryByText("Assigned Task")).toBeNull();
+    });
+  });
+
+  it("supports filtering for tasks without base branch values", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-1", "No Base Branch", "feature/a"),
+        makeTask("FN-2", "Has Base Branch", "feature/a", "main"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "__fusion:no-branch__" } });
+
+    await waitFor(() => {
+      expect(screen.getByText("No Base Branch")).toBeTruthy();
+      expect(screen.queryByText("Has Base Branch")).toBeNull();
+    });
+  });
+
+  it("derives branch filter options from remote task data in remote mode", async () => {
+    mockNodeContextValue.isRemote = true;
+    mockNodeContextValue.currentNodeId = "node-1";
+
+    const remoteSpy = vi.spyOn(apiNodeModule, "useRemoteNodeData").mockReturnValue({
+      projects: [],
+      tasks: [makeTask("FN-3", "Remote Task", "feature/remote", "develop")],
+      health: null,
+      loading: false,
+      error: null,
+      refresh: vi.fn(),
+    });
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    expect(screen.getByRole("option", { name: "feature/remote" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "develop" })).toBeTruthy();
+    remoteSpy.mockRestore();
+  });
+
+  it("restores saved branch filter selections per project", async () => {
+    const projectId = "project-restore";
+    mockCurrentProjectState.currentProject = {
+      id: projectId,
+      name: "Restore Project",
+      path: "/restore",
+      status: "active",
+      isolationMode: "in-process",
+      createdAt: "",
+      updatedAt: "",
+    };
+    localStorage.setItem(scopedProjectKey(WORKING_BRANCH_FILTER_STORAGE_KEY, projectId), "feature/a");
+    localStorage.setItem(scopedProjectKey(BASE_BRANCH_FILTER_STORAGE_KEY, projectId), "__fusion:no-branch__");
+
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-1", "Restore Candidate", "feature/a"),
+        makeTask("FN-2", "Filtered Out", "feature/b", "main"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+
+    expect((screen.getByTestId("working-branch-filter") as HTMLSelectElement).value).toBe("feature/a");
+    expect((screen.getByTestId("target-branch-filter") as HTMLSelectElement).value).toBe("__fusion:no-branch__");
+
+    await waitFor(() => {
+      expect(screen.getByText("Restore Candidate")).toBeTruthy();
+      expect(screen.queryByText("Filtered Out")).toBeNull();
+    });
+  });
+
+  it("writes updated filter values to project-scoped storage and isolates between projects", async () => {
+    const projectOneId = "project-one";
+    const projectTwoId = "project-two";
+    mockCurrentProjectState.currentProject = {
+      id: projectOneId,
+      name: "Project One",
+      path: "/one",
+      status: "active",
+      isolationMode: "in-process",
+      createdAt: "",
+      updatedAt: "",
+    };
+
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [makeTask("FN-1", "Alpha Search", "feature/a", "main")],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    const { rerender } = render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "feature/a" } });
+    fireEvent.change(screen.getByTestId("target-branch-filter"), { target: { value: "main" } });
+
+    expect(localStorage.getItem(scopedProjectKey(WORKING_BRANCH_FILTER_STORAGE_KEY, projectOneId))).toBe("feature/a");
+    expect(localStorage.getItem(scopedProjectKey(BASE_BRANCH_FILTER_STORAGE_KEY, projectOneId))).toBe("main");
+
+    mockCurrentProjectState.currentProject = {
+      id: projectTwoId,
+      name: "Project Two",
+      path: "/two",
+      status: "active",
+      isolationMode: "in-process",
+      createdAt: "",
+      updatedAt: "",
+    };
+
+    rerender(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+
+    expect((screen.getByTestId("working-branch-filter") as HTMLSelectElement).value).toBe("");
+    expect((screen.getByTestId("target-branch-filter") as HTMLSelectElement).value).toBe("");
+    expect(localStorage.getItem(scopedProjectKey(WORKING_BRANCH_FILTER_STORAGE_KEY, projectTwoId))).toBeNull();
+    expect(localStorage.getItem(scopedProjectKey(BASE_BRANCH_FILTER_STORAGE_KEY, projectTwoId))).toBeNull();
+  });
+
+  it("composes with search and does not affect list view tasks", async () => {
+    mockUseTasks.mockImplementation(() => ({
+      tasks: [
+        makeTask("FN-4", "Alpha Search", "feature/a", "main"),
+        makeTask("FN-5", "Beta Search", "feature/b", "main"),
+      ],
+      createTask: mockCreateTask,
+      moveTask: vi.fn(),
+      deleteTask: vi.fn(),
+      mergeTask: vi.fn(),
+      retryTask: vi.fn(),
+      updateTask: vi.fn(),
+      duplicateTask: vi.fn(),
+      archiveTask: vi.fn(),
+      unarchiveTask: vi.fn(),
+      archiveAllDone: vi.fn(),
+    }));
+
+    render(<App />);
+    await waitForAppShell();
+
+    fireEvent.click(screen.getByTestId("desktop-header-search-btn"));
+    fireEvent.change(screen.getByPlaceholderText("Search tasks..."), { target: { value: "Search" } });
+    fireEvent.change(screen.getByTestId("working-branch-filter"), { target: { value: "feature/a" } });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alpha Search")).toBeTruthy();
+      expect(screen.queryByText("Beta Search")).toBeNull();
+    });
+
+    fireEvent.click(screen.getByTitle("List view"));
+    await waitFor(() => {
+      expect(screen.getByText("Alpha Search")).toBeTruthy();
+      expect(screen.getByText("Beta Search")).toBeTruthy();
+    });
+  });
+});
+
+describe("App shell connection status plumbing", () => {
+  it("loads shell connection status for native shell host", async () => {
+    mockShellHostContextValue.host = { kind: "desktop-shell", mode: "remote", connectionId: "p1", serverUrl: "https://fusion.example.com" };
+    mockGetShellConnectionNativeResult.mockResolvedValueOnce({
+      hostKind: "desktop-shell",
+      available: true,
+      mode: "remote",
+      profileLabel: "Prod",
+      serverOrigin: "https://fusion.example.com",
+      openConnectionManager: async () => ({ ok: true }),
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockGetShellConnectionNativeResult).toHaveBeenCalledWith(mockShellHostContextValue.host);
+      expect(screen.getByTestId("shell-connection-status-button")).toBeInTheDocument();
+    });
+  });
+
+  it("does not render shell connection status in browser mode", async () => {
+    mockShellHostContextValue.host = { kind: "browser" };
+    mockGetShellConnectionNativeResult.mockResolvedValueOnce({
+      hostKind: "browser",
+      available: false,
+      openConnectionManager: async () => ({ ok: false, reason: "unsupported" }),
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockGetShellConnectionNativeResult).toHaveBeenCalledWith(mockShellHostContextValue.host);
+    });
+    expect(screen.queryByTestId("shell-connection-status-button")).toBeNull();
+  });
+
+  it("renders shell connection status for mobile shell host in mobile More sheet only", async () => {
+    mockUseViewportMode.mockReturnValue("mobile");
+    mockShellHostContextValue.host = { kind: "mobile-shell", mode: "remote", connectionId: "p1", serverUrl: "https://fusion.example.com" };
+    mockGetShellConnectionNativeResult.mockResolvedValueOnce({
+      hostKind: "mobile-shell",
+      available: true,
+      mode: "remote",
+      profileLabel: "Mobile",
+      serverOrigin: "https://fusion.example.com",
+      openConnectionManager: async () => ({ ok: true }),
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(mockGetShellConnectionNativeResult).toHaveBeenCalledWith(mockShellHostContextValue.host);
+      expect(screen.getByTestId("mobile-nav-tab-more")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId("shell-connection-status-button")).toBeNull();
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+    expect(screen.getAllByTestId("shell-connection-status-button")).toHaveLength(1);
+    expect(screen.getByTestId("mobile-more-shell-connection")).toBeInTheDocument();
+  });
+
+  it("keeps desktop shell connection status in header and out of mobile sheet", async () => {
+    mockUseViewportMode.mockReturnValue("desktop");
+    mockShellHostContextValue.host = { kind: "desktop-shell", mode: "remote", connectionId: "p1", serverUrl: "https://fusion.example.com" };
+    mockGetShellConnectionNativeResult.mockResolvedValueOnce({
+      hostKind: "desktop-shell",
+      available: true,
+      mode: "remote",
+      profileLabel: "Prod",
+      serverOrigin: "https://fusion.example.com",
+      openConnectionManager: async () => ({ ok: true }),
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("shell-connection-status-button")).toHaveLength(1);
+    });
+
+    expect(screen.queryByTestId("mobile-more-shell-connection")).toBeNull();
   });
 });

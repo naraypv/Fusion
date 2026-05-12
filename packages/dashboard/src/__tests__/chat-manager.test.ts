@@ -28,6 +28,14 @@ vi.mock("@fusion/core", () => ({
   resolveModelFallbackChain: mockResolveModelFallbackChain,
   resolveRouteAllLlmCallsViaDspy: mockResolveRouteAllLlmCallsViaDspy,
   summarizeTitle: mockSummarizeTitle,
+  DASHBOARD_USER_ID: "dashboard",
+  normalizeMessageParticipant: (id: string, type: "user" | "agent" | "system") => {
+    const normalized = id.trim();
+    if (type === "user" && ["dashboard", "user:dashboard", "User: user:dashboard"].includes(normalized)) {
+      return { id: "dashboard", type: "user" as const };
+    }
+    return { id: normalized, type };
+  },
 }));
 
 // SessionManager is constructed per-chat for CLI session continuity. We don't
@@ -59,6 +67,8 @@ const mockChatStore = {
   getMessages: vi.fn(),
   updateSession: vi.fn(),
   setCliSessionFile: vi.fn(),
+  setInFlightGeneration: vi.fn(),
+  getRoomMessages: vi.fn(),
 };
 
 const mockAgentStore = {
@@ -67,8 +77,8 @@ const mockAgentStore = {
   listAgents: vi.fn(),
 };
 
-function createChatManager(pluginRunner?: Record<string, unknown>): ChatManager {
-  return new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, pluginRunner as any);
+function createChatManager(pluginRunner?: Record<string, unknown>, messageStore?: Record<string, unknown>): ChatManager {
+  return new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, pluginRunner as any, undefined, messageStore as any);
 }
 
 function createChatManagerWithSettings(settings: {
@@ -110,6 +120,7 @@ describe("ChatManager.sendMessage", () => {
       content: "",
     });
     mockChatStore.getMessages.mockReturnValue([]);
+    mockChatStore.getRoomMessages.mockReturnValue([]);
 
     mockAgentStore.init.mockResolvedValue(undefined);
     mockAgentStore.getAgent.mockResolvedValue({
@@ -351,6 +362,83 @@ describe("ChatManager.sendMessage", () => {
     );
     expect(assistantCall).toBeDefined();
     expect(assistantCall?.[1].content).toBe("Hello world!");
+  });
+
+  it("persists and clears durable in-flight generation snapshots during streaming", async () => {
+    let onTextCb: ((delta: string) => void) | undefined;
+
+    __setCreateFnAgent(async (options: any) => {
+      onTextCb = options.onText;
+      return {
+        session: {
+          prompt: vi.fn().mockImplementation(async () => {
+            onTextCb?.("chunk");
+          }),
+          dispose: vi.fn(),
+          state: { messages: [{ role: "assistant", content: "chunk" }] },
+        },
+      };
+    });
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "Hello");
+
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenCalledWith(
+      "chat-001",
+      expect.objectContaining({ status: "generating" }),
+    );
+    expect(mockChatStore.setInFlightGeneration).toHaveBeenLastCalledWith("chat-001", null);
+  });
+
+  it("broadcasts done with persisted assistant message snapshot", async () => {
+    const events: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe("chat-001", (event) => {
+      events.push(event);
+    });
+
+    __setCreateFnAgent(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: {
+          messages: [{ role: "assistant", content: "Final content" }],
+        },
+      },
+    }));
+
+    mockChatStore.addMessage.mockReturnValueOnce({ id: "msg-user", role: "user" });
+    mockChatStore.addMessage.mockReturnValueOnce({
+      id: "msg-final",
+      sessionId: "chat-001",
+      role: "assistant",
+      content: "Final content",
+      thinkingOutput: null,
+      metadata: null,
+      attachments: undefined,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "Hello");
+    unsubscribe();
+
+    expect(events).toContainEqual({
+      type: "done",
+      data: {
+        messageId: "msg-final",
+        message: {
+          id: "msg-final",
+          sessionId: "chat-001",
+          role: "assistant",
+          content: "Final content",
+          thinkingOutput: null,
+          metadata: null,
+          attachments: undefined,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+        attachments: undefined,
+      },
+    });
   });
 
 
@@ -605,7 +693,13 @@ describe("ChatManager.sendMessage", () => {
       getRuntimeById: vi.fn(),
       createRuntimeContext: vi.fn(),
     };
-    const chatManager = createChatManager(pluginRunner);
+    const messageStore = {
+      sendMessage: vi.fn(),
+      getInbox: vi.fn(),
+      markAsRead: vi.fn(),
+      markAllAsRead: vi.fn(),
+    };
+    const chatManager = createChatManager(pluginRunner, messageStore);
 
     await chatManager.sendMessage("chat-001", "Hello");
 
@@ -613,6 +707,99 @@ describe("ChatManager.sendMessage", () => {
       sessionPurpose: "executor",
       runtimeHint: "openclaw",
       pluginRunner,
+    }));
+    expect(createResolvedSession).toHaveBeenCalledWith(expect.objectContaining({
+      customTools: expect.arrayContaining([
+        expect.objectContaining({ name: "fn_send_message" }),
+        expect.objectContaining({ name: "fn_read_messages" }),
+      ]),
+    }));
+  });
+
+  it("routes Hermes mailbox sends from agent to canonical dashboard user", async () => {
+    const createResolvedSession = vi.fn(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: {
+          messages: [{ role: "assistant", content: "Runtime response" }],
+        },
+      },
+    }));
+    __setCreateResolvedAgentSession(createResolvedSession as any);
+
+    mockAgentStore.getAgent.mockResolvedValue({
+      id: "agent-001",
+      name: "Avery",
+      role: "executor",
+      soul: "Be calm and precise.",
+      memory: "Remember to keep test coverage high.",
+      instructionsText: "Keep replies focused.",
+      runtimeConfig: {
+        runtimeHint: "hermes-runtime",
+      },
+    });
+
+    const messageStore = {
+      sendMessage: vi.fn().mockReturnValue({ id: "msg-123" }),
+      getInbox: vi.fn().mockReturnValue([]),
+      markAsRead: vi.fn(),
+      markAllAsRead: vi.fn(),
+    };
+    const chatManager = createChatManager(undefined, messageStore);
+
+    await chatManager.sendMessage("chat-001", "Hello");
+
+    const customTools = createResolvedSession.mock.calls[0]?.[0]?.customTools ?? [];
+    const sendTool = customTools.find((tool: { name: string }) => tool.name === "fn_send_message");
+    expect(sendTool).toBeDefined();
+
+    const sendResult = await sendTool.execute("call-1", {
+      to_id: "User: user:dashboard",
+      content: "status",
+      type: "agent-to-user",
+    }, undefined, undefined, undefined);
+
+    expect(sendResult.content[0]?.type === "text" ? sendResult.content[0].text : "").toContain("Message sent to dashboard");
+    expect(messageStore.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      fromId: "agent-001",
+      fromType: "agent",
+      toId: "dashboard",
+      toType: "user",
+      type: "agent-to-user",
+    }));
+  });
+
+  it("does not inject mailbox tools for non-agent chat sessions", async () => {
+    mockChatStore.getSession.mockReturnValue({
+      id: "chat-001",
+      agentId: null,
+      status: "active",
+    });
+
+    const createResolvedSession = vi.fn(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: {
+          messages: [{ role: "assistant", content: "Runtime response" }],
+        },
+      },
+    }));
+    __setCreateResolvedAgentSession(createResolvedSession as any);
+
+    const messageStore = {
+      sendMessage: vi.fn(),
+      getInbox: vi.fn(),
+      markAsRead: vi.fn(),
+      markAllAsRead: vi.fn(),
+    };
+    const chatManager = createChatManager(undefined, messageStore);
+
+    await chatManager.sendMessage("chat-001", "Hello");
+
+    expect(createResolvedSession).toHaveBeenCalledWith(expect.not.objectContaining({
+      customTools: expect.anything(),
     }));
   });
 
@@ -934,6 +1121,30 @@ describe("ChatManager.sendMessage", () => {
     expect(mockAgentStore.init).toHaveBeenCalledTimes(1);
     expect(mockAgentStore.getAgent).toHaveBeenCalledWith("agent-001");
     expect(createOptions.systemPrompt).toContain("Be calm and precise.");
+    expect(createOptions.systemPrompt).toContain("Your chat reply is the primary response to the user.");
+    expect(createOptions.systemPrompt).toContain("Only use `fn_send_message` when the user explicitly asks");
+  });
+
+  it("includes guidance to avoid double-sending mailbox copies by default", async () => {
+    let createOptions: any;
+    __setCreateFnAgent(async (options: any) => {
+      createOptions = options;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          state: {
+            messages: [{ role: "assistant", content: "Done" }],
+          },
+        },
+      };
+    });
+
+    const chatManager = createChatManager();
+    await chatManager.sendMessage("chat-001", "Hello");
+
+    expect(createOptions.systemPrompt).toContain("Do not also call `fn_send_message` with the same content");
+    expect(createOptions.systemPrompt).toContain("Only use `fn_send_message` when the user explicitly asks for mailbox/inbox/notification delivery");
   });
 
   it("passes enriched system prompt with agent memory when agent context is available", async () => {
@@ -1342,6 +1553,7 @@ describe("ChatManager diagnostics", () => {
       content: "",
     });
     mockChatStore.getMessages.mockReturnValue([]);
+    mockChatStore.getRoomMessages.mockReturnValue([]);
     mockAgentStore.init.mockResolvedValue(undefined);
     mockAgentStore.getAgent.mockResolvedValue({
       id: "agent-001",
@@ -1613,4 +1825,207 @@ describe("ChatManager.getGeneratingSessionIds", () => {
 
     expect(chatManager.getGeneratingSessionIds()).toEqual([]);
   });
+});
+
+describe("ChatManager generation isolation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetChatState();
+    mockChatStore.getSession.mockReturnValue({
+      id: "chat-001",
+      agentId: "agent-001",
+      status: "active",
+    });
+    mockChatStore.addMessage.mockReturnValue({
+      id: "msg-001",
+      sessionId: "chat-001",
+      role: "assistant",
+      content: "",
+    });
+    mockChatStore.getRoomMessages.mockReturnValue([]);
+  });
+
+  // Regression: a "Generation cancelled" broadcast from a previous generation
+  // must not leak into a new SSE subscriber that connected after the cancel
+  // request landed. Before per-generation tagging this race silently flipped
+  // the new chat into "no streaming" state with no Stop button or indicator.
+  it("cancelGeneration broadcast does not reach a new generation's subscriber", async () => {
+    const chatManager = createChatManager();
+
+    // Start gen #1 manually so we can hold a reference to its generationId
+    // without driving a real agent loop.
+    const firstGen = chatManager.beginGeneration("chat-001");
+    expect(firstGen.generationId).toBe(1);
+
+    // Simulate the new request subscribing for gen #2 BEFORE the cancel of
+    // gen #1 has been processed by the backend.
+    const secondGen = chatManager.beginGeneration("chat-001");
+    expect(secondGen.generationId).toBe(2);
+    // beginGeneration aborts the prior controller so the old loop unwinds.
+    expect(firstGen.abortController.signal.aborted).toBe(true);
+
+    const eventsForNewSubscriber: Array<{ type: string; data: unknown }> = [];
+    const unsubscribe = chatStreamManager.subscribe(
+      "chat-001",
+      (event) => { eventsForNewSubscriber.push(event); },
+      { generationId: secondGen.generationId },
+    );
+
+    // Cancel gen #1 (which is what the in-flight HTTP cancel request would do).
+    // Today this is a no-op for activeGenerations because beginGeneration #2
+    // overwrote the entry, but in production the cancel can race with the
+    // beginGeneration. Simulate the broadcast directly as well to exercise the
+    // tagged-broadcast filtering.
+    chatStreamManager.broadcast(
+      "chat-001",
+      { type: "error", data: "Generation cancelled" },
+      { generationId: firstGen.generationId },
+    );
+
+    expect(eventsForNewSubscriber).toEqual([]);
+
+    // A broadcast tagged for gen #2 still reaches the subscriber.
+    chatStreamManager.broadcast(
+      "chat-001",
+      { type: "text", data: "hello" },
+      { generationId: secondGen.generationId },
+    );
+    expect(eventsForNewSubscriber).toEqual([{ type: "text", data: "hello" }]);
+
+    unsubscribe();
+  });
+
+  // Regression: an old generation completing its `finally` block must not
+  // delete a newer generation's activeGenerations entry, otherwise
+  // `isGenerating(sessionId)` returns false while the new request is still
+  // streaming and recovery polling cannot find it.
+  it("old generation finally does not delete a newer generation's slot", async () => {
+    const chatManager = createChatManager();
+
+    let resolvePrompt: (() => void) | undefined;
+    let promptCallCount = 0;
+    __setCreateFnAgent(async () => {
+      promptCallCount += 1;
+      const callIndex = promptCallCount;
+      return {
+        session: {
+          prompt: vi.fn().mockImplementation(() => {
+            // First call hangs until we resolve it; second resolves immediately.
+            if (callIndex === 1) {
+              return new Promise<void>((resolve) => { resolvePrompt = resolve; });
+            }
+            return Promise.resolve();
+          }),
+          dispose: vi.fn(),
+          state: { messages: [{ role: "assistant", content: "ok" }] },
+        },
+      };
+    });
+
+    // Kick off generation #1 — it will hang inside prompt().
+    const sendOne = chatManager.sendMessage("chat-001", "first");
+    // Yield enough microtasks for sendOne to set its activeGenerations entry.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(chatManager.isGenerating("chat-001")).toBe(true);
+
+    // Cancel #1 (so its prompt() will eventually unwind via the abort path).
+    chatManager.cancelGeneration("chat-001");
+
+    // Start generation #2 and let it run. Its sendMessage promise resolves
+    // synchronously (mock prompt returns immediately on the second call), but
+    // the activeGenerations slot for #2 is set during its execution.
+    const sendTwo = chatManager.sendMessage("chat-001", "second");
+    await sendTwo;
+
+    // Now release #1's prompt so its finally block runs.
+    resolvePrompt?.();
+    await sendOne;
+
+    // The slot was correctly cleaned up by sendTwo (the most recent owner)
+    // and not re-deleted/corrupted by sendOne's late finally.
+    expect(chatManager.isGenerating("chat-001")).toBe(false);
+  });
+
+  it("sendRoomMessage persists assistant room replies", async () => {
+    (mockChatStore as any).getRoom = vi.fn().mockReturnValue({ id: "room-1", name: "team" });
+    (mockChatStore as any).listRoomMembers = vi.fn().mockReturnValue([
+      { roomId: "room-1", agentId: "agent-001", role: "member", addedAt: "2026-01-01" },
+    ]);
+    (mockChatStore as any).addRoomMessage = vi.fn().mockImplementation((_roomId: string, input: any) => ({
+      id: "room-msg",
+      roomId: "room-1",
+      ...input,
+    }));
+
+    mockAgentStore.listAgents.mockResolvedValue([
+      { id: "agent-001", name: "Avery", role: "executor", state: "idle" },
+    ]);
+    mockAgentStore.getAgent.mockResolvedValue({ id: "agent-001", name: "Avery", role: "executor", state: "idle" });
+
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [{ role: "assistant", content: "Room answer" }] },
+      },
+      provider: "test",
+      model: "test",
+      fallbackInfo: undefined,
+    } as any));
+
+    const chatManager = createChatManager();
+    await chatManager.sendRoomMessage("room-1", "hello @Avery");
+
+    const assistant = (mockChatStore as any).addRoomMessage.mock.calls
+      .map((call: any[]) => call[1])
+      .find((entry: any) => entry.role === "assistant");
+
+    expect(assistant).toMatchObject({
+      role: "assistant",
+      senderAgentId: "agent-001",
+      content: "Room answer",
+    });
+  });
+
+  it("sendRoomMessage still resolves room member responders when listAgents is unavailable", async () => {
+    (mockChatStore as any).getRoom = vi.fn().mockReturnValue({ id: "room-1", name: "team" });
+    (mockChatStore as any).listRoomMembers = vi.fn().mockReturnValue([
+      { roomId: "room-1", agentId: "agent-001", role: "member", addedAt: "2026-01-01" },
+    ]);
+    (mockChatStore as any).addRoomMessage = vi.fn().mockImplementation((_roomId: string, input: any) => ({
+      id: "room-msg",
+      roomId: "room-1",
+      ...input,
+    }));
+
+    mockAgentStore.listAgents.mockRejectedValue(new Error("agent listing offline"));
+    mockAgentStore.getAgent.mockResolvedValue({ id: "agent-001", name: "Avery", role: "executor", state: "idle" });
+
+    __setCreateResolvedAgentSession(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+        state: { messages: [{ role: "assistant", content: "Recovered room answer" }] },
+      },
+      provider: "test",
+      model: "test",
+      fallbackInfo: undefined,
+    } as any));
+
+    const chatManager = createChatManager();
+    await chatManager.sendRoomMessage("room-1", "hello @Avery");
+
+    const assistant = (mockChatStore as any).addRoomMessage.mock.calls
+      .map((call: any[]) => call[1])
+      .find((entry: any) => entry.role === "assistant");
+
+    expect(assistant).toMatchObject({
+      role: "assistant",
+      senderAgentId: "agent-001",
+      content: "Recovered room answer",
+    });
+  });
+
 });

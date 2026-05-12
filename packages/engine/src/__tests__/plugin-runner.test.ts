@@ -34,11 +34,17 @@ describe("PluginRunner", () => {
     getPluginTools: ReturnType<typeof vi.fn>;
     getPluginRoutes: ReturnType<typeof vi.fn>;
     getPluginUiSlots: ReturnType<typeof vi.fn>;
+    getPluginUiContributions: ReturnType<typeof vi.fn>;
     getPluginRuntimes: ReturnType<typeof vi.fn>;
+    getCliProviderContributions: ReturnType<typeof vi.fn>;
     getPluginSkills: ReturnType<typeof vi.fn>;
     getPluginWorkflowSteps: ReturnType<typeof vi.fn>;
+    getPluginWorkflowStepTemplates: ReturnType<typeof vi.fn>;
     getPluginPromptContributions: ReturnType<typeof vi.fn>;
     getPluginSetupInfo: ReturnType<typeof vi.fn>;
+    checkPluginSetup: ReturnType<typeof vi.fn>;
+    installPluginSetup: ReturnType<typeof vi.fn>;
+    uninstallPluginSetup: ReturnType<typeof vi.fn>;
     getLoadedPlugins: ReturnType<typeof vi.fn>;
     getPlugin: ReturnType<typeof vi.fn>;
     loadPlugin: ReturnType<typeof vi.fn>;
@@ -93,11 +99,17 @@ describe("PluginRunner", () => {
       getPluginTools: vi.fn().mockReturnValue([]),
       getPluginRoutes: vi.fn().mockReturnValue([]),
       getPluginUiSlots: vi.fn().mockReturnValue([]),
+      getPluginUiContributions: vi.fn().mockReturnValue([]),
       getPluginRuntimes: vi.fn().mockReturnValue([]),
+      getCliProviderContributions: vi.fn().mockReturnValue([]),
       getPluginSkills: vi.fn().mockReturnValue([]),
       getPluginWorkflowSteps: vi.fn().mockReturnValue([]),
+      getPluginWorkflowStepTemplates: vi.fn().mockReturnValue([]),
       getPluginPromptContributions: vi.fn().mockReturnValue([]),
       getPluginSetupInfo: vi.fn().mockReturnValue([]),
+      checkPluginSetup: vi.fn().mockResolvedValue({ status: "installed" }),
+      installPluginSetup: vi.fn().mockResolvedValue(undefined),
+      uninstallPluginSetup: vi.fn().mockResolvedValue(undefined),
       getLoadedPlugins: vi.fn().mockReturnValue([]),
       getPlugin: vi.fn(),
       loadPlugin: vi.fn().mockResolvedValue({}),
@@ -532,6 +544,50 @@ describe("PluginRunner", () => {
     });
   });
 
+  describe("getPluginUiContributions()", () => {
+    it("returns structured contributions from pluginLoader", () => {
+      const contributions = [
+        {
+          pluginId: "plugin-a",
+          contribution: {
+            surface: "settings-config-section",
+            contributionId: "cfg-a",
+            sectionId: "openai",
+            title: "OpenAI settings",
+            pluginSettingKeys: ["openai.apiKey"],
+          },
+        },
+      ];
+      mockPluginLoader.getPluginUiContributions.mockReturnValue(contributions);
+
+      const result = pluginRunner.getPluginUiContributions();
+
+      expect(result).toEqual(contributions);
+      expect(mockPluginLoader.getPluginUiContributions).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses cached contributions until invalidated", () => {
+      const contributions = [
+        {
+          pluginId: "plugin-a",
+          contribution: {
+            surface: "onboarding-provider-recommendation",
+            contributionId: "rec-a",
+            providerId: "openai",
+            title: "OpenAI",
+            reason: "default",
+          },
+        },
+      ];
+      mockPluginLoader.getPluginUiContributions.mockReturnValue(contributions);
+
+      pluginRunner.getPluginUiContributions();
+      pluginRunner.getPluginUiContributions();
+
+      expect(mockPluginLoader.getPluginUiContributions).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("getPluginRuntimes()", () => {
     it("should return empty array when no plugins have runtimes", async () => {
       mockPluginLoader.getPluginRuntimes.mockReturnValue([]);
@@ -778,6 +834,28 @@ describe("PluginRunner", () => {
   });
 
   describe("new plugin contribution accessors", () => {
+    it("getCliProviderContributions returns cached CLI-provider contributions", async () => {
+      const contributions = [
+        {
+          pluginId: "cursor-plugin",
+          contribution: {
+            providerId: "cursor-cli",
+            displayName: "Cursor CLI",
+            binaryName: "cursor-agent",
+            providerType: "cli",
+            statusRoute: "/providers/cursor-cli/status",
+            authRoute: "/auth/cursor-cli",
+          },
+        },
+      ];
+      mockPluginLoader.getCliProviderContributions.mockReturnValue(contributions);
+      await pluginRunner.init();
+      const first = pluginRunner.getCliProviderContributions();
+      const second = pluginRunner.getCliProviderContributions();
+      expect(first).toEqual(contributions);
+      expect(second).toBe(first);
+    });
+
     it("getPluginSkills returns empty array initially", async () => {
       await pluginRunner.init();
       expect(pluginRunner.getPluginSkills()).toEqual([]);
@@ -793,15 +871,18 @@ describe("PluginRunner", () => {
       expect(second).toBe(first);
     });
 
-    it("returns workflow steps, prompt contributions, and setup info", async () => {
+    it("returns workflow steps, workflow step templates, prompt contributions, and setup info", async () => {
       const steps = [{ pluginId: "test-plugin", step: { stepId: "ws1", name: "Step", description: "d", mode: "prompt", prompt: "Run checks" } }];
+      const templates = [{ pluginId: "test-plugin", template: { id: "plugin:test-plugin:ws1", name: "Step", description: "d", prompt: "Run checks", category: "Plugin", icon: "puzzle" } }];
       const prompts = [{ pluginId: "test-plugin", contribution: { surface: "executor-system", content: "extra" }, config: { enabledByDefault: true, contributions: [] } }];
       const setups = [{ pluginId: "test-plugin", manifest: { binaryName: "agent-browser", description: "Do it" }, hooks: { checkSetup: vi.fn().mockResolvedValue({ status: "installed" }) } }];
       mockPluginLoader.getPluginWorkflowSteps.mockReturnValue(steps);
+      mockPluginLoader.getPluginWorkflowStepTemplates.mockReturnValue(templates);
       mockPluginLoader.getPluginPromptContributions.mockReturnValue(prompts);
       mockPluginLoader.getPluginSetupInfo.mockReturnValue(setups);
       await pluginRunner.init();
       expect(pluginRunner.getPluginWorkflowSteps()).toEqual(steps);
+      expect(pluginRunner.getPluginWorkflowStepTemplates()).toEqual(templates);
       expect(pluginRunner.getPluginPromptContributions()).toEqual(prompts);
       expect(pluginRunner.getPluginSetupInfo()).toEqual(setups);
     });
@@ -830,29 +911,95 @@ describe("PluginRunner", () => {
 
     it("invalidates new contribution caches on state change and loader events", async () => {
       await pluginRunner.init();
+      pluginRunner.getCliProviderContributions();
       pluginRunner.getPluginSkills();
       pluginRunner.getPluginWorkflowSteps();
+      pluginRunner.getPluginWorkflowStepTemplates();
       pluginRunner.getPluginPromptContributions();
       pluginRunner.getPluginSetupInfo();
 
       const stateChanged = mockPluginStore.on.mock.calls.find((call) => call[0] === "plugin:stateChanged")?.[1];
       stateChanged?.();
+      pluginRunner.getCliProviderContributions();
       pluginRunner.getPluginSkills();
       pluginRunner.getPluginWorkflowSteps();
+      pluginRunner.getPluginWorkflowStepTemplates();
       pluginRunner.getPluginPromptContributions();
       pluginRunner.getPluginSetupInfo();
 
       const loaded = mockPluginLoader.on.mock.calls.find((call) => call[0] === "plugin:loaded")?.[1];
       loaded?.({ pluginId: "test-plugin" });
+      pluginRunner.getCliProviderContributions();
       pluginRunner.getPluginSkills();
       pluginRunner.getPluginWorkflowSteps();
+      pluginRunner.getPluginWorkflowStepTemplates();
       pluginRunner.getPluginPromptContributions();
       pluginRunner.getPluginSetupInfo();
 
+      expect(mockPluginLoader.getCliProviderContributions).toHaveBeenCalledTimes(3);
       expect(mockPluginLoader.getPluginSkills).toHaveBeenCalledTimes(3);
       expect(mockPluginLoader.getPluginWorkflowSteps).toHaveBeenCalledTimes(3);
+      expect(mockPluginLoader.getPluginWorkflowStepTemplates).toHaveBeenCalledTimes(3);
       expect(mockPluginLoader.getPluginPromptContributions).toHaveBeenCalledTimes(3);
       expect(mockPluginLoader.getPluginSetupInfo).toHaveBeenCalledTimes(3);
+    });
+
+    it("checkPluginSetup delegates to loader and returns result", async () => {
+      const result = { status: "installed" as const, version: "1.2.3" };
+      mockPluginLoader.checkPluginSetup.mockResolvedValue(result);
+      await expect(pluginRunner.checkPluginSetup("test-plugin")).resolves.toEqual(result);
+      expect(mockPluginLoader.checkPluginSetup).toHaveBeenCalledWith("test-plugin");
+    });
+
+    it("checkPluginSetup returns error status when loader throws", async () => {
+      mockPluginLoader.checkPluginSetup.mockRejectedValue(new Error("check failed"));
+      await expect(pluginRunner.checkPluginSetup("test-plugin")).resolves.toEqual({ status: "error", error: "check failed" });
+    });
+
+    it("installPluginSetup returns success true on success", async () => {
+      await expect(pluginRunner.installPluginSetup("test-plugin")).resolves.toEqual({ success: true });
+      expect(mockPluginLoader.installPluginSetup).toHaveBeenCalledWith("test-plugin");
+    });
+
+    it("installPluginSetup returns success false on failure", async () => {
+      mockPluginLoader.installPluginSetup.mockRejectedValue(new Error("install failed"));
+      await expect(pluginRunner.installPluginSetup("test-plugin")).resolves.toEqual({ success: false, error: "install failed" });
+    });
+
+    it("uninstallPluginSetup returns success and failure results", async () => {
+      await expect(pluginRunner.uninstallPluginSetup("test-plugin")).resolves.toEqual({ success: true });
+      mockPluginLoader.uninstallPluginSetup.mockRejectedValueOnce(new Error("uninstall failed"));
+      await expect(pluginRunner.uninstallPluginSetup("test-plugin")).resolves.toEqual({ success: false, error: "uninstall failed" });
+    });
+
+    it("getSetupStatuses returns statuses for all plugins with setup", async () => {
+      mockPluginLoader.getPluginSetupInfo.mockReturnValue([
+        { pluginId: "a", manifest: { binaryName: "a-bin", description: "A" }, hooks: { checkSetup: vi.fn() } },
+        { pluginId: "b", manifest: { binaryName: "b-bin", description: "B" }, hooks: { checkSetup: vi.fn() } },
+      ]);
+      mockPluginLoader.checkPluginSetup
+        .mockResolvedValueOnce({ status: "installed", version: "1.0.0" })
+        .mockResolvedValueOnce({ status: "not-installed" });
+
+      await expect(pluginRunner.getSetupStatuses()).resolves.toEqual([
+        { pluginId: "a", manifest: { binaryName: "a-bin", description: "A" }, status: { status: "installed", version: "1.0.0" } },
+        { pluginId: "b", manifest: { binaryName: "b-bin", description: "B" }, status: { status: "not-installed" } },
+      ]);
+    });
+
+    it("getSetupStatuses handles setup check failures gracefully", async () => {
+      mockPluginLoader.getPluginSetupInfo.mockReturnValue([
+        { pluginId: "offline", manifest: { binaryName: "off-bin", description: "Offline" }, hooks: { checkSetup: vi.fn() } },
+      ]);
+      mockPluginLoader.checkPluginSetup.mockRejectedValue(new Error("Plugin \"offline\" is not loaded"));
+
+      await expect(pluginRunner.getSetupStatuses()).resolves.toEqual([
+        {
+          pluginId: "offline",
+          manifest: { binaryName: "off-bin", description: "Offline" },
+          status: { status: "error", error: 'Plugin "offline" is not loaded' },
+        },
+      ]);
     });
   });
 

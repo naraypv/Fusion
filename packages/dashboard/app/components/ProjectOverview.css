@@ -36,7 +36,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  font-size: 20px;
+  font-size: calc(var(--space-lg) + var(--space-xs));
   font-weight: 700;
   color: var(--text);
   margin: 0;
@@ -111,8 +111,8 @@
 }
 
 .project-stat--error {
-  border-color: rgba(248, 81, 73, 0.3);
-  background: rgba(248, 81, 73, 0.08);
+  border-color: color-mix(in srgb, var(--color-error) 30%, var(--border));
+  background: color-mix(in srgb, var(--color-error) 8%, transparent);
 }
 
 .project-stat--error .project-stat__value {
@@ -148,13 +148,13 @@
 .project-filter-tab {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  gap: calc(var(--space-sm) - var(--space-xs) * 0.5);
+  padding: calc(var(--space-sm) - var(--space-xs) * 0.5) var(--space-md);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
   font-weight: 500;
   cursor: pointer;
   transition:
@@ -175,23 +175,29 @@
   box-shadow: var(--shadow-sm);
 }
 
+.project-filter-tab:focus-visible {
+  outline: none;
+  border-color: var(--todo);
+  box-shadow: var(--focus-ring-strong);
+}
+
 .project-filter-tab.has-errors {
   color: var(--color-error);
 }
 
 .project-filter-tab.has-errors.active {
-  background: rgba(248, 81, 73, 0.12);
-  border-color: rgba(248, 81, 73, 0.3);
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-error) 30%, var(--border));
 }
 
 .project-filter-count {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  font-size: 11px;
+  min-width: calc(var(--space-lg) + var(--space-xs) * 0.5);
+  height: calc(var(--space-lg) + var(--space-xs) * 0.5);
+  padding: 0 var(--space-xs);
+  font-size: calc(var(--space-sm) + var(--space-xs) * 0.75);
   font-weight: 600;
   font-family: var(--font-mono);
   background: var(--border);
@@ -206,7 +212,7 @@
 }
 
 .project-filter-tab.has-errors .project-filter-count {
-  background: rgba(248, 81, 73, 0.2);
+  background: color-mix(in srgb, var(--color-error) 20%, transparent);
   color: var(--color-error);
 }
 
@@ -216,7 +222,7 @@
   align-items: center;
   gap: var(--space-sm);
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
 }
 
 .project-sort-select {
@@ -225,8 +231,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  font-size: 13px;
-  padding: 6px 28px 6px 10px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
+  padding: calc(var(--space-sm) - var(--space-xs) * 0.5) calc(var(--space-xl) + var(--space-xs)) calc(var(--space-sm) - var(--space-xs) * 0.5) calc(var(--space-sm) + var(--space-xs) * 0.5);
   cursor: pointer;
   font-family: var(--font-primary);
   transition:
@@ -252,7 +258,7 @@
   align-items: center;
   gap: var(--space-sm);
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
 }
 
 .project-node-filter-select {
@@ -261,8 +267,8 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  font-size: 13px;
-  padding: 6px 28px 6px 10px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
+  padding: calc(var(--space-sm) - var(--space-xs) * 0.5) calc(var(--space-xl) + var(--space-xs)) calc(var(--space-sm) - var(--space-xs) * 0.5) calc(var(--space-sm) + var(--space-xs) * 0.5);
   cursor: pointer;
   font-family: var(--font-primary);
   transition:
@@ -309,7 +315,7 @@
 }
 
 .project-overview__no-results p {
-  font-size: 15px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.75);
 }
 
 /* --- Empty State --- */
@@ -327,8 +333,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 80px;
-  height: 80px;
+  width: calc(var(--space-2xl) * 2.5);
+  height: calc(var(--space-2xl) * 2.5);
   background: var(--surface);
   border: 2px dashed var(--border);
   border-radius: var(--radius-xl);
@@ -336,17 +342,17 @@
 }
 
 .project-empty-state__title {
-  font-size: 20px;
+  font-size: calc(var(--space-lg) + var(--space-xs));
   font-weight: 700;
   color: var(--text);
   margin: 0;
 }
 
 .project-empty-state__description {
-  font-size: 14px;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.5);
   color: var(--text-muted);
   line-height: 1.6;
-  max-width: 380px;
+  max-width: calc(var(--space-2xl) * 11.875);
 }
 
 .project-empty-state__cta {
@@ -354,8 +360,8 @@
   align-items: center;
   gap: var(--space-sm);
   margin-top: var(--space-sm);
-  padding: 10px 20px;
-  font-size: 14px;
+  padding: calc(var(--space-sm) + var(--space-xs) * 0.5) calc(var(--space-lg) + var(--space-xs));
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.5);
   font-weight: 600;
 }
 
@@ -428,7 +434,7 @@
 }
 
 .project-skeleton--tab {
-  width: 80px;
+  width: calc(var(--space-2xl) * 2.5);
   height: 32px;
   border-radius: var(--radius-sm);
   animation: skeleton-pulse 1.5s ease-in-out infinite;
@@ -553,7 +559,7 @@
   }
 
   .project-stat__value {
-    font-size: 14px;
+    font-size: calc(var(--space-md) + var(--space-xs) * 0.5);
   }
 
   .project-stat__label {

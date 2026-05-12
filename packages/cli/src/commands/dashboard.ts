@@ -1,5 +1,5 @@
 import type { AddressInfo } from "node:net";
-import { dirname, join, resolve as pathResolve } from "node:path";
+import { join, resolve as pathResolve } from "node:path";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { stat, readdir, readFile as fsReadFile } from "node:fs/promises";
@@ -8,7 +8,6 @@ import {
   AutomationStore,
   CentralCore,
   AgentStore,
-  PluginStore,
   PluginLoader,
   getTaskMergeBlocker,
   getEnabledPiExtensionPaths,
@@ -16,6 +15,7 @@ import {
   DaemonTokenManager,
   GlobalSettingsStore,
   resolveGlobalDir,
+  DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS,
 } from "@fusion/core";
 import {
   createServer,
@@ -37,7 +37,7 @@ import {
 import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getClaudeCodeCredentialPaths, getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
@@ -60,7 +60,7 @@ import {
 } from "./llama-cpp-extension.js";
 import { getCachedUpdateStatus, isUpdateCheckEnabled } from "../update-cache.js";
 import { resolveSelfExtension } from "./self-extension.js";
-import { ensureBundledDependencyGraphPluginInstalled } from "../plugins/bundled-plugin-install.js";
+import { ensureBundledDependencyGraphPluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { syncStartupModels } from "./startup-model-sync.js";
 import { DashboardTUI, DashboardLogSink, isTTYAvailable, type SystemInfo, type GitStatus, type GitCommit, type GitCommitDetail, type GitBranch, type GitWorktree, type FileEntry, type FileReadResult, type TaskStep as TUITaskStep, type TaskLogEntry as TUITaskLogEntry, type TaskDetailData, type TaskEvent } from "./dashboard-tui/index.js";
@@ -147,7 +147,7 @@ function formatUpdateMessage(updateStatus: StartupUpdateStatus | null): string |
     return null;
   }
 
-  return `⬆ Update available: v${updateStatus.latestVersion} (current: v${updateStatus.currentVersion})`;
+  return `⬆ Update available: v${updateStatus.latestVersion} (current: v${updateStatus.currentVersion}). Run \`fn update\` for an installed CLI, or pull the source checkout.`;
 }
 
 export class StreamedLogBuffer {
@@ -1066,11 +1066,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // Enables the PluginManager UI to list, install, enable, disable, and
   // configure plugins via the /api/plugins REST endpoints.
   //
-  const pluginStoreRootDir =
-    typeof (store as { getRootDir?: () => string }).getRootDir === "function"
-      ? store.getRootDir()
-      : dirname(store.getFusionDir());
-  const pluginStore = new PluginStore(pluginStoreRootDir);
+  const pluginStore = store.getPluginStore();
   await pluginStore.init();
 
   // ── PluginLoader: plugin lifecycle management ───────────────────────
@@ -1098,6 +1094,35 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       "plugins",
     );
   }
+
+  // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip).
+  // Invoked by dashboard's PUT /api/plugins/:id/settings the first time the
+  // user clicks Save in Settings. Returns true if the plugin is now registered.
+  const ensureBundledPluginInstalledCallback = async (pluginId: string): Promise<boolean> => {
+    if (!isBundledPluginId(pluginId)) {
+      logSink.log(`ensureBundledPluginInstalled: unknown bundled plugin id "${pluginId}"`, "plugins");
+      return false;
+    }
+    try {
+      const status = await ensureBundledPluginInstalled(pluginStore, pluginLoader, pluginId);
+      if (status === "missing-bundle") {
+        logSink.log(`Bundled plugin "${pluginId}" was not found in this build`, "plugins");
+        return false;
+      }
+      if (status === "installed") {
+        logSink.log(`Installed bundled plugin "${pluginId}"`, "plugins");
+      } else if (status === "updated") {
+        logSink.log(`Updated bundled plugin "${pluginId}"`, "plugins");
+      }
+      return true;
+    } catch (err) {
+      logSink.log(
+        `Failed to auto-install bundled plugin "${pluginId}": ${err instanceof Error ? err.message : err}`,
+        "plugins",
+      );
+      throw err;
+    }
+  };
 
   // Auto-load all enabled plugins so runtime UI (NewAgentDialog, AgentDetailView)
   // can discover installed runtimes like Hermes and OpenClaw.
@@ -1220,6 +1245,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   const supplementalAuthStorage = createReadOnlyAuthFileStorage([
     ...getLegacyAuthPaths(),
     getCodexCliAuthPath(),
+    ...getClaudeCodeCredentialPaths(),
   ]);
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, [supplementalAuthStorage]);
   const modelRegistry = ModelRegistry.create(mergedAuthStorage, getModelRegistryModelsPath());
@@ -1544,6 +1570,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       pluginStore,
       pluginLoader,
       pluginRunner: pluginLoader,
+      ensureBundledPluginInstalled: ensureBundledPluginInstalledCallback,
       onProjectFirstAccessed: (projectId: string) => engineManager.onProjectAccessed(projectId),
       onProjectRegistered: ({ path }) => {
         maybeInstallClaudeSkillForNewProject(path);
@@ -1750,25 +1777,62 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       triggerScheduler.start();
 
       const agents = await agentStore.listAgents();
+      const missedCatchupTargets: { agentId: string; lastHeartbeatAt: string }[] = [];
       for (const agent of agents) {
-        // State is the source of truth: arm timers only for non-ephemeral
-        // agents that are currently active/running. Transitions into
+        // State is the source of truth: arm timers only for non-ephemeral,
+        // heartbeat-enabled agents in tickable states. Transitions into
         // tickable states while the scheduler is already running are
-        // handled by the scheduler's own agent:updated listener.
+        // handled by the scheduler's own lifecycle listeners.
         if (isEphemeralAgent(agent)) continue;
-        if (agent.state !== "active" && agent.state !== "running") continue;
+        if (agent.runtimeConfig?.enabled === false) continue;
+        if (agent.state !== "active" && agent.state !== "running" && agent.state !== "idle") continue;
         const rc = agent.runtimeConfig;
+        const intervalMs = (rc?.heartbeatIntervalMs as number | undefined) ?? DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS;
         triggerScheduler.registerAgent(
           agent.id,
           {
+            enabled: rc?.enabled as boolean | undefined,
             heartbeatIntervalMs: rc?.heartbeatIntervalMs as number | undefined,
             maxConcurrentRuns: rc?.maxConcurrentRuns as number | undefined,
           },
           { lastHeartbeatAt: agent.lastHeartbeatAt },
         );
+
+        // Per-agent opt-in: if the server was down across a scheduled tick,
+        // fire one catch-up heartbeat. We require explicit lastHeartbeatAt to
+        // avoid firing on agents that have never run.
+        if (
+          rc?.runMissedHeartbeatOnStartup === true
+          && rc?.enabled !== false
+          && typeof agent.lastHeartbeatAt === "string"
+          && agent.lastHeartbeatAt.length > 0
+        ) {
+          const lastMs = Date.parse(agent.lastHeartbeatAt);
+          if (Number.isFinite(lastMs) && Date.now() - lastMs > intervalMs) {
+            missedCatchupTargets.push({ agentId: agent.id, lastHeartbeatAt: agent.lastHeartbeatAt });
+          }
+        }
       }
       if (agents.length > 0) {
         logSink.log(`Registered ${triggerScheduler.getRegisteredAgents().length} agents for heartbeat triggers`, "engine");
+      }
+
+      for (const target of missedCatchupTargets) {
+        const monitor = heartbeatMonitorImpl;
+        if (!monitor) break;
+        logSink.log(
+          `Firing catch-up heartbeat for ${target.agentId} (lastHeartbeatAt=${target.lastHeartbeatAt})`,
+          "engine",
+        );
+        // Fire and forget; serialized per-agent inside executeHeartbeat.
+        void monitor.executeHeartbeat({
+          agentId: target.agentId,
+          source: "timer",
+          triggerDetail: "startup-missed-heartbeat-catchup",
+        }).catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          logSink.warn(`Catch-up heartbeat for ${target.agentId} failed: ${message}`, "engine");
+        });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1805,6 +1869,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       pluginStore,
       pluginLoader,
       pluginRunner: pluginLoader,
+      ensureBundledPluginInstalled: ensureBundledPluginInstalledCallback,
       onProjectRegistered: ({ path }) => {
         maybeInstallClaudeSkillForNewProject(path);
       },

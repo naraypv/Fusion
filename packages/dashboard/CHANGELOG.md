@@ -1,5 +1,132 @@
 # @fusion/dashboard
 
+## 0.27.0
+
+### Patch Changes
+
+- @fusion/core@0.27.0
+- @fusion/engine@0.27.0
+- @fusion-plugin-examples/cli-printing-press@0.1.2
+- @fusion-plugin-examples/dependency-graph@0.1.16
+- @fusion-plugin-examples/roadmap@0.1.4
+- @fusion-plugin-examples/cursor-runtime@0.1.4
+- @fusion-plugin-examples/droid-runtime@0.1.11
+- @fusion-plugin-examples/hermes-runtime@0.2.35
+- @fusion-plugin-examples/openclaw-runtime@0.2.35
+- @fusion-plugin-examples/paperclip-runtime@0.2.35
+
+## 0.26.0
+
+### Patch Changes
+
+- @fusion/core@0.26.0
+- @fusion/engine@0.26.0
+- @fusion-plugin-examples/dependency-graph@0.1.15
+- @fusion-plugin-examples/roadmap@0.1.3
+- @fusion-plugin-examples/cursor-runtime@0.1.3
+- @fusion-plugin-examples/droid-runtime@0.1.10
+- @fusion-plugin-examples/hermes-runtime@0.2.34
+- @fusion-plugin-examples/openclaw-runtime@0.2.34
+- @fusion-plugin-examples/paperclip-runtime@0.2.34
+
+## 0.25.0
+
+### Patch Changes
+
+- @fusion/core@0.25.0
+- @fusion/engine@0.25.0
+- @fusion-plugin-examples/dependency-graph@0.1.14
+- @fusion-plugin-examples/roadmap@0.1.2
+- @fusion-plugin-examples/cursor-runtime@0.1.2
+- @fusion-plugin-examples/droid-runtime@0.1.9
+- @fusion-plugin-examples/hermes-runtime@0.2.33
+- @fusion-plugin-examples/openclaw-runtime@0.2.33
+- @fusion-plugin-examples/paperclip-runtime@0.2.33
+
+## 0.24.0
+
+### Patch Changes
+
+- @fusion/core@0.24.0
+- @fusion/engine@0.24.0
+- @fusion-plugin-examples/dependency-graph@0.1.13
+- @fusion-plugin-examples/roadmap@0.1.1
+- @fusion-plugin-examples/cursor-runtime@0.1.1
+- @fusion-plugin-examples/droid-runtime@0.1.8
+- @fusion-plugin-examples/hermes-runtime@0.2.32
+- @fusion-plugin-examples/openclaw-runtime@0.2.32
+- @fusion-plugin-examples/paperclip-runtime@0.2.32
+
+## 0.23.0
+
+### Patch Changes
+
+- @fusion/core@0.23.0
+- @fusion/engine@0.23.0
+- @fusion-plugin-examples/dependency-graph@0.1.12
+- @fusion-plugin-examples/droid-runtime@0.1.7
+- @fusion-plugin-examples/hermes-runtime@0.2.31
+- @fusion-plugin-examples/openclaw-runtime@0.2.31
+- @fusion-plugin-examples/paperclip-runtime@0.2.31
+
+## 0.22.0
+
+### Minor Changes
+
+- e658e8e: Decouple permanent agent heartbeats from task state, and add per-agent `allowParallelExecution` setting.
+
+  Heartbeats now run for permanent agents regardless of bound-task block state — the prior early-exit on `queued + blockedBy` is removed along with its dead state-tracking machinery. `HEARTBEAT_SYSTEM_PROMPT` is rewritten to scope heartbeats to ambient coordination (messaging, memory, finding work, delegation, surfacing/chasing blockers, status); task body work continues to run via the executor path. Ephemeral agents are unchanged — they don't run heartbeats and their blocked-task gating in the scheduler is untouched.
+
+  New `allowParallelExecution` flag (default `true`, permanent agents only) on `AgentHeartbeatConfig`. When `false`, the heartbeat and task executor paths serialize symmetrically: a heartbeat will not start while the agent's bound task has an active executor session, and an executor session will not start while the agent has an active heartbeat run. Either side re-dispatches the other's deferred work on completion via `resumeTaskForAgent` and the in-process runtime's `onRunCompleted` hook.
+
+  UI toggle surfaces in the agent's Heartbeat Settings tab alongside `runMissedHeartbeatOnStartup`.
+
+- bb32765: Add a "Tools: On/Off" toggle next to the existing "Markdown/Plain" toggle in the agent log viewer (used by both agent logs and task agent logs). When tool output is off, entries of type `tool` / `tool_result` / `tool_error` are hidden — only agent text and thinking are shown. Both toggles now persist globally across sessions via `localStorage` (`fn-agent-log-markdown`, `fn-agent-log-tool-output`).
+
+### Patch Changes
+
+- 9d13295: Move the agent Import button to the global agents header, next to "New Agent", and remove it from individual agent detail pages and the controls panel.
+- 11e5f69: Show provider icons in chat: small icon next to the model name in the sidebar session list, and replace the generic robot icon in the chat thread header and assistant message avatars with the active provider icon.
+- 24017b8: Drop residual `terminated` AgentState references that the merger autostash dropped during FN-3530 cleanup: `[data-state="terminated"]` selectors in `AgentListModal.css`, `--terminated` CSS-class assertions in `agent-css-classes.test.ts`, and a `state: "terminated"` test fixture in `routes-agents.test.ts` (now `paused`, which is correctly rejected as paused→paused is not a valid transition).
+- Updated dependencies [e658e8e]
+- Updated dependencies [aecc050]
+- Updated dependencies [6ee3225]
+- Updated dependencies [81bf882]
+  - @fusion/core@0.22.0
+  - @fusion/engine@0.22.0
+  - @fusion-plugin-examples/dependency-graph@0.1.11
+  - @fusion-plugin-examples/droid-runtime@0.1.6
+  - @fusion-plugin-examples/hermes-runtime@0.2.30
+  - @fusion-plugin-examples/openclaw-runtime@0.2.30
+  - @fusion-plugin-examples/paperclip-runtime@0.2.30
+
+## 0.21.0
+
+### Patch Changes
+
+- e6fd593: Differentiate the CLI banner between missing-install and version-mismatch states: when the installed `fn`/`fusion` CLI is out of date, show "Update the Fusion CLI" with current vs target versions and an "Update with npm" button instead of the generic install copy.
+- dc8863d: Add `blocked` to `FeatureStatus` so blocked features render with mission-blocked colors in the mission manager.
+  - @fusion/core@0.21.0
+  - @fusion/engine@0.21.0
+  - @fusion-plugin-examples/dependency-graph@0.1.10
+  - @fusion-plugin-examples/droid-runtime@0.1.5
+  - @fusion-plugin-examples/hermes-runtime@0.2.29
+  - @fusion-plugin-examples/openclaw-runtime@0.2.29
+  - @fusion-plugin-examples/paperclip-runtime@0.2.29
+
+## 0.20.0
+
+### Patch Changes
+
+- ba6666f: Fix Planning Mode modal getting stuck at partial height on mobile. Two issues: (1) `useModalResizePersist` was replaying a desktop-saved pixel height into the inline `style` attribute, overriding the mobile `height: 100dvh` rule and leaving the modal at half-screen even before the keyboard appeared — now skipped on touch devices ≤768px wide. (2) When the iOS keyboard was dismissed, React reconciled the removed CSS custom properties (`--vv-height`, `--keyboard-overlap`, `--vv-offset-top`) by setting them to empty string instead of calling `removeProperty()`. On Safari that left `var(--vv-height, 100dvh)` resolving to empty (the fallback only kicks in when the variable is undefined), collapsing the modal to content height — now driven imperatively via `setProperty`/`removeProperty` on the modal ref.
+  - @fusion/core@0.20.0
+  - @fusion/engine@0.20.0
+  - @fusion-plugin-examples/dependency-graph@0.1.9
+  - @fusion-plugin-examples/droid-runtime@0.1.4
+  - @fusion-plugin-examples/hermes-runtime@0.2.28
+  - @fusion-plugin-examples/openclaw-runtime@0.2.28
+  - @fusion-plugin-examples/paperclip-runtime@0.2.28
+
 ## 0.19.0
 
 ### Patch Changes

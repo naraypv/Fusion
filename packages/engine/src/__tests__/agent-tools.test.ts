@@ -14,11 +14,13 @@ import {
   createReadMessagesTool,
   createResearchTools,
   qmdAgentMemoryCollectionName,
+  readAgentMemoryWorkspaceLongTerm,
   sendMessageParams,
   readMessagesParams,
 } from "../agent-tools.js";
 import * as core from "@fusion/core";
 import type { MessageStore, Message } from "@fusion/core";
+import { getEnabledPluginTools, getResearchToolSurfaceStatus } from "../tool-availability.js";
 
 const loggerSpies = vi.hoisted(() => ({
   log: vi.fn(),
@@ -58,6 +60,30 @@ vi.mock("node:child_process", async () => {
     ...actual,
     execFile: execFileMock,
   };
+});
+
+describe("tool availability helpers", () => {
+  it("treats research surface as disabled when researchView experimental flag is off", () => {
+    expect(getResearchToolSurfaceStatus({ experimentalFeatures: { researchView: false } } as any)).toEqual({
+      enabled: false,
+      reason: "experimental-disabled",
+    });
+  });
+
+  it("treats research surface as enabled when researchView experimental flag is on", () => {
+    expect(getResearchToolSurfaceStatus({ experimentalFeatures: { researchView: true } } as any)).toEqual({
+      enabled: true,
+      reason: "enabled",
+    });
+  });
+
+  it("resolves legacy experimental feature aliases through core helper", () => {
+    expect(core.isExperimentalFeatureEnabled({ experimentalFeatures: { devServer: true } } as any, "devServerView")).toBe(true);
+  });
+
+  it("returns no plugin tools when plugin runner is absent", () => {
+    expect(getEnabledPluginTools(undefined)).toEqual([]);
+  });
 });
 
 describe("createTaskCreateTool", () => {
@@ -136,6 +162,23 @@ describe("createDelegateTaskTool", () => {
     }), expect.objectContaining({
       settings: { autoSummarizeTitles: false },
     }));
+  });
+
+  it("forwards override=true marker in source metadata", async () => {
+    const agentStore = {
+      getAgent: vi.fn().mockResolvedValue({ id: "agent-2", name: "Planner", role: "triage", state: "idle" }),
+    };
+    const taskStore = {
+      getSettings: vi.fn().mockResolvedValue({ autoSummarizeTitles: false }),
+      createTask: vi.fn().mockResolvedValue({ id: "FN-102", dependencies: [], description: "Delegated" }),
+    };
+
+    const tool = createDelegateTaskTool(agentStore as any, taskStore as any);
+    await tool.execute("call-1", { agent_id: "agent-2", description: "Delegated", override: true } as any, undefined, undefined, {} as any);
+
+    expect(taskStore.createTask).toHaveBeenCalledWith(expect.objectContaining({
+      source: { sourceType: "api", sourceMetadata: { executorRoleOverride: true } },
+    }), expect.any(Object));
   });
 
   it("wires title summarization callback when rootDir is provided", async () => {
@@ -237,11 +280,15 @@ describe("createMemoryTools", () => {
   });
 
   it("includes fn_memory_append for writable memory backends", () => {
-    expect(createMemoryTools("/repo", { memoryBackendType: "file" }).map((tool) => tool.name)).toEqual([
+    const tools = createMemoryTools("/repo", { memoryBackendType: "file" });
+    expect(tools.map((tool) => tool.name)).toEqual([
       "fn_memory_search",
       "fn_memory_get",
       "fn_memory_append",
     ]);
+    const appendTool = tools.find((tool) => tool.name === "fn_memory_append");
+    expect(appendTool?.description).toContain('scope="agent"');
+    expect(appendTool?.description).toContain('scope="project"');
   });
 
   it("searches per-agent memory through the fn_memory_search tool", async () => {
@@ -389,6 +436,45 @@ describe("createMemoryTools", () => {
     ]);
   });
 
+  it("readAgentMemoryWorkspaceLongTerm returns empty string when MEMORY.md is missing", async () => {
+    await expect(readAgentMemoryWorkspaceLongTerm(tempDir, "ceo-agent")).resolves.toBe("");
+  });
+
+  it("readAgentMemoryWorkspaceLongTerm returns trimmed MEMORY.md contents", async () => {
+    const tools = createMemoryTools(tempDir, { memoryBackendType: "file" }, {
+      agentMemory: {
+        agentId: "ceo-agent",
+        agentName: "CEO",
+        memory: "",
+      },
+    });
+    const appendTool = tools.find((tool) => tool.name === "fn_memory_append")!;
+    await (appendTool as any).execute("call-1", {
+      scope: "agent",
+      layer: "long-term",
+      content: "  durable memory content  ",
+    }, undefined, undefined, undefined);
+
+    await expect(readAgentMemoryWorkspaceLongTerm(tempDir, "ceo-agent")).resolves.toContain("durable memory content");
+  });
+
+  it("readAgentMemoryWorkspaceLongTerm reads sanitized agent ids", async () => {
+    const tools = createMemoryTools(tempDir, { memoryBackendType: "file" }, {
+      agentMemory: {
+        agentId: "Agent X/1",
+        agentName: "CEO",
+        memory: "",
+      },
+    });
+    const appendTool = tools.find((tool) => tool.name === "fn_memory_append")!;
+    await (appendTool as any).execute("call-1", {
+      scope: "agent",
+      layer: "long-term",
+      content: "- sanitized id memory",
+    }, undefined, undefined, undefined);
+
+    await expect(readAgentMemoryWorkspaceLongTerm(tempDir, "Agent X/1")).resolves.toContain("sanitized id memory");
+  });
 
   it("logs a warning and continues when agent memory directory read fails", async () => {
     readdirMock.mockRejectedValueOnce(new Error("EACCES"));
@@ -428,7 +514,7 @@ describe("createMemoryTools", () => {
               score: 0.8,
             },
             {
-              path: "qmd://fusion-agent-memory/.fusion/agent-memory/ceo-agent/2026-05-01.md",
+              path: join(tempDir, ".fusion", "agent-memory", "ceo-agent", "2026-05-01.md"),
               snippet: "Daily note about delegation follow-up",
               lineStart: 1,
               lineEnd: 2,
@@ -643,6 +729,7 @@ function createMockMessageStore(overrides: Partial<MessageStore> = {}): MessageS
   return {
     sendMessage: vi.fn(),
     getInbox: vi.fn().mockReturnValue([]),
+    getMessage: vi.fn().mockReturnValue(null),
     markAsRead: vi.fn(),
     markAllAsRead: vi.fn(),
     ...overrides,
@@ -712,6 +799,23 @@ describe("createSendMessageTool", () => {
     );
   });
 
+  it.each(["dashboard", "user:dashboard", "User: user:dashboard"])(
+    "infers agent-to-user when type is omitted for dashboard alias '%s'",
+    async (dashboardAlias) => {
+      const mockMessage = createMessage({ toId: "dashboard", toType: "user", type: "agent-to-user" });
+      vi.mocked(messageStore.sendMessage).mockReturnValue(mockMessage);
+
+      await executeTool(tool, {
+        to_id: dashboardAlias,
+        content: "Test",
+      });
+
+      expect(messageStore.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ toId: "dashboard", toType: "user", type: "agent-to-user" }),
+      );
+    },
+  );
+
   it("uses provided type when specified and maps recipient type for agent-to-user", async () => {
     const mockMessage = createMessage({ toType: "user", type: "agent-to-user" });
     vi.mocked(messageStore.sendMessage).mockReturnValue(mockMessage);
@@ -726,6 +830,24 @@ describe("createSendMessageTool", () => {
       expect.objectContaining({ type: "agent-to-user", toType: "user" })
     );
   });
+
+  it.each(["dashboard", "user:dashboard", "User: user:dashboard"])(
+    "canonicalizes dashboard alias '%s' for agent-to-user sends",
+    async (dashboardAlias) => {
+      const mockMessage = createMessage({ toId: "dashboard", toType: "user", type: "agent-to-user" });
+      vi.mocked(messageStore.sendMessage).mockReturnValue(mockMessage);
+
+      await executeTool(tool, {
+        to_id: dashboardAlias,
+        content: "Status",
+        type: "agent-to-user",
+      });
+
+      expect(messageStore.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ toId: "dashboard", toType: "user", type: "agent-to-user" }),
+      );
+    },
+  );
 
   it("maps recipient type to agent for agent-to-agent messages", async () => {
     const mockMessage = createMessage({ toType: "agent", type: "agent-to-agent" });
@@ -1021,7 +1143,66 @@ describe("createReadMessagesTool", () => {
     expect((text as { text: string }).text).toContain("Messages (2)");
     expect((text as { text: string }).text).toContain("[unread] [id: msg-1] [from: agent:agent-2] Hello there");
     expect((text as { text: string }).text).toContain("[read] [id: msg-2] [from: user:user-1] Another message");
-    expect(result.details).toEqual({ messages });
+    expect(result.details).toEqual({ messages, threadContext: [] });
+  });
+
+  it("includes reply-parent context inline and in details when message links to a parent", async () => {
+    const child = createMessage({
+      id: "msg-child",
+      content: "Follow-up question",
+      metadata: { replyTo: { messageId: "msg-parent" } } as any,
+    });
+    const parent = createMessage({
+      id: "msg-parent",
+      fromId: "agent-9",
+      fromType: "agent",
+      content: "Parent message context",
+    });
+    vi.mocked(messageStore.getInbox).mockReturnValue([child]);
+    vi.mocked(messageStore.getMessage).mockReturnValue(parent);
+
+    const result = await executeTool(tool, {});
+    const text = result.content[0] as { type: string; text: string };
+
+    expect(text.text).toContain("↳ reply-to [id: msg-parent] [from: agent:agent-9] Parent message context");
+    expect(result.details).toEqual({
+      messages: [child],
+      threadContext: [{
+        messageId: "msg-child",
+        replyTo: {
+          parentMessageId: "msg-parent",
+          parentMessage: parent,
+          missingParent: false,
+        },
+      }],
+    });
+  });
+
+  it("surfaces missing-parent context without changing base inbox behavior", async () => {
+    const child = createMessage({
+      id: "msg-child",
+      content: "Follow-up question",
+      metadata: { replyTo: { messageId: "msg-missing" } } as any,
+    });
+    vi.mocked(messageStore.getInbox).mockReturnValue([child]);
+    vi.mocked(messageStore.getMessage).mockReturnValue(null);
+
+    const result = await executeTool(tool, {});
+    const text = result.content[0] as { type: string; text: string };
+
+    expect(text.text).toContain("↳ reply-to [id: msg-missing] (missing parent message)");
+    expect(result.details).toEqual({
+      messages: [child],
+      threadContext: [{
+        messageId: "msg-child",
+        replyTo: {
+          parentMessageId: "msg-missing",
+          parentMessage: null,
+          missingParent: true,
+        },
+      }],
+    });
+    expect(messageStore.getInbox).toHaveBeenCalledWith("agent-1", "agent", { read: false, limit: 20 });
   });
 
   it("returns error when messageStore.getInbox throws", async () => {

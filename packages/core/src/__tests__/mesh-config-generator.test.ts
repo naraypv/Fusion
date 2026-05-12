@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManagedDockerNode, MeshConnectionConfig } from "../types.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
@@ -224,6 +224,14 @@ describe("MeshConfigGenerator", () => {
   // ── applyConfig ────────────────────────────────────────────────────────
 
   describe("applyConfig", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     const config: MeshConnectionConfig = {
       nodeApiKey: "test-key",
       reachableUrl: "http://localhost:4041",
@@ -249,7 +257,9 @@ describe("MeshConfigGenerator", () => {
         containerId: "new-container-id",
       });
 
-      await generator.applyConfig("dn_test123", config, { host: undefined });
+      const applyPromise = generator.applyConfig("dn_test123", config, { host: undefined });
+      await vi.advanceTimersByTimeAsync(2_500);
+      await applyPromise;
 
       // Status set to "recreating" first
       expect(mockCentral.updateManagedDockerNode).toHaveBeenCalledWith(
@@ -377,17 +387,19 @@ describe("MeshConfigGenerator", () => {
 
       // Use fake timers to speed up the timeout test
       vi.useFakeTimers();
-      const resultPromise = generator.registerInMesh("dn_test123", config);
+      try {
+        const resultPromise = generator.registerInMesh("dn_test123", config);
 
-      // Fast-forward through the polling
-      await vi.advanceTimersByTimeAsync(35_000);
+        // Fast-forward through the polling
+        await vi.advanceTimersByTimeAsync(35_000);
 
-      const result = await resultPromise;
+        const result = await resultPromise;
 
-      expect(result.isHealthy).toBe(false);
-      expect(result.error).toContain("did not reach online status");
-
-      vi.useRealTimers();
+        expect(result.isHealthy).toBe(false);
+        expect(result.error).toContain("did not reach online status");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("re-throws when registration fails", async () => {
@@ -415,6 +427,14 @@ describe("MeshConfigGenerator", () => {
   // ── provisionAndRegister ──────────────────────────────────────────────
 
   describe("provisionAndRegister", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it("runs full end-to-end flow: generate → apply → register", async () => {
       const generator = createGenerator();
       const node = createManagedNode();
@@ -429,13 +449,16 @@ describe("MeshConfigGenerator", () => {
       mockCentral.linkManagedDockerNodeToNode.mockResolvedValue(node);
       mockCentral.checkNodeHealth.mockResolvedValue("online");
 
-      const result = await generator.provisionAndRegister({
+      const resultPromise = generator.provisionAndRegister({
         managedNode: node,
         orchestratorUrl: "http://orchestrator:4040",
         orchestratorApiKey: "orch-key",
         nodeApiKey: "my-key",
         containerPort: 4041,
       });
+
+      await vi.advanceTimersByTimeAsync(2_500);
+      const result = await resultPromise;
 
       expect(result.isHealthy).toBe(true);
       expect(result.config.nodeApiKey).toBe("my-key");
@@ -482,13 +505,15 @@ describe("MeshConfigGenerator", () => {
       mockDockerClient.recreateContainer.mockResolvedValue("new-container-id");
       mockCentral.registerNode.mockRejectedValue(new Error("Registration failed"));
 
-      await expect(
-        generator.provisionAndRegister({
-          managedNode: node,
-          orchestratorUrl: "http://orchestrator:4040",
-          orchestratorApiKey: "orch-key",
-        }),
-      ).rejects.toThrow("Registration failed");
+      const resultPromise = generator.provisionAndRegister({
+        managedNode: node,
+        orchestratorUrl: "http://orchestrator:4040",
+        orchestratorApiKey: "orch-key",
+      });
+      const assertion = expect(resultPromise).rejects.toThrow("Registration failed");
+
+      await vi.advanceTimersByTimeAsync(2_500);
+      await assertion;
 
       expect(mockCentral.updateManagedDockerNode).toHaveBeenCalledWith(
         "dn_test123",

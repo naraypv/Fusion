@@ -1,7 +1,12 @@
 import "./ExecutorStatusBar.css";
 import { useMemo, useState } from "react";
-import type { Task } from "@fusion/core";
+import {
+  HIGH_FANOUT_BLOCKER_TODO_THRESHOLD,
+  STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS,
+  type Task,
+} from "@fusion/core";
 import { AlertTriangle, Clock, Folder, Pause, Play, Zap } from "lucide-react";
+import { computeBlockerFanoutMap } from "../hooks/useBlockerFanout";
 import { useExecutorStats } from "../hooks/useExecutorStats";
 import type { ExecutorState, AiSessionSummary } from "../api";
 import { BackgroundTasksIndicator } from "./BackgroundTasksIndicator";
@@ -13,6 +18,8 @@ interface ExecutorStatusBarProps {
   projectId?: string;
   /** Project-level stuck task timeout in milliseconds (undefined = disabled) */
   taskStuckTimeoutMs?: number;
+  /** Age threshold in milliseconds before high fan-out blockers escalate in dashboard surfaces. */
+  staleHighFanoutBlockerAgeThresholdMs?: number;
   /** Background AI sessions */
   backgroundSessions?: AiSessionSummary[];
   backgroundGenerating?: number;
@@ -25,6 +32,10 @@ interface ExecutorStatusBarProps {
   currentProjectPath?: string;
   /** Opens the workspace-aware file browser to the project workspace. */
   onOpenProjectDirectory?: () => void;
+  /** When true on mobile, hide the bar so it doesn't slide over messages
+   *  during visualViewport pans (position:fixed is anchored to layout
+   *  viewport, which iOS leaves below the keyboard). */
+  keyboardOpen?: boolean;
 }
 
 /**
@@ -74,13 +85,32 @@ function getStateDisplay(state: ExecutorState): { label: string; color: string; 
  * - Executor state badge (idle/running/paused)
  * - Last activity timestamp
  */
-export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, backgroundSessions, backgroundGenerating, backgroundNeedsInput, onOpenBackgroundSession, onDismissBackgroundSession, lastFetchTimeMs, currentProjectPath, onOpenProjectDirectory }: ExecutorStatusBarProps) {
+export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, staleHighFanoutBlockerAgeThresholdMs, backgroundSessions, backgroundGenerating, backgroundNeedsInput, onOpenBackgroundSession, onDismissBackgroundSession, lastFetchTimeMs, currentProjectPath, onOpenProjectDirectory, keyboardOpen }: ExecutorStatusBarProps) {
+  if (keyboardOpen) return null;
   const { stats, loading, error } = useExecutorStats(tasks, projectId, taskStuckTimeoutMs, lastFetchTimeMs);
   const [isProjectPathVisible, setIsProjectPathVisible] = useState(false);
 
   const stateDisplay = useMemo(() => getStateDisplay(stats.executorState), [stats.executorState]);
 
   const relativeTime = useMemo(() => formatRelativeTime(stats.lastActivityAt), [stats.lastActivityAt]);
+
+  const highestEscalatedBlocker = useMemo(() => {
+    const fanoutMap = computeBlockerFanoutMap(tasks, {
+      staleHighFanoutAgeThresholdMs:
+        staleHighFanoutBlockerAgeThresholdMs ?? STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS,
+    });
+    const candidates = Array.from(fanoutMap.values())
+      .map((entry) => entry.escalation)
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+      .sort((a, b) => {
+        if (b.activeTodoCount !== a.activeTodoCount) return b.activeTodoCount - a.activeTodoCount;
+        if (b.totalActiveCount !== a.totalActiveCount) return b.totalActiveCount - a.totalActiveCount;
+        if (b.blockingAgeMs !== a.blockingAgeMs) return b.blockingAgeMs - a.blockingAgeMs;
+        return a.blockerId.localeCompare(b.blockerId, "en", { numeric: true, sensitivity: "base" });
+      });
+
+    return candidates[0] ?? null;
+  }, [tasks, staleHighFanoutBlockerAgeThresholdMs]);
 
   const StateIcon = stateDisplay.icon;
 
@@ -181,6 +211,22 @@ export function ExecutorStatusBar({ tasks, projectId, taskStuckTimeoutMs, backgr
         <span className="executor-status-bar__label">In Review</span>
         <span className="executor-status-bar__count">{stats.inReviewCount}</span>
       </div>
+
+      {highestEscalatedBlocker && (
+        <>
+          <span className="executor-status-bar__divider" aria-hidden="true" />
+          <div className="executor-status-bar__segment executor-status-bar__segment--fanout">
+            <span className="executor-status-bar__indicator executor-status-bar__indicator--fanout executor-status-bar__indicator--active" aria-hidden="true" />
+            <span className="executor-status-bar__label">Escalated</span>
+            <span
+              className="executor-status-bar__fanout-summary"
+              title={`Escalated blocker ${highestEscalatedBlocker.blockerId}: ${highestEscalatedBlocker.activeTodoCount} todo waiting (threshold ${HIGH_FANOUT_BLOCKER_TODO_THRESHOLD}), ${highestEscalatedBlocker.totalActiveCount} active total`}
+            >
+              {highestEscalatedBlocker.blockerId} · {highestEscalatedBlocker.activeTodoCount} todo
+            </span>
+          </div>
+        </>
+      )}
 
       {currentProjectPath && onOpenProjectDirectory && (
         <>

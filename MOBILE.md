@@ -67,6 +67,7 @@ The dashboard includes a PWA manifest (`packages/dashboard/app/public/manifest.j
 - Installed standalone mode sets `--standalone-bottom-gap` via `@media (display-mode: standalone) { :root { ... } }`.
 - Bottom spacing must stay scoped to layout/component rules (for example mobile content padding and footer/nav offsets), not global `#root` padding.
 - Keep standalone spacing additive with existing safe-area handling (`env(safe-area-inset-bottom, 0px)`).
+- The `.project-content` wrapper is the single source of truth for mobile-nav/footer/standalone bottom reservation; inline dashboard tabs (for example Agents and Missions) must only apply their own content padding and must not re-add `--mobile-nav-height` or duplicate footer spacing.
 
 Install from browser:
 
@@ -77,9 +78,27 @@ Install from browser:
 
 ## Mobile UX Behavior
 
+### Native shell onboarding and connection profiles
+
+First launch in the mobile shell enters a shell-level remote connection onboarding flow before dashboard model onboarding.
+
+For the canonical flow (QR/manual setup, saved profiles, active-profile behavior, and security caveats), see [Native Shell Connection Guide](./docs/native-shell.md).
+
+Implementation notes:
+- Mobile shell profiles are persisted in shell-local storage (Capacitor Preferences), separate from Fusion project/global settings.
+- Active-profile deletion fallback is shell-owned: deleting the active profile promotes the first remaining profile, and deleting the final profile resets to a clean empty state.
+- The dashboard consumes this through the shared `window.fusionShell` connection APIs.
+
 ### Planning Mode
 
 Planning Mode opens directly into the composer pane on mobile when no planning sessions exist, avoiding an empty-sidebar dead end. On desktop/tablet the split view is unaffected. Once sessions are saved, mobile shows the session list as usual and the user can navigate between list and detail panes.
+
+### Chat and Quick Chat mobile scroll/readability behavior
+
+- Chat and Quick Chat must keep scrolling container-scoped (`.chat-messages` / `.quick-chat-panel-messages`) and must not switch to page-level scroll APIs (including `scrollIntoView()`) to avoid mobile Safari viewport drift.
+- Full Chat direct-thread mobile headers include a title-triggered quick session switcher; preserve one-pane behavior (back-to-list still works) and keep the switcher scoped to direct sessions only (room threads keep existing room header/back behavior).
+- Both surfaces now pause live-tail autoscroll when the user scrolls away from bottom, show a temporary **Latest** jump control, and resume tail-follow only after jumping back.
+- Mobile bubble widths are intentionally slightly wider for readability, but safe-area padding, full-screen Quick Chat bounds, and compact mobile tool-call summaries must remain intact.
 
 ## CI/CD Pipeline
 

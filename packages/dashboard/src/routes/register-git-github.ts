@@ -1,7 +1,14 @@
 import { type NextFunction, type Request, type Response } from "express";
 import { isAbsolute } from "node:path";
 import { spawn } from "node:child_process";
-import type { BatchStatusEntry, BatchStatusResponse, BatchStatusResult, IssueInfo, PrInfo, TaskStore } from "@fusion/core";
+import type {
+  BatchStatusEntry,
+  BatchStatusResponse,
+  BatchStatusResult,
+  IssueInfo,
+  PrInfo,
+  TaskStore,
+} from "@fusion/core";
 import { getCurrentRepo, isGhAuthenticated } from "@fusion/core";
 import {
   ApiError,
@@ -14,6 +21,8 @@ import {
 } from "../api-error.js";
 import { GitHubClient, parseBadgeUrl } from "../github.js";
 import { GitHubIssueCommentService } from "../github-issue-comment.js";
+import { GitHubTrackingCommentService } from "../github-tracking-comments.js";
+import { GitHubTrackingStateService } from "../github-tracking-state.js";
 import { githubRateLimiter } from "../github-poll.js";
 import {
   classifyWebhookEvent,
@@ -156,28 +165,53 @@ export interface GitCommit {
   hash: string;
   shortHash: string;
   message: string;
+  body?: string;
   author: string;
   date: string;
   parents: string[];
 }
 
-export async function getGitCommits(limit = 20, cwd?: string): Promise<GitCommit[]> {
-  try {
-    const format = "%H|%h|%s|%an|%aI|%P";
-    const output = await runGitCommand(["log", `--max-count=${limit}`, `--pretty=format:${format}`], cwd, 10000);
+function parseGitCommitsFromLogOutput(output: string): GitCommit[] {
+  const commits: GitCommit[] = [];
 
-    const commits: GitCommit[] = [];
-    for (const line of output.split("\n")) {
-      const parts = line.split("|");
-      if (parts.length < 5) continue;
+  for (const record of output.split("\0")) {
+    if (!record) continue;
 
-      const [hash, shortHash, message, author, date, parentsStr] = parts;
-      const parents = parentsStr ? parentsStr.split(" ").filter(Boolean) : [];
+    const parts = record.split("\x1f");
+    if (parts.length < 7) continue;
 
-      commits.push({ hash, shortHash, message: message || "", author: author || "", date: date || "", parents });
+    const [hash, shortHash, message, fullMessage, author, date, parentsStr] = parts;
+    const trimmedFullMessage = fullMessage.trimEnd();
+    const subjectLine = message || "";
+    let body = trimmedFullMessage;
+
+    if (subjectLine && body.startsWith(subjectLine)) {
+      body = body.slice(subjectLine.length);
+      body = body.replace(/^\n+/, "");
     }
 
-    return commits;
+    body = body.trim();
+    const parents = parentsStr ? parentsStr.split(" ").filter(Boolean) : [];
+
+    commits.push({
+      hash,
+      shortHash,
+      message: subjectLine,
+      body: body || undefined,
+      author: author || "",
+      date: date || "",
+      parents,
+    });
+  }
+
+  return commits;
+}
+
+export async function getGitCommits(limit = 20, cwd?: string): Promise<GitCommit[]> {
+  try {
+    const format = "%H%x1f%h%x1f%s%x1f%B%x1f%an%x1f%aI%x1f%P";
+    const output = await runGitCommand(["log", "-z", `--max-count=${limit}`, `--pretty=format:${format}`], cwd, 10000);
+    return parseGitCommitsFromLogOutput(output);
   } catch {
     return [];
   }
@@ -199,21 +233,9 @@ export function isValidGitRef(ref: string): boolean {
 
 export async function getGitCommitsForBranch(branch: string, limit = 10, cwd?: string): Promise<GitCommit[]> {
   try {
-    const format = "%H|%h|%s|%an|%aI|%P";
-    const output = await runGitCommand(["log", `--max-count=${limit}`, `--pretty=format:${format}`, branch], cwd, 10000);
-
-    const commits: GitCommit[] = [];
-    for (const line of output.split("\n")) {
-      const parts = line.split("|");
-      if (parts.length < 5) continue;
-
-      const [hash, shortHash, message, author, date, parentsStr] = parts;
-      const parents = parentsStr ? parentsStr.split(" ").filter(Boolean) : [];
-
-      commits.push({ hash, shortHash, message: message || "", author: author || "", date: date || "", parents });
-    }
-
-    return commits;
+    const format = "%H%x1f%h%x1f%s%x1f%B%x1f%an%x1f%aI%x1f%P";
+    const output = await runGitCommand(["log", "-z", `--max-count=${limit}`, `--pretty=format:${format}`, branch], cwd, 10000);
+    return parseGitCommitsFromLogOutput(output);
   } catch {
     return [];
   }
@@ -227,21 +249,9 @@ export async function getAheadCommits(cwd?: string): Promise<GitCommit[]> {
       return [];
     }
 
-    const format = "%H|%h|%s|%an|%aI|%P";
-    const output = await runGitCommand(["log", "@{u}..HEAD", `--pretty=format:${format}`], cwd, 10000);
-
-    const commits: GitCommit[] = [];
-    for (const line of output.split("\n")) {
-      const parts = line.split("|");
-      if (parts.length < 5) continue;
-
-      const [hash, shortHash, message, author, date, parentsStr] = parts;
-      const parents = parentsStr ? parentsStr.split(" ").filter(Boolean) : [];
-
-      commits.push({ hash, shortHash, message: message || "", author: author || "", date: date || "", parents });
-    }
-
-    return commits;
+    const format = "%H%x1f%h%x1f%s%x1f%B%x1f%an%x1f%aI%x1f%P";
+    const output = await runGitCommand(["log", "-z", "@{u}..HEAD", `--pretty=format:${format}`], cwd, 10000);
+    return parseGitCommitsFromLogOutput(output);
   } catch {
     return [];
   }
@@ -259,22 +269,10 @@ export async function getRemoteCommits(remoteRef: string, limit = 10, cwd?: stri
       return [];
     }
 
-    const format = "%H|%h|%s|%an|%aI|%P";
+    const format = "%H%x1f%h%x1f%s%x1f%B%x1f%an%x1f%aI%x1f%P";
     const safeLimit = Math.min(Math.max(1, limit), 50);
-    const output = await runGitCommand(["log", `--max-count=${safeLimit}`, `--pretty=format:${format}`, remoteRef], cwd, 10000);
-
-    const commits: GitCommit[] = [];
-    for (const line of output.split("\n")) {
-      const parts = line.split("|");
-      if (parts.length < 5) continue;
-
-      const [hash, shortHash, message, author, date, parentsStr] = parts;
-      const parents = parentsStr ? parentsStr.split(" ").filter(Boolean) : [];
-
-      commits.push({ hash, shortHash, message: message || "", author: author || "", date: date || "", parents });
-    }
-
-    return commits;
+    const output = await runGitCommand(["log", "-z", `--max-count=${safeLimit}`, `--pretty=format:${format}`, remoteRef], cwd, 10000);
+    return parseGitCommitsFromLogOutput(output);
   } catch {
     return [];
   }
@@ -475,16 +473,21 @@ export interface GitPullResult {
   conflict?: boolean;
 }
 
-export async function pullGitBranch(cwd?: string): Promise<GitPullResult> {
+export async function pullGitBranch(cwd?: string, options?: { rebase?: boolean }): Promise<GitPullResult> {
+  const rebase = options?.rebase === true;
   try {
-    const output = await runGitCommand(["pull"], cwd, 30000);
-    return { success: true, message: output.trim() };
+    const output = await runGitCommand(rebase ? ["pull", "--rebase"] : ["pull"], cwd, 30000);
+    const message = output.trim();
+    if (message) {
+      return { success: true, message };
+    }
+    return { success: true, message: rebase ? "Pull completed (rebase)" : "Pull completed" };
   } catch (err: unknown) {
     if (err instanceof ApiError) {
       throw err;
     }
     const message = getCommandErrorMessage(err);
-    if (message.includes("CONFLICT") || message.includes("Merge conflict")) {
+    if (message.includes("CONFLICT") || message.includes("Merge conflict") || message.includes("could not apply")) {
       return { success: false, message: "Merge conflict detected. Resolve manually.", conflict: true };
     }
     throw new Error(message || "Pull failed");
@@ -714,6 +717,23 @@ export async function dropGitStash(index: number, cwd?: string): Promise<string>
   if (index < 0 || !Number.isInteger(index)) throw new Error("Invalid stash index");
   const output = (await runGitCommand(["stash", "drop", `stash@{${index}}`], cwd, 10000)).trim();
   return output || "Stash dropped";
+}
+
+export async function getGitStashDiff(index: number, cwd?: string): Promise<{ stat: string; patch: string } | null> {
+  if (index < 0 || !Number.isInteger(index)) {
+    throw new Error("Invalid stash index");
+  }
+
+  const stashRef = `stash@{${index}}`;
+  try {
+    await runGitCommand(["rev-parse", "--verify", stashRef], cwd, 5000);
+  } catch {
+    return null;
+  }
+
+  const stat = (await runGitCommand(["stash", "show", "--stat", stashRef], cwd, 10000)).trim();
+  const patch = await runGitCommand(["stash", "show", "-p", stashRef], cwd, 10000);
+  return { stat, patch };
 }
 
 export async function getGitFileChanges(cwd?: string): Promise<GitFileChange[]> {
@@ -946,6 +966,19 @@ export function createBatchImportRateLimiter(): (req: Request, res: Response, ne
   };
 }
 
+function buildGitHubIssueSource(owner: string, repo: string, issue: { number: number; html_url: string }) {
+  return {
+    sourceIssue: {
+      provider: "github" as const,
+      repository: `${owner}/${repo}`,
+      externalIssueId: String(issue.number),
+      issueNumber: issue.number,
+      url: issue.html_url,
+    },
+    sourceMetadata: { issueUrl: issue.html_url, issueNumber: issue.number },
+  };
+}
+
 export function getDefaultGitHubRepo(store: TaskStore): { owner: string; repo: string } | null {
   const envRepo = process.env.GITHUB_REPOSITORY;
   if (envRepo) {
@@ -1073,6 +1106,14 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
     );
     githubIssueCommentService.start();
     ctx.registerDispose(() => githubIssueCommentService.stop());
+
+    const githubTrackingCommentService = new GitHubTrackingCommentService(store);
+    githubTrackingCommentService.start();
+    ctx.registerDispose(() => githubTrackingCommentService.stop());
+
+    const githubTrackingStateService = new GitHubTrackingStateService(store);
+    githubTrackingStateService.start();
+    ctx.registerDispose(() => githubTrackingStateService.stop());
   }
 
   /**
@@ -1634,7 +1675,11 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       if (!(await isGitRepo(rootDir))) {
         throw badRequest("Not a git repository");
       }
-      const result = await pullGitBranch(rootDir);
+      const { rebase } = req.body ?? {};
+      if (rebase !== undefined && typeof rebase !== "boolean") {
+        throw badRequest("rebase must be a boolean");
+      }
+      const result = await pullGitBranch(rootDir, { rebase: rebase === true });
       if (result.conflict) {
         throw new ApiError(409, result.message ?? "Merge conflict detected. Resolve manually.", {
           ...result,
@@ -1745,6 +1790,37 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const { drop } = req.body;
       const result = await applyGitStash(index, drop === true, rootDir);
       res.json({ message: result });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * GET /api/git/stashes/:index/diff
+   * Returns stash diff (stat + patch) for a stash entry.
+   */
+  router.get("/git/stashes/:index/diff", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const rootDir = scopedStore.getRootDir();
+      if (!(await isGitRepo(rootDir))) {
+        throw badRequest("Not a git repository");
+      }
+
+      const index = parseInt(req.params.index, 10);
+      if (isNaN(index) || index < 0) {
+        throw badRequest("Invalid stash index");
+      }
+
+      const diff = await getGitStashDiff(index, rootDir);
+      if (!diff) {
+        throw notFound("Stash not found");
+      }
+
+      res.json(diff);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -2093,21 +2169,16 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const body = issue.body?.trim() || "(no description)";
       const description = `${body}\n\nSource: ${sourceUrl}`;
 
+      const source = buildGitHubIssueSource(owner, repo, issue);
       const task = await scopedStore.createTask({
         title: title || undefined,
         description,
         column: "triage",
         dependencies: [],
-        sourceIssue: {
-          provider: "github",
-          repository: `${owner}/${repo}`,
-          externalIssueId: String(issue.number),
-          issueNumber: issue.number,
-          url: issue.html_url,
-        },
+        sourceIssue: source.sourceIssue,
         source: {
           sourceType: "github_import",
-          sourceMetadata: { issueUrl: issue.html_url, issueNumber: issue.number },
+          sourceMetadata: source.sourceMetadata,
         },
       });
 
@@ -2233,21 +2304,16 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
         const description = `${body}\n\nSource: ${sourceUrl}`;
 
         try {
+          const source = buildGitHubIssueSource(owner, repo, issue);
           const task = await scopedStore.createTask({
             title: title || undefined,
             description,
             column: "triage",
             dependencies: [],
-            sourceIssue: {
-              provider: "github",
-              repository: `${owner}/${repo}`,
-              externalIssueId: String(issue.number),
-              issueNumber: issue.number,
-              url: issue.html_url,
-            },
+            sourceIssue: source.sourceIssue,
             source: {
               sourceType: "github_import",
-              sourceMetadata: { issueUrl: issue.html_url, issueNumber: issue.number },
+              sourceMetadata: source.sourceMetadata,
             },
           });
 

@@ -106,8 +106,6 @@
 .agent-detail-icon {
   width: calc(var(--space-lg) * 2 + var(--space-xs));
   height: calc(var(--space-lg) * 2 + var(--space-xs));
-  border-radius: var(--radius-md);
-  background: var(--todo);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -165,6 +163,60 @@
   align-items: center;
   gap: var(--space-xs);
   flex-shrink: 0;
+}
+
+.agent-detail-bulk-menu {
+  position: relative;
+}
+
+.agent-detail-bulk-menu-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--space-xs));
+  min-width: calc(var(--space-xl) * 9);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 2;
+  padding: var(--space-xs);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.agent-detail-bulk-menu-item {
+  width: 100%;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--space-xs) * 0.5);
+  cursor: pointer;
+}
+
+.agent-detail-bulk-menu-item:hover:not(:disabled),
+.agent-detail-bulk-menu-item:focus-visible {
+  outline: none;
+  background: var(--card-hover);
+}
+
+.agent-detail-bulk-menu-item:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.agent-detail-bulk-menu-item-hint {
+  font-size: calc(var(--space-sm) + var(--space-xs) * 0.5);
+  color: var(--text-muted);
+}
+
+.agent-detail-import-btn {
+  min-height: calc(var(--space-lg) + var(--space-md) + var(--space-xs));
 }
 
 /* Legacy class for backward compatibility */
@@ -258,6 +310,11 @@
   padding-bottom: var(--space-md);
 }
 
+.dashboard-summary-health-reason {
+  margin-left: var(--space-xs);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+}
+
 .dashboard-summary-card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -295,6 +352,13 @@
   flex-wrap: wrap;
   gap: var(--space-md);
   color: var(--text-muted);
+}
+
+.agent-detail-approval-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  color: var(--color-warning);
 }
 
 .dashboard-summary-skills {
@@ -563,6 +627,100 @@
 
 .logs-empty p {
   margin: var(--space-sm) 0 0 0;
+}
+
+/* --- Mail Tab --- */
+.agent-mail-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.agent-mail-tab-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.agent-mail-tab-header h3 {
+  margin: 0;
+  font-size: calc(var(--space-md) + var(--space-xs) * 0.5);
+}
+
+.agent-mail-tab-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  color: var(--color-error);
+}
+
+.agent-detail-loading--inline {
+  flex-direction: row;
+  justify-content: flex-start;
+  padding: var(--space-md) 0;
+}
+
+.agent-mail-tab .agent-mail-tab-message {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.agent-mail-tab .agent-mail-tab-message:hover {
+  background: var(--card-hover);
+}
+
+.agent-mail-tab .agent-mail-tab-message:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
+}
+
+.agent-mail-tab .agent-mail-tab-message--selected {
+  background: color-mix(in srgb, var(--todo) 12%, transparent);
+}
+
+.agent-mail-tab .agent-mail-tab-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.agent-mail-tab .agent-mail-tab-back {
+  align-self: flex-start;
+}
+
+.agent-mail-tab .agent-mail-tab-detail-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.agent-mail-tab .agent-mail-tab-detail-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.agent-mail-tab .agent-mail-tab-detail-label {
+  color: var(--text-muted);
+  min-width: calc(var(--space-2xl) * 2);
+}
+
+.agent-mail-tab .agent-mail-tab-reply-context {
+  color: var(--text-muted);
+}
+
+.agent-mail-tab .agent-mail-tab-detail-body {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* --- Runs Tab --- */
@@ -915,6 +1073,13 @@
   margin: 0 0 calc(var(--space-md) + var(--space-sm)) 0;
 }
 
+.config-actions-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
 .config-fields {
   display: flex;
   flex-direction: column;
@@ -930,6 +1095,23 @@
 .config-field label {
   font-size: calc(var(--space-md) + var(--space-xs) * 0.25);
   font-weight: 500;
+}
+
+.agent-avatar-editor {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.agent-avatar-editor-preview {
+  background: var(--card);
+}
+
+.agent-avatar-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
 }
 
 .config-runtime-tabs {
@@ -1488,9 +1670,17 @@
     margin-left: 0;
   }
 
+  .agent-detail-bulk-menu-popover {
+    right: 0;
+  }
+
   .agent-detail-utility-actions .btn-icon {
     min-height: calc(var(--space-lg) + var(--space-md) + var(--space-xs));
     min-width: calc(var(--space-lg) + var(--space-md) + var(--space-xs));
+  }
+
+  .agent-detail-import-btn {
+    min-width: calc(var(--space-xl) * 3 + var(--space-xs));
   }
 
   /* Legacy selectors for backward compatibility */
@@ -1597,6 +1787,29 @@
     padding: var(--space-2xl) var(--space-lg);
   }
 
+  /* Mail Tab mobile */
+  .agent-mail-tab-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .agent-mail-tab .mailbox-agent-subtabs {
+    width: 100%;
+  }
+
+  .agent-mail-tab .mailbox-agent-subtab {
+    flex: 1;
+  }
+
+  .agent-mail-tab .agent-mail-tab-detail {
+    width: 100%;
+    padding: var(--space-md);
+  }
+
+  .agent-mail-tab .agent-mail-tab-back {
+    min-height: calc(var(--space-lg) * 2 + var(--space-xs));
+  }
+
   /* Runs Tab mobile */
   .run-card {
     padding: var(--space-md);
@@ -1693,6 +1906,19 @@
 
 /* === Agent Dialog Mobile Responsive === */
 @media (max-width: 768px) {
+  .agent-avatar-editor {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .agent-avatar-editor-actions {
+    width: 100%;
+  }
+
+  .agent-avatar-editor-actions .btn {
+    min-height: calc(var(--space-lg) * 2 + var(--space-xs));
+  }
+
   .agent-dialog-overlay {
     padding: 0;
     align-items: stretch;

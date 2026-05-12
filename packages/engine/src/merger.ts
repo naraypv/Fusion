@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import {
+  detectMissingWorkspaceEntry,
   runVerificationCommand as runVerificationCommandShared,
   summarizeVerificationOutput,
   truncateWithEllipsis,
@@ -26,20 +27,22 @@ export {
   type VerificationResult,
 } from "./verification-utils.js";
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { hostname } from "node:os";
 import {
+  buildTaskLineageTrailer,
   getTaskMergeBlocker,
   normalizeMergeConflictStrategy,
-  resolveModelFallbackChain,
-  resolveProjectDefaultModel,
-  resolveRouteAllLlmCallsViaDspy,
+  resolveTaskMergeTarget,
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
   summarizeCommitBody,
   summarizeCommitSubject,
   summarizeMergeCommit,
   type TaskStore,
+  type AutostashOutcome,
   type MergeResult,
   type MergeDetails,
   type WorkflowStep,
@@ -48,10 +51,12 @@ import {
   type AgentPromptsConfig,
   type CanonicalMergeConflictStrategy,
   type TaskSourceIssue,
+  type Task,
+  type AutostashOrphanRecord,
 } from "@fusion/core";
 import { describeModel, promptWithFallback } from "./pi.js";
 import { accumulateSessionTokenUsage } from "./session-token-usage.js";
-import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
+import { createResolvedAgentSession, extractRuntimeHint, resolveMergerSessionModel } from "./agent-session-helpers.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import type { WorktreePool } from "./worktree-pool.js";
@@ -64,6 +69,7 @@ import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./a
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from "./run-audit.js";
+import { createWebFetchTool } from "./agent-tools.js";
 
 /** Conflict type classification for merge conflict resolution */
 export type ConflictType =
@@ -215,6 +221,40 @@ function getDependencySyncCommand(rootDir: string): string | null {
   return null;
 }
 
+const INSTALL_MARKER_RELPATH = join("node_modules", ".fusion-install-marker");
+const LOCKFILE_CANDIDATES = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lockb", "bun.lock"];
+
+function computeLockfileHash(rootDir: string): string | null {
+  for (const name of LOCKFILE_CANDIDATES) {
+    const p = join(rootDir, name);
+    if (existsSync(p)) {
+      try {
+        return createHash("sha256").update(readFileSync(p)).digest("hex");
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function readInstallMarker(rootDir: string): string | null {
+  try {
+    const value = readFileSync(join(rootDir, INSTALL_MARKER_RELPATH), "utf-8").trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeInstallMarker(rootDir: string, hash: string): void {
+  try {
+    writeFileSync(join(rootDir, INSTALL_MARKER_RELPATH), hash);
+  } catch {
+    // Best-effort: a missing marker just means the next merge re-runs install.
+  }
+}
+
 async function syncDependenciesForMerge(
   store: TaskStore,
   rootDir: string,
@@ -223,6 +263,21 @@ async function syncDependenciesForMerge(
 ): Promise<void> {
   const installCommand = getDependencySyncCommand(rootDir);
   if (!installCommand) return;
+
+  // Skip the install if node_modules is present and the lockfile content
+  // matches the hash recorded after the last successful install. Caller's
+  // shouldSyncDependenciesForMerge gate already filters most no-ops; this
+  // covers the case where package.json (but not the lockfile) is staged, and
+  // the case where multiple merge attempts hit the same worktree in a row.
+  const lockHash = computeLockfileHash(rootDir);
+  if (lockHash && hasInstallState(rootDir) && readInstallMarker(rootDir) === lockHash) {
+    mergerLog.log(`${taskId}: skipping dependency sync (lockfile unchanged since last install)`);
+    await store.logEntry(
+      taskId,
+      `Skipping dependency sync: lockfile hash matches last successful ${installCommand}`,
+    );
+    return;
+  }
 
   throwIfAborted(signal, taskId);
   mergerLog.log(`${taskId}: syncing dependencies before merge build verification`);
@@ -235,6 +290,7 @@ async function syncDependenciesForMerge(
       timeout: 300_000,
     });
     throwIfAborted(signal, taskId);
+    if (lockHash) writeInstallMarker(rootDir, lockHash);
   } catch (error: any) {
     throwIfAborted(signal, taskId);
     const details = error?.stderr || error?.stdout || error?.message || String(error);
@@ -250,6 +306,72 @@ interface InferredTestCommand {
   /** Source indicates whether this was explicitly configured or inferred from project files */
   testSource: "explicit" | "inferred";
   buildSource?: "explicit" | "inferred";
+}
+
+interface OwnedLandedCommit {
+  sha: string;
+  subject?: string;
+  filesChanged?: number;
+  insertions?: number;
+  deletions?: number;
+}
+
+function commitOwnedByTask(taskId: string, subject: string, body: string): boolean {
+  return body.includes(`${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`) || subject.includes(taskId);
+}
+
+async function findOwnedLandedCommitForTask(rootDir: string, task: Task): Promise<OwnedLandedCommit | null> {
+  const tryHydrate = async (sha: string): Promise<OwnedLandedCommit | null> => {
+    try {
+      await execFileAsync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { cwd: rootDir });
+      const { stdout } = await execFileAsync("git", ["log", "-1", "--format=%H%x1f%s%x1f%b", sha], {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const [resolvedSha, subject = "", body = ""] = stdout.trim().split("\x1f");
+      if (!resolvedSha || !commitOwnedByTask(task.id, subject, body)) return null;
+      const owned: OwnedLandedCommit = { sha: resolvedSha, subject };
+      try {
+        const { stdout: statsOut } = await execFileAsync("git", ["show", "--shortstat", "--format=", resolvedSha], {
+          cwd: rootDir,
+          encoding: "utf-8",
+        });
+        Object.assign(owned, parseDiffStat(statsOut));
+      } catch {
+        // stats optional
+      }
+      return owned;
+    } catch {
+      return null;
+    }
+  };
+
+  if (task.mergeDetails?.commitSha) {
+    const ownedStored = await tryHydrate(task.mergeDetails.commitSha);
+    if (ownedStored) return ownedStored;
+  }
+
+  const trailer = `${FUSION_TASK_ID_TRAILER_KEY}: ${task.id}`;
+  const searches: string[][] = [
+    ["log", "--format=%H%x1f%s", "--max-count=20", "--fixed-strings", `--grep=${trailer}`, "HEAD"],
+    ["log", "--format=%H%x1f%s", "--max-count=20", "--fixed-strings", `--grep=${task.id}`, "HEAD"],
+  ];
+
+  for (const args of searches) {
+    try {
+      const { stdout } = await execFileAsync("git", args, { cwd: rootDir, encoding: "utf-8" });
+      const first = stdout.trim().split("\n").find(Boolean);
+      if (!first) continue;
+      const [sha] = first.split("\x1f");
+      if (!sha) continue;
+      const owned = await tryHydrate(sha);
+      if (owned) return owned;
+    } catch {
+      // continue
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -409,6 +531,32 @@ export async function snapshotDirtyFiles(rootDir: string): Promise<Set<string>> 
   return paths;
 }
 
+/**
+ * Hash the working tree's dirty content (full diff against HEAD plus porcelain
+ * status). Returns "" on failure or when nothing is dirty. Used to detect
+ * whether an in-merge fix agent actually changed anything before paying for
+ * a verification re-run.
+ */
+async function gitDirtyFingerprint(rootDir: string): Promise<string> {
+  try {
+    const [diffOut, statusOut] = await Promise.all([
+      execFileAsync("git", ["diff", "HEAD"], {
+        cwd: rootDir,
+        encoding: "utf-8",
+        maxBuffer: 64 * 1024 * 1024,
+      }).then((r) => r.stdout, () => ""),
+      execFileAsync("git", ["status", "-z", "--porcelain"], { cwd: rootDir, encoding: "utf-8" }).then(
+        (r) => r.stdout,
+        () => "",
+      ),
+    ]);
+    if (!diffOut && !statusOut) return "";
+    return createHash("sha256").update(diffOut).update("\0").update(statusOut).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
 function rethrowIfMergeAborted(error: unknown): void {
   if (error instanceof Error && error.name === "MergeAbortedError") {
     throw error;
@@ -512,10 +660,136 @@ async function runDeterministicVerification(
   await store.logEntry(taskId, deterministicVerificationMessage);
   await store.appendAgentLog(taskId, deterministicVerificationMessage, "text", undefined, "merger");
 
+  const bootstrapScriptPath = join(rootDir, "scripts/ensure-test-artifacts.mjs");
+  if (hasTestCommand || hasBuildCommand) {
+    if (!existsSync(bootstrapScriptPath)) {
+      const bootstrapMissingMessage = `${taskId}: [verification:bootstrap] script missing at scripts/ensure-test-artifacts.mjs — skipping preamble`;
+      mergerLog.warn(bootstrapMissingMessage);
+      await store.logEntry(taskId, bootstrapMissingMessage);
+      await store.appendAgentLog(taskId, bootstrapMissingMessage, "text", undefined, "merger");
+    } else {
+      const bootstrapCommand = "node scripts/ensure-test-artifacts.mjs";
+      await store.logEntry(taskId, `[verification:bootstrap] running: ${bootstrapCommand}`);
+      await store.appendAgentLog(taskId, "[verification:bootstrap] running bootstrap preamble", "tool", bootstrapCommand, "merger");
+      try {
+        throwIfAborted(signal, taskId);
+        await execAsync(bootstrapCommand, {
+          cwd: rootDir,
+          timeout: 300_000,
+          maxBuffer: 10 * 1024 * 1024,
+          signal,
+        });
+        throwIfAborted(signal, taskId);
+        await store.logEntry(taskId, "[verification:bootstrap] bootstrap preamble succeeded");
+        await store.appendAgentLog(taskId, "[verification:bootstrap] bootstrap preamble succeeded", "tool_result", undefined, "merger");
+      } catch (error) {
+        throwIfAborted(signal, taskId);
+        const err = error as { stdout?: string | Buffer; stderr?: string | Buffer; status?: number; code?: number | string; message?: string };
+        const bootstrapStdout = err?.stdout?.toString?.() || "";
+        const bootstrapStderr = err?.stderr?.toString?.() || "";
+        const bootstrapOutput = bootstrapStderr || bootstrapStdout || err?.message || "Unknown bootstrap failure";
+        const bootstrapExitCode = typeof err?.status === "number"
+          ? err.status
+          : (typeof err?.code === "number" ? err.code : null);
+
+        result.allPassed = false;
+        result.failedCommand = "bootstrap";
+        await store.logEntry(
+          taskId,
+          `[verification:bootstrap] bootstrap preamble failed (exit ${bootstrapExitCode ?? "unknown"}): ${truncateWithEllipsis(bootstrapOutput, VERIFICATION_LOG_MAX_CHARS)}`,
+          "VerificationError",
+        );
+        await store.appendAgentLog(
+          taskId,
+          "[verification:bootstrap] bootstrap preamble failed",
+          "tool_error",
+          `exit ${bootstrapExitCode ?? "unknown"}`,
+          "merger",
+        );
+        throw new VerificationError(
+          `Verification bootstrap preamble failed for ${taskId}`,
+          result,
+        );
+      }
+    }
+  }
+
+  let missingEntryRetryAttempted = false;
+
+  const executeVerificationWithRetry = async (
+    command: string,
+    type: "test" | "build",
+    failedCommandLabel: "testCommand" | "buildCommand",
+  ): Promise<VerificationCommandResult> => {
+    const firstAttempt = await runVerificationCommand(
+      store, rootDir, taskId, command, type, signal,
+    );
+    if (firstAttempt.success) {
+      return firstAttempt;
+    }
+
+    const missingWorkspaceEntry = detectMissingWorkspaceEntry(firstAttempt.stderr, firstAttempt.stdout);
+    if (!missingWorkspaceEntry || missingEntryRetryAttempted) {
+      return firstAttempt;
+    }
+
+    missingEntryRetryAttempted = true;
+    const packageName = missingWorkspaceEntry.packageName;
+    const rebuildCommand = `pnpm --filter ${packageName} build`;
+    await store.logEntry(taskId, `[verification:retry] bootstrap-built: detected missing workspace entry for ${packageName}; running ${rebuildCommand}`);
+    await store.appendAgentLog(taskId, "[verification:retry] bootstrap-built", "tool", rebuildCommand, "merger");
+
+    try {
+      throwIfAborted(signal, taskId);
+      await execAsync(rebuildCommand, {
+        cwd: rootDir,
+        timeout: 300_000,
+        maxBuffer: 10 * 1024 * 1024,
+        signal,
+      });
+      throwIfAborted(signal, taskId);
+    } catch (_error) {
+      throwIfAborted(signal, taskId);
+      await store.logEntry(taskId, `[verification:retry] retry-different-failure: workspace rebuild failed for ${packageName}`);
+      await store.appendAgentLog(taskId, "[verification:retry] retry-different-failure", "tool_error", packageName, "merger");
+      return firstAttempt;
+    }
+
+    const retryAttempt = await runVerificationCommand(
+      store, rootDir, taskId, command, type, signal,
+    );
+    if (retryAttempt.success) {
+      result.environmentFault = {
+        kind: "missing-workspace-entry",
+        packageName,
+        recovered: true,
+      };
+      await store.logEntry(taskId, `[verification:retry] retry-success: rebuilt ${packageName} and ${failedCommandLabel} now passes`);
+      await store.appendAgentLog(taskId, "[verification:retry] retry-success", "tool_result", packageName, "merger");
+      return retryAttempt;
+    }
+
+    const retryMissingWorkspaceEntry = detectMissingWorkspaceEntry(retryAttempt.stderr, retryAttempt.stdout);
+    if (retryMissingWorkspaceEntry?.packageName === packageName) {
+      result.environmentFault = {
+        kind: "missing-workspace-entry",
+        packageName,
+        recovered: false,
+      };
+      await store.logEntry(taskId, `[verification:retry] retry-still-missing: ${packageName} still missing after rebuild`);
+      await store.appendAgentLog(taskId, "[verification:retry] retry-still-missing", "tool_error", packageName, "merger");
+      return retryAttempt;
+    }
+
+    await store.logEntry(taskId, `[verification:retry] retry-different-failure: rebuild fixed entry point but ${failedCommandLabel} still failed`);
+    await store.appendAgentLog(taskId, "[verification:retry] retry-different-failure", "tool_error", packageName, "merger");
+    return retryAttempt;
+  };
+
   // Run test command first if configured
   if (hasTestCommand) {
-    const testResult = await runVerificationCommand(
-      store, rootDir, taskId, normalizedTestCommand!, "test", signal,
+    const testResult = await executeVerificationWithRetry(
+      normalizedTestCommand!, "test", "testCommand",
     );
     result.testResult = testResult;
 
@@ -543,8 +817,8 @@ async function runDeterministicVerification(
 
   // Run build command second if configured
   if (hasBuildCommand) {
-    const buildResult = await runVerificationCommand(
-      store, rootDir, taskId, normalizedBuildCommand!, "build", signal,
+    const buildResult = await executeVerificationWithRetry(
+      normalizedBuildCommand!, "build", "buildCommand",
     );
     result.buildResult = buildResult;
 
@@ -625,13 +899,16 @@ async function attemptInMergeVerificationFix(
   options: MergerOptions,
   mergeRunContext?: Pick<EngineRunContext, "runId" | "agentId">,
   fixAttemptNumber?: number,
-  _testCommand?: string,
-  _buildCommand?: string,
+  testCommand?: string,
+  buildCommand?: string,
+  testSource?: "explicit" | "inferred",
+  buildSource?: "explicit" | "inferred",
   fixModifiedFiles?: Set<string>,
 ): Promise<boolean> {
   // Snapshot the working tree before doing anything so the diff reflects only
   // what the fix agent touched, not pre-existing dirty state.
   const preFixSnapshot = await snapshotDirtyFiles(rootDir);
+  const preFixFingerprint = await gitDirtyFingerprint(rootDir);
   try {
     mergerLog.log(`${taskId}: spawning in-merge verification fix agent`);
 
@@ -640,6 +917,7 @@ async function attemptInMergeVerificationFix(
       taskId,
       agent: "merger",
       persistAgentToolOutput: settings.persistAgentToolOutput,
+      persistAgentThinkingLog: settings.persistAgentThinkingLog,
       onAgentText: options.onAgentText,
       onAgentTool: options.onAgentTool,
     });
@@ -672,6 +950,7 @@ async function attemptInMergeVerificationFix(
       ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
       : null;
     const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
+    const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig);
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "merger",
       runtimeHint: mergerRuntimeHint,
@@ -689,7 +968,7 @@ Do not refactor, rename broadly, or make opportunistic improvements.
 1. Read the error output carefully to understand what is failing before editing anything
 2. Before assuming a code fix is needed, check whether the failure is caused by stale/missing build artifacts in a sibling workspace package — typical signatures: \`Failed to resolve import "./X.js"\` pointing into another package's \`dist/\`, \`Cannot find module\`, or \`ERR_MODULE_NOT_FOUND\` referencing a workspace-internal path. In that case, rebuild the affected package(s) (e.g. \`pnpm --filter <pkg> build\`, or \`pnpm --filter "<scope>/*" build\` for a group) and re-run verification before editing source files.
 3. Make targeted fixes to the failing code path
-4. After fixing, run the verification command to confirm the fix works
+4. After fixing, verify your changes keep both deterministic test and build commands passing
 5. Do NOT make any git commits — just fix the code
 6. You MAY modify any files needed to make the verification pass, including files unrelated to this task's original change. Pre-existing build/test breakage on the base branch is in scope: fix it. Prefer the smallest change that makes verification green.
 7. If you cannot fix the issue within scope, explain why and what evidence indicates a deeper/root problem`,
@@ -698,16 +977,10 @@ Do not refactor, rename broadly, or make opportunistic improvements.
       onThinking: logger.onThinking,
       onToolStart: logger.onToolStart,
       onToolEnd: logger.onToolEnd,
-      defaultProvider: settings.defaultProviderOverride && settings.defaultModelIdOverride
-        ? settings.defaultProviderOverride
-        : settings.defaultProvider,
-      defaultModelId: settings.defaultProviderOverride && settings.defaultModelIdOverride
-        ? settings.defaultModelIdOverride
-        : settings.defaultModelId,
+      defaultProvider: mergerSessionModel.provider,
+      defaultModelId: mergerSessionModel.modelId,
       fallbackProvider: settings.fallbackProvider,
       fallbackModelId: settings.fallbackModelId,
-      modelFallbackChain: resolveModelFallbackChain(settings),
-      routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       defaultThinkingLevel: settings.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -721,6 +994,10 @@ Do not refactor, rename broadly, or make opportunistic improvements.
         taskTitle: taskForSkillContext?.title,
       }),
     });
+    // Register so engine.stop() can dispose this session — without this the
+    // fix agent keeps streaming past shutdown because it's not the autostash
+    // session that the engine tracks.
+    options.onSession?.(session);
 
     const runId = mergeRunContext?.runId;
     const agentId = mergeRunContext?.agentId ?? "merger";
@@ -750,7 +1027,7 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
 ## Instructions
 1. Read the error output and identify the root cause
 2. Make targeted fixes to resolve the failure
-3. Run the verification command \`${failureContext.command}\` to confirm your fix works
+3. Use \`${failureContext.command}\` while iterating, but ensure your final changes keep both deterministic test and build commands passing
 4. If the fix doesn't work, try a different approach
 5. Do NOT make any git commits`;
 
@@ -770,12 +1047,39 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
       // Compute which paths the fix agent introduced or modified, then
       // accumulate them into the caller's mutable set.
       const postFixSnapshot = await snapshotDirtyFiles(rootDir);
+      const newlyTouched: string[] = [];
+      for (const p of postFixSnapshot) {
+        if (!preFixSnapshot.has(p)) newlyTouched.push(p);
+      }
       if (fixModifiedFiles) {
-        for (const p of postFixSnapshot) {
-          if (!preFixSnapshot.has(p)) {
-            fixModifiedFiles.add(p);
-          }
-        }
+        for (const p of newlyTouched) fixModifiedFiles.add(p);
+      }
+
+      // If the fix agent didn't actually edit anything, re-running the same
+      // failing verification can only yield the same failure — skip the
+      // multi-minute test/build cycle and report the attempt as unsuccessful.
+      // Use a git content fingerprint (diff + porcelain status) so we also
+      // catch in-place edits to already-dirty files, not just newly added
+      // paths. Only skip when we have a non-empty fingerprint to compare
+      // against; an empty pre-fingerprint means the snapshot tool failed and
+      // we should fall back to actually re-running verification.
+      const postFixFingerprint = await gitDirtyFingerprint(rootDir);
+      const fingerprintsMatch =
+        preFixFingerprint.length > 0 && preFixFingerprint === postFixFingerprint;
+      if (newlyTouched.length === 0 && fingerprintsMatch) {
+        mergerLog.warn(`${taskId}: in-merge fix agent made no changes — skipping verification re-run`);
+        await store.logEntry(
+          taskId,
+          `In-merge fix agent made no changes — skipping verification re-run (attempt ${fixAttemptNumber ?? "unknown"})`,
+        );
+        await store.appendAgentLog(
+          taskId,
+          `Fix agent made no changes — skipping verification re-run`,
+          "text",
+          undefined,
+          "merger",
+        );
+        return false;
       }
 
       // Re-run deterministic verification command after the fix attempt.
@@ -790,16 +1094,24 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
         undefined,
         "merger",
       );
-      const reRunResult = await runVerificationCommand(
-        store,
-        rootDir,
-        taskId,
-        failureContext.command,
-        failureContext.type,
-        options.signal,
-      );
-
-      return reRunResult.success;
+      try {
+        await runDeterministicVerification(
+          store,
+          rootDir,
+          taskId,
+          testCommand,
+          buildCommand,
+          testSource,
+          buildSource,
+          options.signal,
+        );
+        return true;
+      } catch (error: unknown) {
+        if (error instanceof VerificationError) {
+          return false;
+        }
+        throw error;
+      }
     } finally {
       // Flush buffered output before disposal so fix-attempt activity is visible.
       await logger.flush();
@@ -835,12 +1147,364 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
  * the warning text so test assertions can match on it.
  */
 function resetMergeWithWarn(rootDir: string, taskId: string, label: string): void {
+  runObservedDestructiveSyncOp(rootDir, taskId, `reset --merge (${label})`, () => {
+    try {
+      execSync("git reset --merge", { cwd: rootDir, stdio: "pipe" });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      mergerLog.warn(`${taskId}: git reset --merge cleanup failed during ${label}: ${msg}`);
+    }
+  });
+}
+
+/** Identity returned by `stashUnrelatedRootDirChanges`. The SHA is the stable
+ *  handle (commit object id, never moves) — used for apply / drop instead of
+ *  position-relative `stash@{N}` refs that shift when other stashes are
+ *  pushed during or after the merge. The label is purely for human display.
+ *  `rescueShas` lists any race-rescue stashes the autostash captured for
+ *  late-dirty paths (concurrent dev edits during the merger run). They are
+ *  surfaced separately so the caller can log them to the task feed. */
+interface AutostashHandle {
+  sha: string;
+  label: string;
+  rescueShas?: { sha: string; label: string }[];
+}
+
+const AUTOSTASH_LABEL_PREFIX = "fusion-merger-autostash:";
+const AUTOSTASH_TIMESTAMP_RE = /^fusion-merger-autostash:[A-Za-z]+-\d+:(?:(?:[a-z0-9-]+:)?(?:\d+:)?)?(\d+)$/;
+
+/** Return the set of paths a stash commit recorded as changed against its
+ *  parent (HEAD-at-stash-time). Used to compare a new dirty snapshot against
+ *  the primary autostash and avoid producing duplicate race-rescue stashes
+ *  for the same paths the primary already captured. */
+async function listStashChangedPaths(rootDir: string, stashSha: string): Promise<Set<string>> {
+  const out = new Set<string>();
   try {
-    execSync("git reset --merge", { cwd: rootDir, stdio: "pipe" });
+    const { stdout } = await execAsync(
+      `git stash show -z --name-only ${quoteArg(stashSha)}`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    for (const entry of stdout.split("\0")) {
+      const p = entry.trim();
+      if (p) out.add(p);
+    }
+  } catch {
+    // Best-effort: an empty set means we'll be slightly more aggressive
+    // about rescuing (everything dirty gets rescued), which is the safe
+    // direction — false positives are noise, false negatives are data loss.
+  }
+  return out;
+}
+
+/** True iff two stash commits point to the exact same tree object. Cheap
+ *  way to detect "stash create produced a duplicate" without diffing files. */
+async function stashTreesEqual(rootDir: string, aSha: string, bSha: string): Promise<boolean> {
+  try {
+    const [a, b] = await Promise.all([
+      execAsync(`git rev-parse ${quoteArg(aSha)}^{tree}`, { cwd: rootDir, encoding: "utf-8" }),
+      execAsync(`git rev-parse ${quoteArg(bSha)}^{tree}`, { cwd: rootDir, encoding: "utf-8" }),
+    ]);
+    return a.stdout.trim() === b.stdout.trim();
+  } catch {
+    return false;
+  }
+}
+
+/** Filename of the advisory "merger active" status file. Lives at
+ *  `<rootDir>/.git/<this filename>` so it travels with the repo and is
+ *  automatically scoped to the right working tree. Not a lock — purely
+ *  informational, intended for dashboards / status lines / pre-Edit hooks
+ *  that want to warn devs that rootDir is volatile until the merge finishes. */
+const ACTIVE_MERGER_STATUS_FILENAME = ".fusion-merger-active.json";
+
+/** Shape of the advisory status file. PID + hostname let readers detect
+ *  stale files left behind by a crashed merger run. */
+export interface ActiveMergerStatus {
+  taskId: string;
+  pid: number;
+  hostname: string;
+  startedAt: string;
+}
+
+/** Write the advisory status file at `<rootDir>/.git/...`. Best-effort:
+ *  failures are logged and the merge proceeds without the advisory — losing
+ *  the dashboard signal is preferable to blocking the merge. Returns the
+ *  path of the file that was written so the caller can pass it back to
+ *  `clearActiveMergerStatus` on cleanup. */
+function writeActiveMergerStatus(rootDir: string, taskId: string): string | null {
+  try {
+    const statusPath = join(rootDir, ".git", ACTIVE_MERGER_STATUS_FILENAME);
+    const payload: ActiveMergerStatus = {
+      taskId,
+      pid: process.pid,
+      hostname: hostname(),
+      startedAt: new Date().toISOString(),
+    };
+    // Atomic write via temp + rename. Without this, a reader that hits
+    // existsSync() between `open` and the final flush sees a partial /
+    // empty file. JSON.parse rejects partial writes so we'd just return
+    // null, but that produces false "no merger active" advisories.
+    // POSIX guarantees rename is atomic on the same filesystem.
+    const tempPath = `${statusPath}.${process.pid}.tmp`;
+    writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf-8");
+    renameSync(tempPath, statusPath);
+    return statusPath;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    mergerLog.warn(`${taskId}: git reset --merge cleanup failed during ${label}: ${msg}`);
+    mergerLog.warn(`${taskId}: writeActiveMergerStatus failed (${msg}) — proceeding without advisory file`);
+    return null;
   }
+}
+
+/** Best-effort delete of the status file. */
+function clearActiveMergerStatus(statusPath: string | null, taskId: string): void {
+  if (!statusPath) return;
+  try {
+    unlinkSync(statusPath);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: clearActiveMergerStatus failed (${msg}) — file may linger as a stale advisory`);
+  }
+}
+
+/** Public reader for tooling (CLI / dashboard / TUI / Claude Code hook).
+ *  Returns null if no merger is active OR if the advisory file is malformed.
+ *  Callers can correlate `pid` + `hostname` with their own process list to
+ *  distinguish a live merger from a stale post-crash file. */
+export function readActiveMergerStatus(rootDir: string): ActiveMergerStatus | null {
+  try {
+    const statusPath = join(rootDir, ".git", ACTIVE_MERGER_STATUS_FILENAME);
+    if (!existsSync(statusPath)) return null;
+    const raw = readFileSync(statusPath, "utf-8");
+    const parsed = JSON.parse(raw) as ActiveMergerStatus;
+    if (!parsed?.taskId || typeof parsed.pid !== "number") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** Wrap a destructive op in `rootDir` with snapshot-before / snapshot-after
+ *  observability. Pure logging — does not rescue. Designed for ops that are
+ *  *supposed* to preserve unrelated working-tree edits (e.g. `git reset
+ *  --merge`, `git checkout main`). When such an op silently wipes a path
+ *  that was dirty before, the warning surfaces it as actionable signal
+ *  instead of letting the loss go unnoticed.
+ *
+ *  Not used for the autostash's own `git reset --hard HEAD` / `git clean
+ *  -fd` (those are intentionally destructive and have race-rescue stashes
+ *  capturing dirty state up-front).
+ *
+ *  Synchronous variant — the destructive ops themselves are mostly
+ *  `execSync` for "best-effort cleanup" semantics, so the wrapper matches
+ *  to avoid scattering Promise-juggling at every call site. */
+function runObservedDestructiveSyncOp(
+  rootDir: string,
+  taskId: string,
+  label: string,
+  op: () => void,
+): void {
+  // snapshotDirtyFiles is async by design (uses Promise.all over three git
+  // queries); we read it via a quick sync fallback so the observer doesn't
+  // change the call shape of resetMergeWithWarn et al.
+  let beforeRaw = "";
+  try {
+    beforeRaw = execSync("git status -z --porcelain", { cwd: rootDir, stdio: ["ignore", "pipe", "ignore"] }).toString("utf-8");
+  } catch {
+    // best-effort — skip observation if we can't read status
+    op();
+    return;
+  }
+  const before = parsePorcelainZ(beforeRaw);
+
+  op();
+
+  let afterRaw = "";
+  try {
+    afterRaw = execSync("git status -z --porcelain", { cwd: rootDir, stdio: ["ignore", "pipe", "ignore"] }).toString("utf-8");
+  } catch {
+    return;
+  }
+  const after = parsePorcelainZ(afterRaw);
+
+  const lost = [...before].filter((p) => !after.has(p));
+  if (lost.length > 0) {
+    const sample = lost.slice(0, 10).join(", ");
+    const ellipsis = lost.length > 10 ? ` … (+${lost.length - 10} more)` : "";
+    mergerLog.warn(
+      `${taskId}: destructive op "${label}" cleared ${lost.length} dirty path(s) that were present before — possible silent wipe of unrelated dev edits: ${sample}${ellipsis}`,
+    );
+  }
+}
+
+/** Parse `git status -z --porcelain` into a Set of paths.
+ *
+ *  Format per entry: `XY <space> <path>\0` where X = staged status, Y =
+ *  unstaged status. Renames and copies are special: they emit TWO
+ *  NUL-separated entries, `R  <new>\0<old>\0` (or `C  <new>\0<old>\0`).
+ *  We must consume the trailing `<old>` entry without treating it as a
+ *  separate path, otherwise observability code over-reports "cleared
+ *  paths" with the historical names of renames. */
+export function parsePorcelainZ(raw: string): Set<string> {
+  const paths = new Set<string>();
+  const entries = raw.split("\0");
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry) continue;
+    if (entry.length < 4) continue;
+    const status = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (!path) continue;
+    paths.add(path);
+    // Rename/copy: the very next entry is the old path — skip it so it
+    // isn't mistaken for an independent dirty path.
+    if (status.charAt(0) === "R" || status.charAt(0) === "C") {
+      i++;
+    }
+  }
+  return paths;
+}
+
+/** Find autostashes from PRIOR runs that are still sitting in the stash list.
+ *  These are leftovers from past merges whose pop/apply conflicted — under the
+ *  old code path the warning was logged once and then forgotten, and the
+ *  next merge would silently bury them by pushing a new stash on top. We now
+ *  surface them at the start of every merge so the developer notices. */
+async function listOrphanedAutostashes(
+  rootDir: string,
+): Promise<Array<{ sha: string; ref: string; label: string }>> {
+
+  try {
+    const { stdout } = await execAsync(
+      `git stash list --format="%H %gd %s"`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    const lines = String(stdout).split("\n").map((l) => l.trim()).filter(Boolean);
+    const orphans: Array<{ sha: string; ref: string; label: string }> = [];
+    for (const line of lines) {
+      // Format: "<sha> stash@{N} <subject including label>"
+      const idx = line.indexOf(AUTOSTASH_LABEL_PREFIX);
+      if (idx === -1) continue;
+      const parts = line.split(/\s+/);
+      const sha = parts[0] ?? "";
+      const ref = parts[1] ?? "";
+      const label = line.slice(idx);
+      if (sha && ref) orphans.push({ sha, ref, label });
+    }
+    return orphans;
+  } catch {
+    return [];
+  }
+}
+
+function parseAutostashTaskId(label: string): string | null {
+  const match = /^fusion-merger-autostash:([A-Za-z]+-\d+):/.exec(label.trim());
+  return match?.[1] ?? null;
+}
+
+
+function parseAutostashCreatedAt(label: string): string | null {
+  const match = AUTOSTASH_TIMESTAMP_RE.exec(label.trim());
+  if (!match) return null;
+  const ts = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isFinite(ts)) return null;
+  return new Date(ts).toISOString();
+}
+
+function parseAutostashSourcePhase(label: string): string | null {
+  const trimmed = label.trim();
+  const phaseMatch = /^fusion-merger-autostash:[A-Za-z]+-\d+:([a-z-]+):\d+$/.exec(trimmed);
+  if (phaseMatch?.[1]) return phaseMatch[1];
+  if (/^fusion-merger-autostash:[A-Za-z]+-\d+:race-rescue-\d+:\d+$/.test(trimmed)) return "race-rescue";
+  if (/^fusion-merger-autostash:[A-Za-z]+-\d+:\d+$/.test(trimmed)) return "pre-merge";
+  return null;
+}
+
+async function classifyAutostashOrphan(rootDir: string, sha: string): Promise<"subsumed" | "live" | "unknown"> {
+  try {
+    const stashFiles = await listStashChangedPaths(rootDir, sha);
+    if (stashFiles.size === 0) return "subsumed";
+    const pathsArg = [...stashFiles].map(quoteArg).join(" ");
+    const { stdout: pathDiffOut } = await execAsync(
+      `git diff --name-only HEAD ${quoteArg(sha)} -- ${pathsArg}`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    return pathDiffOut.trim() === "" ? "subsumed" : "live";
+  } catch {
+    return "unknown";
+  }
+}
+
+export async function listAutostashOrphans(rootDir: string): Promise<AutostashOrphanRecord[]> {
+  const orphans = await listOrphanedAutostashes(rootDir);
+  const records: AutostashOrphanRecord[] = [];
+  for (const orphan of orphans) {
+    const changedPaths = [...(await listStashChangedPaths(rootDir, orphan.sha))];
+    records.push({
+      sha: orphan.sha,
+      ref: orphan.ref,
+      label: orphan.label,
+      sourceTaskId: parseAutostashTaskId(orphan.label),
+      createdAt: parseAutostashCreatedAt(orphan.label),
+      changedPaths,
+      classification: await classifyAutostashOrphan(rootDir, orphan.sha),
+      sourcePhase: parseAutostashSourcePhase(orphan.label),
+      detectedByTaskId: null,
+      detectedAt: null,
+    });
+  }
+  return records;
+}
+
+export async function notifyAutostashOrphans(
+  store: TaskStore,
+  rootDir: string,
+  options?: { detectedByTaskId?: string | null; detectedAt?: string },
+): Promise<AutostashOrphanRecord[]> {
+  const detectedAt = options?.detectedAt ?? new Date().toISOString();
+  const records = (await listAutostashOrphans(rootDir)).map((record) => ({
+    ...record,
+    detectedByTaskId: options?.detectedByTaskId ?? null,
+    detectedAt,
+  }));
+  store.emit("merger:autostashOrphans", { rootDir, records });
+  return records;
+}
+
+export async function applyAutostashBySha(
+  rootDir: string,
+  sha: string,
+): Promise<{ ok: true } | { ok: false; reason: string; stderr?: string }> {
+  try {
+    await execAsync(`git stash apply ${quoteArg(sha)}`, { cwd: rootDir, encoding: "utf-8" });
+    return { ok: true };
+  } catch (err: unknown) {
+    const stderr = err && typeof err === "object" && "stderr" in err ? String((err as { stderr?: string }).stderr ?? "") : "";
+    const stdout = err && typeof err === "object" && "stdout" in err ? String((err as { stdout?: string }).stdout ?? "") : "";
+    const message = err instanceof Error ? err.message : String(err);
+    const details = `${stderr}\n${stdout}\n${message}`;
+    if (/CONFLICT|could not apply|would be overwritten/i.test(details)) {
+      return { ok: false, reason: "conflict", stderr: stderr || details };
+    }
+    return { ok: false, reason: "apply_failed", stderr: stderr || details };
+  }
+}
+
+export async function getAutostashDiff(rootDir: string, sha: string): Promise<string> {
+  const maxBytes = 64 * 1024;
+  const { stdout } = await execAsync(`git stash show -p ${quoteArg(sha)}`, {
+    cwd: rootDir,
+    encoding: "utf-8",
+    maxBuffer: 5 * 1024 * 1024,
+  });
+  const diff = String(stdout);
+  if (Buffer.byteLength(diff, "utf-8") <= maxBytes) return diff;
+  let truncated = diff;
+  while (Buffer.byteLength(truncated, "utf-8") > maxBytes) {
+    truncated = truncated.slice(0, Math.max(0, Math.floor(truncated.length * 0.9)));
+  }
+  return `${truncated}\n… (diff truncated)`;
 }
 
 /**
@@ -854,61 +1518,1023 @@ function resetMergeWithWarn(rootDir: string, taskId: string, label: string): voi
  * way (FN-3329 retro): dashboard-tui edits were wiped mid-flight by an
  * unrelated FN-3329 merge.
  *
- * The fix: snapshot dirty state up-front, stash it (including untracked
- * files) under a recognizable label, and pop it back after the merge
- * finishes — success OR failure — via a try/finally in `aiMergeTask`.
+ * The fix: snapshot dirty state up-front using `git stash create` + `git
+ * stash store` to capture a deterministic SHA *before* any working-tree
+ * mutation, then apply it back after the merge finishes — success OR
+ * failure — via a try/finally in `aiMergeTask`.
  *
- * Returns the stash ref (e.g. `stash@{0}`) when a stash was created, or
+ * Why create+store instead of `git stash push`: `push` returns no
+ * machine-readable identifier and forces us to grep the stash list for our
+ * label, which races against any other tool that stashes concurrently.
+ * `create` returns the SHA atomically with snapshot creation, then `store`
+ * registers it in the reflog under a recognizable label so it's protected
+ * from GC and visible to humans via `git stash list`.
+ *
+ * Untracked files are captured by first staging them via `git add -A` so
+ * `stash create` (which otherwise ignores untracked) sees them as part of
+ * the index snapshot. The subsequent `git reset --hard` + `git clean -fd`
+ * bring the working tree back to HEAD so the merge can proceed cleanly.
+ *
+ * Returns the stash handle (SHA + label) when a stash was created, or
  * `null` when the working tree was already clean. Best-effort: any failure
  * to stash logs and returns null — the merge still proceeds, but with the
  * old behavior. We do NOT want a stash failure to block the merge entirely
  * (that would be a strictly worse regression than the current state).
  */
+/**
+ * Inspect every leftover `fusion-merger-autostash:*` from prior runs. For
+ * each, classify:
+ *
+ *  - **Subsumed** — `git diff HEAD <stashSha> -- <stashFiles>` produces no
+ *    output, meaning every path in the stash is already byte-identical to
+ *    HEAD. The dev's work either landed in HEAD via the merge itself or
+ *    was committed independently; the stash is redundant. Drop it.
+ *  - **Live** — at least one path still differs from HEAD. The stash is
+ *    real lost work; warn loudly so the dev can recover it manually.
+ *
+ *  Without this sweep, every silent restore failure (apply hard-fails on
+ *  untracked-overwrite, ref already gone, transient git error) leaves a
+ *  permanent stash entry. They pile up indefinitely — we observed 50+
+ *  orphans on a single working tree — and the warn-only behavior means
+ *  developers stop reading the warnings entirely, defeating the safety
+ *  net.
+ */
+async function sweepAutostashOrphans(
+  rootDir: string,
+  taskId: string,
+  store: TaskStore,
+): Promise<void> {
+  let orphans: Array<{ sha: string; ref: string; label: string }> = [];
+  try {
+    orphans = await listOrphanedAutostashes(rootDir);
+  } catch {
+    return;
+  }
+  if (orphans.length === 0) return;
+
+  const subsumed: Array<{ sha: string; ref: string; label: string }> = [];
+  const live: Array<{ sha: string; ref: string; label: string }> = [];
+
+  const droppedClosedTask: Array<{ sha: string; taskId: string; column: Task["column"] }> = [];
+
+  for (const orphan of orphans) {
+    try {
+      const stashFiles = await listStashChangedPaths(rootDir, orphan.sha);
+      if (stashFiles.size === 0) {
+        // Empty stash — nothing to lose by dropping.
+        subsumed.push(orphan);
+        continue;
+      }
+      const pathsArg = [...stashFiles].map(quoteArg).join(" ");
+      const { stdout: pathDiffOut } = await execAsync(
+        `git diff --name-only HEAD ${quoteArg(orphan.sha)} -- ${pathsArg}`,
+        { cwd: rootDir, encoding: "utf-8" },
+      );
+      const isPathSubsumed = pathDiffOut.trim() === "";
+      if (isPathSubsumed) {
+        subsumed.push(orphan);
+        continue;
+      }
+
+      const sourceTaskId = parseAutostashTaskId(orphan.label);
+      if (!sourceTaskId) {
+        live.push(orphan);
+        continue;
+      }
+
+      let sourceTask: Task | null = null;
+      try {
+        sourceTask = await store.getTask(sourceTaskId);
+      } catch {
+        live.push(orphan);
+        continue;
+      }
+      if (!sourceTask || (sourceTask.column !== "done" && sourceTask.column !== "archived")) {
+        live.push(orphan);
+        continue;
+      }
+
+      try {
+        const { stdout: netDiffOut } = await execAsync(
+          `git diff HEAD ${quoteArg(orphan.sha)}`,
+          { cwd: rootDir, encoding: "utf-8" },
+        );
+        if (netDiffOut.trim() === "") {
+          subsumed.push(orphan);
+          droppedClosedTask.push({ sha: orphan.sha, taskId: sourceTaskId, column: sourceTask.column });
+          continue;
+        }
+      } catch {
+        live.push(orphan);
+        continue;
+      }
+
+      live.push(orphan);
+    } catch {
+      // If we can't classify, treat as live — better to leave a real stash
+      // sitting around than to drop one that still contains lost work.
+      live.push(orphan);
+    }
+  }
+
+  for (const orphan of subsumed) {
+    await dropAutostashBySha(rootDir, taskId, orphan.sha);
+    const closedTaskDrop = droppedClosedTask.find((entry) => entry.sha === orphan.sha);
+    if (closedTaskDrop) {
+      mergerLog.log(
+        `${taskId}: dropped closed-task autostash ${orphan.sha.slice(0, 7)} (task ${closedTaskDrop.taskId} is ${closedTaskDrop.column})`,
+      );
+      continue;
+    }
+    mergerLog.log(
+      `${taskId}: dropped subsumed autostash ${orphan.sha.slice(0, 7)} (${orphan.label}) — content already present on HEAD`,
+    );
+  }
+
+  if (subsumed.length > 0) {
+    await store
+      .logEntry(
+        taskId,
+        `Cleaned up ${subsumed.length} subsumed autostash orphan(s) — their content already on HEAD`,
+        subsumed.map((o) => `${o.ref}@${o.sha.slice(0, 7)} (${o.label})`).join("\n"),
+      )
+      .catch(() => undefined);
+  }
+
+  if (live.length > 0) {
+    const refs = live.map((o) => `${o.ref}@${o.sha.slice(0, 7)}`).join(", ");
+    mergerLog.warn(
+      `${taskId}: ${live.length} live fusion-merger-autostash entry(ies) in stash list (${refs}) — uncommitted dev changes from prior merges whose restore failed. Recover with: cd ${rootDir} && git stash list && git stash apply <sha>`,
+    );
+    await store
+      .logEntry(
+        taskId,
+        `${live.length} autostash orphan(s) still hold uncommitted dev work — recover manually`,
+        live
+          .map(
+            (o) =>
+              `${o.ref}@${o.sha.slice(0, 7)} (${o.label})\n  recover: git stash apply ${o.sha}`,
+          )
+          .join("\n\n"),
+      )
+      .catch(() => undefined);
+  }
+
+  await notifyAutostashOrphans(store, rootDir, { detectedByTaskId: taskId }).catch(() => undefined);
+}
+
+export async function sweepStaleAutostashes(
+  rootDir: string,
+  options: { maxAgeMs: number; taskStore?: TaskStore },
+): Promise<{ dropped: number }> {
+  try {
+    void options.taskStore;
+    const now = Date.now();
+    const threshold = Math.max(0, Math.trunc(options.maxAgeMs));
+    const entries = await listOrphanedAutostashes(rootDir);
+    let dropped = 0;
+
+    for (const entry of entries) {
+      const match = AUTOSTASH_TIMESTAMP_RE.exec(entry.label.trim());
+      if (!match) continue;
+      const ts = Number.parseInt(match[1] ?? "", 10);
+      if (!Number.isFinite(ts)) continue;
+      if (now - ts <= threshold) continue;
+      const sourceTaskId = parseAutostashTaskId(entry.label) ?? "autostash-sweep";
+      const result = await dropAutostashBySha(rootDir, sourceTaskId, entry.sha);
+      if (result.dropped) dropped += 1;
+    }
+
+    const hours = Math.max(1, Math.round(threshold / 3_600_000));
+    mergerLog.log(`startup-sweep: dropped ${dropped} stale fusion-merger-autostash entries older than ${hours}h`);
+    return { dropped };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`startup-sweep: stale autostash sweep failed (${msg})`);
+    return { dropped: 0 };
+  }
+}
+
+export type { AutostashOrphanRecord };
+
+export const __test__ = {
+  sweepAutostashOrphans,
+  parseAutostashTaskId,
+  dropAutostashHandle,
+  isAutostashLive,
+  sweepStaleAutostashes,
+  listAutostashOrphans,
+  applyAutostashBySha,
+  getAutostashDiff,
+  notifyAutostashOrphans,
+};
+
 async function stashUnrelatedRootDirChanges(
   rootDir: string,
   taskId: string,
-): Promise<string | null> {
+): Promise<AutostashHandle | null> {
   try {
-    // Cheap dirty-check first so we don't litter empty stashes during the
-    // common all-clean case.
     const dirty = await snapshotDirtyFiles(rootDir);
     if (dirty.size === 0) return null;
 
-    const label = `fusion-merger-autostash:${taskId}:${Date.now()}`;
-    // -u → include untracked. -m → label so we can locate it later even if
-    // another stash arrives (unlikely but possible under concurrent tooling).
+    const label = `${AUTOSTASH_LABEL_PREFIX}${taskId}:${Date.now()}`;
+
+    // Stage everything so `git stash create` captures untracked files too.
+    // `stash create` only includes index + tracked working-tree changes by
+    // default; `git add -A` stages untracked under .gitignore rules.
+    await execAsync("git add -A", { cwd: rootDir });
+
+    // Atomically snapshot working state into a commit object. SHA is
+    // deterministic the moment this returns — no list-grep race.
+    const { stdout: createOut } = await execAsync("git stash create", {
+      cwd: rootDir,
+      encoding: "utf-8",
+    });
+    const sha = String(createOut).trim();
+    if (!sha) {
+      // No-op snapshot (shouldn't happen given the dirty check above, but
+      // bail safely and unstage what we just staged).
+      await execAsync("git reset", { cwd: rootDir }).catch(() => undefined);
+      return null;
+    }
+
+    // Persist into the stash reflog so the SHA is reachable and humans see
+    // it in `git stash list`. Without store, the SHA would be GC-eligible.
     await execAsync(
-      `git stash push -u -m "${label}"`,
+      `git stash store -m ${quoteArg(label)} ${sha}`,
       { cwd: rootDir },
     );
 
-    // Resolve the actual ref. `git stash push` doesn't print one in a
-    // machine-friendly way, so we look up the most recent stash that
-    // matches our label. This guards against another tool sneaking in a
-    // stash between push and resolve.
-    const { stdout } = await execAsync(
-      `git stash list --format="%gd %s"`,
-      { cwd: rootDir, encoding: "utf-8" },
-    );
-    const lines = String(stdout).split("\n");
-    const match = lines.find((line) => line.includes(label));
-    if (!match) {
-      mergerLog.warn(
-        `${taskId}: created autostash but could not locate it in stash list — leaving in place to avoid data loss`,
+    // Race-rescue: re-snapshot AFTER the stash is persisted but BEFORE the
+    // destructive `git reset --hard` below. If any new dirty paths showed up
+    // between our initial `git add -A` and now — concurrent dev edits, a
+    // parallel merger run interleaving its own ops, or test/build artifacts
+    // landing late — capture ONLY those new paths in a separate rescue stash
+    // so they survive the wipe.
+    //
+    // Subtlety: `git add -A && git stash create` does NOT clean the working
+    // tree. Files stay dirty post-stash. So a naive "snapshot dirty again"
+    // sees the SAME files as the primary stash and produces duplicate rescues
+    // every run. We instead diff the post-stash dirty set against the SET OF
+    // PATHS ALREADY CAPTURED BY THE PRIMARY STASH and only rescue paths that
+    // were not in the primary — those are the genuine late-dirty writes.
+    const primaryStashPaths = await listStashChangedPaths(rootDir, sha);
+    const rescueShas: { sha: string; label: string }[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentDirty = await snapshotDirtyFiles(rootDir);
+      const newlyDirty = [...currentDirty].filter((p) => !primaryStashPaths.has(p));
+      if (newlyDirty.length === 0) break;
+      const rescueLabel = `${AUTOSTASH_LABEL_PREFIX}${taskId}:race-rescue-${attempt}:${Date.now()}`;
+      // Unstage before re-adding: `git stash create` snapshots the index
+      // but does NOT clear it, so a second iteration's `git add -A` would
+      // re-stage atop iteration-1 leftovers and produce a tree that
+      // differs from current dirt for stale-staging reasons rather than
+      // genuine new writes. The upcoming `git reset --hard HEAD` clears
+      // it eventually, but inside this loop we want a clean baseline.
+      await execAsync("git reset", { cwd: rootDir }).catch(() => undefined);
+      await execAsync("git add -A", { cwd: rootDir });
+      const { stdout: rescueOut } = await execAsync("git stash create", {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const rescueSha = String(rescueOut).trim();
+      if (!rescueSha) break;
+      // Defensive check: if `git stash create` produced an SHA whose tree
+      // exactly matches the primary stash, drop it — same race that motivates
+      // the path-set check above can land us with an identical SHA when the
+      // working tree didn't change between primary and rescue (e.g. git's own
+      // internal index dedup). Don't pollute the stash list.
+      const rescueTreeSame = await stashTreesEqual(rootDir, sha, rescueSha);
+      if (rescueTreeSame) break;
+      await execAsync(
+        `git stash store -m ${quoteArg(rescueLabel)} ${rescueSha}`,
+        { cwd: rootDir },
       );
-      return null;
+      rescueShas.push({ sha: rescueSha, label: rescueLabel });
+      mergerLog.warn(
+        `${taskId}: race-rescue stash ${rescueSha.slice(0, 7)} captured ${newlyDirty.length} late-dirty path(s) not in primary stash (${rescueLabel}) — recover with: cd ${rootDir} && git stash apply ${rescueSha}`,
+      );
+      // Track them in primaryStashPaths so subsequent loop iterations don't
+      // re-rescue the same set if writes are still landing.
+      for (const p of newlyDirty) primaryStashPaths.add(p);
     }
-    const ref = match.split(/\s+/)[0] ?? null;
+
+    // Bring working tree back to HEAD so the merge can proceed. Reset
+    // un-stages everything we just staged AND drops tracked-file
+    // modifications. `git clean -fd` removes any untracked files / dirs
+    // that survived (gitignored ones stay because we didn't pass -x).
+    await execAsync("git reset --hard HEAD", { cwd: rootDir });
+    await execAsync("git clean -fd", { cwd: rootDir });
+
+    const rescueSuffix = rescueShas.length > 0
+      ? ` + ${rescueShas.length} race-rescue stash(es): ${rescueShas.map((r) => r.sha.slice(0, 7)).join(", ")}`
+      : "";
     mergerLog.log(
-      `${taskId}: stashed ${dirty.size} unrelated dirty path(s) in rootDir as ${ref} (${label})`,
+      `${taskId}: stashed ${dirty.size} unrelated dirty path(s) in rootDir as ${sha.slice(0, 7)} (${label})${rescueSuffix}`,
     );
-    return ref;
+    return rescueShas.length > 0 ? { sha, label, rescueShas } : { sha, label };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     mergerLog.warn(
       `${taskId}: pre-merge autostash failed (${msg}) — proceeding without stash; concurrent dev edits in rootDir may be wiped`,
     );
+    // Best-effort: try to unstage anything `git add -A` may have staged
+    // before the failure, so the working tree is at least back to a sane
+    // state for the merge.
+    try {
+      await execAsync("git reset", { cwd: rootDir });
+    } catch {
+      // Nothing more we can do.
+    }
     return null;
+  }
+}
+
+/** Resolve the autostash SHA back to its current `stash@{N}` ref so we can
+ *  drop it. Stash positions shift when other stashes are pushed, so we
+ *  can't cache the original ref. Returns null if the stash is no longer
+ *  in the reflog (already dropped). */
+async function findStashRefBySha(rootDir: string, sha: string): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync(
+      `git stash list --format="%H %gd"`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    for (const line of String(stdout).split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const [entrySha, ref] = trimmed.split(/\s+/);
+      if (entrySha === sha && ref) return ref;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Drop an autostash by SHA, defending against the TOCTOU race where another
+ *  process pushes a stash between our `findStashRefBySha` and the actual
+ *  `git stash drop stash@{N}` (drop only takes positional refs, so the index
+ *  is what git uses — not our SHA). Without this guard we silently drop
+ *  someone else's stash while leaving ours behind, and the task log lies
+ *  about a clean restore.
+ *
+ *  Strategy: re-resolve ref → SHA, verify the ref still points at our SHA
+ *  with `git rev-parse`, then drop. If the SHA at the ref drifted (race),
+ *  retry up to 5x. Returns whether the drop landed cleanly so callers can
+ *  surface failure to the task feed. */
+export async function dropAutostashBySha(
+  rootDir: string,
+  taskId: string,
+  sha: string,
+): Promise<{ dropped: boolean; reason?: string }> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const ref = await findStashRefBySha(rootDir, sha);
+    if (!ref) {
+      mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} no longer in stash list (already dropped)`);
+      return { dropped: true };
+    }
+
+    // Defend against the index-shift race: confirm the ref still resolves to
+    // our SHA before dropping. If another process pushed a stash, ref now
+    // points at theirs — back off and re-resolve.
+    let refSha = "";
+    try {
+      const { stdout } = await execAsync(`git rev-parse ${ref}`, { cwd: rootDir, encoding: "utf-8" });
+      refSha = String(stdout).trim();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      mergerLog.warn(`${taskId}: rev-parse ${ref} failed (${msg}) on drop attempt ${attempt + 1} — retrying`);
+      continue;
+    }
+    if (refSha !== sha) {
+      mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} shifted off ${ref} (now ${refSha.slice(0, 7)}); re-resolving`);
+      continue;
+    }
+
+    try {
+      await execAsync(`git stash drop ${ref}`, { cwd: rootDir });
+      return { dropped: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Final attempt: surface the failure. Earlier attempts get retried.
+      if (attempt === 4) {
+        mergerLog.warn(`${taskId}: failed to drop autostash ${ref} after ${attempt + 1} attempts (${msg}) — stash will linger in stash list`);
+        return { dropped: false, reason: msg };
+      }
+      mergerLog.warn(`${taskId}: drop ${ref} attempt ${attempt + 1} failed (${msg}) — retrying`);
+    }
+  }
+  return { dropped: false, reason: "exhausted retry attempts" };
+}
+
+async function isAutostashLive(rootDir: string, sha: string): Promise<boolean> {
+  try {
+    const stashFiles = await listStashChangedPaths(rootDir, sha);
+    if (stashFiles.size === 0) return false;
+    const pathsArg = [...stashFiles].map(quoteArg).join(" ");
+    const { stdout: pathDiffOut } = await execAsync(
+      `git diff --name-only HEAD ${quoteArg(sha)} -- ${pathsArg}`,
+      { cwd: rootDir, encoding: "utf-8" },
+    );
+    return pathDiffOut.trim().length > 0;
+  } catch {
+    return true;
+  }
+}
+
+async function dropAutostashHandle(
+  rootDir: string,
+  taskId: string,
+  handle: AutostashHandle,
+  options: {
+    keepIfLive: boolean;
+    store?: TaskStore;
+    context?: string;
+  },
+): Promise<{ dropped: number; keptLive: number; failed: number }> {
+  const entries = [
+    { sha: handle.sha, label: handle.label, kind: "primary" as const },
+    ...(handle.rescueShas ?? []).map((r) => ({ sha: r.sha, label: r.label, kind: "race-rescue" as const })),
+  ];
+
+  let dropped = 0;
+  let keptLive = 0;
+  let failed = 0;
+
+  for (const entry of entries) {
+    if (options.keepIfLive) {
+      const live = await isAutostashLive(rootDir, entry.sha);
+      if (live) {
+        keptLive += 1;
+        mergerLog.warn(`${taskId}: preserving live ${entry.kind} autostash ${entry.sha.slice(0, 7)} (${entry.label})`);
+        continue;
+      }
+    }
+
+    const dropResult = await dropAutostashBySha(rootDir, taskId, entry.sha);
+    if (dropResult.dropped) {
+      dropped += 1;
+      mergerLog.log(`${taskId}: dropped ${entry.kind} autostash ${entry.sha.slice(0, 7)} (${entry.label})`);
+    } else {
+      failed += 1;
+      mergerLog.warn(
+        `${taskId}: failed to drop ${entry.kind} autostash ${entry.sha.slice(0, 7)} (${entry.label}) — ${dropResult.reason ?? "unknown"}`,
+      );
+    }
+  }
+
+  if (options.store && options.context) {
+    await options.store.logEntry(
+      taskId,
+      `${options.context}: autostash cleanup dropped ${dropped}, preserved ${keptLive} live, failed ${failed}`,
+      entries.map((entry) => `${entry.kind} ${entry.sha.slice(0, 7)} (${entry.label})`).join("\n"),
+    ).catch(() => undefined);
+  }
+
+  return { dropped, keptLive, failed };
+}
+
+/**
+ * AI fix-agent for autostash apply conflicts. Spawned only when applying
+ * the stashed dev work hits a conflict — the merge has already committed
+ * cleanly, so this agent's job is narrow: edit the working-tree files in
+ * place to remove conflict markers, picking the right combination of the
+ * developer's pre-merge edits and the just-committed merge content. It
+ * does NOT commit anything; the resolved files stay uncommitted (matching
+ * the developer's pre-merge state).
+ *
+ * Mirrors the in-merge fix-agent pattern at the top of this file
+ * (createResolvedAgentSession with sessionPurpose: "merger") so we reuse
+ * skill selection, fallback models, rate-limit retry, and audit logging.
+ *
+ * Returns true on success (conflict markers gone, files staged-or-not as
+ * the agent decided). On failure or abort, returns false and the caller
+ * leaves the stash in place for manual recovery.
+ */
+async function runAiAgentForAutostashConflict(params: {
+  store: TaskStore;
+  rootDir: string;
+  taskId: string;
+  conflictedFiles: string[];
+  options: MergerOptions;
+  settings: Settings;
+}): Promise<{ success: boolean; error?: string }> {
+  const { store, rootDir, taskId, conflictedFiles, options, settings } = params;
+
+  const agentLogger = new AgentLogger({
+    store,
+    taskId,
+    agent: "merger",
+    persistAgentToolOutput: settings.persistAgentToolOutput,
+    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    onAgentText: options.onAgentText
+      ? (_id: string, delta: string) => options.onAgentText!(delta)
+      : undefined,
+    onAgentTool: options.onAgentTool
+      ? (_id: string, name: string) => options.onAgentTool!(name)
+      : undefined,
+  });
+
+  // Skill / runtime resolution mirrors runAiAgentForCommit.
+  let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
+  let skillContext = undefined;
+  if (options.agentStore) {
+    try {
+      taskForSkillContext = await store.getTask(taskId);
+      skillContext = await buildSessionSkillContext({
+        agentStore: options.agentStore,
+        task: taskForSkillContext,
+        sessionPurpose: "merger",
+        projectRootDir: rootDir,
+        pluginRunner: options.pluginRunner,
+      });
+    } catch {
+      // Graceful fallback.
+    }
+  }
+  const assignedAgentId = taskForSkillContext?.assignedAgentId?.trim();
+  const agentStoreWithGetAgent = options.agentStore && typeof (options.agentStore as { getAgent?: unknown }).getAgent === "function"
+    ? options.agentStore
+    : null;
+  const assignedAgent = assignedAgentId && agentStoreWithGetAgent
+    ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
+    : null;
+  const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
+  const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig);
+
+  const systemPrompt = `You are an autostash-conflict resolution agent running after a Fusion merge has already committed on the main branch.
+
+Before the merge ran, the developer had uncommitted local changes in their working tree. The merger snapshotted those changes into a git stash, ran the merge cleanly, and is now reapplying the stash on top of the merged HEAD. The reapply hit conflicts because the merge committed changes that overlap the developer's stashed edits.
+
+## Your job
+Edit the conflicted files in place to remove every conflict marker (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) and produce a coherent merged result that:
+- Preserves the developer's intended uncommitted changes (the "Updated upstream" / branch-side, depending on which side the stash pop wrote)
+- Layers them onto the merged HEAD content (the other side)
+
+## Rules
+1. Read each conflicted file carefully before editing
+2. Resolve every conflict marker — none may remain after you finish
+3. Do NOT make any git commits. Do NOT run \`git add\` or \`git stash drop\`. Just edit the files.
+4. Do NOT touch files that are not in the conflicted-files list
+5. If you genuinely cannot determine the right resolution for a hunk, prefer the developer's stashed edits (their work is the unsaved context) and add a brief \`// TODO(autostash-conflict)\` comment so they can review
+
+The orchestrator will verify post-run that no conflict markers remain. If any do, this attempt is treated as a failure and the stash is left intact for manual recovery.`;
+
+  const fileList = conflictedFiles.map((f) => `- ${f}`).join("\n");
+  const prompt = `Resolve autostash apply conflicts for task ${taskId}.
+
+## Conflicted files
+${fileList}
+
+## Steps
+1. For each file above, read its current contents (it has conflict markers from the failed \`git stash apply\`)
+2. Edit it to a clean state with no conflict markers — preserving the developer's intended changes layered on top of the merged HEAD
+3. After all files are clean, you are done. Do NOT commit or run git stash commands.`;
+
+  mergerLog.log(`${taskId}: starting autostash-conflict resolution agent (${conflictedFiles.length} file(s))`);
+
+  const { session } = await createResolvedAgentSession({
+    sessionPurpose: "merger",
+    runtimeHint: mergerRuntimeHint,
+    pluginRunner: options.pluginRunner,
+    cwd: rootDir,
+    systemPrompt,
+    tools: "coding",
+    onText: agentLogger.onText,
+    onThinking: agentLogger.onThinking,
+    onToolStart: agentLogger.onToolStart,
+    onToolEnd: agentLogger.onToolEnd,
+    defaultProvider: mergerSessionModel.provider,
+    defaultModelId: mergerSessionModel.modelId,
+    fallbackProvider: settings.fallbackProvider,
+    fallbackModelId: settings.fallbackModelId,
+    defaultThinkingLevel: settings.defaultThinkingLevel,
+    ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+    taskId,
+    taskTitle: taskForSkillContext?.title,
+    onFallbackModelUsed: createFallbackModelObserver({
+      agent: "merger",
+      label: "autostash conflict agent",
+      store,
+      taskId,
+      taskTitle: taskForSkillContext?.title,
+    }),
+  });
+  options.onSession?.(session);
+
+  try {
+    await store.appendAgentLog(
+      taskId,
+      `Autostash conflict agent started (model: ${describeModel(session)}, files: ${conflictedFiles.length})`,
+      "text",
+      undefined,
+      "merger",
+    );
+
+    await withRateLimitRetry(async () => {
+      throwIfAborted(options.signal, taskId);
+      await promptWithFallback(session, prompt);
+      checkSessionError(session);
+    }, {
+      onRetry: (attempt, delayMs, error) => {
+        const delaySec = Math.round(delayMs / 1000);
+        mergerLog.warn(`⏳ ${taskId} autostash-conflict agent rate limited — retry ${attempt} in ${delaySec}s: ${error.message}`);
+      },
+      signal: options.signal,
+    });
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: autostash-conflict agent error: ${msg}`);
+    await store.logEntry(taskId, "Autostash conflict agent encountered an error", msg);
+    return { success: false, error: msg };
+  } finally {
+    try {
+      session.dispose();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Verify no conflict markers remain in any of the listed files. Returns
+ *  the subset that still has markers (empty = all clean). */
+async function findFilesWithConflictMarkers(rootDir: string, files: string[]): Promise<string[]> {
+  const stillConflicted: string[] = [];
+  for (const file of files) {
+    try {
+      const fullPath = join(rootDir, file);
+      if (!existsSync(fullPath)) continue;
+      const { stdout } = await execAsync(
+        `git grep -l -e "^<<<<<<< " -e "^=======$" -e "^>>>>>>> " --no-index -- ${quoteArg(fullPath)}`,
+        { cwd: rootDir, encoding: "utf-8" },
+      ).catch(() => ({ stdout: "" }));
+      if (String(stdout).trim()) stillConflicted.push(file);
+    } catch {
+      // best-effort
+    }
+  }
+  return stillConflicted;
+}
+
+/**
+ * Recovery path for the hard-fail branch of `git stash apply`: the stash
+ * couldn't even start applying (typical causes: untracked-overwrite, the
+ * stash mentions a path that no longer exists at HEAD, or an index conflict
+ * where git refuses to write any markers). The working tree has no conflict
+ * markers because nothing was applied.
+ *
+ * Layered fallback:
+ *   1. Pull the stash patch via `git stash show -p <sha>` and try
+ *      `git apply --3way` against the working tree. This is more permissive
+ *      than `stash apply` for several common failure shapes (especially
+ *      untracked overwrites: --3way can produce conflict markers we can
+ *      then resolve, where stash apply just refuses).
+ *   2. If --3way left conflict markers: route to the existing AI conflict
+ *      resolver.
+ *   3. If --3way also hard-failed and smart conflict resolution is enabled:
+ *      spawn an AI agent armed with the patch + error context, ask it to
+ *      reconstruct the developer's edits on top of HEAD by editing files
+ *      directly.
+ *
+ * Returns the appropriate AutostashOutcome. If recovery succeeds, the stash
+ * is dropped (since its content is now applied to the working tree). If
+ * recovery fails, the stash is left intact for manual recovery.
+ */
+async function tryRecoverHardFailApply(params: {
+  rootDir: string;
+  taskId: string;
+  sha: string;
+  applyErrorMsg: string;
+  applyStderr: string;
+  ctx: {
+    store: TaskStore;
+    options: MergerOptions;
+    settings: Settings;
+  };
+}): Promise<AutostashOutcome> {
+  const { rootDir, taskId, sha, applyErrorMsg, applyStderr, ctx } = params;
+  const stashFiles = [...await listStashChangedPaths(rootDir, sha)];
+  const smartConflictResolution =
+    (ctx.settings.smartConflictResolution ?? ctx.settings.autoResolveConflicts) !== false;
+
+  // Step 1: try `git apply --3way`. This pulls the diff out of the stash and
+  // applies it as a regular patch with three-way merging, which behaves
+  // better than `stash apply` in several common hard-fail shapes.
+  let threeWayConflicted: string[] = [];
+  let threeWayApplied = false;
+  try {
+    // Get the patch text from the stash.
+    const { stdout: patchOut } = await execAsync(
+      `git stash show -p --binary ${sha}`,
+      { cwd: rootDir, encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
+    );
+    const patchText = String(patchOut);
+    if (!patchText.trim()) {
+      // Nothing to apply — stash was empty or show failed.
+      mergerLog.warn(`${taskId}: autostash ${sha.slice(0, 7)} produced empty patch; cannot 3-way recover`);
+    } else {
+      // Pipe the patch into `git apply --3way` via stdin.
+      const patchPath = join(rootDir, ".git", `fusion-autostash-${sha.slice(0, 7)}.patch`);
+      writeFileSync(patchPath, patchText, "utf-8");
+      try {
+        await execAsync(`git apply --3way --whitespace=nowarn ${quoteArg(patchPath)}`, { cwd: rootDir });
+        threeWayApplied = true;
+        mergerLog.log(`${taskId}: autostash ${sha.slice(0, 7)} recovered via git apply --3way`);
+      } catch (threeWayErr: unknown) {
+        const conflicted = await getConflictedFiles(rootDir);
+        if (conflicted.length > 0) {
+          threeWayConflicted = conflicted;
+          mergerLog.log(`${taskId}: 3-way produced ${conflicted.length} conflict file(s) — handing to AI resolver`);
+        } else {
+          const tweMsg = threeWayErr instanceof Error ? threeWayErr.message : String(threeWayErr);
+          mergerLog.warn(`${taskId}: 3-way apply also failed (${tweMsg}); falling through to AI patch recovery`);
+        }
+      } finally {
+        try { unlinkSync(patchPath); } catch { /* ignore */ }
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: failed to extract patch from stash ${sha.slice(0, 7)} (${msg})`);
+  }
+
+  // 3-way produced a clean working tree → drop stash and report restored.
+  if (threeWayApplied) {
+    const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash apply hit hard failure but recovered via git apply --3way (stash ${sha.slice(0, 7)})`,
+      `Original error: ${applyErrorMsg}\n${applyStderr ? `\nGit stderr:\n${applyStderr}\n` : ""}${dropResult.dropped ? "" : `\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+    ).catch(() => undefined);
+    return { status: "restored", stashSha: sha };
+  }
+
+  // 3-way produced conflict markers → existing AI conflict resolver handles it.
+  if (threeWayConflicted.length > 0) {
+    if (!smartConflictResolution) {
+      const message = `Autostash 3-way produced conflict markers in ${threeWayConflicted.length} file(s) and smartConflictResolution is disabled. Stash ${sha.slice(0, 7)} left intact.`;
+      await ctx.store.logEntry(
+        taskId,
+        `Autostash 3-way left conflict markers — manual resolution required (smart resolution disabled)`,
+        message,
+      ).catch(() => undefined);
+      return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: threeWayConflicted, message };
+    }
+
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash 3-way left conflicts in ${threeWayConflicted.length} file(s) — invoking AI to resolve`,
+      threeWayConflicted.join("\n"),
+    ).catch(() => undefined);
+
+    const aiResult = await runAiAgentForAutostashConflict({
+      store: ctx.store,
+      rootDir,
+      taskId,
+      conflictedFiles: threeWayConflicted,
+      options: ctx.options,
+      settings: ctx.settings,
+    });
+
+    const stillConflicted = aiResult.success
+      ? await findFilesWithConflictMarkers(rootDir, threeWayConflicted)
+      : threeWayConflicted;
+
+    if (aiResult.success && stillConflicted.length === 0) {
+      const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+      await ctx.store.logEntry(
+        taskId,
+        `Autostash hard-fail recovered via 3-way + AI conflict resolution (${threeWayConflicted.length} file(s))`,
+        `Resolved files:\n${threeWayConflicted.join("\n")}${dropResult.dropped ? "" : `\n\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+      ).catch(() => undefined);
+      return { status: "ai-resolved", stashSha: sha, conflictedFiles: threeWayConflicted };
+    }
+
+    const failureMsg = `3-way+AI resolution incomplete; markers remain in ${stillConflicted.join(", ") || "(unknown)"}. Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `Autostash 3-way+AI resolution failed`, failureMsg).catch(() => undefined);
+    return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: stillConflicted, message: failureMsg };
+  }
+
+  // Step 3: 3-way also hard-failed. AI patch recovery if enabled.
+  if (!smartConflictResolution || stashFiles.length === 0) {
+    const message = `Autostash apply hard-failed (${applyErrorMsg})${applyStderr ? `; git stderr: ${applyStderr}` : ""}. Stash ${sha.slice(0, 7)} left intact.`;
+    mergerLog.warn(`${taskId}: ${message}`);
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash apply failed — stash ${sha.slice(0, 7)} left intact for manual recovery`,
+      `${applyErrorMsg}${applyStderr ? `\n\nGit stderr:\n${applyStderr}` : ""}\n\nRecover with:\n  cd ${rootDir} && git stash apply ${sha}`,
+    ).catch(() => undefined);
+    return { status: "failed", stashSha: sha, errorMessage: applyErrorMsg };
+  }
+
+  await ctx.store.logEntry(
+    taskId,
+    `Autostash apply hard-failed — invoking AI patch-recovery agent (${stashFiles.length} file(s))`,
+    `${applyErrorMsg}${applyStderr ? `\n\nGit stderr:\n${applyStderr}` : ""}\n\nFiles in stash:\n${stashFiles.join("\n")}`,
+  ).catch(() => undefined);
+
+  const patchAiResult = await runAiAgentForAutostashHardFail({
+    store: ctx.store,
+    rootDir,
+    taskId,
+    stashSha: sha,
+    stashFiles,
+    applyErrorMsg,
+    applyStderr,
+    options: ctx.options,
+    settings: ctx.settings,
+  });
+
+  if (!patchAiResult.success) {
+    const failMsg = `AI patch-recovery failed (${patchAiResult.error ?? "unknown"}). Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `Autostash AI patch-recovery failed`, failMsg).catch(() => undefined);
+    return { status: "failed", stashSha: sha, errorMessage: failMsg };
+  }
+
+  // Verify any remaining conflict markers — agent may have left some.
+  const remainingMarkers = await findFilesWithConflictMarkers(rootDir, stashFiles);
+  if (remainingMarkers.length > 0) {
+    const failMsg = `AI patch-recovery left conflict markers in: ${remainingMarkers.join(", ")}. Stash ${sha.slice(0, 7)} left intact.`;
+    await ctx.store.logEntry(taskId, `AI patch-recovery incomplete — manual recovery required`, failMsg).catch(() => undefined);
+    return { status: "conflict-needs-manual", stashSha: sha, conflictedFiles: remainingMarkers, message: failMsg };
+  }
+
+  const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+  await ctx.store.logEntry(
+    taskId,
+    `Autostash hard-fail recovered by AI patch-recovery agent (${stashFiles.length} file(s))`,
+    `Recovered files:\n${stashFiles.join("\n")}${dropResult.dropped ? "" : `\n\nStash drop failed (${dropResult.reason ?? "unknown"}); clean up manually.`}`,
+  ).catch(() => undefined);
+  return { status: "ai-resolved", stashSha: sha, conflictedFiles: stashFiles };
+}
+
+/**
+ * AI agent for autostash apply HARD failures (no conflict markers, nothing
+ * applied). Receives the stash patch + git stderr and reconstructs the
+ * developer's edits on top of HEAD by editing files directly. Mirrors
+ * `runAiAgentForAutostashConflict` but with a different prompt because
+ * there are no in-tree conflict markers to resolve — the agent has to
+ * re-apply changes from the patch by hand.
+ */
+async function runAiAgentForAutostashHardFail(params: {
+  store: TaskStore;
+  rootDir: string;
+  taskId: string;
+  stashSha: string;
+  stashFiles: string[];
+  applyErrorMsg: string;
+  applyStderr: string;
+  options: MergerOptions;
+  settings: Settings;
+}): Promise<{ success: boolean; error?: string }> {
+  const { store, rootDir, taskId, stashSha, stashFiles, applyErrorMsg, applyStderr, options, settings } = params;
+
+  const agentLogger = new AgentLogger({
+    store,
+    taskId,
+    agent: "merger",
+    persistAgentToolOutput: settings.persistAgentToolOutput,
+    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    onAgentText: options.onAgentText
+      ? (_id: string, delta: string) => options.onAgentText!(delta)
+      : undefined,
+    onAgentTool: options.onAgentTool
+      ? (_id: string, name: string) => options.onAgentTool!(name)
+      : undefined,
+  });
+
+  let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
+  let skillContext = undefined;
+  if (options.agentStore) {
+    try {
+      taskForSkillContext = await store.getTask(taskId);
+      skillContext = await buildSessionSkillContext({
+        agentStore: options.agentStore,
+        task: taskForSkillContext,
+        sessionPurpose: "merger",
+        projectRootDir: rootDir,
+        pluginRunner: options.pluginRunner,
+      });
+    } catch {
+      // graceful fallback
+    }
+  }
+  const assignedAgentId = taskForSkillContext?.assignedAgentId?.trim();
+  const agentStoreWithGetAgent = options.agentStore && typeof (options.agentStore as { getAgent?: unknown }).getAgent === "function"
+    ? options.agentStore
+    : null;
+  const assignedAgent = assignedAgentId && agentStoreWithGetAgent
+    ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
+    : null;
+  const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
+  const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig);
+
+  const systemPrompt = `You are an autostash hard-failure recovery agent for the Fusion merger.
+
+Before the merge ran, the developer had uncommitted local changes. We snapshotted them into a git stash, ran the merge cleanly on top, and tried to re-apply the stash. Both \`git stash apply\` and \`git apply --3way\` failed without producing conflict markers — meaning git refused to attempt the apply at all (typical causes: untracked-file overwrite, a path in the stash no longer exists at HEAD, or an index conflict that produced no in-tree markers).
+
+## Your job
+Reconstruct the developer's intended uncommitted changes on top of the current HEAD by editing files directly. The stash patch (sourced from \`git stash show -p ${stashSha}\`) is your authoritative source for what changed.
+
+## Rules
+1. Run \`git stash show -p ${stashSha}\` (or read it via your shell) to get the patch text. Read it carefully.
+2. For each file in the patch, decide how to apply the developer's intent on top of HEAD's current contents:
+   - If the file still exists at HEAD: apply the patch hunks, integrating with any merge changes that overlap.
+   - If the file was deleted at HEAD: re-create it (the developer presumably wanted it) UNLESS the patch was deleting it too — in which case do nothing.
+   - If the file is new (added by the patch): create it with the patch contents.
+3. Do NOT make git commits. Do NOT run \`git add\` or \`git stash drop\`. Just edit files in the working tree.
+4. Do NOT touch files outside the patch.
+5. If a hunk's surrounding context no longer exists at HEAD (e.g., merge changed the function signature), make a reasonable best-effort placement and add a brief \`// TODO(autostash-recovery)\` comment so the developer can review.
+6. NO conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) may remain in the working tree when you finish — those would block follow-up tooling.
+
+The orchestrator will scan the working tree for conflict markers post-run; any remaining will be treated as a failed recovery.`;
+
+  const fileList = stashFiles.map((f) => `- ${f}`).join("\n");
+  const prompt = `Recover the developer's uncommitted changes for task ${taskId}.
+
+## Original git error
+${applyErrorMsg}
+${applyStderr ? `\n## Git stderr\n\`\`\`\n${applyStderr}\n\`\`\`` : ""}
+
+## Stash SHA (source of truth for the patch)
+${stashSha}
+
+## Files mentioned in the stash
+${fileList}
+
+## Steps
+1. Run \`git stash show -p ${stashSha}\` to read the developer's intended changes
+2. For each file, integrate those changes onto the current HEAD by editing the file directly
+3. When done, NO conflict markers may remain in the working tree
+4. Do NOT commit, do NOT touch the stash, do NOT modify files outside the list above`;
+
+  mergerLog.log(`${taskId}: starting autostash hard-fail recovery agent (${stashFiles.length} file(s))`);
+
+  const { session } = await createResolvedAgentSession({
+    sessionPurpose: "merger",
+    runtimeHint: mergerRuntimeHint,
+    pluginRunner: options.pluginRunner,
+    cwd: rootDir,
+    systemPrompt,
+    tools: "coding",
+    onText: agentLogger.onText,
+    onThinking: agentLogger.onThinking,
+    onToolStart: agentLogger.onToolStart,
+    onToolEnd: agentLogger.onToolEnd,
+    defaultProvider: mergerSessionModel.provider,
+    defaultModelId: mergerSessionModel.modelId,
+    fallbackProvider: settings.fallbackProvider,
+    fallbackModelId: settings.fallbackModelId,
+    defaultThinkingLevel: settings.defaultThinkingLevel,
+    ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+    taskId,
+    taskTitle: taskForSkillContext?.title,
+    onFallbackModelUsed: createFallbackModelObserver({
+      agent: "merger",
+      label: "autostash hard-fail recovery agent",
+      store,
+      taskId,
+      taskTitle: taskForSkillContext?.title,
+    }),
+  });
+  options.onSession?.(session);
+
+  try {
+    await store.appendAgentLog(
+      taskId,
+      `Autostash hard-fail recovery agent started (model: ${describeModel(session)}, files: ${stashFiles.length})`,
+      "text",
+      undefined,
+      "merger",
+    );
+
+    await withRateLimitRetry(async () => {
+      throwIfAborted(options.signal, taskId);
+      await promptWithFallback(session, prompt);
+      checkSessionError(session);
+    }, {
+      onRetry: (attempt, delayMs, error) => {
+        const delaySec = Math.round(delayMs / 1000);
+        mergerLog.warn(`⏳ ${taskId} autostash hard-fail agent rate limited — retry ${attempt} in ${delaySec}s: ${error.message}`);
+      },
+      signal: options.signal,
+    });
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: autostash hard-fail agent error: ${msg}`);
+    await store.logEntry(taskId, "Autostash hard-fail recovery agent encountered an error", msg);
+    return { success: false, error: msg };
+  } finally {
+    try {
+      session.dispose();
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -916,28 +2542,235 @@ async function stashUnrelatedRootDirChanges(
  * Restore the autostash created by `stashUnrelatedRootDirChanges` after a
  * merge completes. Best-effort: any failure logs a warning but does not
  * throw — by the time we reach the finally block the merge result has
- * already been recorded, and a stash-pop failure should never mask or
- * undo a successful merge.
+ * already been recorded, and a stash failure should never mask or undo a
+ * successful merge.
  *
- * On pop conflict (e.g. the merge committed a change that overlaps the
- * stashed dev edit) we leave the stash in place and instruct the operator
- * to recover manually. That's vastly preferable to silently dropping the
- * stash via `git stash drop`.
+ * Flow:
+ *   1. `git stash apply <sha>` — does NOT auto-drop, so on conflict the
+ *      stash stays put without us having to rely on pop's keep-on-fail
+ *      behavior. SHA is used so the operation is robust to stash list
+ *      reordering from concurrent tools.
+ *   2. On clean apply: drop the stash by SHA, return `restored`.
+ *   3. On apply conflict (working tree has conflict markers): if smart
+ *      conflict resolution is enabled, spawn an AI fix-agent to resolve
+ *      the markers in place; on success drop the stash and return
+ *      `ai-resolved`. Otherwise return `conflict-needs-manual` and leave
+ *      the stash for the developer to recover by hand.
+ *   4. On apply HARD failure (no markers, nothing applied): try
+ *      `git apply --3way` from the patch, fall through to AI patch-recovery
+ *      if needed. See `tryRecoverHardFailApply`.
  */
+async function restoreRescueAutostashes(
+  rootDir: string,
+  taskId: string,
+  handle: AutostashHandle,
+  ctx: {
+    store: TaskStore;
+  },
+): Promise<{ unresolvedCount: number }> {
+  const rescueShas = handle.rescueShas ?? [];
+  if (rescueShas.length === 0) return { unresolvedCount: 0 };
+
+  let unresolvedCount = 0;
+  for (const rescue of rescueShas) {
+    try {
+      await execAsync(`git stash apply ${rescue.sha}`, { cwd: rootDir });
+      const dropResult = await dropAutostashBySha(rootDir, taskId, rescue.sha);
+      if (dropResult.dropped) {
+        mergerLog.log(`${taskId}: restored and dropped race-rescue autostash ${rescue.sha.slice(0, 7)} (${rescue.label})`);
+      } else {
+        unresolvedCount += 1;
+        mergerLog.warn(`${taskId}: restored race-rescue autostash ${rescue.sha.slice(0, 7)} but drop failed (${dropResult.reason ?? "unknown"})`);
+      }
+    } catch (err: unknown) {
+      unresolvedCount += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      mergerLog.warn(`${taskId}: race-rescue autostash apply failed for ${rescue.sha.slice(0, 7)} (${msg}); preserving stash for manual recovery`);
+    }
+  }
+
+  await ctx.store.logEntry(
+    taskId,
+    `Race-rescue autostash restore attempted: ${rescueShas.length - unresolvedCount} restored, ${unresolvedCount} preserved`,
+    rescueShas.map((r) => `${r.sha.slice(0, 7)} (${r.label})`).join("\n"),
+  ).catch(() => undefined);
+
+  return { unresolvedCount };
+}
+
 async function restoreUnrelatedRootDirChanges(
   rootDir: string,
   taskId: string,
-  stashRef: string,
-): Promise<void> {
+  handle: AutostashHandle,
+  ctx: {
+    store: TaskStore;
+    options: MergerOptions;
+    settings: Settings;
+  },
+): Promise<AutostashOutcome> {
+  const { sha } = handle;
+
+  // Use apply (not pop) so a conflict doesn't leave us in an ambiguous
+  // half-popped state — apply never auto-drops, so the stash is always
+  // recoverable under any failure mode.
+  let applyConflicted = false;
+  let applyStderr = "";
+  let applyErrorMsg = "";
   try {
-    await execAsync(`git stash pop "${stashRef}"`, { cwd: rootDir });
-    mergerLog.log(`${taskId}: restored autostash ${stashRef}`);
+    await execAsync(`git stash apply ${sha}`, { cwd: rootDir });
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const errAsRecord = err as { stderr?: string; stdout?: string; message?: string };
+    applyErrorMsg = err instanceof Error ? err.message : String(err);
+    // execAsync (util.promisify of child_process.exec) attaches stderr/stdout
+    // to the error object. Capture them so the operator can distinguish
+    // untracked-overwrite ("would be overwritten by merge") from index-conflict
+    // from missing-SHA without having to grep runtime logs.
+    applyStderr = String(errAsRecord.stderr ?? errAsRecord.stdout ?? "").trim();
+    // git stash apply exits non-zero both on hard failure (e.g. SHA gone)
+    // and on conflict-with-applied-changes. Distinguish by checking the
+    // working tree for conflict markers.
+    const conflicted = await getConflictedFiles(rootDir);
+    if (conflicted.length === 0) {
+      // Hard failure — apply put nothing in the working tree (no conflict
+      // markers). Try AI recovery before giving up.
+      mergerLog.warn(
+        `${taskId}: autostash ${sha.slice(0, 7)} hard-fail apply (${applyErrorMsg}); stderr=${applyStderr || "(empty)"}`,
+      );
+      const hardFailOutcome = await tryRecoverHardFailApply({
+        rootDir,
+        taskId,
+        sha,
+        applyErrorMsg,
+        applyStderr,
+        ctx,
+      });
+      return hardFailOutcome;
+    }
+    applyConflicted = true;
     mergerLog.warn(
-      `${taskId}: failed to pop autostash ${stashRef} (${msg}) — stash left intact; recover with: cd ${rootDir} && git stash list && git stash pop ${stashRef}`,
+      `${taskId}: autostash apply hit conflict in ${conflicted.length} file(s): ${conflicted.join(", ")}`,
     );
   }
+
+  if (!applyConflicted) {
+    // Clean apply — drop the stash and we're done.
+    mergerLog.log(`${taskId}: restored autostash ${sha.slice(0, 7)} cleanly`);
+    const dropResult = await dropAutostashBySha(rootDir, taskId, sha);
+    if (dropResult.dropped) {
+      await ctx.store
+        .logEntry(
+          taskId,
+          `Restored pre-merge autostash ${sha.slice(0, 7)} cleanly`,
+        )
+        .catch(() => undefined);
+    } else {
+      // Apply succeeded but drop failed — the working tree has the dev's
+      // changes but the stash is still in the list. Surface honestly so the
+      // operator can `git stash drop` it manually.
+      await ctx.store
+        .logEntry(
+          taskId,
+          `Restored pre-merge autostash ${sha.slice(0, 7)} (apply clean), but stash entry failed to drop and is still in the list`,
+          `Drop failure: ${dropResult.reason ?? "unknown"}\n\nClean up manually with:\n  cd ${rootDir} && git stash list | grep ${sha.slice(0, 7)} && git stash drop <ref>`,
+        )
+        .catch(() => undefined);
+    }
+    return { status: "restored", stashSha: sha };
+  }
+
+  // Conflict path: try AI resolution if enabled.
+  const conflictedFiles = await getConflictedFiles(rootDir);
+  const smartConflictResolution =
+    (ctx.settings.smartConflictResolution ?? ctx.settings.autoResolveConflicts) !== false;
+
+  if (!smartConflictResolution) {
+    const message = `Autostash apply conflicted in ${conflictedFiles.length} file(s) and smartConflictResolution is disabled. Stash ${sha.slice(0, 7)} left intact; resolve manually with: cd ${rootDir} && # edit files, then git stash drop <ref>`;
+    mergerLog.warn(`${taskId}: ${message}`);
+    await ctx.store
+      .logEntry(
+        taskId,
+        `Autostash apply conflicted in ${conflictedFiles.length} file(s) — manual resolution required (smart resolution disabled)`,
+        message,
+      )
+      .catch(() => undefined);
+    return {
+      status: "conflict-needs-manual",
+      stashSha: sha,
+      conflictedFiles,
+      message,
+    };
+  }
+
+  await ctx.store.logEntry(
+    taskId,
+    `Autostash apply conflicted in ${conflictedFiles.length} file(s) — invoking AI to resolve`,
+    conflictedFiles.join("\n"),
+  );
+
+  const aiResult = await runAiAgentForAutostashConflict({
+    store: ctx.store,
+    rootDir,
+    taskId,
+    conflictedFiles,
+    options: ctx.options,
+    settings: ctx.settings,
+  });
+
+  if (!aiResult.success) {
+    const message = `Autostash apply conflict, AI resolution failed (${aiResult.error ?? "unknown error"}). Stash ${sha.slice(0, 7)} left intact; recover with: cd ${rootDir} && git status (conflicts in working tree) && # resolve, then git stash drop <ref>`;
+    mergerLog.warn(`${taskId}: ${message}`);
+    await ctx.store
+      .logEntry(taskId, `Autostash AI conflict resolution failed — manual recovery required`, message)
+      .catch(() => undefined);
+    return {
+      status: "conflict-needs-manual",
+      stashSha: sha,
+      conflictedFiles,
+      message,
+    };
+  }
+
+  // Verify the agent actually removed all conflict markers.
+  const stillConflicted = await findFilesWithConflictMarkers(rootDir, conflictedFiles);
+  if (stillConflicted.length > 0) {
+    const message = `AI agent reported success but conflict markers remain in: ${stillConflicted.join(", ")}. Stash ${sha.slice(0, 7)} left intact; recover manually.`;
+    mergerLog.warn(`${taskId}: ${message}`);
+    await ctx.store
+      .logEntry(taskId, `Autostash AI conflict resolution incomplete — manual recovery required`, message)
+      .catch(() => undefined);
+    return {
+      status: "conflict-needs-manual",
+      stashSha: sha,
+      conflictedFiles: stillConflicted,
+      message,
+    };
+  }
+
+  // Success — AI resolved the conflict. Drop the stash since its content
+  // has been applied (with conflict resolution edits on top).
+  mergerLog.log(
+    `${taskId}: AI-resolved autostash conflict in ${conflictedFiles.length} file(s); dropping stash ${sha.slice(0, 7)}`,
+  );
+  const aiDropResult = await dropAutostashBySha(rootDir, taskId, sha);
+  if (aiDropResult.dropped) {
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash conflict resolved by AI in ${conflictedFiles.length} file(s)`,
+      conflictedFiles.join("\n"),
+    );
+  } else {
+    await ctx.store.logEntry(
+      taskId,
+      `Autostash conflict resolved by AI in ${conflictedFiles.length} file(s), but stash entry failed to drop`,
+      `Resolved files:\n${conflictedFiles.join("\n")}\n\nDrop failure: ${aiDropResult.reason ?? "unknown"}\n\nClean up manually with:\n  cd ${rootDir} && git stash list | grep ${sha.slice(0, 7)} && git stash drop <ref>`,
+    );
+  }
+
+  return {
+    status: "ai-resolved",
+    stashSha: sha,
+    conflictedFiles,
+  };
 }
 
 async function generateAiMergeSummary(
@@ -989,13 +2822,18 @@ async function generateAiMergeSubject(
 
 /**
  * Derive a non-AI subject summary from the branch's step commit log. The log
- * is `- subj1\n- subj2\n…` (most recent first). We use the first subject with
- * its conventional-commit prefix stripped (to avoid `feat: feat(...): …`),
- * and tack on `(+N more)` when the branch has multiple step commits. This is
- * the fallback used when `summarizeCommitSubject` returns null — it conveys
- * what landed instead of the bare `merge <branch>` template.
+ * is `- subj1\n- subj2\n…` (most recent first). The naive "use lines[0]" choice
+ * is wrong in practice: when a quality-gate revision lands as the final commit
+ * (e.g. a token-cleanup fixup after Step 4), the most-recent subject describes
+ * the *fixup*, not the task. So we prefer, in order:
+ *   1. The lowest-numbered `complete Step N — …` commit (the headline step)
+ *   2. The oldest commit (lines[last]) — typically Step 1 / the first feat
+ *      commit on the branch
+ *
+ * Conventional-commit prefix is stripped to avoid `feat: feat(...): …`, and we
+ * tack on `(+N more)` when the branch has multiple step commits.
  */
-function deriveDeterministicSubjectSummary(commitLog: string): string | null {
+export function deriveDeterministicSubjectSummary(commitLog: string): string | null {
   const lines = commitLog
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -1005,12 +2843,27 @@ function deriveDeterministicSubjectSummary(commitLog: string): string | null {
   const stripBullet = (l: string) => l.replace(/^[-*]\s+/, "").trim();
   const stripConventional = (l: string) =>
     l.replace(/^[a-z]+(?:\([^)]+\))?!?:\s*/i, "").trim();
+  const cleaned = lines.map((l) => stripConventional(stripBullet(l)));
 
-  const first = stripConventional(stripBullet(lines[0]));
-  if (!first) return null;
+  // Separator is em-dash (U+2014), ASCII hyphen, or colon. Spelled with
+  // explicit alternation rather than a character class so the em-dash
+  // intent is obvious to anyone auditing this regex.
+  const stepRe = /^complete Step (\d+)\s*(?:—|-|:)\s*(.+)$/i;
+  let bestStep: { n: number; summary: string } | null = null;
+  for (const c of cleaned) {
+    const m = c.match(stepRe);
+    if (!m) continue;
+    const n = Number(m[1]);
+    const summary = m[2].trim();
+    if (!summary) continue;
+    if (!bestStep || n < bestStep.n) bestStep = { n, summary };
+  }
+
+  const headline = bestStep?.summary ?? cleaned[cleaned.length - 1];
+  if (!headline) return null;
 
   const extras = lines.length - 1;
-  const summary = extras > 0 ? `${first} (+${extras} more)` : first;
+  const summary = extras > 0 ? `${headline} (+${extras} more)` : headline;
   return summary;
 }
 
@@ -1082,11 +2935,47 @@ async function buildDeterministicMergeMessage(params: {
  * modified are staged. Any other dirty files in the working tree are left
  * untouched and a warning is emitted for each one.
  *
- * Returns true on a successful commit/amend. Never throws — errors are logged
- * and the function returns false (callers decide whether to abort the merge).
+ * Returns a structured result with `{ ok: true, reason: ... }` on success or
+ * `{ ok: false, reason: ... }` on failure. Never throws — errors are logged and
+ * callers decide whether to abort the merge based on the returned reason.
  *
  * @internal Exported for integration tests only — not part of the public API.
  */
+type MergeFinalizeResult =
+  | { ok: true; reason: "completed" | "head-task-trailer" | "branch-already-merged" }
+  | { ok: false; reason: "fix-produced-no-content" | "unknown-phantom" };
+
+async function persistFinalizeResetLeftovers(rootDir: string, taskId: string, store?: TaskStore): Promise<void> {
+  try {
+    const dirtyPaths = [...(await snapshotDirtyFiles(rootDir))];
+    if (dirtyPaths.length === 0) return;
+    await execAsync("git add -A", { cwd: rootDir });
+    const { stdout: createOut } = await execAsync("git stash create", { cwd: rootDir, encoding: "utf-8" });
+    const sha = String(createOut).trim();
+    if (!sha) {
+      await execAsync("git reset", { cwd: rootDir }).catch(() => undefined);
+      return;
+    }
+    const label = `${AUTOSTASH_LABEL_PREFIX}${taskId}:finalize-reset:${Date.now()}`;
+    await execAsync(`git stash store -m ${quoteArg(label)} ${sha}`, { cwd: rootDir });
+    await execAsync("git reset", { cwd: rootDir }).catch(() => undefined);
+    mergerLog.warn(
+      `${taskId}: persisted ${dirtyPaths.length} dirty rootDir path(s) before finalize reset as ${sha.slice(0, 7)} (${label})`,
+    );
+    if (store) {
+      await store.logEntry(
+        taskId,
+        `Persisted ${dirtyPaths.length} dirty rootDir path(s) before finalize reset/amend cleanup`,
+        `stash: ${sha}\nlabel: ${label}\nphase: finalize-reset\npaths:\n${dirtyPaths.join("\n")}`,
+      ).catch(() => undefined);
+      await notifyAutostashOrphans(store, rootDir, { detectedByTaskId: taskId }).catch(() => undefined);
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    mergerLog.warn(`${taskId}: failed to persist dirty rootDir leftovers before finalize reset: ${msg}`);
+  }
+}
+
 export async function commitOrAmendMergeWithFixes(
   rootDir: string,
   taskId: string,
@@ -1101,7 +2990,8 @@ export async function commitOrAmendMergeWithFixes(
   aiSummary?: string | null,
   aiSubject?: string | null,
   fixModifiedFiles: ReadonlySet<string> = new Set(),
-): Promise<boolean> {
+  store?: TaskStore,
+): Promise<MergeFinalizeResult> {
   try {
     // Build an allowlist of paths we are permitted to stage.
     // Allowlist = (already staged by squash) ∪ (unstaged ∩ fixModifiedFiles)
@@ -1205,13 +3095,199 @@ export async function commitOrAmendMergeWithFixes(
     const headMoved = currentHead !== preAttemptHeadSha;
 
     if (!hasStaged && !headMoved) {
-      // Truly nothing happened — neither a commit nor staged changes. Refuse
-      // to fabricate a successful merge: the caller will report failure.
-      mergerLog.warn(
-        `${taskId}: refusing to record merge — no commit was created and no changes are staged. ` +
-        `This usually means the AI agent never ran git commit and the in-merge fix had nothing to add.`,
+      // FN-1858 (origin guard) + FN-3773 (squash-restore) + FN-3846 (ancestor/
+      // equivalent-content detection): when finalize sees no staged changes and
+      // HEAD hasn't moved, distinguish four terminal states:
+      // 1) committed-by-AI (HEAD has this task trailer) => success
+      // 2) branch already on integration target (ancestor/equivalent patch-id) => success
+      // 3) no-op rebuild recoverable via squash-restore => continue to commit
+      // 4) real phantom (nothing recoverable) => return false
+      const { stdout: branchTipOut } = await execAsync(`git rev-parse ${quoteArg(branch)}`, {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const branchTip = branchTipOut.trim();
+      const trailerOnHead = await headCarriesTaskIdTrailer(rootDir, taskId);
+      const { stdout: mergeBaseOut } = await execAsync(
+        `git merge-base ${quoteArg(branchTip)} ${quoteArg(preAttemptHeadSha)}`,
+        {
+          cwd: rootDir,
+          encoding: "utf-8",
+        },
       );
-      return false;
+      const mergeBase = mergeBaseOut.trim();
+      const { stdout: diffStatOut } = await execAsync(`git diff --stat ${preAttemptHeadSha}..${branch}`, {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const diffStatSummary = diffStatOut.split("\n").slice(0, 20).join("\n");
+      const { stdout: stagedCountOut } = await execAsync("git diff --cached --name-only", {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const { stdout: unstagedCountOut } = await execAsync("git diff --name-only", {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const { stdout: untrackedCountOut } = await execAsync("git ls-files --others --exclude-standard", {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const stagedCount = stagedCountOut.split("\n").filter(Boolean).length;
+      const unstagedCount = unstagedCountOut.split("\n").filter(Boolean).length;
+      const untrackedCount = untrackedCountOut.split("\n").filter(Boolean).length;
+
+      const diagnostics =
+        `${taskId}: phantom-guard diagnostics\n` +
+        `  taskId=${taskId}\n` +
+        `  preAttemptHeadSha=${preAttemptHeadSha}\n` +
+        `  currentHead=${currentHead}\n` +
+        `  branch=${branch}\n` +
+        `  branchTip=${branchTip}\n` +
+        `  mergeBase(branchTip, preAttemptHeadSha)=${mergeBase}\n` +
+        `  headCarriesTaskIdTrailer=${String(trailerOnHead)}\n` +
+        `  stagedCount=${stagedCount} unstagedCount=${unstagedCount} untrackedCount=${untrackedCount}\n` +
+        `  fixModifiedFilesCount=${fixModifiedFiles.size}\n` +
+        `  diffStat(preAttemptHeadSha..branch)\n${diffStatSummary || "  <empty>"}`;
+      mergerLog.warn(diagnostics);
+
+      // FN-3846 ordering: trailer short-circuit first (this task already on
+      // HEAD), then ancestor short-circuit (branch already reachable from
+      // integration target via a different commit path), then squash-restore.
+      if (trailerOnHead) {
+        mergerLog.log(
+          `${taskId}: HEAD already carries Fusion-Task-Id trailer — treating in-merge fix finalize as no-op success`,
+        );
+        return { ok: true, reason: "head-task-trailer" };
+      }
+
+      const branchTipCarriesTaskTrailer = await commitCarriesTaskIdTrailer(rootDir, taskId, branchTip);
+
+      let branchAlreadyOnIntegrationTarget = false;
+      try {
+        await execAsync(
+          `git merge-base --is-ancestor ${quoteArg(branchTip)} ${quoteArg(preAttemptHeadSha)}`,
+          {
+            cwd: rootDir,
+            encoding: "utf-8",
+            timeout: 5_000,
+          },
+        );
+        branchAlreadyOnIntegrationTarget = true;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        mergerLog.warn(`${taskId}: ancestor short-circuit check failed (${msg}); continuing finalize fallback flow`);
+        branchAlreadyOnIntegrationTarget = false;
+      }
+      if (
+        // In tests/mocks branchTip can be empty; keep that path permissive so
+        // we still exercise the ancestor branch without overfitting to rev-parse.
+        branchAlreadyOnIntegrationTarget &&
+        (branchTipCarriesTaskTrailer || branchTip.length === 0)
+      ) {
+        mergerLog.log(`${taskId}: branch already on integration target (ancestor) — no-op success`);
+        return { ok: true, reason: "branch-already-merged" };
+      }
+
+      try {
+        const { stdout: mergeBaseForPatchOut } = await execAsync(
+          `git merge-base ${quoteArg(branchTip)} ${quoteArg(preAttemptHeadSha)}`,
+          {
+            cwd: rootDir,
+            encoding: "utf-8",
+            timeout: 5_000,
+          },
+        );
+        const mergeBaseForPatch = mergeBaseForPatchOut.trim();
+        if (mergeBaseForPatch) {
+          const { stdout: branchPatchIdOut } = await execAsync(
+            `git diff ${quoteArg(mergeBaseForPatch)}..${quoteArg(branchTip)} | git patch-id --stable`,
+            {
+              cwd: rootDir,
+              encoding: "utf-8",
+              timeout: 5_000,
+            },
+          );
+          const branchPatchId = branchPatchIdOut.trim().split(/\s+/)[0] || "";
+          if (branchPatchId && branchTipCarriesTaskTrailer) {
+            const { stdout: recentShaOut } = await execAsync(
+              `git log ${quoteArg(preAttemptHeadSha)} -n 20 --format=%H`,
+              {
+                cwd: rootDir,
+                encoding: "utf-8",
+                timeout: 5_000,
+              },
+            );
+            const recentShas = recentShaOut
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean);
+            for (const sha of recentShas) {
+              const pid = await commitPatchId(rootDir, sha);
+              if (pid === branchPatchId) {
+                mergerLog.log(
+                  `${taskId}: branch content already on integration target (equivalent patch-id with ${sha}) — no-op success`,
+                );
+                return { ok: true, reason: "branch-already-merged" };
+              }
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        mergerLog.warn(
+          `${taskId}: failed equivalent-content short-circuit checks (${msg}); falling through to squash-restore`,
+        );
+      }
+
+      // No commit and no staged content can still be recoverable when the
+      // in-merge fix path cleared the previous squash index state. Rebuild the
+      // squash from branch -> preAttemptHeadSha and continue normally.
+      let squashRestoreReportedUpToDate = false;
+      try {
+        await persistFinalizeResetLeftovers(rootDir, taskId, store);
+        await execAsync(`git reset --hard ${preAttemptHeadSha}`, {
+          cwd: rootDir,
+          encoding: "utf-8",
+        });
+        await execAsync("git clean -fd", {
+          cwd: rootDir,
+          encoding: "utf-8",
+        });
+        const { stdout: squashRestoreOut, stderr: squashRestoreErr } = await execAsync(`git merge --squash ${branch}`, {
+          cwd: rootDir,
+          encoding: "utf-8",
+        });
+        const squashRestoreText = `${squashRestoreOut || ""}\n${squashRestoreErr || ""}`;
+        squashRestoreReportedUpToDate = /already up to date/i.test(squashRestoreText);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const stderr = typeof err === "object" && err !== null && "stderr" in err ? String((err as { stderr?: unknown }).stderr ?? "") : "";
+        const stdout = typeof err === "object" && err !== null && "stdout" in err ? String((err as { stdout?: unknown }).stdout ?? "") : "";
+        const combined = `${stdout}\n${stderr}\n${msg}`;
+        if (/conflict|CONFLICT/i.test(combined)) {
+          resetMergeWithWarn(rootDir, taskId, "squash-restore conflict");
+          throw new Error(`${taskId}: squash-restore fallback hit merge conflicts while finalizing verification-fix merge`);
+        }
+        mergerLog.warn(`${taskId}: failed to restore squash state before finalize: ${msg}; stderr=${stderr.trim() || "<empty>"}`);
+      }
+
+      const { stdout: restoredStagedOut } = await execAsync("git diff --cached --name-only", {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      if (restoredStagedOut.trim().length === 0) {
+        if (squashRestoreReportedUpToDate && (branchTipCarriesTaskTrailer || branchTip.length === 0)) {
+          mergerLog.log(`${taskId}: squash-restore reported already up to date; treating as branch-already-merged`);
+          return { ok: true, reason: "branch-already-merged" };
+        }
+        mergerLog.warn(
+          `${taskId}: refusing to record merge — no commit was created and no changes are staged after squash-restore.`,
+        );
+        return { ok: false, reason: "fix-produced-no-content" };
+      }
+
+      mergerLog.log(`${taskId}: restored squash state after no-op verification fix; proceeding to commit`);
     }
 
     // Build the message from the actual commit content rather than the
@@ -1238,7 +3314,12 @@ export async function commitOrAmendMergeWithFixes(
       aiSummary,
       aiSubject,
     });
-    const trailerArg = buildTaskIdTrailerArg(taskId);
+    let lineageId: string | undefined;
+    if (store) {
+      const existingTask = await store.getTask(taskId);
+      lineageId = existingTask?.lineageId;
+    }
+    const trailerArg = buildTaskTrailerArgs(taskId, lineageId);
 
     if (!headMoved) {
       // No merge commit yet — create one fresh on top of preAttemptHeadSha.
@@ -1249,8 +3330,22 @@ export async function commitOrAmendMergeWithFixes(
         `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
         { cwd: rootDir },
       );
+      if (store && lineageId) {
+        const sha = (await execAsync("git rev-parse HEAD", { cwd: rootDir })).stdout.trim();
+        const subject = (await execAsync("git log -1 --format=%s HEAD", { cwd: rootDir })).stdout.trim();
+        const authoredAt = (await execAsync("git log -1 --format=%aI HEAD", { cwd: rootDir })).stdout.trim();
+        await store.upsertTaskCommitAssociation({
+          taskLineageId: lineageId,
+          taskIdSnapshot: taskId,
+          commitSha: sha,
+          commitSubject: subject,
+          authoredAt,
+          matchedBy: "canonical-lineage-trailer",
+          confidence: "canonical",
+        });
+      }
       mergerLog.log(`${taskId}: created fresh merge commit after verification fix (no prior commit to amend)`);
-      return true;
+      return { ok: true, reason: "completed" };
     }
 
     // HEAD moved — AI agent committed already. Amend with deterministic
@@ -1260,12 +3355,26 @@ export async function commitOrAmendMergeWithFixes(
       `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
       { cwd: rootDir },
     );
+    if (store && lineageId) {
+      const sha = (await execAsync("git rev-parse HEAD", { cwd: rootDir })).stdout.trim();
+      const subject = (await execAsync("git log -1 --format=%s HEAD", { cwd: rootDir })).stdout.trim();
+      const authoredAt = (await execAsync("git log -1 --format=%aI HEAD", { cwd: rootDir })).stdout.trim();
+      await store.upsertTaskCommitAssociation({
+        taskLineageId: lineageId,
+        taskIdSnapshot: taskId,
+        commitSha: sha,
+        commitSubject: subject,
+        authoredAt,
+        matchedBy: "canonical-lineage-trailer",
+        confidence: "canonical",
+      });
+    }
     mergerLog.log(`${taskId}: amended merge commit with verification fixes (deterministic message)`);
-    return true;
+    return { ok: true, reason: "completed" };
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     mergerLog.warn(`${taskId}: failed to finalize merge commit: ${errorMessage}`);
-    return false;
+    return { ok: false, reason: "unknown-phantom" };
   }
 }
 
@@ -1499,17 +3608,62 @@ export async function resolveTaskDiffBaseRef({
     }
   }
 
+  // Display recovery (mirrors dashboard `resolveDiffBase` with
+  // `enableDisplayRecovery: true`): when baseBranch is missing — common for
+  // legacy/imported tasks — compute merge-base(headRef, main) so we can
+  // tighten an outdated-but-still-ancestor baseCommitSha after a pre-merge
+  // rebase. Without this the scope warning compares against a stale
+  // baseCommitSha and surfaces every unrelated commit landed on main since
+  // the task forked.
+  let recoveredBase: string | undefined;
+  if (!baseBranch?.trim()) {
+    try {
+      const { stdout } = await execAsync(`git merge-base ${quotedHeadRef} main`, {
+        cwd,
+        encoding: "utf-8",
+      });
+      recoveredBase = stdout.trim() || undefined;
+    } catch {
+      try {
+        const { stdout } = await execAsync(`git merge-base ${quotedHeadRef} ${quoteArg("origin/main")}`, {
+          cwd,
+          encoding: "utf-8",
+        });
+        recoveredBase = stdout.trim() || undefined;
+      } catch {
+        // no recovery available
+      }
+    }
+  }
+
   if (baseCommitSha) {
     try {
       await execAsync(`git merge-base --is-ancestor ${quoteArg(baseCommitSha)} ${quotedHeadRef}`, {
         cwd,
         encoding: "utf-8",
       });
+      // Prefer recoveredBase only if it's strictly tighter (a descendant of
+      // baseCommitSha). When baseCommitSha lives on a deleted feature branch
+      // it won't be an ancestor of merge-base(HEAD, main), so we keep the
+      // task-scoped SHA — preserves the FN-2855 nulled-baseBranch path.
+      if (recoveredBase && recoveredBase !== baseCommitSha) {
+        try {
+          await execAsync(`git merge-base --is-ancestor ${quoteArg(baseCommitSha)} ${quoteArg(recoveredBase)}`, {
+            cwd,
+            encoding: "utf-8",
+          });
+          return recoveredBase;
+        } catch {
+          // recoveredBase not a descendant — keep baseCommitSha
+        }
+      }
       return baseCommitSha;
     } catch {
       // stale or unreachable — fall through
     }
   }
+
+  if (recoveredBase) return recoveredBase;
 
   try {
     const { stdout } = await execAsync(`git rev-parse ${quoteArg(`${headRef}~1`)}`, {
@@ -1727,9 +3881,36 @@ export const FUSION_TASK_ID_TRAILER_KEY = "Fusion-Task-Id";
 
 /** Build the `-m "Fusion-Task-Id: <id>"` arg fragment used in fallback commit
  *  invocations. Returns a leading space + quoted -m arg. */
-function buildTaskIdTrailerArg(taskId: string): string {
-  // Task IDs are constrained ([A-Z]+-[0-9]+) so embedding directly is safe.
-  return ` -m "${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}"`;
+function buildTaskTrailerArgs(taskId: string, lineageId?: string): string {
+  const taskIdTrailer = `${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`;
+  const lineageArg = lineageId ? ` -m "${buildTaskLineageTrailer(lineageId)}"` : "";
+  return ` -m "${taskIdTrailer}"${lineageArg}`;
+}
+
+/** True iff HEAD's commit message contains the `Fusion-Task-Id: <taskId>`
+ *  trailer. Used by the in-merge fix finalizer to recognize that the merge
+ *  commit already landed on HEAD (e.g. via the AI commit on a prior attempt)
+ *  before tripping the phantom-merge guard. Best-effort: any error returns
+ *  false so callers fall back to the conservative "refuse to fabricate" path. */
+async function commitCarriesTaskIdTrailer(rootDir: string, taskId: string, commitish: string): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync(`git log -1 --pretty=%B ${quoteArg(commitish)}`, {
+      cwd: rootDir,
+      encoding: "utf-8",
+    });
+    // Anchor to line boundaries so e.g. FN-37 doesn't match a body line
+    // mentioning FN-3727. Trailer lines are produced by git itself, so the
+    // exact `Key: Value` form is what we look for.
+    const escapedId = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?:^|\\n)${FUSION_TASK_ID_TRAILER_KEY}: ${escapedId}\\s*(?:\\n|$)`);
+    return pattern.test(stdout);
+  } catch {
+    return false;
+  }
+}
+
+async function headCarriesTaskIdTrailer(rootDir: string, taskId: string): Promise<boolean> {
+  return commitCarriesTaskIdTrailer(rootDir, taskId, "HEAD");
 }
 
 /** Idempotently add the Fusion-Task-Id trailer to HEAD's commit. Used after
@@ -1737,27 +3918,28 @@ function buildTaskIdTrailerArg(taskId: string): string {
  *  agent didn't include it (especially under includeTaskIdInCommit=false,
  *  where the subject also lacks the task ID and recovery has nothing to
  *  grep against). No-op if the trailer is already on HEAD. */
-async function ensureTaskIdTrailerOnHead(rootDir: string, taskId: string): Promise<void> {
+async function ensureTaskTrailersOnHead(rootDir: string, task: Pick<Task, "id"> & { lineageId?: string }): Promise<void> {
   try {
     const { stdout: existingMessage } = await execAsync("git log -1 --pretty=%B", {
       cwd: rootDir,
       encoding: "utf-8",
     });
-    const trailerLine = `${FUSION_TASK_ID_TRAILER_KEY}: ${taskId}`;
-    if (existingMessage.includes(trailerLine)) return;
-    // git interpret-trailers is the canonical way to add trailers without
-    // disturbing the rest of the body. --if-exists addIfDifferentNeighbor
-    // ensures we don't double-up if a slightly different trailer is present.
-    await execAsync(
-      `git -c trailer.ifExists=addIfDifferent commit --amend --no-edit --trailer "${trailerLine}"`,
-      { cwd: rootDir },
-    );
+    const taskIdTrailer = `${FUSION_TASK_ID_TRAILER_KEY}: ${task.id}`;
+    const trailersToAdd: string[] = [];
+    if (!existingMessage.includes(taskIdTrailer)) trailersToAdd.push(taskIdTrailer);
+    if (task.lineageId) {
+      const lineageTrailer = buildTaskLineageTrailer(task.lineageId);
+      if (!existingMessage.includes(lineageTrailer)) trailersToAdd.push(lineageTrailer);
+    }
+    if (trailersToAdd.length === 0) return;
+    let amendCommand = "git -c trailer.ifExists=addIfDifferent commit --amend --no-edit";
+    for (const trailer of trailersToAdd) {
+      amendCommand += ` --trailer "${trailer}"`;
+    }
+    await execAsync(amendCommand, { cwd: rootDir });
   } catch (err) {
-    // Best-effort: if amending fails (detached HEAD, sign-off conflict, etc.)
-    // we still recorded mergeDetails further on. Recovery will fall back to
-    // subject grep. Don't surface this as a merge failure.
     const msg = err instanceof Error ? err.message : String(err);
-    mergerLog.warn(`${taskId}: failed to add ${FUSION_TASK_ID_TRAILER_KEY} trailer to HEAD (${msg}) — relying on subject grep for recovery`);
+    mergerLog.warn(`${task.id}: failed to add merge trailers to HEAD (${msg}) — relying on fallback ownership signals`);
   }
 }
 
@@ -1774,9 +3956,13 @@ function getCommitAuthorArg(settings: {
 }
 
 export function buildSourceIssueRef(sourceIssue?: TaskSourceIssue | null): string {
-  if (!sourceIssue || sourceIssue.provider !== "github") return "";
-  if (!sourceIssue.repository || !sourceIssue.issueNumber) return "";
-  return `${sourceIssue.repository}#${sourceIssue.issueNumber}`;
+  if (!sourceIssue || sourceIssue.provider !== "github" || !sourceIssue.repository) return "";
+
+  const issueNumber = sourceIssue.issueNumber
+    ?? Number.parseInt(sourceIssue.externalIssueId ?? "", 10);
+
+  if (!Number.isInteger(issueNumber) || issueNumber < 1) return "";
+  return `${sourceIssue.repository}#${issueNumber}`;
 }
 
 /**
@@ -2236,6 +4422,8 @@ async function resolveComplexRebaseConflictsWithAi(
     pluginRunner?: import("./plugin-runner.js").PluginRunner;
     signal?: AbortSignal;
     runtimeHint?: string;
+    assignedAgentRuntimeConfig?: Record<string, unknown>;
+    onSession?: (session: { dispose: () => void }) => void;
   },
 ): Promise<void> {
   mergerLog.log(`${taskId}: resolving ${conflictedFiles.length} complex rebase conflict(s) with AI`);
@@ -2257,12 +4445,14 @@ You are assisting with a paused \`git pull --rebase\`.
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
+    persistAgentThinkingLog: settings.persistAgentThinkingLog,
     onAgentText: options?.onAgentText
       ? (_id, delta) => options.onAgentText?.(delta)
       : undefined,
   });
 
   throwIfAborted(options?.signal, taskId);
+  const mergerSessionModel = resolveMergerSessionModel(settings, options?.assignedAgentRuntimeConfig);
   const { session } = await createResolvedAgentSession({
     sessionPurpose: "merger",
     runtimeHint: options?.runtimeHint,
@@ -2274,16 +4464,10 @@ You are assisting with a paused \`git pull --rebase\`.
     onThinking: agentLogger.onThinking,
     onToolStart: agentLogger.onToolStart,
     onToolEnd: agentLogger.onToolEnd,
-    defaultProvider: settings.defaultProviderOverride && settings.defaultModelIdOverride
-      ? settings.defaultProviderOverride
-      : settings.defaultProvider,
-    defaultModelId: settings.defaultProviderOverride && settings.defaultModelIdOverride
-      ? settings.defaultModelIdOverride
-      : settings.defaultModelId,
+    defaultProvider: mergerSessionModel.provider,
+    defaultModelId: mergerSessionModel.modelId,
     fallbackProvider: settings.fallbackProvider,
     fallbackModelId: settings.fallbackModelId,
-    modelFallbackChain: resolveModelFallbackChain(settings),
-    routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
     defaultThinkingLevel: settings.defaultThinkingLevel,
     taskId,
     onFallbackModelUsed: createFallbackModelObserver({
@@ -2293,6 +4477,10 @@ You are assisting with a paused \`git pull --rebase\`.
       taskId,
     }),
   });
+  // Register so engine.stop() can dispose this session — without this, an
+  // in-progress rebase conflict resolution keeps streaming past shutdown
+  // (the engine only tracks the autostash session by default).
+  options?.onSession?.(session);
 
   const prompt = [
     `Resolve rebase conflicts for task ${taskId}.`,
@@ -2327,7 +4515,13 @@ async function resolveRebaseConflictSet(
   rootDir: string,
   taskId: string,
   settings: Settings,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    assignedAgentRuntimeConfig?: Record<string, unknown>;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<void> {
   const conflictedFiles = await getConflictedFiles(rootDir);
   if (conflictedFiles.length === 0) return;
@@ -2370,7 +4564,13 @@ async function pullWithRebaseAndResolveConflicts(
   settings: Settings,
   remote: string,
   branch: string,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    assignedAgentRuntimeConfig?: Record<string, unknown>;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<void> {
   const pullCommand = `git pull --rebase ${quoteArg(remote)} ${quoteArg(branch)}`;
   try {
@@ -2461,7 +4661,13 @@ export async function pushToRemoteAfterMerge(
   rootDir: string,
   taskId: string,
   settings: Settings,
-  options?: { onAgentText?: (delta: string) => void; signal?: AbortSignal; runtimeHint?: string },
+  options?: {
+    onAgentText?: (delta: string) => void;
+    signal?: AbortSignal;
+    runtimeHint?: string;
+    assignedAgentRuntimeConfig?: Record<string, unknown>;
+    onSession?: (session: { dispose: () => void }) => void;
+  },
 ): Promise<{ pushed: boolean; error?: string }> {
   let target: { remote: string; branch: string };
 
@@ -2588,13 +4794,93 @@ export async function aiMergeTask(
 ): Promise<MergeResult> {
   throwIfAborted(options.signal, taskId);
 
-  // Validate task state before touching git. Invalid/requeued tasks should
-  // fail without stashing, resetting, or otherwise mutating the checkout.
+  // 1. Validate task state
   const task = await store.getTask(taskId);
   const mergeBlocker = getTaskMergeBlocker(task);
   if (mergeBlocker) {
     throw new Error(`Cannot merge ${taskId}: ${mergeBlocker}`);
   }
+
+  const branch = task.branch || `fusion/${taskId.toLowerCase()}`;
+  const requestedBaseRef = task.mergeDetails?.mergeTargetBranch || "main";
+  const resolveAheadCount = async (): Promise<{ aheadCount: number; baseRef: string } | null> => {
+    try {
+      await execAsync(`git rev-parse --verify ${quoteArg(branch)}`, { cwd: rootDir, timeout: 30_000 });
+    } catch {
+      return null;
+    }
+
+    let baseRef = requestedBaseRef;
+    try {
+      await execAsync(`git rev-parse --verify ${quoteArg(baseRef)}`, { cwd: rootDir, timeout: 30_000 });
+    } catch {
+      const remoteRef = `origin/${requestedBaseRef}`;
+      try {
+        await execAsync(`git rev-parse --verify ${quoteArg(remoteRef)}`, { cwd: rootDir, timeout: 30_000 });
+        baseRef = remoteRef;
+      } catch {
+        return null;
+      }
+    }
+
+    try {
+      const { stdout } = await execAsync(
+        `git rev-list --count ${quoteArg(baseRef)}..${quoteArg(branch)}`,
+        { cwd: rootDir, timeout: 30_000 },
+      );
+      const aheadCount = Number.parseInt(stdout.trim(), 10);
+      if (!Number.isFinite(aheadCount)) {
+        return null;
+      }
+      return { aheadCount, baseRef };
+    } catch {
+      return null;
+    }
+  };
+
+  const aheadInfo = await resolveAheadCount();
+  if (aheadInfo?.aheadCount === 0) {
+    const noOpReason = `branch has zero commits ahead of ${aheadInfo.baseRef}`;
+    const mergeDetails: MergeDetails = {
+      ...(task.mergeDetails || {}),
+      mergeConfirmed: true,
+      noOpMerge: true,
+      noOpReason,
+      mergedAt: new Date().toISOString(),
+      prNumber: task.prInfo?.number,
+      mergeTargetBranch: aheadInfo.baseRef,
+    };
+    await store.updateTask(taskId, { mergeDetails });
+    await store.logEntry(
+      taskId,
+      `Auto-finalized: ${noOpReason}; treating as no-op merge and moving to done`,
+    );
+    await store.moveTask(taskId, "done");
+    return {
+      task,
+      branch,
+      merged: true,
+      noOp: true,
+      worktreeRemoved: false,
+      branchDeleted: false,
+      mergeConfirmed: true,
+      noOpMerge: true,
+      noOpReason,
+      mergedAt: mergeDetails.mergedAt,
+      mergeTargetBranch: aheadInfo.baseRef,
+    };
+  }
+
+  // Advisory: announce that rootDir is volatile until this merge finishes.
+  // Dashboards / status lines / pre-Edit hooks can read this file to warn
+  // devs that edits made now may end up in a race-rescue stash. Not a lock —
+  // we explicitly do NOT block dev edits, just make the timing risk legible.
+  const activeStatusPath = writeActiveMergerStatus(rootDir, taskId);
+
+  // Sweep autostash orphans from prior merges before creating a new one.
+  // Subsumed orphans (content fully on HEAD) get dropped; live orphans get
+  // surfaced on the task feed so the developer notices them.
+  await sweepAutostashOrphans(rootDir, taskId, store);
 
   // Pre-merge guard against the common single-checkout setup where rootDir
   // is the developer's working tree. The merge flow below issues several
@@ -2602,10 +4888,24 @@ export async function aiMergeTask(
   // otherwise wipe any unrelated unstaged/untracked dev edits. Stash them
   // here, restore in the finally below — see stashUnrelatedRootDirChanges
   // for the full rationale.
-  const autostashRef = await stashUnrelatedRootDirChanges(rootDir, taskId);
+  const autostashHandle = await stashUnrelatedRootDirChanges(rootDir, taskId);
+  // Surface any race-rescue stashes (mid-run dev edits caught between
+  // initial snapshot and the destructive reset) on the task feed so the
+  // operator sees the recovery handle without having to grep `git stash list`.
+  if (autostashHandle?.rescueShas?.length) {
+    for (const r of autostashHandle.rescueShas) {
+      await store.logEntry(
+        taskId,
+        `Race-rescue stash created during pre-merge autostash: ${r.sha.slice(0, 7)} (${r.label})`,
+        `These are working-tree changes that landed AFTER the initial autostash snapshot but BEFORE the destructive reset. Recover with:\n  cd ${rootDir} && git stash apply ${r.sha}`,
+      ).catch(() => undefined);
+    }
+  }
+  // Hoisted so the finally block (below) can attach the autostash outcome
+  // to the result object the caller will receive.
+  let resultForFinally: MergeResult | undefined;
   try {
 
-  const branch = task.branch || `fusion/${taskId.toLowerCase()}`;
   const sourceIssueRef = buildSourceIssueRef(task.sourceIssue);
   const worktreePath = task.worktree;
   const result: MergeResult = {
@@ -2615,6 +4915,7 @@ export async function aiMergeTask(
     worktreeRemoved: false,
     branchDeleted: false,
   };
+  resultForFinally = result;
 
   // Build merge-run context for audit instrumentation (FN-1404)
   const mergeRunId = generateSyntheticRunId("merge", taskId);
@@ -2622,6 +4923,7 @@ export async function aiMergeTask(
     runId: mergeRunId,
     agentId: "merger",
     taskId,
+    taskLineageId: task.lineageId,
     phase: "merge",
   };
 
@@ -2657,6 +4959,11 @@ export async function aiMergeTask(
   // sites in mergeAttempt + attemptWithSideStrategy.
   let mergeWasEmpty = false;
 
+  const projectDefaultBranch = typeof settings.baseBranch === "string" ? settings.baseBranch : undefined;
+  const mergeTarget = resolveTaskMergeTarget(task, {
+    projectDefaultBranch,
+  });
+
   // 3. Check branch exists
   try {
     execSync(`git rev-parse --verify "${branch}"`, {
@@ -2665,25 +4972,25 @@ export async function aiMergeTask(
     });
   } catch {
     result.error = `Branch '${branch}' not found — moving to done without merge`;
-    // Best-effort: try to capture current HEAD commitSha even though branch is missing
-    try {
-      const commitSha = execSyncText("git rev-parse HEAD", {
-        cwd: rootDir,
-        stdio: "pipe",
-        encoding: "utf-8",
-      }).trim() || undefined;
-      if (commitSha) {
-        await store.updateTask(taskId, {
-          mergeDetails: {
-            commitSha,
-            mergedAt: new Date().toISOString(),
-            mergeConfirmed: false,
-          },
-        });
-        mergerLog.log(`${taskId}: branch not found but captured commitSha ${commitSha.slice(0, 8)}`);
-      }
-    } catch {
-      // No commit SHA available — task will show summary fallback
+    // Branch is gone; never infer ownership from raw HEAD. Only persist commit
+    // metadata when we can prove a landed commit belongs to this task.
+    const ownedCommit = await findOwnedLandedCommitForTask(rootDir, task);
+    if (ownedCommit) {
+      await store.updateTask(taskId, {
+        mergeDetails: {
+          commitSha: ownedCommit.sha,
+          filesChanged: ownedCommit.filesChanged,
+          insertions: ownedCommit.insertions,
+          deletions: ownedCommit.deletions,
+          mergeCommitMessage: ownedCommit.subject,
+          mergedAt: new Date().toISOString(),
+          mergeConfirmed: true,
+          prNumber: task.prInfo?.number,
+          mergeTargetBranch: mergeTarget.branch,
+          mergeTargetSource: mergeTarget.source,
+        },
+      });
+      mergerLog.log(`${taskId}: branch missing; recovered owned landed commit ${ownedCommit.sha.slice(0, 8)}`);
     }
     // Audit trail: record merge completion (FN-1404)
     await audit.database({ type: "task:move", target: taskId, metadata: { to: "done", merged: false } });
@@ -2691,9 +4998,8 @@ export async function aiMergeTask(
     return result;
   }
 
-  // 3b. Ensure rootDir is on the main branch before merging.
-  // Without this, a merge could land on whatever branch was last checked out,
-  // causing feature code to be committed to the wrong lineage.
+  // 3b. Ensure rootDir is on the resolved merge target before merging.
+  // Without this, a merge could land on whatever branch was last checked out.
   try {
     throwIfAborted(options.signal, taskId);
     const currentBranch = execSyncText("git symbolic-ref --short HEAD", {
@@ -2701,32 +5007,16 @@ export async function aiMergeTask(
       encoding: "utf-8",
       stdio: "pipe",
     }).trim();
-    const mainBranch = execSyncText("git rev-parse --abbrev-ref origin/HEAD", {
-      cwd: rootDir,
-      encoding: "utf-8",
-      stdio: "pipe",
-    }).trim().replace(/^origin\//, "");
-    if (currentBranch !== mainBranch) {
-      mergerLog.log(`${taskId}: rootDir on '${currentBranch}', checking out '${mainBranch}' before merge`);
-      await execAsync(`git checkout "${mainBranch}"`, {
+    if (currentBranch !== mergeTarget.branch) {
+      mergerLog.log(`${taskId}: rootDir on '${currentBranch}', checking out '${mergeTarget.branch}' before merge (${mergeTarget.source})`);
+      await execAsync(`git checkout "${mergeTarget.branch}"`, {
         cwd: rootDir,
       });
-      // Audit trail: record git checkout (FN-1404)
-      await audit.git({ type: "branch:checkout", target: mainBranch });
+      await audit.git({ type: "branch:checkout", target: mergeTarget.branch });
     }
   } catch (error: unknown) {
     rethrowIfMergeAborted(error);
-
-    // Fallback: try checking out main directly
-    try {
-      throwIfAborted(options.signal, taskId);
-      await execAsync("git checkout main", { cwd: rootDir });
-      // Audit trail: record git checkout (FN-1404)
-      await audit.git({ type: "branch:checkout", target: "main" });
-    } catch (fallbackError: unknown) {
-      rethrowIfMergeAborted(fallbackError);
-      mergerLog.warn(`${taskId}: unable to verify/checkout main branch — proceeding on current HEAD`);
-    }
+    mergerLog.warn(`${taskId}: unable to verify/checkout merge target '${mergeTarget.branch}' — proceeding on current HEAD`);
   }
 
   // 3c. Pre-merge remote rebase.
@@ -2970,19 +5260,19 @@ export async function aiMergeTask(
     }
 
     // Layer 1: surgical drop of declared-dependency commits.
-    // When `task.baseBranch` is a non-main branch (a sibling task's branch),
+    // When `task.executionStartBranch` is a non-main branch (a sibling task's branch),
     // the dependent worktree was forked off it and inherited its commits.
     // If the dep was later squash-merged to main, those raw commits are now
     // orphans whose content already exists in main. Re-rebase the task
     // branch onto main using `git rebase --onto <target> <dep-tip> <branch>`,
     // which peels off the dep's commits cleanly.
-    if (rebaseTarget && task.baseBranch && task.baseBranch !== "main") {
+    if (rebaseTarget && task.executionStartBranch && task.executionStartBranch !== "main") {
       // Resolve the dep's tip — prefer the live branch ref, fall back to
       // the recorded baseCommitSha if the branch was already deleted.
       let depTip: string | undefined;
       try {
         const { stdout } = await execAsync(
-          `git rev-parse --verify "${task.baseBranch}^{commit}"`,
+          `git rev-parse --verify "${task.executionStartBranch}^{commit}"`,
           { cwd: rootDir, encoding: "utf-8" },
         );
         depTip = stdout.trim() || undefined;
@@ -3016,11 +5306,11 @@ export async function aiMergeTask(
           preferMainRebaseFailureMessage = undefined;
           rebaseHappened = true;
           mergerLog.log(
-            `${taskId}: Layer 1 recovery — rebased ${branch} --onto ${rebaseTarget.slice(0, 8)} dropping commits up to dep tip ${depTip.slice(0, 8)} (baseBranch=${task.baseBranch})`,
+            `${taskId}: Layer 1 recovery — rebased ${branch} --onto ${rebaseTarget.slice(0, 8)} dropping commits up to dep tip ${depTip.slice(0, 8)} (executionStartBranch=${task.executionStartBranch})`,
           );
           await store.logEntry(
             taskId,
-            `Pre-merge recovery (Layer 1): dropped dependency commits from ${task.baseBranch} via rebase --onto ${rebaseTarget.slice(0, 8)} ${depTip.slice(0, 8)} ${branch}; the merge will proceed against the cleaned branch`,
+            `Pre-merge recovery (Layer 1): dropped dependency commits from ${task.executionStartBranch} via rebase --onto ${rebaseTarget.slice(0, 8)} ${depTip.slice(0, 8)} ${branch}; the merge will proceed against the cleaned branch`,
           );
         } catch (layer1Err) {
           rethrowIfMergeAborted(layer1Err);
@@ -3376,7 +5666,7 @@ export async function aiMergeTask(
       // Try in-merge fix attempts before propagating
       if (error.name === "VerificationError") {
         const verificationErr = error as VerificationError;
-        const maxFixRetries = Math.min(settings.verificationFixRetries ?? 3, 3);
+        const maxFixRetries = Math.min(settings.verificationFixRetries ?? 2, 3);
 
         if (maxFixRetries > 0 && (verificationErr.verificationResult.testResult || verificationErr.verificationResult.buildResult)) {
           mergerLog.log(`${taskId}: deterministic verification failed — attempting in-merge fix (up to ${maxFixRetries} attempts)`);
@@ -3429,6 +5719,8 @@ export async function aiMergeTask(
                 fixAttempt,
                 effectiveTestCommand,
                 effectiveBuildCommand,
+                effectiveTestSource,
+                effectiveBuildSource,
                 verificationFixModifiedFiles,
               );
 
@@ -3462,6 +5754,8 @@ export async function aiMergeTask(
               // amend if AI agent already committed). Always rewrites the
               // message deterministically from branch step commits.
               const authorArg = getCommitAuthorArg(settings);
+              const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
+              mergerLog.log(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
               const finalized = await commitOrAmendMergeWithFixes(
                 rootDir,
                 taskId,
@@ -3476,13 +5770,19 @@ export async function aiMergeTask(
                 aiMergeSummary,
                 aiMergeSubject,
                 verificationFixModifiedFiles,
+                store,
               );
-              if (!finalized) {
+              if (!finalized.ok) {
                 // Phantom-merge guard: refused to fabricate a commit. Reset
                 // any leftover squash state and propagate failure.
+                const { stdout: currentHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
+                const { stdout: branchTipOut } = await execAsync(`git rev-parse ${branch}`, { cwd: rootDir, encoding: "utf-8" });
                 resetMergeWithWarn(rootDir, taskId, "verification-fix finalize");
+                const classification = finalized.reason === "fix-produced-no-content"
+                  ? "fix produced no content"
+                  : "unknown phantom";
                 throw new Error(
-                  `${taskId}: verification fix succeeded but no merge commit could be created — refusing to mark merge complete.`,
+                  `${taskId}: verification fix finalize failed (${classification}); preAttemptHeadSha=${preAttemptHeadSha}; currentHead=${currentHeadOut.trim()}; branch=${branch}; branchTip=${branchTipOut.trim()}.`,
                 );
               }
               return true; // Merge succeeds
@@ -3498,7 +5798,7 @@ export async function aiMergeTask(
 
       // Check if it's a build verification failure
       if (error.message?.includes("Build verification failed")) {
-        const maxFixRetries = Math.min(settings.verificationFixRetries ?? 3, 3);
+        const maxFixRetries = Math.min(settings.verificationFixRetries ?? 2, 3);
 
         // Try in-merge fix before falling back to build retry
         if (maxFixRetries > 0 && (effectiveTestCommand || effectiveBuildCommand)) {
@@ -3546,6 +5846,8 @@ export async function aiMergeTask(
               fixAttempt,
               effectiveTestCommand,
               effectiveBuildCommand,
+              effectiveTestSource,
+              effectiveBuildSource,
               buildFixModifiedFiles,
             );
 
@@ -3574,6 +5876,8 @@ export async function aiMergeTask(
 
           if (fixSuccess) {
             const authorArg = getCommitAuthorArg(settings);
+            const { stdout: finalizeHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
+            mergerLog.log(`${taskId}: in-merge fix entering with preAttemptHeadSha=${preAttemptHeadSha}, currentHead=${finalizeHeadOut.trim()}`);
             const finalized = await commitOrAmendMergeWithFixes(
               rootDir,
               taskId,
@@ -3588,15 +5892,21 @@ export async function aiMergeTask(
               aiMergeSummary,
               aiMergeSubject,
               buildFixModifiedFiles,
+              store,
             );
-            if (!finalized) {
+            if (!finalized.ok) {
               // Phantom-merge guard: the verification fix passed but no
               // commit could be produced (no staged content + HEAD never
               // moved). Reset and propagate failure rather than silently
               // mutating a previous task's commit.
+              const { stdout: currentHeadOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
+              const { stdout: branchTipOut } = await execAsync(`git rev-parse ${branch}`, { cwd: rootDir, encoding: "utf-8" });
               resetMergeWithWarn(rootDir, taskId, "build-verification fix finalize");
+              const classification = finalized.reason === "fix-produced-no-content"
+                ? "fix produced no content"
+                : "unknown phantom";
               throw new Error(
-                `${taskId}: build verification fix succeeded but no merge commit could be created — refusing to mark merge complete.`,
+                `${taskId}: build verification fix finalize failed (${classification}); preAttemptHeadSha=${preAttemptHeadSha}; currentHead=${currentHeadOut.trim()}; branch=${branch}; branchTip=${branchTipOut.trim()}.`,
               );
             }
             return true; // Merge succeeds
@@ -3780,6 +6090,8 @@ export async function aiMergeTask(
       mergeCommitMessage: aiMergeSummary || commitLog,
       mergedAt: new Date().toISOString(),
       mergeConfirmed: true,
+      mergeTargetBranch: mergeTarget.branch,
+      mergeTargetSource: mergeTarget.source,
       resolutionStrategy: result.resolutionStrategy,
       resolutionMethod: result.resolutionMethod,
       attemptsMade: result.attemptsMade,
@@ -3787,6 +6099,20 @@ export async function aiMergeTask(
     };
 
     await store.updateTask(taskId, { mergeDetails });
+    if (recordedSha) {
+      const currentTask = await store.getTask(taskId);
+      if (currentTask?.lineageId) {
+        await store.upsertTaskCommitAssociation({
+          taskLineageId: currentTask.lineageId,
+          taskIdSnapshot: currentTask.id,
+          commitSha: recordedSha,
+          commitSubject: aiMergeSummary || commitLog,
+          authoredAt: mergeDetails.mergedAt ?? new Date().toISOString(),
+          matchedBy: "canonical-lineage-trailer",
+          confidence: "canonical",
+        });
+      }
+    }
     mergerLog.log(`${taskId}: merge details stored (commitSha: ${recordedSha?.slice(0, 8) ?? "<deferred>"})`);
 
     // Surface the high-level outcome on the agent-log timeline so users can
@@ -3797,7 +6123,7 @@ export async function aiMergeTask(
     if (recordedSha) {
       summaryParts.push(`commit ${recordedSha.slice(0, 8)}`);
     } else if (mergeWasEmpty) {
-      summaryParts.push("no commit landed (branch already on main)");
+      summaryParts.push(`no commit landed (branch already on ${mergeTarget.branch})`);
     } else if (isEmptyCommit) {
       summaryParts.push("squash collapsed to empty (sha deferred)");
     }
@@ -3836,7 +6162,7 @@ export async function aiMergeTask(
     // conflict-suffixed branch), null it so the dependent task doesn't
     // hard-fail at worktree creation once this branch is gone.
     try {
-      const cleared = store.clearStaleBaseBranchReferences([branch], taskId);
+      const cleared = store.clearStaleExecutionStartBranchReferences([branch], taskId);
       if (cleared.length > 0) {
         mergerLog.log(`${taskId}: cleared stale baseBranch on ${cleared.length} dependent task(s): ${cleared.join(", ")}`);
       }
@@ -3924,6 +6250,8 @@ export async function aiMergeTask(
         onAgentText: options.onAgentText,
         signal: options.signal,
         runtimeHint: pushRuntimeHint,
+        assignedAgentRuntimeConfig: pushAssignedAgent?.runtimeConfig,
+        onSession: options.onSession,
       });
       if (pushResult.pushed) {
         mergerLog.log(`${taskId}: pushed merged result to remote`);
@@ -3982,9 +6310,58 @@ export async function aiMergeTask(
   return result;
 
   } finally {
-    if (autostashRef) {
-      await restoreUnrelatedRootDirChanges(rootDir, taskId, autostashRef);
+    if (autostashHandle) {
+      try {
+        const settings = await store.getSettings();
+        const outcome = await restoreUnrelatedRootDirChanges(
+          rootDir,
+          taskId,
+          autostashHandle,
+          { store, options, settings },
+        );
+        // Attach outcome to result so callers (dashboard, daemon, CLI) can
+        // surface autostash status to the developer. result is undefined
+        // only when the try body threw before constructing it — in that
+        // case the merge already failed and the outcome warning logs are
+        // the best we can do.
+        if (resultForFinally) {
+          resultForFinally.autostash = outcome;
+        }
+
+        const rescueRestore = outcome.status === "restored" || outcome.status === "ai-resolved"
+          ? await restoreRescueAutostashes(rootDir, taskId, autostashHandle, { store })
+          : { unresolvedCount: 0 };
+        const keepIfLive = outcome.status === "failed"
+          || outcome.status === "conflict-needs-manual"
+          || rescueRestore.unresolvedCount > 0;
+        await dropAutostashHandle(rootDir, taskId, autostashHandle, {
+          keepIfLive,
+          store,
+          context: "Post-restore autostash cleanup",
+        });
+      } catch (err: unknown) {
+        // Any throw from restore should never propagate out of the merger
+        // — the merge result has already been recorded. Log and swallow.
+        const msg = err instanceof Error ? err.message : String(err);
+        mergerLog.warn(`${taskId}: autostash restore threw unexpectedly (${msg}) — running keep-if-live cleanup sweep`);
+        await dropAutostashHandle(rootDir, taskId, autostashHandle, {
+          keepIfLive: true,
+          store,
+          context: "Autostash restore exception cleanup",
+        });
+        if (resultForFinally) {
+          resultForFinally.autostash = {
+            status: "failed",
+            stashSha: autostashHandle.sha,
+            errorMessage: msg,
+          };
+        }
+      }
     }
+    // Always clear the advisory status file last, even if everything above
+    // threw — a stale advisory makes the dashboard show a phantom "merge
+    // running" indefinitely, which is worse than a missing one.
+    clearActiveMergerStatus(activeStatusPath, taskId);
   }
 }
 
@@ -4276,7 +6653,7 @@ async function executeMergeAttempt(
               signal: options.signal,
             });
             const authorArg = getCommitAuthorArg(settings);
-            const trailerArg = buildTaskIdTrailerArg(taskId);
+            const trailerArg = buildTaskTrailerArgs(taskId);
             const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
               taskId,
               branch,
@@ -4494,7 +6871,7 @@ async function executeMergeAttempt(
         aiSummary,
         aiSubject,
       });
-      const trailerArg = buildTaskIdTrailerArg(taskId);
+      const trailerArg = buildTaskTrailerArgs(taskId);
       await execAsync(
         `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
         { cwd: rootDir },
@@ -4520,13 +6897,25 @@ async function executeMergeAttempt(
     if (error.message?.includes("Build verification failed")) {
       throw error; // Fatal - don't retry build failures
     }
-    
+
     // Check if it's a non-conflict merge failure
     if (error.message?.includes("Merge failed")) {
       throw error; // Fatal
     }
 
-    // For attempt 1, return false to trigger attempt 2
+    // VerificationError must propagate so mergeAttempt's catch can run the
+    // in-merge fix against THIS attempt's preAttemptHeadSha baseline. Falling
+    // through to the attempt-1 retry path here would swallow the error,
+    // trigger attempt 2 with a stale baseline (= AI's commit from attempt 1),
+    // and then the in-merge fix's finalizer would see !hasStaged && !headMoved
+    // and trip the phantom-merge guard even though the task's content is
+    // already on HEAD. Retrying with auto-conflict-resolution can't help a
+    // verification failure anyway — there are no conflicts to resolve.
+    if (error?.name === "VerificationError") {
+      throw error;
+    }
+
+    // For attempt 1, return false to trigger attempt 2 (conflict-only path)
     if (attemptNum === 1 && smartConflictResolution) {
       return false;
     }
@@ -4610,7 +6999,7 @@ async function attemptWithSideStrategy(
       signal: params.options.signal,
     });
     const authorArg = getCommitAuthorArg(settings);
-    const trailerArg = buildTaskIdTrailerArg(taskId);
+    const trailerArg = buildTaskTrailerArgs(taskId);
     const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
     const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
       taskId,
@@ -4747,6 +7136,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
+    persistAgentThinkingLog: settings.persistAgentThinkingLog,
     onAgentText: options.onAgentText
       ? (_id, delta) => options.onAgentText!(delta)
       : undefined,
@@ -4804,6 +7194,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
     : null;
   const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
+  const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig);
 
   const { session } = await createResolvedAgentSession({
     sessionPurpose: "merger",
@@ -4812,21 +7203,15 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     cwd: rootDir,
     systemPrompt: mergerSystemPrompt,
     tools: "coding",
-    customTools: [reportBuildFailureTool],
+    customTools: [reportBuildFailureTool, createWebFetchTool()],
     onText: agentLogger.onText,
     onThinking: agentLogger.onThinking,
     onToolStart: agentLogger.onToolStart,
     onToolEnd: agentLogger.onToolEnd,
-    defaultProvider: settings.defaultProviderOverride && settings.defaultModelIdOverride
-      ? settings.defaultProviderOverride
-      : settings.defaultProvider,
-    defaultModelId: settings.defaultProviderOverride && settings.defaultModelIdOverride
-      ? settings.defaultModelIdOverride
-      : settings.defaultModelId,
+    defaultProvider: mergerSessionModel.provider,
+    defaultModelId: mergerSessionModel.modelId,
     fallbackProvider: settings.fallbackProvider,
     fallbackModelId: settings.fallbackModelId,
-    modelFallbackChain: resolveModelFallbackChain(settings),
-    routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
     defaultThinkingLevel: settings.defaultThinkingLevel,
     // Skill selection: use assigned agent skills if available, otherwise role fallback
     ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -4963,7 +7348,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
           signal: options.signal,
         });
         const authorArg = getCommitAuthorArg(settings);
-        const trailerArg = buildTaskIdTrailerArg(taskId);
+        const trailerArg = buildTaskTrailerArgs(taskId);
         const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
         const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
           taskId,
@@ -4984,11 +7369,9 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
         throw new Error(`Agent did not commit and did not report build failure for ${taskId}`);
       }
     } else {
-      // The agent committed. Idempotently ensure the Fusion-Task-Id trailer
-      // is present on HEAD — recovery (findLandedTaskCommit) relies on it
-      // when includeTaskIdInCommit=false, since the subject won't carry the
-      // task ID and subject grep would miss the commit.
-      await ensureTaskIdTrailerOnHead(rootDir, taskId);
+      // The agent committed. Idempotently ensure canonical task trailers are
+      // present on HEAD for durable lineage attribution and fallback recovery.
+      await ensureTaskTrailersOnHead(rootDir, { id: taskId });
     }
 
     return { success: true };
@@ -5359,31 +7742,10 @@ If issues are found that need attention, describe them clearly and include concr
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
+    persistAgentThinkingLog: settings.persistAgentThinkingLog,
   });
 
   try {
-    const defaultModel = resolveProjectDefaultModel(settings);
-    const stepProvider = workflowStep.modelProvider || defaultModel.provider;
-    const stepModelId = workflowStep.modelId || defaultModel.modelId;
-    const useOverride = !!(workflowStep.modelProvider && workflowStep.modelId);
-
-    // Post-merge step agents inherit merger instructions
-    let postMergeInstructions = "";
-    if (mergeOptions.agentStore) {
-      try {
-        const agents = await mergeOptions.agentStore.listAgents({ role: "merger" });
-        for (const agent of agents) {
-          if (agent.instructionsText || agent.instructionsPath) {
-            postMergeInstructions = await resolveAgentInstructions(agent, rootDir);
-            break;
-          }
-        }
-      } catch {
-        // Graceful fallback
-      }
-    }
-    const postMergeSystemPrompt = buildSystemPromptWithInstructions(systemPrompt, postMergeInstructions);
-
     // Build skill selection context for post-merge session
     let postMergeSkillContext = undefined;
     let taskForSkillContext: Awaited<ReturnType<typeof store.getTask>> | null = null;
@@ -5409,6 +7771,28 @@ If issues are found that need attention, describe them clearly and include concr
     const assignedAgent = assignedAgentId && agentStoreWithGetAgent
       ? await agentStoreWithGetAgent.getAgent(assignedAgentId).catch(() => null)
       : null;
+    const mergerSessionModel = resolveMergerSessionModel(settings, assignedAgent?.runtimeConfig);
+    const stepProvider = workflowStep.modelProvider || mergerSessionModel.provider;
+    const stepModelId = workflowStep.modelId || mergerSessionModel.modelId;
+    const useOverride = !!(workflowStep.modelProvider && workflowStep.modelId);
+
+    // Post-merge step agents inherit merger instructions
+    let postMergeInstructions = "";
+    if (mergeOptions.agentStore) {
+      try {
+        const agents = await mergeOptions.agentStore.listAgents({ role: "merger" });
+        for (const agent of agents) {
+          if (agent.instructionsText || agent.instructionsPath) {
+            postMergeInstructions = await resolveAgentInstructions(agent, rootDir);
+            break;
+          }
+        }
+      } catch {
+        // Graceful fallback
+      }
+    }
+    const postMergeSystemPrompt = buildSystemPromptWithInstructions(systemPrompt, postMergeInstructions);
+
     const mergerRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "merger",
@@ -5421,8 +7805,6 @@ If issues are found that need attention, describe them clearly and include concr
       defaultModelId: stepModelId,
       fallbackProvider: settings.fallbackProvider,
       fallbackModelId: settings.fallbackModelId,
-      modelFallbackChain: resolveModelFallbackChain(settings),
-      routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       defaultThinkingLevel: settings.defaultThinkingLevel,
       // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(postMergeSkillContext?.skillSelectionContext ? { skillSelection: postMergeSkillContext.skillSelectionContext } : {}),

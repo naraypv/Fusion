@@ -61,6 +61,7 @@ import type {
   TaskDetailData,
   TaskEvent,
   UpdateStatus,
+  SystemInfo,
 } from "./state.js";
 import type { LogEntry } from "./log-ring-buffer.js";
 import { FUSION_LOGO_LINES, FUSION_LOGO_LARGE_LINES, FUSION_TAGLINE, FUSION_URL, FUSION_VERSION } from "./logo.js";
@@ -130,6 +131,86 @@ function AnimatedFusionLogo({ lines }: { lines: readonly string[] }) {
 // to a single pane so content doesn't overflow or overlap on small terminals.
 const NARROW_THRESHOLD = 80;
 
+// In narrow single-pane mode, when there is enough vertical room we
+// horizontally split the screen so log activity stays visible while the
+// user is on a non-logs section. The split is dynamic: the top pane gets
+// exactly the rows it needs to render the active section without
+// truncating, and the bottom log strip absorbs the rest. We only enable
+// the split when the log strip would have at least this many rows.
+const NARROW_SPLIT_MIN_LOG_ROWS = 6;
+
+// Rough upper bound on how many rows each non-System panel needs once
+// rendered — used to size the top pane when the active section is not
+// System. System is computed dynamically from the chip wrap.
+const STATIC_SECTION_CONTENT_ROWS: Record<string, number> = {
+  stats: 4,
+  utilities: 7,
+  settings: 9,
+};
+
+// Estimate the System panel's content row count given the current column
+// count. Mirrors the SystemPanel layout: a wrap-row of small status chips
+// (v / Engine / Auth / [Watcher] / Uptime), then full-width rows for URL
+// and Token (each may wrap onto multiple lines), then an always-on hint
+// row. The hint and token must always be visible, so we never collapse
+// those rows regardless of focus.
+function estimateSystemContentRows(
+  info: SystemInfo | null,
+  cols: number,
+  _isFocused: boolean,
+): number {
+  if (!info) return 1;
+  // Panel content area: terminal cols minus border (2) minus paddingX (2).
+  const inner = Math.max(20, cols - 4);
+  const chipGap = 2;
+  const statusChips: number[] = [];
+  statusChips.push(1 + 1 + FUSION_VERSION.length);
+  statusChips.push(6 + 1 + 6); // Engine + worst-case state
+  statusChips.push(4 + 1 + 6); // Auth + "bearer"
+  if (cols >= 100) statusChips.push(7 + 1 + 8); // Watcher + "inactive"
+  statusChips.push(6 + 1 + 14); // Uptime + worst-case "Xd Yh Zm Ws"
+
+  // Greedy pack of the wrap-row.
+  let chipRows = 1;
+  let used = 0;
+  for (const c of statusChips) {
+    const next = used === 0 ? c : used + chipGap + c;
+    if (next > inner && used > 0) {
+      chipRows++;
+      used = c;
+    } else {
+      used = next;
+    }
+  }
+
+  // URL and Token are each on their own full-width row. Long values wrap
+  // onto multiple lines: total width = label + 1 (gap) + value, divided
+  // by inner width, rounded up.
+  const urlRows = Math.max(
+    1,
+    Math.ceil((3 + 1 + (info.baseUrl?.length ?? 0)) / inner),
+  );
+  const tokenRows = info.authToken
+    ? Math.max(1, Math.ceil((5 + 1 + info.authToken.length) / inner))
+    : 0;
+
+  // +1 for the always-on hint row.
+  return chipRows + urlRows + tokenRows + 1;
+}
+
+function estimateSectionPanelHeight(
+  section: SectionId,
+  state: DashboardState,
+  cols: number,
+  isFocused: boolean,
+): number {
+  const contentRows = section === "system"
+    ? estimateSystemContentRows(state.systemInfo, cols, isFocused)
+    : STATIC_SECTION_CONTENT_ROWS[section] ?? 6;
+  // Panel chrome: top border (1) + title row (1) + bottom border (1).
+  return contentRows + 3;
+}
+
 // Logo width thresholds. Below SPLASH_MIN_COLS we fall back to the plain
 // "FUSION" word; otherwise we pick the largest variant that fits.
 const SPLASH_MIN_COLS = 56;
@@ -155,7 +236,7 @@ function SplashScreen({ loadingStatus, updateStatus }: { loadingStatus: string; 
       <Text color="cyanBright" dimColor>{FUSION_URL}</Text>
       <Text color="cyanBright" dimColor>{`v${FUSION_VERSION}`}</Text>
       {updateStatus?.updateAvailable && (
-        <Text color="yellow" dimColor>{`Update available: v${updateStatus.currentVersion} → v${updateStatus.latestVersion}. Run \`npm install -g @runfusion/fusion\`.`}</Text>
+        <Text color="yellow" dimColor>{`Update available: v${updateStatus.currentVersion} → v${updateStatus.latestVersion}. Run \`fn update\` for an installed CLI, or pull this source checkout.`}</Text>
       )}
       <Box height={1} />
       <Box flexDirection="row" gap={1}>
@@ -227,63 +308,66 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
       {!info ? (
         <Text dimColor>System information not available.</Text>
       ) : (
-        <Box flexDirection="row" gap={2} flexWrap="wrap">
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>v</Text>
-            <Text>{FUSION_VERSION}</Text>
+        <Box flexDirection="column" flexShrink={0}>
+          {/* Status chips wrap to multiple rows at narrow widths. */}
+          <Box flexDirection="row" gap={2} flexWrap="wrap">
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor>v</Text>
+              <Text>{FUSION_VERSION}</Text>
+            </Box>
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor>Engine</Text>
+              {info.engineMode === "dev" && <Text color="yellow">dev</Text>}
+              {info.engineMode === "paused" && <Text color="yellow">paused</Text>}
+              {info.engineMode === "active" && <Text color="green">active</Text>}
+            </Box>
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor>Auth</Text>
+              {info.authEnabled
+                ? <Text color="yellow">bearer</Text>
+                : <Text color="yellow">none</Text>}
+            </Box>
+            {showWatcher && (
+              <Box flexDirection="row" gap={1} flexShrink={0}>
+                <Text dimColor>Watcher</Text>
+                {info.fileWatcher ? <Text color="green">active</Text> : <Text color="red">inactive</Text>}
+              </Box>
+            )}
+            <Box flexDirection="row" gap={1} flexShrink={0}>
+              <Text dimColor>Uptime</Text>
+              <Text>{formatUptime(Date.now() - info.startTimeMs)}</Text>
+            </Box>
           </Box>
+          {/* URL and Token each get their own full-width row so long values
+              wrap onto multiple lines instead of being truncated or pushed
+              off-panel. The token in particular MUST always render in
+              full so users can copy it (via [c]) or click-drag select it. */}
           <Box flexDirection="row" gap={1} flexShrink={0}>
             <Text dimColor>URL</Text>
-            <Text color="cyanBright" wrap="truncate-end">{info.baseUrl}</Text>
+            <Text color="cyanBright">{info.baseUrl}</Text>
           </Box>
           {info.authToken && (
-            // Pinned right after URL so the token is part of the primary
-            // identity row and wraps to a new line at narrow widths instead
-            // of being pushed off-panel.
             <Box flexDirection="row" gap={1} flexShrink={0}>
               <Text dimColor>Token</Text>
-              <Text color="yellow" wrap="truncate-end">{info.authToken}</Text>
+              <Text color="yellow">{info.authToken}</Text>
             </Box>
           )}
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>Engine</Text>
-            {info.engineMode === "dev" && <Text color="yellow">dev</Text>}
-            {info.engineMode === "paused" && <Text color="yellow">paused</Text>}
-            {info.engineMode === "active" && <Text color="green">active</Text>}
+          {/* Inline hint row — always shown so the [Enter] / [c] shortcuts
+              stay discoverable even when the panel doesn't currently own
+              keyboard focus (e.g. when the narrow-mode log strip below has
+              sub-focus). Mouse reporting is auto-off when System is the
+              active section so users can still click-drag to select the
+              token, regardless of split focus. */}
+          <Box flexShrink={0}>
+            <Text dimColor wrap="truncate-end">
+              <Text color="cyanBright">[Enter]</Text> open URL
+              {info.authToken ? (
+                <Text> · <Text color="cyanBright">[c]</Text> copy token · drag to select</Text>
+              ) : (
+                <Text> · drag to select</Text>
+              )}
+            </Text>
           </Box>
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>Auth</Text>
-            {info.authEnabled
-              ? <Text color="yellow">bearer</Text>
-              : <Text color="yellow">none</Text>}
-          </Box>
-          {showWatcher && (
-            <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text dimColor>Watcher</Text>
-              {info.fileWatcher ? <Text color="green">active</Text> : <Text color="red">inactive</Text>}
-            </Box>
-          )}
-          <Box flexDirection="row" gap={1} flexShrink={0}>
-            <Text dimColor>Uptime</Text>
-            <Text>{formatUptime(Date.now() - info.startTimeMs)}</Text>
-          </Box>
-          {isFocused && (
-            // Inline hint row — only shown when the System panel is focused.
-            // Mouse reporting is auto-off here so users can click-drag to
-            // select the token; it auto-toggles on when they focus Logs /
-            // Files / Git / Board for wheel scrolling. [c] is the keyboard
-            // shortcut to copy the token in one keystroke.
-            <Box flexShrink={0}>
-              <Text dimColor wrap="truncate-end">
-                <Text color="cyanBright">[Enter]</Text> open URL
-                {info.authToken ? (
-                  <Text> · <Text color="cyanBright">[c]</Text> copy token · drag to select</Text>
-                ) : (
-                  <Text> · drag to select</Text>
-                )}
-              </Text>
-            </Box>
-          )}
         </Box>
       )}
     </Panel>
@@ -693,8 +777,9 @@ function HelpOverlay() {
     ["[Shift+Tab]", "Cycle focused panel / pane backward"],
     ["[1-5]", "Jump to panel (Main: System/Logs/Stats/Utilities/Settings)"],
     ["[← / →]", "Switch pane (Agents, Settings, Files, Git)"],
-    ["[→] / [n]", "Next panel (Main)"],
-    ["[←] / [p]", "Previous panel (Main)"],
+    ["[→] / [↓] / [n]", "Next panel (Main; ↑/↓ scroll on Logs)"],
+    ["[←] / [↑] / [p]", "Previous panel (Main; ↑/↓ scroll on Logs)"],
+    ["[Enter]", "Expand log + release mouse for text selection (Logs)"],
     ["[r]", "Refresh stats (Utilities)"],
     ["[c]", "Clear logs (Utilities)"],
     ["[k]", "Kill all vitest processes (Utilities)"],
@@ -871,29 +956,60 @@ function StatusModeSingle({
   const { stdout } = useStdout();
   const rows = stdout?.rows ?? 24;
   const cols = stdout?.columns ?? 80;
-  // LogsPanel's row budget — explicit cap so it doesn't render more
-  // entries than fit. Chrome=6:
+  // LogsPanel's row budget when it owns the whole single-pane view. Chrome=6:
   //   header(1) + statusbar(1) +
   //   panel border top(1) + panel title(1) + panel border bottom(1) +
   //   filter row(1) = 6.
-  const logsAvailableRows = Math.max(1, rows - 6);
-  tuiDebug("StatusModeSingle", { cols, rows, logsAvailableRows, focused });
+  const logsAvailableRowsFull = Math.max(1, rows - 6);
 
-  const activePanel = () => {
+  // Dynamic split: give the top pane exactly the rows it needs to render
+  // the active section without truncating, and let the log strip absorb
+  // everything else. We only enable the split when the leftover would still
+  // give the log strip enough rows to be useful.
+  const contentRows = Math.max(1, rows - 2); // rows minus header + statusbar
+  const topNeededRows =
+    focused === "logs"
+      ? contentRows
+      : estimateSectionPanelHeight(focused, state, cols, !state.narrowLogSplitFocused);
+  const candidateSplitHeight = contentRows - topNeededRows;
+  const showLogSplit =
+    focused !== "logs" && candidateSplitHeight >= NARROW_SPLIT_MIN_LOG_ROWS;
+  const splitHeight = showLogSplit ? candidateSplitHeight : 0;
+  // Bottom log pane has its own border + title + filter chrome (4), so the
+  // visible-entries budget is splitHeight - 4.
+  const splitLogRows = Math.max(1, splitHeight - 4);
+  const splitFocused = showLogSplit && state.narrowLogSplitFocused;
+
+  tuiDebug("StatusModeSingle", {
+    cols,
+    rows,
+    logsAvailableRowsFull,
+    focused,
+    showLogSplit,
+    splitHeight,
+    splitFocused,
+  });
+
+  const topPanel = () => {
     switch (focused) {
-      case "system": return <SystemPanel state={state} isFocused />;
-      case "logs": return <LogsPanel state={state} isFocused availableRows={logsAvailableRows} />;
-      case "utilities": return <UtilitiesPanel state={state} isFocused />;
-      case "stats": return <StatsPanel state={state} isFocused />;
-      case "settings": return <SettingsPanel state={state} isFocused />;
+      case "system": return <SystemPanel state={state} isFocused={!splitFocused} />;
+      case "logs": return <LogsPanel state={state} isFocused availableRows={logsAvailableRowsFull} />;
+      case "utilities": return <UtilitiesPanel state={state} isFocused={!splitFocused} />;
+      case "stats": return <StatsPanel state={state} isFocused={!splitFocused} />;
+      case "settings": return <SettingsPanel state={state} isFocused={!splitFocused} />;
     }
   };
 
   return (
     <Box flexDirection="column" flexGrow={1}>
       <Box flexGrow={1} flexDirection="column" overflow="hidden">
-        {activePanel()}
+        {topPanel()}
       </Box>
+      {showLogSplit && (
+        <Box flexShrink={0} flexDirection="column" height={splitHeight} overflow="hidden">
+          <LogsPanel state={state} isFocused={splitFocused} availableRows={splitLogRows} />
+        </Box>
+      )}
       <Box flexShrink={0}>
         <StatusBar state={state} controller={controller} />
       </Box>
@@ -4000,7 +4116,7 @@ export function DashboardApp({ controller }: DashboardAppProps) {
   useEffect(() => {
     return controller.onWheel((dir) => {
       const s = wheelStateRef.current;
-      if (s.activeSection !== "logs") return;
+      if (s.activeSection !== "logs" && !s.narrowLogSplitFocused) return;
       const filtered = controller.getFilteredLogEntries();
       if (filtered.length === 0) return;
       const WHEEL_STEP = 3;
@@ -4022,11 +4138,18 @@ export function DashboardApp({ controller }: DashboardAppProps) {
   // Other status panels (System / Stats / Utilities / Settings) leave it
   // off so the user can select text natively. [M] is still a manual
   // override, but the next focus change will reapply this policy.
+  // When a log entry is expanded, disable mouse reporting so the user can
+  // click-drag to select the message text natively. Esc/Enter closes the
+  // expanded view and the policy reapplies, restoring wheel scrolling.
+  const statusLogsFocused = state.activeSection === "logs"
+    // Narrow-mode split keeps wheel scrolling for the bottom log strip,
+    // except when System is selected (preserve native text selection).
+    || (state.narrowLogSplitFocused && state.activeSection !== "system");
   const wantsMouse = state.mode === "interactive"
     ? (state.interactiveView === "files"
        || state.interactiveView === "git"
        || state.interactiveView === "board")
-    : state.activeSection === "logs";
+    : (statusLogsFocused && !state.logsExpandedMode);
   useEffect(() => {
     if (state.mouseEnabled !== wantsMouse) {
       controller.setMouseEnabled(wantsMouse);
@@ -4094,6 +4217,27 @@ export function DashboardApp({ controller }: DashboardAppProps) {
       return;
     }
 
+    // Narrow single-pane mode shows a bottom log strip when the terminal has
+    // enough rows after the top pane is given everything it needs. Down-arrow
+    // shifts sub-focus into that strip; once focused it gets the same key
+    // bindings as the dedicated logs section. Mirrors the showLogSplit logic
+    // in StatusModeSingle.
+    const narrowSplitActive = (() => {
+      if (state.mode !== "status") return false;
+      if (!(cols < NARROW_THRESHOLD || rows < 20)) return false;
+      if (state.activeSection === "logs") return false;
+      const topNeeded = estimateSectionPanelHeight(
+        state.activeSection,
+        state,
+        cols,
+        !state.narrowLogSplitFocused,
+      );
+      return rows - 2 - topNeeded >= NARROW_SPLIT_MIN_LOG_ROWS;
+    })();
+    const logsFocused =
+      state.mode === "status" &&
+      (state.activeSection === "logs" || (narrowSplitActive && state.narrowLogSplitFocused));
+
     // View switching shortcuts — b/a/g enter interactive + set view
     if (input === "b" || input === "B") {
       controller.setMode("interactive");
@@ -4116,7 +4260,7 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     //   * status mode + Logs panel focused → cycle severity filter
     //   * everywhere else → switch to Files view (interactive)
     if (input === "f" || input === "F") {
-      if (state.mode === "status" && state.activeSection === "logs") {
+      if (logsFocused) {
         controller.cycleSeverityFilter();
         return;
       }
@@ -4228,7 +4372,9 @@ export function DashboardApp({ controller }: DashboardAppProps) {
       return;
     }
 
-    // Arrow/n/p navigation (skip when logs expanded)
+    // Arrow/n/p navigation (skip when logs expanded). cycleSection clears
+    // any narrow-split sub-focus via setActiveSection — left/right always
+    // cycle sections, including reaching the dedicated logs section.
     if (key.rightArrow || input === "n" || input === "N") {
       if (state.activeSection !== "logs" || !state.logsExpandedMode) {
         controller.cycleSection(1);
@@ -4236,20 +4382,61 @@ export function DashboardApp({ controller }: DashboardAppProps) {
       return;
     }
     if (key.leftArrow || input === "p" || input === "P") {
+      // While sub-focus is on the narrow log strip, ← returns to the main
+      // pane (System / Stats / Utilities / Settings) instead of cycling
+      // sections — so the user can jump back to System to drag-select the
+      // auth token without losing their place. p/P still cycle sections.
+      if (key.leftArrow && narrowSplitActive && state.narrowLogSplitFocused) {
+        controller.setNarrowLogSplitFocused(false);
+        return;
+      }
       if (state.activeSection !== "logs" || !state.logsExpandedMode) {
         controller.cycleSection(-1);
       }
       return;
     }
 
-    // Utilities actions
-    if (state.activeSection === "utilities") {
+    // Down arrow:
+    //   * dedicated logs section → handled below as log entry navigation
+    //   * narrow split active, top focused → drop sub-focus into the log strip
+    //   * narrow split active, strip focused → handled below as log navigation
+    //   * otherwise → cycleSection
+    if (key.downArrow && state.activeSection !== "logs") {
+      if (narrowSplitActive && !state.narrowLogSplitFocused) {
+        controller.setNarrowLogSplitFocused(true);
+        return;
+      }
+      if (!(narrowSplitActive && state.narrowLogSplitFocused)) {
+        controller.cycleSection(1);
+        return;
+      }
+      // fall through to log navigation
+    }
+    // Up arrow: when the split strip is focused and the cursor is at the
+    // top, return focus to the main pane instead of navigating further up.
+    if (key.upArrow && state.activeSection !== "logs") {
+      if (narrowSplitActive && state.narrowLogSplitFocused) {
+        if (state.selectedLogIndex <= 0) {
+          controller.setNarrowLogSplitFocused(false);
+          return;
+        }
+        // fall through to log navigation
+      } else {
+        controller.cycleSection(-1);
+        return;
+      }
+    }
+
+    // Utilities actions — skipped when sub-focus has moved to the log strip
+    // so j/k/G/Home/etc. don't get swallowed by utility shortcuts.
+    if (state.activeSection === "utilities" && !logsFocused) {
       void controller.handleUtilityAction(input);
       return;
     }
 
-    // Logs-specific keys
-    if (state.activeSection === "logs") {
+    // Logs-specific keys (apply to dedicated logs section AND the narrow
+    // bottom split when it has sub-focus).
+    if (logsFocused) {
       const filteredEntries = controller.getFilteredLogEntries();
 
       if (key.escape) {
@@ -4258,6 +4445,9 @@ export function DashboardApp({ controller }: DashboardAppProps) {
           controller.setShowHelp(false);
         } else if (state.showHelp) {
           controller.setShowHelp(false);
+        } else if (state.narrowLogSplitFocused) {
+          // Esc out of the bottom log strip back to the main pane.
+          controller.setNarrowLogSplitFocused(false);
         }
         return;
       }

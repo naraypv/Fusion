@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { Settings, Pause, Play, Square, LayoutGrid, List, Terminal, Lightbulb, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Server, Workflow, Bot, Target, ChevronRight, FileCode, Loader2, Grid3X3, Mail, MessageSquare, ChevronDown, Check, Zap, Sparkles, FileText, Brain, CheckSquare } from "lucide-react";
 import "./Header.css";
 // Header renders an inline ProjectSelector dropdown using project-selector-* classes.
@@ -13,10 +13,13 @@ import { useViewportMode, type ViewportMode } from "../hooks/useViewportMode";
 import { getTrailingPath } from "../utils/pathDisplay";
 import type { TaskView } from "../hooks/useViewState";
 import type { PluginDashboardViewEntry } from "../api";
-import { buildPluginTaskViewId } from "../plugins/pluginViewRegistry";
+import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
+import type { ShellHostContext } from "../shell-host";
 
 export { useViewportMode };
+
+const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
 
 // Status icon config for project selector dropdown
 const PROJECT_STATUS_CONFIG: Record<ProjectStatus, { color: string }> = {
@@ -181,6 +184,12 @@ export interface HeaderProps {
   onOpenMailbox?: () => void;
   /** Unread message count for badge display */
   mailboxUnreadCount?: number;
+  /** Pending approval count for mailbox indicator */
+  mailboxPendingApprovalCount?: number;
+  /** Whether chat has an unread assistant response */
+  chatHasUnreadResponse?: boolean;
+  /** Count of orphaned merger autostashes for stash recovery indicator. */
+  stashOrphanCount?: number;
   onOpenSchedules?: () => void;
   onOpenGitManager?: () => void;
   onOpenNodes?: () => void;
@@ -208,13 +217,19 @@ export interface HeaderProps {
   showAgentsTab?: boolean;
   searchQuery?: string;
   onSearchChange?: (query: string) => void;
+  branchFilter?: string;
+  baseBranchFilter?: string;
+  branchOptions?: string[];
+  baseBranchOptions?: string[];
+  onBranchFilterChange?: (value: string) => void;
+  onBaseBranchFilterChange?: (value: string) => void;
   /** Multi-project props */
   projects?: ProjectInfo[];
   currentProject?: ProjectInfo | null;
   onSelectProject?: (project: ProjectInfo) => void;
   onViewAllProjects?: () => void;
   projectId?: string;
-  isElectron?: boolean;
+  shellHost?: ShellHostContext;
   /** When true, the mobile bottom nav bar handles primary navigation and header nav controls are hidden. */
   mobileNavEnabled?: boolean;
   /** Available nodes for the node selector */
@@ -226,8 +241,9 @@ export interface HeaderProps {
   /** Whether the current view is a remote node */
   isRemote?: boolean;
   /** Experimental feature flags controlling visibility of nav items. */
-  experimentalFeatures?: { insights?: boolean; roadmap?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean };
+  experimentalFeatures?: { insights?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean; evalsView?: boolean };
   pluginDashboardViews?: PluginDashboardViewEntry[];
+  shellConnectionControl?: ReactNode;
 }
 
 export function Header({
@@ -241,6 +257,9 @@ export function Header({
   onOpenSystemStats,
   onOpenMailbox,
   mailboxUnreadCount = 0,
+  mailboxPendingApprovalCount = 0,
+  chatHasUnreadResponse = false,
+  stashOrphanCount = 0,
   onOpenSchedules,
   onOpenGitManager,
   onOpenNodes,
@@ -264,12 +283,18 @@ export function Header({
   showAgentsTab,
   searchQuery = "",
   onSearchChange,
+  branchFilter = "",
+  baseBranchFilter = "",
+  branchOptions = [],
+  baseBranchOptions = [],
+  onBranchFilterChange,
+  onBaseBranchFilterChange,
   projects = [],
   currentProject,
   onSelectProject,
   onViewAllProjects,
   projectId,
-  isElectron = false,
+  shellHost = { kind: "browser" },
   mobileNavEnabled,
   availableNodes = [],
   currentNode,
@@ -277,6 +302,7 @@ export function Header({
   isRemote = false,
   experimentalFeatures,
   pluginDashboardViews = [],
+  shellConnectionControl,
 }: HeaderProps) {
   const mode: ViewportMode = useViewportMode();
   const isMobile = mode === "mobile";
@@ -338,24 +364,20 @@ export function Header({
     return Object.entries(overflowScripts).sort(([a], [b]) => a.localeCompare(b));
   }, [overflowScripts]);
 
-  const hasRoadmapsPluginView = useMemo(
-    () => pluginDashboardViews.some((entry) => entry.pluginId === "fusion-plugin-roadmap"),
-    [pluginDashboardViews],
-  );
-
   const hasViewOverflowItems = useMemo(() => {
     return !!(
+      onChangeView ||
       experimentalFeatures?.researchView ||
       todosEnabled ||
       experimentalFeatures?.insights ||
-      (experimentalFeatures?.roadmap && !hasRoadmapsPluginView) ||
+
       showSkillsTab ||
       experimentalFeatures?.memoryView ||
       experimentalFeatures?.devServerView ||
       !hideFullNav ||
       pluginDashboardViews.some((entry) => entry.view.placement !== "primary")
     );
-  }, [experimentalFeatures, todosEnabled, showSkillsTab, hideFullNav, pluginDashboardViews, hasRoadmapsPluginView]);
+  }, [onChangeView, experimentalFeatures, todosEnabled, showSkillsTab, hideFullNav, pluginDashboardViews]);
 
   const getEffectiveViewport = useCallback(() => {
     const vv = window.visualViewport;
@@ -642,6 +664,7 @@ export function Header({
   // Show toggle when search is available, NOT currently shown, NOT explicitly closed, AND query is empty
   const canShowNonMobileSearchToggle = (view === "board" || view === "list") && !isMobile && onSearchChange && !isNonMobileSearchExplicitlyClosed && searchQuery.length === 0;
   const canShowNonMobileSearch = (view === "board" || view === "list") && !isMobile && onSearchChange;
+  const showBoardBranchFilters = view === "board";
 
   // Reset explicit close flag when query becomes empty (so toggle reappears)
   useEffect(() => {
@@ -823,9 +846,11 @@ export function Header({
     if (onSearchChange) onSearchChange("");
   }, [onSearchChange]);
 
+  const isDesktopShell = shellHost.kind === "desktop-shell";
+
   return (
     <div className="header-wrapper">
-      <header className="header">
+      <header className="header" data-shell-kind={shellHost.kind}>
         <div className="header-left">
           <div className="header-brand">
           <svg
@@ -992,6 +1017,7 @@ export function Header({
       </div>
 
       <div className="header-actions">
+        {shellConnectionControl}
         {/* Mobile View Toggle - compact board/list switcher in header when mobile nav is active */}
         {hideFullNav && onChangeView && (view === "board" || view === "list") && (
           <div className="view-toggle" data-testid="mobile-view-toggle">
@@ -1104,8 +1130,12 @@ export function Header({
               title="Chat view"
               aria-label="Chat view"
               aria-pressed={view === "chat"}
+              data-testid="header-chat-view-btn"
             >
               <MessageSquare size={16} />
+              {chatHasUnreadResponse && view !== "chat" && (
+                <span className="status-dot status-dot--pending header-chat-unread-dot" aria-label="Unread chat response" />
+              )}
             </button>
             <button
               className={`view-toggle-btn${view === "documents" ? " active" : ""}`}
@@ -1124,6 +1154,9 @@ export function Header({
               aria-pressed={view === "mailbox"}
             >
               <Mail size={16} />
+              {mailboxPendingApprovalCount > 0 && view !== "mailbox" && (
+                <span className="status-dot status-dot--pending header-chat-unread-dot" aria-label="Pending approvals" />
+              )}
             </button>
             {pluginDashboardViews
               .filter((entry) => entry.view.placement === "primary")
@@ -1134,8 +1167,8 @@ export function Header({
                 return (
                   <button
                     key={`${entry.pluginId}:${entry.view.viewId}`}
-                    className={`view-toggle-btn${view === pluginTaskView ? " active" : ""}`}
-                    onClick={() => onChangeView(pluginTaskView)}
+                    className={`view-toggle-btn${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " active" : ""}`}
+                    onClick={() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView)}
                     title={`${entry.view.label} view`}
                     aria-label={`${entry.view.label} view`}
                     aria-pressed={view === pluginTaskView}
@@ -1149,7 +1182,7 @@ export function Header({
               <>
                 <button
                   ref={viewOverflowTriggerRef}
-                  className={`view-toggle-btn${["research", "skills", "roadmaps", "insights", "memory", "dev-server", "devserver"].includes(view) || (todosEnabled && todosOpen) || view.startsWith("plugin:") ? " active" : ""}`}
+                  className={`view-toggle-btn${["research", "skills", "insights", "memory", "dev-server", "devserver", "graph", "stash-recovery"].includes(view) || (experimentalFeatures?.evalsView && view === "evals") || (todosEnabled && todosOpen) || isPluginViewId(view) ? " active" : ""}`}
                   onClick={() => setIsViewOverflowOpen((prev) => !prev)}
                   title="More views"
                   aria-label="More views"
@@ -1166,6 +1199,34 @@ export function Header({
                     role="menu"
                     aria-label="More views"
                   >
+                    {experimentalFeatures?.evalsView && (
+                      <button
+                        className={`view-toggle-overflow-item${view === "evals" ? " active" : ""}`}
+                        onClick={() => {
+                          onChangeView("evals");
+                          setIsViewOverflowOpen(false);
+                        }}
+                        role="menuitem"
+                        data-testid="view-overflow-evals"
+                      >
+                        <Target size={14} />
+                        <span>Evals</span>
+                      </button>
+                    )}
+                    <button
+                      className={`view-toggle-overflow-item${view === "stash-recovery" ? " active" : ""}`}
+                      onClick={() => {
+                        onChangeView("stash-recovery");
+                        setIsViewOverflowOpen(false);
+                      }}
+                      role="menuitem"
+                      data-testid="view-overflow-stash-recovery"
+                    >
+                      <History size={14} />
+                      <span>Stash Recovery</span>
+                      {stashOrphanCount > 0 ? <span className="btn-badge">{stashOrphanCount}</span> : null}
+                    </button>
+
                     {experimentalFeatures?.researchView && (
                       <button
                         className={`view-toggle-overflow-item${view === "research" ? " active" : ""}`}
@@ -1194,19 +1255,7 @@ export function Header({
                         <span>Insights</span>
                       </button>
                     )}
-                    {experimentalFeatures?.roadmap && !hasRoadmapsPluginView && (
-                      <button
-                        className={`view-toggle-overflow-item${view === "roadmaps" ? " active" : ""}`}
-                        onClick={() => {
-                          onChangeView("roadmaps");
-                          setIsViewOverflowOpen(false);
-                        }}
-                        role="menuitem"
-                        data-testid="view-overflow-roadmaps"
-                      >
-                        <span>Roadmaps</span>
-                      </button>
-                    )}
+
                     {showSkillsTab && (
                       <button
                         className={`view-toggle-overflow-item${view === "skills" ? " active" : ""}`}
@@ -1273,9 +1322,9 @@ export function Header({
                         return (
                           <button
                             key={`${entry.pluginId}:${entry.view.viewId}`}
-                            className={`view-toggle-overflow-item${view === pluginTaskView ? " active" : ""}`}
+                            className={`view-toggle-overflow-item${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " active" : ""}`}
                             onClick={() => {
-                              onChangeView(pluginTaskView);
+                              onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView);
                               setIsViewOverflowOpen(false);
                             }}
                             role="menuitem"
@@ -1320,7 +1369,7 @@ export function Header({
         )}
 
         {/* Desktop actions */}
-        {!isCompact && !isElectron && (
+        {!isCompact && !isDesktopShell && (
           <button className="btn-icon" onClick={onOpenGitHubImport} title="Import from GitHub">
             <GitHubLogo size={16} />
           </button>
@@ -1467,17 +1516,6 @@ export function Header({
             data-testid="files-toggle-btn"
           >
             <Folder size={16} />
-          </button>
-        )}
-
-        {!isCompact && todosEnabled && onOpenTodos && (
-          <button
-            className={`btn-icon${todosOpen ? " btn-icon--active" : ""}`}
-            onClick={onOpenTodos}
-            title="Open todos"
-            data-testid="todos-toggle-btn"
-          >
-            <CheckSquare size={16} />
           </button>
         )}
 
@@ -1696,7 +1734,7 @@ export function Header({
                 <span>Nodes</span>
               </button>
             )}
-            {!isElectron && (
+            {!isDesktopShell && (
               <button
                 className="mobile-overflow-item"
                 onClick={() => handleOverflowAction(onOpenGitHubImport)}
@@ -1819,6 +1857,9 @@ export function Header({
               >
                 <Mail size={16} />
                 <span>Mailbox{mailboxUnreadCount > 0 ? ` (${mailboxUnreadCount})` : ""}</span>
+                {mailboxPendingApprovalCount > 0 && (
+                  <span className="header-badge" data-testid="overflow-mailbox-approval-badge">{mailboxPendingApprovalCount}</span>
+                )}
               </button>
             )}
             {/* Usage - in overflow on mobile */}
@@ -1882,6 +1923,44 @@ export function Header({
             <X size={14} />
           </button>
         </div>
+        {showBoardBranchFilters && (
+          <div className="header-branch-filters" data-testid="header-branch-filters-desktop">
+            <label className="header-branch-filter-label">
+              <span>Working branch</span>
+              <select
+                className="header-branch-filter-select"
+                value={branchFilter}
+                onChange={(event) => onBranchFilterChange?.(event.target.value)}
+                data-testid="working-branch-filter"
+              >
+                <option value="">All working branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No working branch</option>
+                {branchOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="header-branch-filter-label">
+              <span>Base branch</span>
+              <select
+                className="header-branch-filter-select"
+                value={baseBranchFilter}
+                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
+                data-testid="target-branch-filter"
+              >
+                <option value="">All base branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No base branch</option>
+                {baseBranchOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
       </div>
     )}
 
@@ -1910,6 +1989,44 @@ export function Header({
             <X size={14} />
           </button>
         </div>
+        {showBoardBranchFilters && (
+          <div className="header-branch-filters" data-testid="header-branch-filters-mobile">
+            <label className="header-branch-filter-label">
+              <span>Working branch</span>
+              <select
+                className="header-branch-filter-select"
+                value={branchFilter}
+                onChange={(event) => onBranchFilterChange?.(event.target.value)}
+                data-testid="working-branch-filter-mobile"
+              >
+                <option value="">All working branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No working branch</option>
+                {branchOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="header-branch-filter-label">
+              <span>Base branch</span>
+              <select
+                className="header-branch-filter-select"
+                value={baseBranchFilter}
+                onChange={(event) => onBaseBranchFilterChange?.(event.target.value)}
+                data-testid="target-branch-filter-mobile"
+              >
+                <option value="">All base branches</option>
+                <option value={NO_BRANCH_FILTER_VALUE}>No base branch</option>
+                {baseBranchOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
       </div>
     )}
   </div>

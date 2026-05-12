@@ -16,6 +16,7 @@ import { SessionNotificationBanner } from "./components/SessionNotificationBanne
 import { CliBinaryInstallBanner } from "./components/CliBinaryInstallBanner";
 import { SetupWarningBanner } from "./components/SetupWarningBanner";
 import { UpdateAvailableBanner } from "./components/UpdateAvailableBanner";
+import { ApprovalNotificationBanner } from "./components/ApprovalNotificationBanner";
 import { OnboardingResumeCard } from "./components/OnboardingResumeCard";
 import { PostOnboardingRecommendations } from "./components/PostOnboardingRecommendations";
 import {
@@ -36,7 +37,7 @@ import { useCurrentProject } from "./hooks/useCurrentProject";
 import { ToastProvider, useToast } from "./hooks/useToast";
 import { ConfirmDialogProvider } from "./hooks/useConfirm";
 import { useTheme } from "./hooks/useTheme";
-import { useModalManager, type DetailTaskOrigin } from "./hooks/useModalManager";
+import { useModalManager, type DetailTaskOrigin, type DetailTaskTab } from "./hooks/useModalManager";
 import { useAppSettings } from "./hooks/useAppSettings";
 import { useDeepLink } from "./hooks/useDeepLink";
 import { useFavorites } from "./hooks/useFavorites";
@@ -49,13 +50,22 @@ import { useViewState, type TaskView } from "./hooks/useViewState";
 import { useNavigationHistory } from "./hooks/useNavigationHistory";
 import { usePluginDashboardViews } from "./hooks/usePluginDashboardViews";
 import { PluginDashboardViewHost } from "./plugins/PluginDashboardViewHost";
+import { isPluginViewId, isPluginViewRegistered } from "./plugins/pluginViewRegistry";
+import { registerBundledPluginViews } from "./plugins/registerBundledPluginViews";
 import { useProjectActions } from "./hooks/useProjectActions";
 import { useTaskHandlers } from "./hooks/useTaskHandlers";
 import { useRemoteNodeData } from "./hooks/useRemoteNodeData";
 import { useRemoteNodeEvents } from "./hooks/useRemoteNodeEvents";
 import { NodeProvider, useNodeContext } from "./context/NodeContext";
+import { ShellProvider } from "./context/ShellContext";
+import { ShellHostProvider, useShellHostContext } from "./context/ShellHostContext";
+import { useShellConnection } from "./hooks/useShellConnection";
+import { NativeShellOnboardingModal } from "./components/NativeShellOnboardingModal";
+import { NativeShellConnectionManager } from "./components/NativeShellConnectionManager";
+import { ShellConnectionStatus } from "./components/ShellConnectionStatus";
+import { getShellConnectionNativeResult, type ShellConnectionNativeResult } from "./shell-native";
 import type { AiSessionSummary } from "./api";
-import { fetchUnreadCount, reportDashboardPerf, fetchTaskDetail, fetchWorkflowSteps } from "./api";
+import { api, fetchUnreadCount, fetchTaskDetail, fetchWorkflowSteps } from "./api";
 import { getScopedItem, setScopedItem } from "./utils/projectStorage";
 import { subscribeSse } from "./sse-bus";
 import { AUTH_TOKEN_RECOVERY_REQUIRED_EVENT } from "./auth";
@@ -74,13 +84,15 @@ const AgentsView = lazy(() => import("./components/AgentsView").then((m) => ({ d
 const DocumentsView = lazy(() => import("./components/DocumentsView").then((m) => ({ default: m.DocumentsView })));
 const InsightsView = lazy(() => import("./components/InsightsView").then((m) => ({ default: m.InsightsView })));
 const ResearchView = lazy(() => import("./components/ResearchView").then((m) => ({ default: m.ResearchView })));
+const EvalsView = lazy(() => import("./components/EvalsView").then((m) => ({ default: m.EvalsView })));
 const NodesView = lazy(() => import("./components/NodesView").then((m) => ({ default: m.NodesView })));
 const ChatView = lazy(() => import("./components/ChatView").then((m) => ({ default: m.ChatView })));
-const RoadmapsView = lazy(() => import("./components/RoadmapsView").then((m) => ({ default: m.RoadmapsView })));
+
 const SkillsView = lazy(() => import("./components/SkillsView").then((m) => ({ default: m.SkillsView })));
 const MemoryView = lazy(() => import("./components/MemoryView").then((m) => ({ default: m.MemoryView })));
 const DevServerView = lazy(() => import("./components/DevServerView").then((m) => ({ default: m.DevServerView })));
 const _TodoView = lazy(() => import("./components/TodoView").then((m) => ({ default: m.TodoView })));
+const StashRecoveryView = lazy(() => import("./components/StashRecoveryView").then((m) => ({ default: m.StashRecoveryView })));
 
 // Warm lazy chunks during browser idle so first navigation to each view is
 // instant. Each chunk is ~10–80 kB; total prefetch finishes well under a
@@ -98,21 +110,105 @@ function prefetchLazyViews() {
     void import("./components/DocumentsView");
     void import("./components/InsightsView");
     void import("./components/ResearchView");
+    void import("./components/EvalsView");
     void import("./components/NodesView");
     void import("./components/ChatView");
-    void import("./components/RoadmapsView");
+
     void import("./components/SkillsView");
     void import("./components/MemoryView");
     void import("./components/DevServerView");
     void import("./components/TodoView");
+    void import("./components/StashRecoveryView");
   });
 }
 
+registerBundledPluginViews();
+
 const SETUP_WARNING_DISMISSED_KEY = "kb-setup-warning-dismissed";
+const ACTIVE_CHAT_SESSION_STORAGE_KEY = "kb-chat-active-session";
+const WORKING_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-working-branch-filter";
+const BASE_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-base-branch-filter";
+const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
+const APPROVAL_BANNER_DISMISSED_STORAGE_KEY = "fusion:approval-banner-dismissed";
+
+interface ApprovalBannerCandidate {
+  dedupeKey: string;
+  updatedAtMs: number;
+}
+
+export function didEnterAwaitingApproval(nextStatus: string | undefined, previousStatus: string | undefined): boolean {
+  return nextStatus === "awaiting-approval" && previousStatus !== "awaiting-approval";
+}
+
+function parseDateMs(value: string | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function loadApprovalBannerDismissals(): Map<string, number> {
+  if (typeof window === "undefined") return new Map();
+  try {
+    const raw = window.localStorage.getItem(APPROVAL_BANNER_DISMISSED_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    const map = new Map<string, number>();
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        map.set(key, value);
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+function persistApprovalBannerDismissals(map: Map<string, number>): void {
+  if (typeof window === "undefined") return;
+  try {
+    const data: Record<string, number> = {};
+    for (const [key, value] of map) {
+      data[key] = value;
+    }
+    window.localStorage.setItem(APPROVAL_BANNER_DISMISSED_STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // no-op
+  }
+}
+
+function buildRemoteDashboardUrl(serverUrl: string, authToken?: string | null): string {
+  const url = new URL(serverUrl);
+  if (authToken) {
+    url.searchParams.set("rt", authToken);
+  }
+  return url.toString();
+}
+
+export function requiresNativeShellOnboarding(
+  shellState: { host: "web" | "mobile-shell" | "desktop-shell"; desktopMode?: "local" | "remote"; activeProfileId: string | null },
+  shellReady: boolean,
+  shellOnboardingComplete: boolean,
+): boolean {
+  if (!shellReady || shellOnboardingComplete || shellState.host === "web") {
+    return false;
+  }
+
+  if (shellState.host === "mobile-shell") {
+    return !shellState.activeProfileId;
+  }
+
+  if (shellState.desktopMode === "local") {
+    return false;
+  }
+
+  return !shellState.activeProfileId;
+}
 
 function AppInner() {
   const { toasts, addToast, removeToast } = useToast();
-  const isElectron = typeof window !== "undefined" && Boolean((window as Window & { electronAPI?: unknown }).electronAPI);
+  const { shellApi, state: shellState, ready: shellReady, openConnectionManagerSignal } = useShellConnection();
+  const shellHost = useShellHostContext();
 
   // Warm lazy view chunks during browser idle so first navigation is instant.
   useEffect(() => {
@@ -170,6 +266,23 @@ function AppInner() {
   
   // Search query state - must be defined before useTasks
   const [searchQuery, setSearchQuery] = useState("");
+  const [branchFilter, setBranchFilter] = useState("");
+  const [baseBranchFilter, setBaseBranchFilter] = useState("");
+
+  useEffect(() => {
+    setBranchFilter(getScopedItem(WORKING_BRANCH_FILTER_STORAGE_KEY, currentProject?.id) ?? "");
+    setBaseBranchFilter(getScopedItem(BASE_BRANCH_FILTER_STORAGE_KEY, currentProject?.id) ?? "");
+  }, [currentProject?.id]);
+
+  const handleBranchFilterChange = useCallback((value: string) => {
+    setBranchFilter(value);
+    setScopedItem(WORKING_BRANCH_FILTER_STORAGE_KEY, value, currentProject?.id);
+  }, [currentProject?.id]);
+
+  const handleBaseBranchFilterChange = useCallback((value: string) => {
+    setBaseBranchFilter(value);
+    setScopedItem(BASE_BRANCH_FILTER_STORAGE_KEY, value, currentProject?.id);
+  }, [currentProject?.id]);
   
   // Remote node data and events when in remote mode (pass searchQuery for server-side filtering)
   const remoteData = useRemoteNodeData(currentNodeId, { projectId: currentProject?.id, searchQuery: searchQuery || undefined });
@@ -200,8 +313,8 @@ function AppInner() {
   const viewportMode = useViewportMode();
   const isMobile = viewportMode === "mobile";
 
-  // Navigation history for mobile back button / iOS swipe-back.
-  const { pushNav, replaceCurrent } = useNavigationHistory({ enabled: isMobile });
+  // Navigation history for browser back button (desktop + mobile).
+  const { pushNav, replaceCurrent } = useNavigationHistory({ enabled: true });
 
   // View state must be defined before useTasks since useTasks depends on taskView for SSE gating
   const { viewMode, setViewMode, taskView, handleChangeTaskView } = useViewState({
@@ -217,8 +330,21 @@ function AppInner() {
   });
 
   const { views: pluginDashboardViews } = usePluginDashboardViews(currentProject?.id);
+  const graphPluginTaskView = useMemo(() => {
+    // Prefer API response for the graph view (supports dynamic plugin discovery)
+    const graphView = pluginDashboardViews.find(
+      (entry) => entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph",
+    );
+    if (graphView) return `plugin:${graphView.pluginId}:${graphView.view.viewId}` as const;
+    // Fall back to bundled static registration so the graph view works even when
+    // the plugin is not installed/loaded through the API (e.g. fresh DB).
+    if (isPluginViewRegistered("fusion-plugin-dependency-graph", "graph")) {
+      return `plugin:fusion-plugin-dependency-graph:graph` as const;
+    }
+    return null;
+  }, [pluginDashboardViews]);
 
-  // History-aware view change handler — pushes nav entry on mobile.
+  // History-aware view change handler — pushes nav entry on back-navigation stack.
   const handleTaskViewChange = useCallback((newView: TaskView) => {
     if (newView === "missions") {
       setMissionResumeSessionId(undefined);
@@ -227,7 +353,6 @@ function AppInner() {
     }
     const previousView = taskView;
     handleChangeTaskView(newView);
-    // pushNav reads enabledRef internally; isMobile not needed in deps.
     if (previousView !== newView) {
       pushNav({ type: "view", revert: () => handleChangeTaskView(previousView) });
     }
@@ -243,6 +368,8 @@ function AppInner() {
       sseEnabled: taskSseEnabled,
     }
   );
+
+  const boardSourceTasks = isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks;
 
   const [initialLoadComplete, setInitialLoadComplete] = useState(false);
   const [researchReadinessVersion, setResearchReadinessVersion] = useState(0);
@@ -262,7 +389,6 @@ function AppInner() {
       const msg = `projects loaded at ${Math.round(performance.now() - mountTimeRef.current)}ms from mount`;
       if (!IS_TEST_ENV) {
         console.log(`[App] ${msg}`);
-        reportDashboardPerf("[App]", msg);
       }
     }
     if (!currentProjectLoading && !projectReadyLoggedRef.current) {
@@ -270,7 +396,6 @@ function AppInner() {
       const msg = `current-project resolved at ${Math.round(performance.now() - mountTimeRef.current)}ms from mount`;
       if (!IS_TEST_ENV) {
         console.log(`[App] ${msg}`);
-        reportDashboardPerf("[App]", msg);
       }
     }
   }, [projectsLoading, currentProjectLoading]);
@@ -289,7 +414,6 @@ function AppInner() {
       const msg = `dashboard ready at ${Math.round(performance.now() - mountTimeRef.current)}ms from mount (settle delay=${Math.round(performance.now() - settleStart)}ms)`;
       if (!IS_TEST_ENV) {
         console.log(`[App] ${msg}`);
-        reportDashboardPerf("[App]", msg);
       }
       setInitialLoadComplete(true);
     }, DASHBOARD_READY_SETTLE_DELAY_MS);
@@ -314,18 +438,39 @@ function AppInner() {
   // via useMobileScrollLock — the reference-counted hook handles overlap.
   useMobileScrollLock(mobileKeyboardOpen);
 
-  // App-level mailbox unread count state (used for header/mobile nav badges)
+  // App-level mailbox/chat unread state (used for header/mobile nav badges)
   const [mailboxUnreadCount, setMailboxUnreadCount] = useState(0);
+  const [mailboxPendingApprovalCount, setMailboxPendingApprovalCount] = useState(0);
+  const [chatHasUnreadResponse, setChatHasUnreadResponse] = useState(false);
+  const [stashOrphanCount, setStashOrphanCount] = useState(0);
+  const [approvalBannerCandidate, setApprovalBannerCandidate] = useState<ApprovalBannerCandidate | null>(null);
+  const taskStatusByIdRef = useRef<Map<string, string | undefined>>(new Map());
+  const seenApprovalKeysRef = useRef<Set<string>>(new Set());
+  const approvalDismissalsRef = useRef<Map<string, number>>(loadApprovalBannerDismissals());
 
   const refreshMailboxUnreadCount = useCallback(() => {
     fetchUnreadCount(currentProject?.id)
-      .then((data: { unreadCount: number }) => {
+      .then((data: { unreadCount: number; pendingApprovalCount?: number }) => {
         setMailboxUnreadCount(data.unreadCount);
+        setMailboxPendingApprovalCount(data.pendingApprovalCount ?? 0);
       })
       .catch((err) => {
         console.warn("[App] Failed to fetch mailbox unread count:", err);
       });
   }, [currentProject?.id]);
+
+  useEffect(() => {
+    const next = new Map<string, string | undefined>();
+    const nextSeen = new Set<string>();
+    for (const task of tasks) {
+      next.set(task.id, task.status);
+      if (task.status === "awaiting-approval") {
+        nextSeen.add(`task:${task.id}`);
+      }
+    }
+    taskStatusByIdRef.current = next;
+    seenApprovalKeysRef.current = nextSeen;
+  }, [tasks]);
 
   // Initial fetch + live updates from mailbox SSE events.
   useEffect(() => {
@@ -337,15 +482,166 @@ function AppInner() {
     }
     const query = params.size > 0 ? `?${params.toString()}` : "";
 
+    const triggerApprovalBanner = (candidate: ApprovalBannerCandidate) => {
+      const dismissedAt = approvalDismissalsRef.current.get(candidate.dedupeKey);
+      if (dismissedAt !== undefined && candidate.updatedAtMs <= dismissedAt) {
+        return;
+      }
+      setApprovalBannerCandidate(candidate);
+    };
+
     return subscribeSse(`/api/events${query}`, {
+      onReconnect: refreshMailboxUnreadCount,
       events: {
         "message:sent": refreshMailboxUnreadCount,
         "message:received": refreshMailboxUnreadCount,
         "message:read": refreshMailboxUnreadCount,
         "message:deleted": refreshMailboxUnreadCount,
+        "approval:requested": (event: MessageEvent) => {
+          refreshMailboxUnreadCount();
+          try {
+            const payload = JSON.parse(event.data) as { id?: string; taskId?: string; updatedAt?: string; createdAt?: string };
+            const dedupeKey = payload.id ? `approval:${payload.id}` : payload.taskId ? `task:${payload.taskId}` : undefined;
+            if (!dedupeKey || seenApprovalKeysRef.current.has(dedupeKey)) {
+              return;
+            }
+            seenApprovalKeysRef.current.add(dedupeKey);
+            triggerApprovalBanner({
+              dedupeKey,
+              updatedAtMs: parseDateMs(payload.updatedAt ?? payload.createdAt),
+            });
+          } catch {
+            // no-op
+          }
+        },
+        "approval:updated": refreshMailboxUnreadCount,
+        "approval:decided": refreshMailboxUnreadCount,
+        "task:updated": (event: MessageEvent) => {
+          try {
+            const payload = JSON.parse(event.data) as { id?: string; status?: string; updatedAt?: string };
+            if (!payload?.id) {
+              return;
+            }
+            const dedupeKey = `task:${payload.id}`;
+            const previousStatus = taskStatusByIdRef.current.get(payload.id);
+            taskStatusByIdRef.current.set(payload.id, payload.status);
+            if (payload.status !== "awaiting-approval") {
+              seenApprovalKeysRef.current.delete(dedupeKey);
+              approvalDismissalsRef.current.delete(dedupeKey);
+              persistApprovalBannerDismissals(approvalDismissalsRef.current);
+              return;
+            }
+            if (seenApprovalKeysRef.current.has(dedupeKey)) {
+              return;
+            }
+            if (didEnterAwaitingApproval(payload.status, previousStatus)) {
+              seenApprovalKeysRef.current.add(dedupeKey);
+              triggerApprovalBanner({
+                dedupeKey,
+                updatedAtMs: parseDateMs(payload.updatedAt),
+              });
+              refreshMailboxUnreadCount();
+            }
+          } catch {
+            // no-op
+          }
+        },
       },
     });
   }, [currentProject?.id, refreshMailboxUnreadCount]);
+
+  useEffect(() => {
+    if (taskView === "chat") {
+      setChatHasUnreadResponse(false);
+    }
+  }, [taskView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const data = await api<{ count: number }>("/stash-recovery/orphans");
+        if (!cancelled) setStashOrphanCount(data.count ?? 0);
+      } catch {
+        if (!cancelled) setStashOrphanCount(0);
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (currentProject?.id) {
+      params.set("projectId", currentProject.id);
+    }
+    const query = params.size > 0 ? `?${params.toString()}` : "";
+
+    return subscribeSse(`/api/events${query}`, {
+      events: {
+        "chat:message:added": (event: MessageEvent) => {
+          try {
+            const payload = JSON.parse(event.data) as { role?: string; sessionId?: string; projectId?: string | null };
+            const activeSessionId = getScopedItem(ACTIVE_CHAT_SESSION_STORAGE_KEY, currentProject?.id);
+            if (!activeSessionId) return;
+            if (payload.role !== "assistant") return;
+            if (taskView === "chat") return;
+            if (payload.sessionId !== activeSessionId) return;
+            if (payload.projectId && currentProject?.id && payload.projectId !== currentProject.id) return;
+            setChatHasUnreadResponse(true);
+          } catch {
+            // no-op
+          }
+        },
+      },
+    });
+  }, [currentProject?.id, taskView]);
+
+  const branchOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        boardSourceTasks
+          .map((task) => task.branch?.trim())
+          .filter((branch): branch is string => Boolean(branch && branch.length > 0)),
+      ),
+    ).sort((a, b) => a.localeCompare(b));
+  }, [boardSourceTasks]);
+
+  const baseBranchOptions = useMemo(() => {
+    return Array.from(
+      new Set(
+        boardSourceTasks
+          .map((task) => task.baseBranch?.trim())
+          .filter((baseBranch): baseBranch is string => Boolean(baseBranch && baseBranch.length > 0)),
+      ),
+    ).sort((a, b) => a.localeCompare(b));
+  }, [boardSourceTasks]);
+
+  const filteredBoardTasks = useMemo(() => {
+    return boardSourceTasks.filter((task) => {
+      const taskBranch = task.branch?.trim() ?? "";
+      const taskBaseBranch = task.baseBranch?.trim() ?? "";
+      if (branchFilter === NO_BRANCH_FILTER_VALUE) {
+        if (taskBranch.length > 0) {
+          return false;
+        }
+      } else if (branchFilter.length > 0 && taskBranch !== branchFilter) {
+        return false;
+      }
+      if (baseBranchFilter === NO_BRANCH_FILTER_VALUE) {
+        if (taskBaseBranch.length > 0) {
+          return false;
+        }
+      } else if (baseBranchFilter.length > 0 && taskBaseBranch !== baseBranchFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [boardSourceTasks, branchFilter, baseBranchFilter]);
 
   // Nodes management is an overlay view (not a modal), so it stays local to App.
   const [nodesOpen, setNodesOpen] = useState(false);
@@ -388,12 +684,12 @@ function AppInner() {
     globalPaused,
     enginePaused,
     taskStuckTimeoutMs,
+    staleHighFanoutBlockerAgeThresholdMs,
     showQuickChatFAB,
     prAuthAvailable,
     settingsLoaded,
     experimentalFeatures,
     insightsEnabled,
-    roadmapEnabled,
     memoryEnabled,
     devServerEnabled,
     todosEnabled,
@@ -406,6 +702,7 @@ function AppInner() {
   const skillsEnabled = experimentalFeatures.skillsView === true;
   const nodesEnabled = experimentalFeatures.nodesView === true;
   const researchEnabled = experimentalFeatures.researchView === true;
+  const evalsEnabled = experimentalFeatures.evalsView === true;
   const agentOnboardingEnabled = experimentalFeatures.agentOnboarding === true;
   const agentsEnabled = true;
 
@@ -422,13 +719,15 @@ function AppInner() {
   // Redirect to board if feature-gated views are disabled.
   useEffect(() => {
     if (!settingsLoaded) return;
+    if (isPluginViewId(taskView)) return;
+    if (taskView === "graph" && !graphPluginTaskView) {
+      handleChangeTaskView("board");
+      return;
+    }
     if (taskView === "skills" && !skillsEnabled) {
       handleChangeTaskView("board");
     }
     if (taskView === "insights" && !insightsEnabled) {
-      handleChangeTaskView("board");
-    }
-    if (taskView === "roadmaps" && !roadmapEnabled) {
       handleChangeTaskView("board");
     }
     if (taskView === "agents" && !agentsEnabled) {
@@ -443,7 +742,10 @@ function AppInner() {
     if (taskView === "research" && !researchEnabled) {
       handleChangeTaskView("board");
     }
-  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, roadmapEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled]);
+    if (taskView === "evals" && !evalsEnabled) {
+      handleChangeTaskView("board");
+    }
+  }, [taskView, settingsLoaded, skillsEnabled, insightsEnabled, handleChangeTaskView, agentsEnabled, memoryEnabled, devServerEnabled, researchEnabled, evalsEnabled, graphPluginTaskView]);
 
   // Auto-close nodes overlay if feature flag is toggled off while overlay is open
   useEffect(() => {
@@ -470,7 +772,7 @@ function AppInner() {
   const {
     handleSelectProject,
     handleViewAllProjects,
-    handleOpenSettings,
+    handleOpenSettings: _handleOpenSettings,
     handleAddProject,
     handleSetupComplete,
     handleModelOnboardingComplete,
@@ -586,13 +888,13 @@ function AppInner() {
     [workflowSteps],
   );
 
-  const handleOpenNodes = useCallback(() => {
+  const _handleOpenNodes = useCallback(() => {
     if (!nodesEnabled) return;
     setNodesOpen((prev) => !prev);
   }, [nodesEnabled]);
 
   // History-aware nodes toggle — pushes nav entry only when opening
-  const handleOpenNodesWithHistory = useCallback(() => {
+  const handleOpenNodesWithNav = useCallback(() => {
     if (!nodesEnabled) return;
     if (!nodesOpen) {
       setNodesOpen(true);
@@ -602,50 +904,48 @@ function AppInner() {
     }
   }, [nodesEnabled, nodesOpen, pushNav]);
 
-  // History-aware modal open handlers — push nav entries on mobile only.
-  // Desktop (isMobile=false): pushNav/replaceCurrent are no-ops.
-  const openDetailTaskWithHistory = useCallback((task: Task | TaskDetail, tab?: Parameters<typeof modalManager.openDetailTask>[1], opts?: { origin?: DetailTaskOrigin }) => {
+  // History-aware modal open handlers — push nav entries for back-navigation.
+  const openDetailTask = useCallback((task: Task | TaskDetail, tab?: Parameters<typeof modalManager.openDetailTask>[1], opts?: { origin?: DetailTaskOrigin }) => {
     modalManager.openDetailTask(task, tab, opts);
     pushNav({ type: "modal", close: modalManager.closeDetailTask });
   }, [modalManager, pushNav]);
 
-  const openSettingsWithHistory = useCallback((section?: Parameters<typeof modalManager.openSettings>[0]) => {
+  const openSettingsWithNav = useCallback((section?: Parameters<typeof modalManager.openSettings>[0]) => {
     modalManager.openSettings(section);
     pushNav({ type: "modal", close: handleSettingsClose });
   }, [modalManager, pushNav, handleSettingsClose]);
 
-  const openNewTaskWithHistory = useCallback(() => {
+  const openNewTaskWithNav = useCallback(() => {
     modalManager.openNewTask();
     pushNav({ type: "modal", close: modalManager.closeNewTask });
   }, [modalManager, pushNav]);
 
-  const openPlanningWithHistory = useCallback(() => {
+  const openPlanningWithNav = useCallback(() => {
     modalManager.openPlanning();
     pushNav({ type: "modal", close: modalManager.closePlanning });
   }, [modalManager, pushNav]);
 
-  const openPlanningWithInitialPlanWithHistory = useCallback((initialPlan: string) => {
+  const openPlanningWithInitialPlanWithNav = useCallback((initialPlan: string) => {
     modalManager.openPlanningWithInitialPlan(initialPlan);
     pushNav({ type: "modal", close: modalManager.closePlanning });
   }, [modalManager, pushNav]);
 
-  const resumePlanningWithHistory = useCallback(() => {
+  const resumePlanningWithNav = useCallback(() => {
     modalManager.resumePlanning();
     pushNav({ type: "modal", close: modalManager.closePlanning });
   }, [modalManager, pushNav]);
 
-  const openSubtaskBreakdownWithHistory = useCallback((description: string) => {
+  const openSubtaskBreakdownWithNav = useCallback((description: string) => {
     modalManager.openSubtaskBreakdown(description);
     pushNav({ type: "modal", close: modalManager.closeSubtask });
   }, [modalManager, pushNav]);
 
-  const openGitHubImportWithHistory = useCallback(() => {
+  const openGitHubImportWithNav = useCallback(() => {
     modalManager.openGitHubImport();
     pushNav({ type: "modal", close: modalManager.closeGitHubImport });
   }, [modalManager, pushNav]);
 
-  const toggleTerminalWithHistory = useCallback(() => {
-    // Only push if terminal is currently closed (opening)
+  const toggleTerminalWithNav = useCallback(() => {
     if (!modalManager.terminalOpen) {
       modalManager.toggleTerminal();
       pushNav({ type: "modal", close: modalManager.closeTerminal });
@@ -654,59 +954,59 @@ function AppInner() {
     }
   }, [modalManager, pushNav]);
 
-  const openFilesWithHistory = useCallback(() => {
+  const openFilesWithNav = useCallback(() => {
     modalManager.openFiles();
     pushNav({ type: "modal", close: modalManager.closeFiles });
   }, [modalManager, pushNav]);
 
-  const openTodosWithHistory = useCallback(() => {
+  const openTodosWithNav = useCallback(() => {
     modalManager.openTodos();
     pushNav({ type: "modal", close: modalManager.closeTodos });
   }, [modalManager, pushNav]);
 
-  const openActivityLogWithHistory = useCallback(() => {
+  const openActivityLogWithNav = useCallback(() => {
     modalManager.openActivityLog();
     pushNav({ type: "modal", close: modalManager.closeActivityLog });
   }, [modalManager, pushNav]);
 
-  const openGitManagerWithHistory = useCallback(() => {
+  const openGitManagerWithNav = useCallback(() => {
     modalManager.openGitManager();
     pushNav({ type: "modal", close: modalManager.closeGitManager });
   }, [modalManager, pushNav]);
 
-  const openSystemStatsWithHistory = useCallback(() => {
+  const openSystemStatsWithNav = useCallback(() => {
     modalManager.openSystemStats();
     pushNav({ type: "modal", close: modalManager.closeSystemStats });
   }, [modalManager, pushNav]);
 
-  const openSchedulesWithHistory = useCallback(() => {
+  const openSchedulesWithNav = useCallback(() => {
     modalManager.openSchedules();
     pushNav({ type: "modal", close: modalManager.closeSchedules });
   }, [modalManager, pushNav]);
 
-  const openScriptsWithHistory = useCallback(() => {
+  const openScriptsWithNav = useCallback(() => {
     modalManager.openScripts();
     pushNav({ type: "modal", close: modalManager.closeScripts });
   }, [modalManager, pushNav]);
 
-  const openWorkflowStepsWithHistory = useCallback(() => {
+  const openWorkflowStepsWithNav = useCallback(() => {
     modalManager.openWorkflowSteps();
     pushNav({ type: "modal", close: modalManager.closeWorkflowSteps });
   }, [modalManager, pushNav]);
 
-  const openUsageWithHistory = useCallback((anchorRect?: DOMRect | null) => {
+  const openUsageWithNav = useCallback((anchorRect?: DOMRect | null) => {
     modalManager.openUsage(anchorRect);
     pushNav({ type: "modal", close: modalManager.closeUsage });
   }, [modalManager, pushNav]);
 
   // Modal-to-modal transition: scripts -> terminal uses replaceCurrent
-  const runScriptWithHistory = useCallback(async (name: string, command: string) => {
+  const runScriptWithNav = useCallback(async (name: string, command: string) => {
     await modalManager.runScript(name, command);
     replaceCurrent({ type: "modal", close: modalManager.closeTerminal });
   }, [modalManager, replaceCurrent]);
 
   // Modal-to-modal transition: settings -> onboarding uses replaceCurrent
-  const reopenOnboardingWithHistory = useCallback(() => {
+  const reopenOnboardingWithNav = useCallback(() => {
     modalManager.closeSettings();
     modalManager.openModelOnboarding();
     replaceCurrent({ type: "modal", close: modalManager.closeModelOnboarding });
@@ -764,6 +1064,68 @@ function AppInner() {
     // intentional no-op
   }, []);
 
+  const [shellOnboardingComplete, setShellOnboardingComplete] = useState(false);
+  const [shellConnectionManagerOpen, setShellConnectionManagerOpen] = useState(false);
+  const [shellConnectionStatus, setShellConnectionStatus] = useState<ShellConnectionNativeResult | null>(null);
+
+  const requiresShellOnboarding = requiresNativeShellOnboarding(shellState, shellReady, shellOnboardingComplete);
+
+  useEffect(() => {
+    if (!shellApi || openConnectionManagerSignal === 0) {
+      return;
+    }
+    setShellConnectionManagerOpen(true);
+  }, [shellApi, openConnectionManagerSignal]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getShellConnectionNativeResult(shellHost.host).then((result) => {
+      if (!cancelled) {
+        setShellConnectionStatus(result);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [shellHost.host, shellState.activeProfileId, shellState.desktopMode, shellState.host, shellState.profiles]);
+
+  useEffect(() => {
+    if (shellState.host !== "desktop-shell") {
+      return;
+    }
+
+    if (shellState.desktopMode !== "local") {
+      return;
+    }
+
+    if (shellState.localServer?.status !== "ready" || !shellState.localServer.port) {
+      return;
+    }
+
+    if (window.location.port === String(shellState.localServer.port)) {
+      return;
+    }
+
+    window.location.href = `http://localhost:${shellState.localServer.port}`;
+  }, [shellState]);
+
+  useEffect(() => {
+    if (shellState.host !== "desktop-shell" || shellState.desktopMode !== "remote") {
+      return;
+    }
+
+    const activeProfile = shellState.profiles.find((profile) => profile.id === shellState.activeProfileId);
+    if (!activeProfile || typeof window === "undefined") {
+      return;
+    }
+
+    const nextUrl = buildRemoteDashboardUrl(activeProfile.serverUrl, activeProfile.authToken ?? null);
+    if (window.location.href !== nextUrl) {
+      window.location.href = nextUrl;
+    }
+  }, [shellState]);
+
   const showBackendConnectionErrorPage =
     !projectsLoading &&
     !currentProjectLoading &&
@@ -779,6 +1141,9 @@ function AppInner() {
           errorMessage={projectsError ?? "Failed to fetch projects"}
           isRetrying={retryingProjects}
           onRetry={handleRetryProjects}
+          onManageConnection={shellApi ? () => {
+            void shellApi.openConnectionManager();
+          } : undefined}
         />
       );
     }
@@ -812,26 +1177,30 @@ function AppInner() {
       );
     }
 
+    const resolvedPluginTaskView = taskView === "graph" ? graphPluginTaskView : (isPluginViewId(taskView) ? taskView : null);
+
     // Project view
-    if (taskView.startsWith("plugin:")) {
+    if (resolvedPluginTaskView) {
       return (
         <PageErrorBoundary>
           <PluginDashboardViewHost
-            taskView={taskView as `plugin:${string}:${string}`}
+            taskView={resolvedPluginTaskView as `plugin:${string}:${string}`}
             context={{
               projectId: currentProject?.id,
               tasks: isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks,
               workflowSteps,
-              openTaskDetail: isMobile ? (task, initialTab) => openDetailTaskWithHistory(task, initialTab) : (task, initialTab) => modalManager.openDetailTask(task, initialTab),
-              renderTaskCard: (task) => (
+              openTaskDetail: (task: Task | TaskDetail, initialTab?: DetailTaskTab) => openDetailTask(task, initialTab),
+              renderTaskCard: (task: Task | TaskDetail) => (
                 <TaskCard
                   task={task}
                   projectId={currentProject?.id}
-                  onOpenDetail={isMobile ? (value: Task | TaskDetail) => openDetailTaskWithHistory(value) : (value: Task | TaskDetail) => modalManager.openDetailTask(value)}
+                  onOpenDetail={(value: Task | TaskDetail) => openDetailTask(value)}
                   addToast={addToast}
                   workflowStepNameLookup={workflowStepNameLookup}
+                  disableDrag={true}
                 />
               ),
+              addToast,
             }}
           />
         </PageErrorBoundary>
@@ -859,7 +1228,11 @@ function AppInner() {
       return (
         <PageErrorBoundary>
           <Suspense fallback={null}>
-            <ChatView addToast={addToast} projectId={currentProject?.id} />
+            <ChatView
+              addToast={addToast}
+              projectId={currentProject?.id}
+              experimentalFeatures={experimentalFeatures}
+            />
           </Suspense>
         </PageErrorBoundary>
       );
@@ -877,18 +1250,6 @@ function AppInner() {
       );
     }
 
-    if (taskView === "roadmaps") {
-      if (!settingsLoaded || !roadmapEnabled) {
-        return null;
-      }
-      return (
-        <PageErrorBoundary>
-          <Suspense fallback={null}>
-            <RoadmapsView addToast={addToast} projectId={currentProject?.id} />
-          </Suspense>
-        </PageErrorBoundary>
-      );
-    }
 
     if (taskView === "missions") {
       return (
@@ -906,7 +1267,7 @@ function AppInner() {
             projectId={currentProject?.id}
             onSelectTask={(taskId) => {
               const task = tasks.find((t) => t.id === taskId);
-              if (task) (isMobile ? openDetailTaskWithHistory : modalManager.openDetailTask)(task as TaskDetail);
+              if (task) openDetailTask(task as TaskDetail);
             }}
             availableTasks={tasks.map((t) => ({ id: t.id, title: t.title }))}
             resumeSessionId={missionResumeSessionId}
@@ -940,8 +1301,18 @@ function AppInner() {
             <DocumentsView
               projectId={currentProject?.id}
               addToast={addToast}
-              onOpenDetail={isMobile ? openDetailTaskWithHistory : modalManager.openDetailTask}
+              onOpenDetail={openDetailTask}
             />
+          </Suspense>
+        </PageErrorBoundary>
+      );
+    }
+
+    if (taskView === "stash-recovery") {
+      return (
+        <PageErrorBoundary>
+          <Suspense fallback={null}>
+            <StashRecoveryView />
           </Suspense>
         </PageErrorBoundary>
       );
@@ -983,6 +1354,27 @@ function AppInner() {
       );
     }
 
+    if (taskView === "evals") {
+      if (!settingsLoaded || !evalsEnabled) {
+        return null;
+      }
+      return (
+        <PageErrorBoundary>
+          <Suspense fallback={null}>
+            <EvalsView
+              projectId={currentProject?.id}
+              onOpenSettings={(section) => modalManager.openSettings(section as SectionId)}
+              onOpenTaskDetail={(taskId) => {
+                void fetchTaskDetail(taskId, currentProject?.id)
+                  .then((task) => openDetailTask(task as TaskDetail))
+                  .catch((error) => addToast(error instanceof Error ? error.message : "Failed to open task detail", "error"));
+              }}
+            />
+          </Suspense>
+        </PageErrorBoundary>
+      );
+    }
+
     if (taskView === "memory") {
       if (!settingsLoaded || !memoryEnabled) {
         return null;
@@ -1013,17 +1405,17 @@ function AppInner() {
       return (
         <PageErrorBoundary>
           <Board
-            tasks={isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks}
+            tasks={filteredBoardTasks}
             projectId={currentProject?.id}
             maxConcurrent={maxConcurrent}
             onMoveTask={moveTask}
             onPauseTask={pauseTask}
-            onOpenDetail={isMobile ? openDetailTaskWithHistory : modalManager.openDetailTask}
+            onOpenDetail={openDetailTask}
             addToast={addToast}
             onQuickCreate={handleBoardQuickCreate}
-            onNewTask={isMobile ? openNewTaskWithHistory : modalManager.openNewTask}
-            onPlanningMode={isMobile ? openPlanningWithInitialPlanWithHistory : modalManager.openPlanningWithInitialPlan}
-            onSubtaskBreakdown={isMobile ? openSubtaskBreakdownWithHistory : modalManager.openSubtaskBreakdown}
+            onNewTask={openNewTaskWithNav}
+            onPlanningMode={openPlanningWithInitialPlanWithNav}
+            onSubtaskBreakdown={openSubtaskBreakdownWithNav}
             autoMerge={autoMerge}
             onToggleAutoMerge={toggleAutoMerge}
             globalPaused={globalPaused}
@@ -1042,6 +1434,7 @@ function AppInner() {
             onToggleFavorite={handleToggleFavorite}
             onToggleModelFavorite={handleToggleModelFavorite}
             taskStuckTimeoutMs={taskStuckTimeoutMs}
+            staleHighFanoutBlockerAgeThresholdMs={staleHighFanoutBlockerAgeThresholdMs}
             onOpenMission={handleOpenMission}
             lastFetchTimeMs={lastFetchTimeMs}
           />
@@ -1061,13 +1454,13 @@ function AppInner() {
           onMergeTask={mergeTask}
           onResetTask={resetTask}
           onDuplicateTask={duplicateTask}
-          onOpenDetail={isMobile ? (task, options) => openDetailTaskWithHistory(task, undefined, options) : (task, options) => modalManager.openDetailTask(task, undefined, options)}
+          onOpenDetail={(task, options) => openDetailTask(task, undefined, options)}
           addToast={addToast}
           globalPaused={globalPaused}
-          onNewTask={isMobile ? openNewTaskWithHistory : modalManager.openNewTask}
+          onNewTask={openNewTaskWithNav}
           onQuickCreate={handleBoardQuickCreate}
-          onPlanningMode={isMobile ? openPlanningWithInitialPlanWithHistory : modalManager.openPlanningWithInitialPlan}
-          onSubtaskBreakdown={isMobile ? openSubtaskBreakdownWithHistory : modalManager.openSubtaskBreakdown}
+          onPlanningMode={openPlanningWithInitialPlanWithNav}
+          onSubtaskBreakdown={openSubtaskBreakdownWithNav}
           availableModels={availableModels}
           favoriteProviders={favoriteProviders}
           favoriteModels={favoriteModels}
@@ -1101,28 +1494,31 @@ function AppInner() {
   return (
     <>
       <Header
-        isElectron={isElectron}
-        onOpenSettings={isMobile ? openSettingsWithHistory : handleOpenSettings}
-        onOpenGitHubImport={isMobile ? openGitHubImportWithHistory : modalManager.openGitHubImport}
-        onOpenPlanning={isMobile ? openPlanningWithHistory : modalManager.openPlanning}
-        onResumePlanning={isMobile ? resumePlanningWithHistory : modalManager.resumePlanning}
+        shellHost={shellHost.host}
+        onOpenSettings={openSettingsWithNav}
+        onOpenGitHubImport={openGitHubImportWithNav}
+        onOpenPlanning={openPlanningWithNav}
+        onResumePlanning={resumePlanningWithNav}
         activePlanningSessionCount={bgPlanningSessions.length}
-        onOpenUsage={isMobile ? openUsageWithHistory : modalManager.openUsage}
-        onOpenActivityLog={isMobile ? openActivityLogWithHistory : modalManager.openActivityLog}
-        onOpenSystemStats={isMobile ? openSystemStatsWithHistory : modalManager.openSystemStats}
+        onOpenUsage={openUsageWithNav}
+        onOpenActivityLog={openActivityLogWithNav}
+        onOpenSystemStats={openSystemStatsWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
         mailboxUnreadCount={mailboxUnreadCount}
-        onOpenSchedules={isMobile ? openSchedulesWithHistory : modalManager.openSchedules}
-        onOpenGitManager={isMobile ? openGitManagerWithHistory : modalManager.openGitManager}
-        onOpenNodes={isMobile ? handleOpenNodesWithHistory : handleOpenNodes}
+        mailboxPendingApprovalCount={mailboxPendingApprovalCount}
+        chatHasUnreadResponse={chatHasUnreadResponse}
+        stashOrphanCount={stashOrphanCount}
+        onOpenSchedules={openSchedulesWithNav}
+        onOpenGitManager={openGitManagerWithNav}
+        onOpenNodes={handleOpenNodesWithNav}
         showNodesButton={nodesEnabled}
-        onOpenWorkflowSteps={isMobile ? openWorkflowStepsWithHistory : modalManager.openWorkflowSteps}
-        onOpenScripts={isMobile ? openScriptsWithHistory : modalManager.openScripts}
-        onRunScript={isMobile ? runScriptWithHistory : modalManager.runScript}
-        onToggleTerminal={isMobile ? toggleTerminalWithHistory : modalManager.toggleTerminal}
-        onOpenFiles={isMobile ? openFilesWithHistory : modalManager.openFiles}
+        onOpenWorkflowSteps={openWorkflowStepsWithNav}
+        onOpenScripts={openScriptsWithNav}
+        onRunScript={runScriptWithNav}
+        onToggleTerminal={toggleTerminalWithNav}
+        onOpenFiles={openFilesWithNav}
         filesOpen={modalManager.filesOpen}
-        onOpenTodos={isMobile ? openTodosWithHistory : modalManager.openTodos}
+        onOpenTodos={openTodosWithNav}
         todosOpen={modalManager.todosOpen}
         todosEnabled={todosEnabled}
         globalPaused={globalPaused}
@@ -1135,6 +1531,12 @@ function AppInner() {
         showAgentsTab={agentsEnabled}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
+        branchFilter={branchFilter}
+        baseBranchFilter={baseBranchFilter}
+        branchOptions={branchOptions}
+        baseBranchOptions={baseBranchOptions}
+        onBranchFilterChange={handleBranchFilterChange}
+        onBaseBranchFilterChange={handleBaseBranchFilterChange}
         projects={effectiveProjects}
         currentProject={currentProject}
         onSelectProject={handleSelectProject}
@@ -1154,13 +1556,21 @@ function AppInner() {
         isRemote={isRemote}
         experimentalFeatures={{
           insights: insightsEnabled,
-          roadmap: roadmapEnabled,
           memoryView: memoryEnabled,
           devServer: devServerEnabled,
           devServerView: devServerEnabled,
           researchView: researchEnabled,
+          evalsView: evalsEnabled,
         }}
         pluginDashboardViews={pluginDashboardViews}
+        shellConnectionControl={
+          !isMobile && shellConnectionStatus ? (
+            <ShellConnectionStatus
+              status={shellConnectionStatus}
+              onError={(message) => addToast(message, "error")}
+            />
+          ) : undefined
+        }
       />
       {viewMode === "project" && currentProject && !nodesOpen && taskView !== "missions" && !modalManager.isPlanningOpen && !sessionBannersHidden && (
         <SessionNotificationBanner
@@ -1198,8 +1608,22 @@ function AppInner() {
           onDismiss={handleDismissSetupWarning}
         />
       )}
+      {viewMode === "project" && currentProject && approvalBannerCandidate && (
+        <ApprovalNotificationBanner
+          pendingCount={Math.max(mailboxPendingApprovalCount, 1)}
+          onOpenMailbox={() => handleTaskViewChange("mailbox")}
+          onDismiss={() => {
+            approvalDismissalsRef.current.set(
+              approvalBannerCandidate.dedupeKey,
+              Math.max(Date.now(), approvalBannerCandidate.updatedAtMs),
+            );
+            persistApprovalBannerDismissals(approvalDismissalsRef.current);
+            setApprovalBannerCandidate(null);
+          }}
+        />
+      )}
       <div
-        className={`project-content${viewMode === "project" && currentProject ? " project-content--with-footer" : ""}${isMobile && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
+        className={`project-content${viewMode === "project" && currentProject && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
       >
         {renderMainContent()}
       </div>
@@ -1208,6 +1632,7 @@ function AppInner() {
           tasks={isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks}
           projectId={currentProject.id}
           taskStuckTimeoutMs={taskStuckTimeoutMs}
+          staleHighFanoutBlockerAgeThresholdMs={staleHighFanoutBlockerAgeThresholdMs}
           backgroundSessions={bgSessions}
           backgroundGenerating={bgGenerating}
           backgroundNeedsInput={bgNeedsInput}
@@ -1216,6 +1641,7 @@ function AppInner() {
           lastFetchTimeMs={lastFetchTimeMs}
           currentProjectPath={currentProject.path}
           onOpenProjectDirectory={handleOpenProjectDirectory}
+          keyboardOpen={mobileKeyboardOpen}
         />
       )}
       <MobileNavBar
@@ -1224,42 +1650,53 @@ function AppInner() {
         footerVisible={viewMode === "project" && !!currentProject}
         modalOpen={modalManager.anyModalOpen}
         keyboardOpen={mobileKeyboardOpen}
-        onOpenSettings={isMobile ? openSettingsWithHistory : handleOpenSettings}
-        onOpenActivityLog={isMobile ? openActivityLogWithHistory : modalManager.openActivityLog}
-        onOpenSystemStats={isMobile ? openSystemStatsWithHistory : modalManager.openSystemStats}
+        onOpenSettings={openSettingsWithNav}
+        onOpenActivityLog={openActivityLogWithNav}
+        onOpenSystemStats={openSystemStatsWithNav}
         onOpenMailbox={() => handleTaskViewChange("mailbox")}
-        onOpenNodes={isMobile ? handleOpenNodesWithHistory : handleOpenNodes}
+        onOpenNodes={handleOpenNodesWithNav}
         mailboxUnreadCount={mailboxUnreadCount}
-        onOpenGitManager={isMobile ? openGitManagerWithHistory : modalManager.openGitManager}
-        onOpenWorkflowSteps={isMobile ? openWorkflowStepsWithHistory : modalManager.openWorkflowSteps}
-        onOpenSchedules={isMobile ? openSchedulesWithHistory : modalManager.openSchedules}
-        onOpenScripts={isMobile ? openScriptsWithHistory : modalManager.openScripts}
-        onToggleTerminal={isMobile ? toggleTerminalWithHistory : modalManager.toggleTerminal}
-        onOpenFiles={isMobile ? openFilesWithHistory : modalManager.openFiles}
-        onOpenTodos={isMobile ? openTodosWithHistory : modalManager.openTodos}
+        mailboxPendingApprovalCount={mailboxPendingApprovalCount}
+        chatHasUnreadResponse={chatHasUnreadResponse}
+        stashOrphanCount={stashOrphanCount}
+        onOpenGitManager={openGitManagerWithNav}
+        onOpenWorkflowSteps={openWorkflowStepsWithNav}
+        onOpenSchedules={openSchedulesWithNav}
+        onOpenScripts={openScriptsWithNav}
+        onToggleTerminal={toggleTerminalWithNav}
+        onOpenFiles={openFilesWithNav}
+        onOpenTodos={openTodosWithNav}
         todosOpen={modalManager.todosOpen}
-        onOpenGitHubImport={isMobile ? openGitHubImportWithHistory : modalManager.openGitHubImport}
-        onOpenPlanning={isMobile ? openPlanningWithHistory : modalManager.openPlanning}
-        onResumePlanning={isMobile ? resumePlanningWithHistory : modalManager.resumePlanning}
+        onOpenGitHubImport={openGitHubImportWithNav}
+        onOpenPlanning={openPlanningWithNav}
+        onResumePlanning={resumePlanningWithNav}
         activePlanningSessionCount={bgPlanningSessions.length}
-        onOpenUsage={isMobile ? () => openUsageWithHistory(null) : () => modalManager.openUsage(null)}
+        onOpenUsage={() => openUsageWithNav(null)}
         onViewAllProjects={handleViewAllProjects}
-        onRunScript={isMobile ? runScriptWithHistory : modalManager.runScript}
+        onRunScript={runScriptWithNav}
         projectId={currentProject?.id}
         showSkillsTab={skillsEnabled}
         experimentalFeatures={{
           insights: insightsEnabled,
-          roadmap: roadmapEnabled,
           memoryView: memoryEnabled,
           devServer: devServerEnabled,
           devServerView: devServerEnabled,
           todoView: todosEnabled,
           researchView: researchEnabled,
+          evalsView: evalsEnabled,
           nodesView: nodesEnabled,
         }}
         pluginDashboardViews={pluginDashboardViews}
+        shellConnectionControl={
+          isMobile && shellConnectionStatus ? (
+            <ShellConnectionStatus
+              status={shellConnectionStatus}
+              onError={(message) => addToast(message, "error")}
+            />
+          ) : undefined
+        }
       />
-      {viewMode === "project" && currentProject && taskView !== "chat" && taskView !== "mailbox" && taskView !== "insights" && taskView !== "devserver" && taskView !== "dev-server" && !taskView.startsWith("plugin:") && (
+      {viewMode === "project" && currentProject && taskView !== "chat" && taskView !== "mailbox" && taskView !== "insights" && taskView !== "evals" && taskView !== "devserver" && taskView !== "dev-server" && taskView !== "graph" && !isPluginViewId(taskView) && (
         <QuickChatFAB
           projectId={currentProject.id}
           addToast={addToast}
@@ -1293,12 +1730,25 @@ function AppInner() {
         deepLink={{ handleDetailClose }}
         settings={{ prAuthAvailable, themeMode, colorTheme, dashboardFontScalePct, setThemeMode, setColorTheme, setDashboardFontScalePct }}
         onSettingsClose={handleSettingsClose}
-        onReopenOnboarding={isMobile ? reopenOnboardingWithHistory : () => {
-          modalManager.closeSettings();
-          modalManager.openModelOnboarding();
-        }}
+        onReopenOnboarding={reopenOnboardingWithNav}
       />
       <AuthTokenRecoveryDialog open={authTokenRecoveryOpen} />
+      {shellApi && (
+        <>
+          <NativeShellOnboardingModal
+            open={requiresShellOnboarding}
+            shellApi={shellApi}
+            shellState={shellState}
+            onComplete={() => setShellOnboardingComplete(true)}
+          />
+          <NativeShellConnectionManager
+            open={shellConnectionManagerOpen}
+            shellApi={shellApi}
+            shellState={shellState}
+            onClose={() => setShellConnectionManagerOpen(false)}
+          />
+        </>
+      )}
     </>
   );
 }
@@ -1306,11 +1756,15 @@ function AppInner() {
 export function App() {
   return (
     <ToastProvider>
-      <NodeProvider>
-        <ConfirmDialogProvider>
-          <AppInner />
-        </ConfirmDialogProvider>
-      </NodeProvider>
+      <ShellHostProvider>
+        <ShellProvider>
+          <NodeProvider>
+            <ConfirmDialogProvider>
+              <AppInner />
+            </ConfirmDialogProvider>
+          </NodeProvider>
+        </ShellProvider>
+      </ShellHostProvider>
     </ToastProvider>
   );
 }

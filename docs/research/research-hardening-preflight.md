@@ -159,7 +159,24 @@ Key endpoints:
   - keep error classification in `ResearchStepRunner`,
   - keep sequencing and policy decisions in `ResearchOrchestrator`.
 
-## 10) Validation references used for this baseline
+## 10) FN-3370 refinement scope correction
+
+- FN-3370 replaces FN-3015's stale insights-backed child scope with the landed research subsystem surfaces in this document (core `ResearchStore` + dashboard `/api/research` + engine orchestrator lifecycle persistence).
+- Regression coverage work should stay bounded to shipped lifecycle/status/export/task-integration contracts and use follow-up tasks for any unshipped behavior instead of feature expansion.
+
+## 11) Dashboard regression coverage status (FN-3368 refinement)
+
+- Dashboard interaction tests are anchored to landed standalone research surfaces (`ResearchView`, `ResearchTaskActionModal`, `useResearch`, `App` research route wiring).
+- Route regression tests explicitly cover finding-to-task create/enrich provenance metadata, task-document writes, duplicate-attachment skip behavior, archived/missing target guards, and payload validation.
+- There is no placeholder/optional assumption that research dashboard files or `/api/research` routes are absent.
+
+## 12) FN-3369/FN-3599 verification lock note
+
+- Extension research tool contracts are now explicitly locked for missing-run errors and completed-run structured details (`summary`, `findings`, `citations`) across `fn_research_get` / `fn_research_cancel` / `fn_research_retry` behavior.
+- Server-level `/api/research` integration assertions are locked through `createServer` coverage for cancel/retry success paths, structured `400`/`404`/`409` envelopes, and export response contract checks.
+- CLI routing + docs alignment are locked to shipped behavior, including intentional CLI/core vs server export-format asymmetry documentation (no forced unification).
+
+## 13) Validation references used for this baseline
 
 - `packages/dashboard/src/__tests__/research-routes.test.ts`
 - `packages/core/src/__tests__/research-store.test.ts`

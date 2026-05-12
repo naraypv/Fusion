@@ -18,6 +18,7 @@ import {
   InsightLifecycleError,
   InsightStore,
   executeInsightRunLifecycle,
+  resolvePlanningSettingsModel,
   retryInsightRunLifecycle,
   type InsightCategory,
   type MemoryInsightCategory,
@@ -26,6 +27,7 @@ import {
   type InsightRunTrigger,
   type InsightRunListOptions,
   type InsightRunStatus,
+  type Settings,
 } from "@fusion/core";
 import {
   ApiError,
@@ -72,7 +74,7 @@ const VALID_CATEGORIES: InsightCategory[] = [
 ];
 
 // Valid insight statuses
-const VALID_STATUSES: InsightStatus[] = ["generated", "confirmed", "stale", "dismissed"];
+const VALID_STATUSES: InsightStatus[] = ["generated", "confirmed", "stale", "dismissed", "archived"];
 
 // Valid run triggers
 const VALID_TRIGGERS: InsightRunTrigger[] = ["schedule", "manual", "task_completion", "merge_event", "api"];
@@ -86,6 +88,80 @@ const INSIGHT_CATEGORY_BY_MEMORY_CATEGORY: Record<MemoryInsightCategory, Insight
 };
 
 const activeRunControllers = new Map<string, AbortController>();
+const ORPHAN_GRACE_MS = 30_000;
+
+function getRunAgeMs(run: { startedAt: string | null; createdAt: string }, nowMs: number): number {
+  const anchor = run.startedAt ?? run.createdAt;
+  const anchorMs = Date.parse(anchor);
+  if (!Number.isFinite(anchorMs)) return 0;
+  return Math.max(0, nowMs - anchorMs);
+}
+
+function maybeRecoverOrphanedActiveRun(params: {
+  insightStore: InsightStore;
+  run: ReturnType<InsightStore["getRun"]>;
+  trigger: InsightRunTrigger;
+  now: Date;
+}): boolean {
+  const { insightStore, run, trigger, now } = params;
+  if (!run || !["pending", "running"].includes(run.status)) {
+    return false;
+  }
+
+  if (activeRunControllers.has(run.id)) {
+    return false;
+  }
+
+  const ageMs = getRunAgeMs(run, now.getTime());
+  if (ageMs <= ORPHAN_GRACE_MS) {
+    return false;
+  }
+
+  const nowIso = now.toISOString();
+  insightStore.appendRunEvent(run.id, {
+    type: "warning",
+    status: run.status,
+    classification: "non_retryable",
+    message: `Recovered orphaned active run after ${ageMs}ms without controller ownership`,
+    metadata: {
+      recovery: "orphaned_active_run",
+      trigger,
+      ageMs,
+      graceMs: ORPHAN_GRACE_MS,
+      hadController: false,
+      anchorTimestamp: run.startedAt ?? run.createdAt,
+    },
+  });
+
+  const failed = insightStore.updateRun(run.id, {
+    status: "failed",
+    summary: "Recovered orphaned run",
+    error: "Run was marked active but had no live controller after grace period",
+    completedAt: nowIso,
+    lifecycle: {
+      ...run.lifecycle,
+      terminalReason: "failed",
+      terminalCause: "orphaned_active_run_recovered",
+      failureClass: "non_retryable",
+      retryable: false,
+    },
+  });
+
+  if (failed) {
+    insightStore.appendRunEvent(run.id, {
+      type: "status_changed",
+      status: "failed",
+      classification: "non_retryable",
+      message: "Run marked failed after orphaned active-run recovery",
+      metadata: {
+        recovery: "orphaned_active_run",
+      },
+    });
+    return true;
+  }
+
+  return false;
+}
 
 async function withAbort<T>(signal: AbortSignal, task: Promise<T>): Promise<T> {
   if (signal.aborted) {
@@ -104,6 +180,9 @@ async function executeInsightAttempt(params: {
   runId: string;
   signal: AbortSignal;
   insightStore: InsightStore;
+  settings: Settings;
+  modelProvider?: string;
+  modelId?: string;
 }): Promise<{ summary: string; insightsCreated: number; insightsUpdated: number }> {
   const {
     readWorkingMemory,
@@ -120,10 +199,23 @@ async function executeInsightAttempt(params: {
     throw new Error("No working memory to analyze");
   }
 
+  const { provider: settingsProvider, modelId: settingsModelId } =
+    resolvePlanningSettingsModel(params.settings);
+
+  const finalProvider = params.modelProvider ?? settingsProvider;
+  const finalModelId = params.modelId ?? settingsModelId;
+  const hasCustomModel = params.modelProvider && params.modelId;
+  const fallbackProvider = hasCustomModel ? settingsProvider : undefined;
+  const fallbackModelId = hasCustomModel ? settingsModelId : undefined;
+
   const existingInsights = await readInsightsMemory(params.rootDir);
   let responseText = "";
   const { session } = await createFnAgent({
     cwd: params.rootDir,
+    defaultProvider: finalProvider,
+    defaultModelId: finalModelId,
+    fallbackProvider,
+    fallbackModelId,
     systemPrompt: [
       "You extract durable project insights from working memory notes.",
       "Return only valid JSON that matches the requested schema.",
@@ -309,14 +401,42 @@ export function createInsightsRouter(store: TaskStore): Router {
       const taskStore = requestContext.getStore();
       if (!taskStore) throw new ApiError(500, "Store context not available");
       const rootDir = taskStore.getRootDir();
+      const settings = await taskStore.getSettings();
+      const rawProvider = typeof req.body.modelProvider === "string" ? req.body.modelProvider.trim() : undefined;
+      const rawModelId = typeof req.body.modelId === "string" ? req.body.modelId.trim() : undefined;
+      // Require both provider and model ID together — partial values are discarded
+      const modelProvider = rawProvider && rawModelId ? rawProvider : undefined;
+      const modelId = rawProvider && rawModelId ? rawModelId : undefined;
       const controller = new AbortController();
+
+      // Stash model selection in inputMetadata.metadata so retries can recover it
+      const inputMetadata = typeof req.body.inputMetadata === "object" && req.body.inputMetadata !== null
+        ? { ...req.body.inputMetadata }
+        : {};
+      if (modelProvider || modelId) {
+        inputMetadata.metadata = {
+          ...(typeof inputMetadata.metadata === "object" && inputMetadata.metadata !== null ? inputMetadata.metadata : {}),
+          ...(modelProvider ? { modelProvider } : {}),
+          ...(modelId ? { modelId } : {}),
+        };
+      }
+
+      const existingActiveRun = insightStore.findActiveRun(projectId, trigger);
+      if (existingActiveRun) {
+        maybeRecoverOrphanedActiveRun({
+          insightStore,
+          run: existingActiveRun,
+          trigger,
+          now: new Date(),
+        });
+      }
 
       const run = await executeInsightRunLifecycle({
         store: insightStore,
         projectId,
         input: {
           trigger,
-          inputMetadata: req.body.inputMetadata,
+          inputMetadata,
         },
         signal: controller.signal,
         timeoutMs: typeof req.body.timeoutMs === "number" ? req.body.timeoutMs : 120_000,
@@ -330,6 +450,9 @@ export function createInsightsRouter(store: TaskStore): Router {
             runId: run.id,
             signal,
             insightStore,
+            settings,
+            modelProvider,
+            modelId,
           });
         },
       });
@@ -338,7 +461,15 @@ export function createInsightsRouter(store: TaskStore): Router {
       res.status(201).json(run);
     } catch (error) {
       if (error instanceof InsightLifecycleError && error.code === "active_run_conflict") {
-        throw new ApiError(409, error.message);
+        const projectId = getProjectId(req) ?? "";
+        const trigger: InsightRunTrigger = (req.body.trigger as InsightRunTrigger) ?? "manual";
+        const activeRun = getInsightStore().findActiveRun(projectId, trigger);
+        throw new ApiError(409, "Insight generation is already running", {
+          code: "ACTIVE_RUN_CONFLICT",
+          activeRunId: activeRun?.id,
+          activeRunStatus: activeRun?.status,
+          trigger,
+        });
       }
       rethrowAsApiError(error, "Failed to create insight run");
     }
@@ -474,7 +605,17 @@ export function createInsightsRouter(store: TaskStore): Router {
       const taskStore = requestContext.getStore();
       if (!taskStore) throw new ApiError(500, "Store context not available");
       const rootDir = taskStore.getRootDir();
+      const settings = await taskStore.getSettings();
       const controller = new AbortController();
+
+      // Recover model selection from the original run's inputMetadata
+      const originalMetadata = existing.inputMetadata?.metadata;
+      const retryModelProvider = typeof (originalMetadata as Record<string, unknown> | undefined)?.modelProvider === "string"
+        ? (originalMetadata as Record<string, unknown>).modelProvider as string
+        : undefined;
+      const retryModelId = typeof (originalMetadata as Record<string, unknown> | undefined)?.modelId === "string"
+        ? (originalMetadata as Record<string, unknown>).modelId as string
+        : undefined;
 
       const { run } = await retryInsightRunLifecycle({
         store,
@@ -491,6 +632,9 @@ export function createInsightsRouter(store: TaskStore): Router {
             runId: run.id,
             signal,
             insightStore: store,
+            settings,
+            modelProvider: retryModelProvider,
+            modelId: retryModelId,
           });
         },
       });
@@ -590,6 +734,34 @@ export function createInsightsRouter(store: TaskStore): Router {
       res.json(insight);
     } catch (error) {
       rethrowAsApiError(error, "Failed to dismiss insight");
+    }
+  });
+
+  router.post("/:id/archive", (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const store = getInsightStore();
+      const insight = store.updateInsight(id, { status: "archived" });
+      if (!insight) {
+        throw notFound(`Insight not found: ${id}`);
+      }
+      res.json(insight);
+    } catch (error) {
+      rethrowAsApiError(error, "Failed to archive insight");
+    }
+  });
+
+  router.post("/:id/unarchive", (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const store = getInsightStore();
+      const insight = store.updateInsight(id, { status: "confirmed" });
+      if (!insight) {
+        throw notFound(`Insight not found: ${id}`);
+      }
+      res.json(insight);
+    } catch (error) {
+      rethrowAsApiError(error, "Failed to unarchive insight");
     }
   });
 

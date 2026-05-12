@@ -13,16 +13,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentStore } from "../agent-store.js";
 import { TaskStore } from "../store.js";
+import { validateSnapshotEnvelope } from "../shared-mesh-state.js";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import {
+  AGENT_PERMISSION_POLICY_ACTION_CATEGORIES,
   CheckoutConflictError,
   getCanonicalAgentAssetDirectoryName,
   type AgentCapability,
-  type AgentState,
+  type AgentRating,
 } from "../types.js";
 
 function makeTmpDir(): string {
@@ -132,6 +134,43 @@ describe("AgentStore", () => {
       const persisted = await store.getAgent(agent.id);
       expect((persisted?.runtimeConfig as Record<string, unknown> | undefined)?.enabled).toBe(false);
     });
+
+    it("migrates persisted terminated agents to paused once", async () => {
+      store.close();
+      store = new AgentStore({ rootDir });
+      await store.init();
+
+      const agent = await store.createAgent({
+        name: "Legacy Terminated Agent",
+        role: "executor",
+      });
+      await store.updateAgent(agent.id, {
+        lastError: "legacy stop",
+      });
+      const testDb = (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown; get?: (key: string) => { value?: string } | undefined } } }).db;
+      testDb.prepare("UPDATE agents SET state = ? WHERE id = ?").run("terminated", agent.id);
+      testDb.prepare("DELETE FROM __meta WHERE key = ?").run("removeTerminatedAgentState");
+
+      store.close();
+      store = new AgentStore({ rootDir });
+      await store.init();
+
+      const migrated = await store.getAgent(agent.id);
+      expect(migrated?.state).toBe("paused");
+      expect(migrated?.pauseReason).toBe("migrated-from-terminated");
+      expect(migrated?.lastError).toBe("legacy stop");
+
+      const metaRow = (store as unknown as { db: { prepare: (sql: string) => { get: (key: string) => { value?: string } | undefined } } }).db
+        .prepare("SELECT value FROM __meta WHERE key = ?")
+        .get("removeTerminatedAgentState");
+      expect(metaRow?.value).toBe("1");
+
+      const reopenedDb = (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
+      reopenedDb.prepare("UPDATE agents SET state = ?, data = json_set(COALESCE(data, '{}'), '$.pauseReason', null) WHERE id = ?").run("terminated", agent.id);
+      await store.init();
+      const stillTerminated = await store.getAgent(agent.id);
+      expect(stillTerminated?.state).toBe("terminated");
+    });
   });
 
   // ── createAgent ───────────────────────────────────────────────────
@@ -204,13 +243,43 @@ describe("AgentStore", () => {
       expect(agent.id).toMatch(/^agent-/);
       expect(agent.name).toBe("Test Agent"); // trimmed
       expect(agent.role).toBe("executor");
-      expect(agent.state).toBe("idle");
+      expect(agent.state).toBe("active");
       expect(agent.metadata).toEqual({});
       expect(agent.runtimeConfig).toMatchObject({
         enabled: true,
+        autoClaimRelevantTasks: true,
       });
       expect(new Date(agent.createdAt).getTime()).not.toBeNaN();
       expect(new Date(agent.updatedAt).getTime()).not.toBeNaN();
+    });
+
+    it("starts newly created non-ephemeral agents in active state", async () => {
+      const agent = await store.createAgent({
+        name: "DefaultActive",
+        role: "executor",
+      });
+
+      expect(agent.state).toBe("active");
+    });
+
+    it("starts task-worker agents in idle state", async () => {
+      const agent = await store.createAgent({
+        name: "executor-FN-3773",
+        role: "executor",
+        metadata: { agentKind: "task-worker" },
+      });
+
+      expect(agent.state).toBe("idle");
+    });
+
+    it("starts legacy taskWorker-marked agents in idle state", async () => {
+      const agent = await store.createAgent({
+        name: "executor-legacy-FN-3773",
+        role: "executor",
+        metadata: { taskWorker: true },
+      });
+
+      expect(agent.state).toBe("idle");
     });
 
     it("defaults heartbeat procedure path to canonical display-name directory", async () => {
@@ -232,6 +301,71 @@ describe("AgentStore", () => {
       const expectedDir = getCanonicalAgentAssetDirectoryName(agent.name, agent.id);
       expect(expectedDir).toContain("agent-");
       expect(agent.heartbeatProcedurePath).toBe(`.fusion/agents/${expectedDir}/HEARTBEAT.md`);
+    });
+
+    it("defaults autoClaimRelevantTasks to true when unset", async () => {
+      const agent = await store.createAgent({
+        name: "Auto Claim Default",
+        role: "executor",
+      });
+
+      const runtimeConfig = agent.runtimeConfig as Record<string, unknown>;
+      expect(runtimeConfig.autoClaimRelevantTasks).toBe(true);
+    });
+
+    it("preserves explicit autoClaimRelevantTasks=false", async () => {
+      const agent = await store.createAgent({
+        name: "Auto Claim Disabled",
+        role: "executor",
+        runtimeConfig: { autoClaimRelevantTasks: false },
+      });
+
+      const runtimeConfig = agent.runtimeConfig as Record<string, unknown>;
+      expect(runtimeConfig.autoClaimRelevantTasks).toBe(false);
+    });
+
+    it("does not default runMissedHeartbeatOnStartup when unset (default off)", async () => {
+      const agent = await store.createAgent({
+        name: "Catchup Default",
+        role: "executor",
+      });
+
+      const runtimeConfig = agent.runtimeConfig as Record<string, unknown>;
+      // Field stays absent so consumers that read it as `=== true` see falsy.
+      expect(runtimeConfig.runMissedHeartbeatOnStartup).toBeUndefined();
+    });
+
+    it("preserves explicit runMissedHeartbeatOnStartup=true", async () => {
+      const agent = await store.createAgent({
+        name: "Catchup Enabled",
+        role: "executor",
+        runtimeConfig: { runMissedHeartbeatOnStartup: true },
+      });
+
+      const runtimeConfig = agent.runtimeConfig as Record<string, unknown>;
+      expect(runtimeConfig.runMissedHeartbeatOnStartup).toBe(true);
+    });
+
+    it("stores default unrestricted permission policy for durable agents", async () => {
+      const agent = await store.createAgent({
+        name: "Policy Default",
+        role: "executor",
+      });
+
+      expect(agent.permissionPolicy?.presetId).toBe("unrestricted");
+      for (const category of AGENT_PERMISSION_POLICY_ACTION_CATEGORIES) {
+        expect(agent.permissionPolicy?.rules[category]).toBe("allow");
+      }
+    });
+
+    it("does not backfill permission policy for ephemeral task workers", async () => {
+      const agent = await store.createAgent({
+        name: "executor-FN-100",
+        role: "executor",
+        metadata: { agentKind: "task-worker", taskWorker: true },
+      });
+
+      expect(agent.permissionPolicy).toBeUndefined();
     });
 
     it("preserves custom metadata", async () => {
@@ -306,12 +440,24 @@ describe("AgentStore", () => {
       expect(found!.id).toBe(created.id);
       expect(found!.name).toBe("Lookup Agent");
       expect(found!.role).toBe("executor");
-      expect(found!.state).toBe("idle");
+      expect(found!.state).toBe("active");
     });
 
     it("returns null for a non-existent ID", async () => {
       const result = await store.getAgent("agent-nonexistent");
       expect(result).toBeNull();
+    });
+
+    it("resolves legacy durable agents without permissionPolicy to unrestricted", async () => {
+      const created = await store.createAgent({ name: "Legacy Policy", role: "executor" });
+      const testDb = (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => unknown } } }).db;
+      testDb.prepare("UPDATE agents SET data = json_remove(data, '$.permissionPolicy') WHERE id = ?").run(created.id);
+
+      const hydrated = await store.getAgent(created.id);
+      expect(hydrated?.permissionPolicy?.presetId).toBe("unrestricted");
+      for (const category of AGENT_PERMISSION_POLICY_ACTION_CATEGORIES) {
+        expect(hydrated?.permissionPolicy?.rules[category]).toBe("allow");
+      }
     });
   });
 
@@ -738,6 +884,27 @@ describe("AgentStore", () => {
       expect(persisted?.memory).toBe("Avoids broad rewrites; prefers incremental changes.");
     });
 
+    it("round-trips imageUrl through create, read, and update", async () => {
+      const created = await store.createAgent({
+        name: "Avatar Agent",
+        role: "executor",
+        imageUrl: "/api/agents/avatar-agent/avatar",
+      });
+
+      expect(created.imageUrl).toBe("/api/agents/avatar-agent/avatar");
+
+      const persisted = await store.getAgent(created.id);
+      expect(persisted?.imageUrl).toBe("/api/agents/avatar-agent/avatar");
+
+      const updated = await store.updateAgent(created.id, {
+        imageUrl: "/api/agents/avatar-agent/avatar?t=1",
+      });
+      expect(updated.imageUrl).toBe("/api/agents/avatar-agent/avatar?t=1");
+
+      const persistedAfterUpdate = await store.getAgent(created.id);
+      expect(persistedAfterUpdate?.imageUrl).toBe("/api/agents/avatar-agent/avatar?t=1");
+    });
+
     it("does not clear soul when updates.soul is undefined", async () => {
       const created = await store.createAgent({
         name: "Stable Soul",
@@ -833,7 +1000,7 @@ describe("AgentStore", () => {
       expect(revisions[0].after.name).toBe("Renamed");
     });
 
-    it("records revisions for runtimeConfig, permissions, instructions, soul, and memory changes", async () => {
+    it("records revisions for runtimeConfig, permissions, permissionPolicy, instructions, soul, and memory changes", async () => {
       const created = await store.createAgent({
         name: "Configurable",
         role: "executor",
@@ -843,6 +1010,13 @@ describe("AgentStore", () => {
 
       await store.updateAgent(created.id, { runtimeConfig: { heartbeatIntervalMs: 10000 } });
       await store.updateAgent(created.id, { permissions: { canReview: true, canExecute: true } });
+      await store.updateAgent(created.id, { permissionPolicy: { presetId: "locked-down", rules: {
+        "git-write": "block",
+        "file-write-delete": "block",
+        "shell-command": "block",
+        "network-api": "block",
+        "task-agent-management": "block",
+      } } });
       await store.updateAgent(created.id, { instructionsPath: "docs/agent.md" });
       await store.updateAgent(created.id, { instructionsText: "Follow safety checks." });
       await store.updateAgent(created.id, { soul: "Thoughtful collaborator" });
@@ -853,6 +1027,7 @@ describe("AgentStore", () => {
 
       expect(changedFields).toContain("runtimeConfig");
       expect(changedFields).toContain("permissions");
+      expect(changedFields).toContain("permissionPolicy");
       expect(changedFields).toContain("instructionsPath");
       expect(changedFields).toContain("instructionsText");
       expect(changedFields).toContain("soul");
@@ -932,6 +1107,7 @@ describe("AgentStore", () => {
       // whatever the caller supplied.
       expect(result.agent.runtimeConfig).toEqual({
         enabled: true,
+        autoClaimRelevantTasks: true,
         heartbeatTimeoutMs: 60000,
         heartbeatIntervalMs: 3_600_000,
       });
@@ -1071,6 +1247,24 @@ describe("AgentStore", () => {
       expect(handler).toHaveBeenCalledOnce();
       expect(handler).toHaveBeenCalledWith(created.id);
     });
+
+    it("blocks delete when checked-out assigned task exists unless force=true", async () => {
+      const taskStore = new TaskStore(rootDir, join(rootDir, ".fusion-global-settings"));
+      await taskStore.init();
+      const linkedStore = new AgentStore({ rootDir, inMemoryDb: true, taskStore });
+      await linkedStore.init();
+
+      const created = await linkedStore.createAgent({ name: "Checked Out", role: "executor" });
+      const task = await taskStore.createTask({ title: "T", description: "D", column: "todo", assignedAgentId: created.id });
+      await taskStore.updateTask(task.id, { checkedOutBy: created.id });
+
+      await expect(linkedStore.deleteAgent(created.id)).rejects.toThrow("holds checkout");
+      await linkedStore.deleteAgent(created.id, { force: true });
+      expect(await taskStore.getTask(task.id)).toEqual(expect.objectContaining({ assignedAgentId: undefined, checkedOutBy: undefined }));
+
+      linkedStore.close();
+      taskStore.close();
+    });
   });
 
   // ── listAgents ────────────────────────────────────────────────────
@@ -1105,14 +1299,14 @@ describe("AgentStore", () => {
     });
 
     it("filters by state", async () => {
-      const a1 = await store.createAgent({ name: "Idle", role: "executor" });
+      const a1 = await store.createAgent({
+        name: "IdleTaskWorker",
+        role: "executor",
+        metadata: { agentKind: "task-worker" },
+      });
       const a2 = await store.createAgent({ name: "Active", role: "executor" });
-      // Record a heartbeat first so that updateAgentState(→active) doesn't
-      // trigger startHeartbeatRun internally (which would re-enter withLock).
-      await store.recordHeartbeat(a2.id, "ok");
-      await store.updateAgentState(a2.id, "active");
 
-      const idle = await store.listAgents({ state: "idle" });
+      const idle = await store.listAgents({ state: "idle", includeEphemeral: true });
       expect(idle).toHaveLength(1);
       expect(idle[0].id).toBe(a1.id);
 
@@ -1131,13 +1325,13 @@ describe("AgentStore", () => {
     });
 
     it("filters by both state and role", async () => {
-      const a1 = await store.createAgent({ name: "ActiveExec", role: "executor" });
-      await store.recordHeartbeat(a1.id, "ok");
-      await store.updateAgentState(a1.id, "active");
-      await store.createAgent({ name: "IdleExec", role: "executor" });
-      const a3 = await store.createAgent({ name: "ActiveReview", role: "reviewer" });
-      await store.recordHeartbeat(a3.id, "ok");
-      await store.updateAgentState(a3.id, "active");
+      await store.createAgent({ name: "ActiveExec", role: "executor" });
+      await store.createAgent({
+        name: "IdleExec",
+        role: "executor",
+        metadata: { agentKind: "task-worker" },
+      });
+      await store.createAgent({ name: "ActiveReview", role: "reviewer" });
 
       const result = await store.listAgents({ state: "active", role: "executor" });
       expect(result).toHaveLength(1);
@@ -1159,29 +1353,29 @@ describe("AgentStore", () => {
       // Create a normal agent
       const normal = await store.createAgent({ name: "Normal Agent", role: "executor" });
 
-      // Create a task-worker agent
-      const taskWorker = await store.createAgent({
+      // Create a task-worker agent (return value not needed — just populate the DB)
+      await store.createAgent({
         name: "executor-FN-TEST",
         role: "executor",
         metadata: { agentKind: "task-worker" },
       });
 
       // Create a spawned child agent
-      const spawned = await store.createAgent({
+      await store.createAgent({
         name: "spawned-agent",
         role: "executor",
         metadata: { type: "spawned" },
       });
 
       // Create an agent with taskWorker metadata
-      const withTaskWorker = await store.createAgent({
+      await store.createAgent({
         name: "task-worker-agent",
         role: "executor",
         metadata: { taskWorker: true },
       });
 
       // Create an agent with managedBy metadata
-      const managedBy = await store.createAgent({
+      await store.createAgent({
         name: "managed-agent",
         role: "executor",
         metadata: { managedBy: "task-executor" },
@@ -1212,12 +1406,13 @@ describe("AgentStore", () => {
 
       // Without includeEphemeral filter - only returns active non-ephemeral agents
       const activeNonEphemeral = await store.listAgents({ state: "active" });
-      expect(activeNonEphemeral).toHaveLength(0);
+      expect(activeNonEphemeral).toHaveLength(1);
+      expect(activeNonEphemeral[0].id).toBe(normal.id);
 
       // With includeEphemeral: true, returns all active agents
       const activeAll = await store.listAgents({ state: "active", includeEphemeral: true });
-      expect(activeAll).toHaveLength(1);
-      expect(activeAll[0].id).toBe(taskWorker.id);
+      expect(activeAll).toHaveLength(2);
+      expect(activeAll.map((agent) => agent.id).sort()).toEqual([normal.id, taskWorker.id].sort());
     });
 
     it("filters out agents marked with metadata.internal", async () => {
@@ -1429,22 +1624,16 @@ describe("AgentStore", () => {
   // ── updateAgentState ──────────────────────────────────────────────
 
   describe("updateAgentState", () => {
-    // Helper: create an agent and set lastHeartbeatAt so that
-    // idle→active transitions don't trigger the re-entrant
-    // startHeartbeatRun path (see FN-711 for the deadlock bug).
-    // Also records a "missed" heartbeat to close any active run,
-    // preventing the terminated-transition deadlock path too.
+    // Helper: create an active agent and set lastHeartbeatAt for tests that
+    // exercise heartbeat-aware state transitions.
     async function createReadyAgent(s: AgentStore, name: string) {
       const agent = await s.createAgent({ name, role: "executor" });
       await s.recordHeartbeat(agent.id, "ok");
-      // Close the active run so transitioning to terminated
-      // won't trigger endHeartbeatRun inside withLock.
-      await s.recordHeartbeat(agent.id, "missed");
       return agent;
     }
 
-    it("idle → active transition succeeds", async () => {
-      const agent = await createReadyAgent(store, "IdleToActive");
+    it("active → active transition succeeds as no-op", async () => {
+      const agent = await createReadyAgent(store, "ActiveToActive");
       const updated = await store.updateAgentState(agent.id, "active");
       expect(updated.state).toBe("active");
     });
@@ -1456,13 +1645,6 @@ describe("AgentStore", () => {
       expect(updated.state).toBe("paused");
     });
 
-    it("active → terminated transition succeeds", async () => {
-      const agent = await createReadyAgent(store, "ActiveToTerminated");
-      await store.updateAgentState(agent.id, "active");
-      const updated = await store.updateAgentState(agent.id, "terminated");
-      expect(updated.state).toBe("terminated");
-    });
-
     it("paused → active transition succeeds", async () => {
       const agent = await createReadyAgent(store, "PausedToActive");
       await store.updateAgentState(agent.id, "active");
@@ -1471,81 +1653,52 @@ describe("AgentStore", () => {
       expect(updated.state).toBe("active");
     });
 
-    it("paused → terminated transition succeeds", async () => {
+    it("running → paused transition succeeds", async () => {
+      const agent = await createReadyAgent(store, "RunningToPaused");
+      await store.updateAgentState(agent.id, "active");
+      await store.updateAgentState(agent.id, "running");
+      const updated = await store.updateAgentState(agent.id, "paused");
+      expect(updated.state).toBe("paused");
+    });
+
+    it("error → active transition succeeds", async () => {
+      const agent = await createReadyAgent(store, "ErrorToActive");
+      await store.updateAgentState(agent.id, "active");
+      await store.updateAgentState(agent.id, "error");
+      const updated = await store.updateAgentState(agent.id, "active");
+      expect(updated.state).toBe("active");
+    });
+
+    it("rejects active → terminated transition", async () => {
+      const agent = await createReadyAgent(store, "ActiveToTerminated");
+      await store.updateAgentState(agent.id, "active");
+      await expect(
+        store.updateAgentState(agent.id, "terminated" as never)
+      ).rejects.toThrow("Invalid state transition: active -> terminated");
+    });
+
+    it("rejects paused → terminated transition", async () => {
       const agent = await createReadyAgent(store, "PausedToTerminated");
       await store.updateAgentState(agent.id, "active");
       await store.updateAgentState(agent.id, "paused");
-      const updated = await store.updateAgentState(agent.id, "terminated");
-      expect(updated.state).toBe("terminated");
+      await expect(
+        store.updateAgentState(agent.id, "terminated" as never)
+      ).rejects.toThrow("Invalid state transition: paused -> terminated");
     });
 
     it("same-state transition returns agent unchanged (no-op)", async () => {
       const agent = await store.createAgent({ name: "SameState", role: "executor" });
-      const unchanged = await store.updateAgentState(agent.id, "idle");
-      expect(unchanged.state).toBe("idle");
+      const unchanged = await store.updateAgentState(agent.id, "active");
+      expect(unchanged.state).toBe("active");
       expect(unchanged.updatedAt).toBe(agent.updatedAt);
     });
 
     it("idle → paused throws with descriptive error message", async () => {
       const agent = await store.createAgent({ name: "BadTransition", role: "executor" });
+      await store.updateAgentState(agent.id, "idle");
       await expect(
         store.updateAgentState(agent.id, "paused")
       ).rejects.toThrow("Invalid state transition: idle -> paused");
-    });
-
-    it("idle → terminated throws", async () => {
-      const agent = await store.createAgent({ name: "BadTerminate", role: "executor" });
-      await expect(
-        store.updateAgentState(agent.id, "terminated")
-      ).rejects.toThrow("Invalid state transition: idle -> terminated");
-    });
-
-    it("transition from terminated to paused still throws", async () => {
-      const agent = await createReadyAgent(store, "Terminated");
-      await store.updateAgentState(agent.id, "active");
-      await store.updateAgentState(agent.id, "terminated");
-
-      await expect(
-        store.updateAgentState(agent.id, "paused")
-      ).rejects.toThrow("Invalid state transition: terminated -> paused");
-    });
-
-    it("terminated → active transition succeeds", async () => {
-      const agent = await createReadyAgent(store, "RestartActive");
-      await store.updateAgentState(agent.id, "active");
-      await store.updateAgentState(agent.id, "terminated");
-
-      const updated = await store.updateAgentState(agent.id, "active");
-      expect(updated.state).toBe("active");
-    });
-
-    it("terminated → running transition succeeds", async () => {
-      const agent = await createReadyAgent(store, "RestartRunning");
-      await store.updateAgentState(agent.id, "active");
-      await store.updateAgentState(agent.id, "terminated");
-
-      const updated = await store.updateAgentState(agent.id, "running");
-      expect(updated.state).toBe("running");
-    });
-
-    it("terminated → idle transition succeeds", async () => {
-      const agent = await createReadyAgent(store, "RestartIdle");
-      await store.updateAgentState(agent.id, "active");
-      await store.updateAgentState(agent.id, "terminated");
-
-      const updated = await store.updateAgentState(agent.id, "idle");
-      expect(updated.state).toBe("idle");
-    });
-
-    it("transitioning from terminated clears lastError", async () => {
-      const agent = await createReadyAgent(store, "ClearError");
-      await store.updateAgentState(agent.id, "active");
-      await store.updateAgent(agent.id, { lastError: "something broke" });
-      await store.updateAgentState(agent.id, "terminated");
-
-      const restarted = await store.updateAgentState(agent.id, "active");
-      expect(restarted.state).toBe("active");
-      expect(restarted.lastError).toBeUndefined();
     });
 
     it("emits both 'agent:stateChanged' and 'agent:updated' events", async () => {
@@ -1556,16 +1709,16 @@ describe("AgentStore", () => {
       store.on("agent:stateChanged", stateHandler);
       store.on("agent:updated", updateHandler);
 
-      await store.updateAgentState(agent.id, "active");
+      await store.updateAgentState(agent.id, "idle");
 
       expect(stateHandler).toHaveBeenCalledOnce();
-      expect(stateHandler).toHaveBeenCalledWith(agent.id, "idle", "active");
+      expect(stateHandler).toHaveBeenCalledWith(agent.id, "active", "idle");
 
       // agent:updated is called with updated agent and previousState
       expect(updateHandler).toHaveBeenCalled();
       const [updatedAgent, previousState] = updateHandler.mock.calls[0];
-      expect(updatedAgent.state).toBe("active");
-      expect(previousState).toBe("idle");
+      expect(updatedAgent.state).toBe("idle");
+      expect(previousState).toBe("active");
     });
 
     it("throws for non-existent agent", async () => {
@@ -1639,6 +1792,34 @@ describe("AgentStore", () => {
     });
   });
 
+  describe("syncExecutionTaskLink", () => {
+    it("updates taskId without emitting assignment events", async () => {
+      const agent = await store.createAgent({ name: "Runtime Owner", role: "executor" });
+      const assignedHandler = vi.fn();
+      store.on("agent:assigned", assignedHandler);
+
+      const updated = await store.syncExecutionTaskLink(agent.id, "FN-3249");
+
+      expect(updated.taskId).toBe("FN-3249");
+      expect(assignedHandler).not.toHaveBeenCalled();
+
+      const fetched = await store.getAgent(agent.id);
+      expect(fetched?.taskId).toBe("FN-3249");
+    });
+
+    it("clears taskId without emitting assignment events", async () => {
+      const agent = await store.createAgent({ name: "Runtime Owner 2", role: "executor" });
+      await store.syncExecutionTaskLink(agent.id, "FN-1111");
+
+      const assignedHandler = vi.fn();
+      store.on("agent:assigned", assignedHandler);
+
+      const updated = await store.syncExecutionTaskLink(agent.id, undefined);
+      expect(updated.taskId).toBeUndefined();
+      expect(assignedHandler).not.toHaveBeenCalled();
+    });
+  });
+
   describe("checkout leasing", () => {
     let taskStore: TaskStore;
     let holderId: string;
@@ -1666,23 +1847,45 @@ describe("AgentStore", () => {
       taskStore.close();
     });
 
-    it("checkoutTask acquires a lease and stamps checkedOutAt", async () => {
-      const updated = await store.checkoutTask(holderId, taskId);
+    it("checkoutTask acquires a lease and stamps lease metadata", async () => {
+      const updated = await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-1", leaseEpoch: 2 });
 
       expect(updated.checkedOutBy).toBe(holderId);
       expect(updated.checkedOutAt).toBeDefined();
+      expect(updated.checkoutNodeId).toBe("node-a");
+      expect(updated.checkoutRunId).toBe("run-1");
+      expect(updated.checkoutLeaseRenewedAt).toBeDefined();
+      expect(updated.checkoutLeaseEpoch).toBe(2);
 
       const persisted = await taskStore.getTask(taskId);
       expect(persisted?.checkedOutBy).toBe(holderId);
       expect(persisted?.checkedOutAt).toBeDefined();
+      expect(persisted?.checkoutNodeId).toBe("node-a");
+      expect(persisted?.checkoutRunId).toBe("run-1");
+      expect(persisted?.checkoutLeaseRenewedAt).toBeDefined();
+      expect(persisted?.checkoutLeaseEpoch).toBe(2);
     });
 
-    it("checkoutTask is idempotent when the same agent re-checks out", async () => {
-      const first = await store.checkoutTask(holderId, taskId);
-      const second = await store.checkoutTask(holderId, taskId);
+    it("checkoutTask is idempotent for same agent/node/epoch and renews lease timestamp", async () => {
+      const first = await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-1", leaseEpoch: 2 });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const second = await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-2", leaseEpoch: 2 });
 
       expect(second.checkedOutBy).toBe(holderId);
       expect(second.checkedOutAt).toBe(first.checkedOutAt);
+      expect(second.checkoutNodeId).toBe("node-a");
+      expect(second.checkoutRunId).toBe("run-2");
+      expect(second.checkoutLeaseEpoch).toBe(2);
+      expect(second.checkoutLeaseRenewedAt).not.toBe(first.checkoutLeaseRenewedAt);
+    });
+
+    it("checkoutTask updates epoch for same holder when lease epoch increases", async () => {
+      await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-1", leaseEpoch: 1 });
+      const bumped = await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-2", leaseEpoch: 3 });
+
+      expect(bumped.checkedOutBy).toBe(holderId);
+      expect(bumped.checkoutLeaseEpoch).toBe(3);
+      expect(bumped.checkoutRunId).toBe("run-2");
     });
 
     it("checkoutTask throws CheckoutConflictError when already held by another agent", async () => {
@@ -1734,11 +1937,15 @@ describe("AgentStore", () => {
     });
 
     it("forceReleaseTask clears checkout regardless of holder", async () => {
-      await store.checkoutTask(holderId, taskId);
+      await store.checkoutTask(holderId, taskId, { nodeId: "node-a", runId: "run-1", leaseEpoch: 9 });
 
       const released = await store.forceReleaseTask(taskId);
       expect(released.checkedOutBy).toBeUndefined();
       expect(released.checkedOutAt).toBeUndefined();
+      expect(released.checkoutNodeId).toBeUndefined();
+      expect(released.checkoutRunId).toBeUndefined();
+      expect(released.checkoutLeaseRenewedAt).toBeUndefined();
+      expect(released.checkoutLeaseEpoch).toBeUndefined();
     });
 
     it("getCheckedOutBy returns holder ID when checked out and undefined otherwise", async () => {
@@ -1747,13 +1954,110 @@ describe("AgentStore", () => {
       await store.checkoutTask(holderId, taskId);
       expect(await store.getCheckedOutBy(taskId)).toBe(holderId);
     });
+
+    it("claimTaskForAgent claims unowned task and syncs agent task link", async () => {
+      const result = await store.claimTaskForAgent(holderId, taskId);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      const claimedTask = await taskStore.getTask(taskId);
+      const claimedAgent = await store.getAgent(holderId);
+
+      expect(claimedTask?.assignedAgentId).toBe(holderId);
+      expect(claimedTask?.checkedOutBy).toBe(holderId);
+      expect(claimedAgent?.taskId).toBe(taskId);
+    });
+
+    it("claimTaskForAgent rejects non-executor agents for implementation tasks", async () => {
+      const reviewer = await store.createAgent({ name: "Reviewer", role: "reviewer" });
+
+      const result = await store.claimTaskForAgent(reviewer.id, taskId);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toMatch(/requires an "executor"-role agent/);
+      expect(result.reason).toMatch(/durable "engineer" supported only for explicit routing/);
+
+      const claimedTask = await taskStore.getTask(taskId);
+      expect(claimedTask?.assignedAgentId).toBeUndefined();
+    });
+
+    it("claimTaskForAgent allows engineer claim for explicitly assigned implementation tasks", async () => {
+      const engineer = await store.createAgent({ name: "Engineer", role: "engineer" });
+      await taskStore.updateTask(taskId, { assignedAgentId: engineer.id });
+
+      const result = await store.claimTaskForAgent(engineer.id, taskId);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      const claimedTask = await taskStore.getTask(taskId);
+      expect(claimedTask?.assignedAgentId).toBe(engineer.id);
+      expect(claimedTask?.checkedOutBy).toBe(engineer.id);
+    });
+
+    it("claimTaskForAgent rejects engineer auto-claim for unassigned implementation tasks", async () => {
+      const engineer = await store.createAgent({ name: "Engineer", role: "engineer" });
+
+      const result = await store.claimTaskForAgent(engineer.id, taskId);
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toMatch(/requires an "executor"-role agent/);
+
+      const claimedTask = await taskStore.getTask(taskId);
+      expect(claimedTask?.assignedAgentId).toBeUndefined();
+    });
+
+    it("claimTaskForAgent rejects paused task", async () => {
+      await taskStore.updateTask(taskId, { paused: true });
+
+      const result = await store.claimTaskForAgent(holderId, taskId);
+      expect(result).toMatchObject({ ok: false, reason: "paused" });
+
+      const claimedAgent = await store.getAgent(holderId);
+      expect(claimedAgent?.taskId).toBeUndefined();
+    });
+
+    it("claimTaskForAgent rejects tasks in terminal columns", async () => {
+      const doneTask = await taskStore.createTask({ description: "done task", column: "done" });
+
+      const result = await store.claimTaskForAgent(holderId, doneTask.id);
+      expect(result).toMatchObject({ ok: false, reason: "terminal" });
+
+      const claimedAgent = await store.getAgent(holderId);
+      expect(claimedAgent?.taskId).toBeUndefined();
+    });
+
+    it("claimTaskForAgent returns task_not_found when task is missing", async () => {
+      const result = await store.claimTaskForAgent(holderId, "FN-404");
+      expect(result).toMatchObject({ ok: false, reason: "task_not_found" });
+      expect("task" in result).toBe(false);
+
+      const claimedAgent = await store.getAgent(holderId);
+      expect(claimedAgent?.taskId).toBeUndefined();
+    });
+
+    it("claimTaskForAgent rejects task already assigned to another agent", async () => {
+      await taskStore.updateTask(taskId, { assignedAgentId: otherAgentId });
+
+      const result = await store.claimTaskForAgent(holderId, taskId);
+      expect(result).toMatchObject({ ok: false, reason: "assigned_to_other" });
+    });
+
+    it("claimTaskForAgent rejects checkout conflicts", async () => {
+      await store.checkoutTask(otherAgentId, taskId);
+
+      const result = await store.claimTaskForAgent(holderId, taskId);
+      expect(result).toMatchObject({ ok: false, reason: "checkout_conflict" });
+
+      const claimedAgent = await store.getAgent(holderId);
+      expect(claimedAgent?.taskId).toBeUndefined();
+    });
   });
 
   // ── resetAgent ────────────────────────────────────────────────────
 
   describe("resetAgent", () => {
-    // Helper: create an agent and transition it to terminated with error/task
-    async function createTerminatedAgent(s: AgentStore, name: string) {
+    // Helper: create a paused agent with error/task state to verify reset semantics.
+    async function createPausedAgent(s: AgentStore, name: string) {
       const agent = await s.createAgent({ name, role: "executor" });
       await s.recordHeartbeat(agent.id, "ok");
       await s.recordHeartbeat(agent.id, "missed");
@@ -1763,12 +2067,12 @@ describe("AgentStore", () => {
         pauseReason: "manual",
         lastError: "something broke",
       });
-      await s.updateAgentState(agent.id, "terminated");
+      await s.updateAgentState(agent.id, "paused");
       return agent;
     }
 
-    it("transitions terminated agent to idle", async () => {
-      const agent = await createTerminatedAgent(store, "ResetToIdle");
+    it("transitions paused agent to idle", async () => {
+      const agent = await createPausedAgent(store, "ResetToIdle");
       const reset = await store.resetAgent(agent.id);
 
       expect(reset.state).toBe("idle");
@@ -1793,28 +2097,28 @@ describe("AgentStore", () => {
     });
 
     it("clears lastError", async () => {
-      const agent = await createTerminatedAgent(store, "ResetClearsError");
+      const agent = await createPausedAgent(store, "ResetClearsError");
       const reset = await store.resetAgent(agent.id);
 
       expect(reset.lastError).toBeUndefined();
     });
 
     it("clears pauseReason", async () => {
-      const agent = await createTerminatedAgent(store, "ResetClearsPause");
+      const agent = await createPausedAgent(store, "ResetClearsPause");
       const reset = await store.resetAgent(agent.id);
 
       expect(reset.pauseReason).toBeUndefined();
     });
 
     it("clears taskId", async () => {
-      const agent = await createTerminatedAgent(store, "ResetClearsTask");
+      const agent = await createPausedAgent(store, "ResetClearsTask");
       const reset = await store.resetAgent(agent.id);
 
       expect(reset.taskId).toBeUndefined();
     });
 
     it("starts fresh heartbeat tracking on subsequent active transition", async () => {
-      const agent = await createTerminatedAgent(store, "ResetHeartbeat");
+      const agent = await createPausedAgent(store, "ResetHeartbeat");
       await store.resetAgent(agent.id);
 
       // After reset, explicitly start a heartbeat run (as the caller would)
@@ -2219,7 +2523,7 @@ describe("AgentStore", () => {
       const base = new Date("2026-01-01T00:00:00.000Z").getTime();
 
       try {
-        const ratings = [];
+        const ratings: AgentRating[] = [];
         for (let i = 0; i < scores.length; i++) {
           vi.setSystemTime(new Date(base + i * 1000));
           ratings.push(
@@ -2676,5 +2980,37 @@ describe("AgentStore", () => {
         store2.close();
       }
     });
+  });
+
+  it("exports and applies agent and run snapshots", async () => {
+    const agent = await store.createAgent({ name: "Snapshot Agent", role: "executor" });
+    await store.setLastBlockedState(agent.id, { taskId: "FN-1", blockedBy: "dep", recordedAt: new Date().toISOString(), contextHash: "h" });
+
+    const run1 = await store.startHeartbeatRun(agent.id);
+    await store.endHeartbeatRun(run1.id, "completed");
+    const run2 = await store.startHeartbeatRun(agent.id);
+    await store.endHeartbeatRun(run2.id, "completed");
+
+    const agentSnapshot = await store.getAgentSnapshot();
+    const runSnapshot = store.getAgentRunSnapshot();
+    const limitedRunSnapshot = store.getAgentRunSnapshot(1);
+
+    validateSnapshotEnvelope(agentSnapshot);
+    validateSnapshotEnvelope(runSnapshot);
+
+    const applyAgent = await store.applyAgentSnapshot(agentSnapshot);
+    const applyRun = await store.applyAgentRunSnapshot(runSnapshot);
+    const agentSnapshot2 = await store.getAgentSnapshot();
+    const runSnapshot2 = store.getAgentRunSnapshot();
+
+    expect(applyAgent.appliedAgents).toBeGreaterThan(0);
+    expect(agentSnapshot.payload.agents.length).toBeGreaterThan(0);
+    expect(agentSnapshot.payload.blockedStates.length).toBe(1);
+    expect(agentSnapshot2.payload).toEqual(agentSnapshot.payload);
+    expect(runSnapshot2.payload).toEqual(runSnapshot.payload);
+    expect(limitedRunSnapshot.payload.runs).toHaveLength(1);
+    const limitedRunId = limitedRunSnapshot.payload.runs[0]?.id;
+    expect([run1.id, run2.id]).toContain(limitedRunId);
+    expect(applyRun.applied + applyRun.skipped).toBeGreaterThanOrEqual(0);
   });
 });

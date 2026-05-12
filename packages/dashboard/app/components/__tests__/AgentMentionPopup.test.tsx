@@ -32,6 +32,15 @@ const agents: Agent[] = [
     updatedAt: "2026-04-01T00:00:00.000Z",
     metadata: {},
   },
+  {
+    id: "agent-003",
+    name: "Gamma",
+    role: "triage",
+    state: "idle",
+    createdAt: "2026-04-01T00:00:00.000Z",
+    updatedAt: "2026-04-01T00:00:00.000Z",
+    metadata: {},
+  },
 ];
 
 describe("AgentMentionPopup", () => {
@@ -51,11 +60,14 @@ describe("AgentMentionPopup", () => {
     expect(screen.getByTestId("agent-mention-item-agent-002")).toBeInTheDocument();
   });
 
-  it("filters agents by name case-insensitively", () => {
+  it.each([
+    ["review", "filters agents by name case-insensitively"],
+    ["beta_re", "matches underscore handles for agents with spaces"],
+  ])("%s %s", (filter) => {
     render(
       <AgentMentionPopup
         agents={agents}
-        filter="review"
+        filter={filter}
         highlightedIndex={0}
         visible={true}
         onSelect={vi.fn()}
@@ -114,6 +126,57 @@ describe("AgentMentionPopup", () => {
     );
 
     expect(screen.getByText("No agents found")).toBeInTheDocument();
+  });
+
+  it("shows room sections with members first and member dot label", () => {
+    render(
+      <AgentMentionPopup
+        agents={agents}
+        filter="a"
+        highlightedIndex={0}
+        visible={true}
+        onSelect={vi.fn()}
+        roomMemberIds={new Set(["agent-003", "agent-001"])}
+        roomName="engineering"
+      />,
+    );
+
+    expect(screen.getByTestId("agent-mention-members-header")).toHaveTextContent("Members of #engineering");
+    expect(screen.getByTestId("agent-mention-others-header")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Room member")).toHaveLength(2);
+  });
+
+  it("room mode hides other section when filter is empty and still allows selecting non-member when searching", () => {
+    const onSelect = vi.fn();
+    const roomMemberIds = new Set(["agent-001"]);
+    const { rerender } = render(
+      <AgentMentionPopup
+        agents={agents}
+        filter=""
+        highlightedIndex={0}
+        visible={true}
+        onSelect={onSelect}
+        roomMemberIds={roomMemberIds}
+      />,
+    );
+
+    expect(screen.queryByTestId("agent-mention-others-header")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-mention-other-hint")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-mention-item-agent-002")).not.toBeInTheDocument();
+
+    rerender(
+      <AgentMentionPopup
+        agents={agents}
+        filter="be"
+        highlightedIndex={1}
+        visible={true}
+        onSelect={onSelect}
+        roomMemberIds={roomMemberIds}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("agent-mention-item-agent-002"));
+    expect(onSelect).toHaveBeenCalledWith(agents[1]);
   });
 
   it("renders nothing when visible is false", () => {

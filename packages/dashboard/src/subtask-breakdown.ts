@@ -1,4 +1,4 @@
-import type { TaskStore } from "@fusion/core";
+import type { TaskPriority, TaskStore } from "@fusion/core";
 import { resolvePrompt, type PromptOverrideMap } from "@fusion/core";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -56,6 +56,7 @@ export interface SubtaskItem {
   title: string;
   description: string;
   suggestedSize: "S" | "M" | "L";
+  priority?: TaskPriority;
   dependsOn: string[];
 }
 
@@ -525,6 +526,9 @@ function normalizeSubtaskItem(item: SubtaskItem, index = 0): SubtaskItem {
     title: typeof item.title === "string" ? item.title.trim() : "",
     description: typeof item.description === "string" ? item.description.trim() : "",
     suggestedSize: item.suggestedSize === "S" || item.suggestedSize === "M" || item.suggestedSize === "L" ? item.suggestedSize : "M",
+    priority: item.priority === "low" || item.priority === "normal" || item.priority === "high" || item.priority === "urgent"
+      ? item.priority
+      : "normal",
     dependsOn: Array.isArray(item.dependsOn) ? item.dependsOn.filter((dep): dep is string => typeof dep === "string") : [],
   };
 }
@@ -536,6 +540,7 @@ function generateFallbackSubtasks(initialDescription: string): SubtaskItem[] {
       title: "Define implementation approach",
       description: `Clarify scope and technical approach for: ${initialDescription}`,
       suggestedSize: "S",
+      priority: "normal",
       dependsOn: [],
     },
     {
@@ -543,6 +548,7 @@ function generateFallbackSubtasks(initialDescription: string): SubtaskItem[] {
       title: "Implement core changes",
       description: "Build the main functionality required by the task description.",
       suggestedSize: "M",
+      priority: "normal",
       dependsOn: ["subtask-1"],
     },
     {
@@ -550,6 +556,7 @@ function generateFallbackSubtasks(initialDescription: string): SubtaskItem[] {
       title: "Verify and polish",
       description: "Add tests, validation, and any follow-up cleanup needed for delivery.",
       suggestedSize: "S",
+      priority: "normal",
       dependsOn: ["subtask-2"],
     },
   ];

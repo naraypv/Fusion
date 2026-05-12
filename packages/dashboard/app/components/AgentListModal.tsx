@@ -12,7 +12,8 @@ import { getAgentHealthStatus } from "../utils/agentHealth";
 import { getErrorMessage } from "@fusion/core";
 import type { AgentHealthStatus } from "../utils/agentHealth";
 import { useConfirm } from "../hooks/useConfirm";
-import { CollapsibleErrorDisplay } from "./AgentsView";
+import { AgentAvatar } from "./AgentAvatar";
+import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
 
 interface AgentListModalProps {
   isOpen: boolean;
@@ -75,13 +76,17 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
     });
   }, [agents, optimisticStateOverrides]);
 
-  // Filter agents for display: hide terminated agents in default "All States" view
-  // but show them when the user explicitly filters to "terminated"
+  // Display ordering: paused agents accumulate over time and would crowd
+  // active agents at the top; sort them to the bottom in the default
+  // "All States" view, breaking ties by `updatedAt` desc.
   const displayAgents = useMemo(() => {
-    if (filterState === "all") {
-      return optimisticAgents.filter((a) => a.state !== "terminated");
-    }
-    return optimisticAgents;
+    if (filterState !== "all") return optimisticAgents;
+    return [...optimisticAgents].sort((a, b) => {
+      const aPaused = a.state === "paused" ? 1 : 0;
+      const bPaused = b.state === "paused" ? 1 : 0;
+      if (aPaused !== bPaused) return aPaused - bPaused;
+      return (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "");
+    });
   }, [optimisticAgents, filterState]);
 
   const loadAgents = useCallback(async () => {
@@ -208,7 +213,6 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
   };
 
   const getRoleLabel = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.label ?? role;
-  const getRoleIcon = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.icon ?? "◆";
 
   // Use centralized health status utility for consistent labels across all views
   // This fixes the previous hardcoded 60s timeout that was inconsistent with other views
@@ -221,6 +225,17 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
     if (health.color === "var(--state-paused-text)") return "paused";
     if (health.color === "var(--state-error-text)") return "error";
     return "muted";
+  };
+
+  const getHealthSummary = (agent: Agent, health: AgentHealthStatus): { title: string | undefined; label: string | null } => {
+    if (agent.state === "error") {
+      return { title: undefined, label: "Error" };
+    }
+
+    return {
+      title: health.reason ?? health.label,
+      label: health.stateDerived ? null : health.label,
+    };
   };
 
   if (!isOpen) return null;
@@ -285,7 +300,6 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                 <option value="running">Running</option>
                 <option value="paused">Paused</option>
                 <option value="error">Error</option>
-                <option value="terminated">Terminated</option>
               </select>
             </div>
 
@@ -339,18 +353,19 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
               // Board view: compact grid layout
               displayAgents.map(agent => {
                 const health = getHealthStatus(agent);
+                const healthSummary = getHealthSummary(agent, health);
                 const healthTone = getHealthTone(health);
                 return (
                   <div key={agent.id} className="agent-board-card" data-state={agent.state}>
                     <div className="agent-board-header">
-                      <span className="agent-board-icon">{getRoleIcon(agent.role)}</span>
+                      <span className="agent-board-icon"><AgentAvatar agent={agent} size={20} /></span>
                       <span
                         className="agent-board-badge"
                         data-state={agent.state}
                       >
                         {agent.state}
                       </span>
-                      <span className="agent-board-health" data-health={healthTone} title={health.reason ?? health.label}>
+                      <span className="agent-board-health" data-health={healthTone} title={healthSummary.title}>
                         {health.icon}
                       </span>
                     </div>
@@ -390,7 +405,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
@@ -410,11 +425,10 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
-                            disabled={transitioningAgentIds.has(agent.id)}
-                            title="Stop"
+                            onClick={() => void handleDelete(agent.id, agent.name)}
+                            title="Delete"
                           >
-                            <Square size={14} />
+                            <Trash2 size={14} />
                           </button>
                         </>
                       )}
@@ -430,7 +444,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
@@ -450,22 +464,13 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
                             <Square size={14} />
                           </button>
                         </>
-                      )}
-                      {agent.state === "terminated" && (
-                        <button
-                          className="btn btn--sm btn--danger"
-                          onClick={() => void handleDelete(agent.id, agent.name)}
-                          title="Delete"
-                        >
-                          <Trash2 size={14} />
-                        </button>
                       )}
                     </div>
                   </div>
@@ -475,6 +480,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
               // List view: detailed card layout
               displayAgents.map(agent => {
                 const health = getHealthStatus(agent);
+                const healthSummary = getHealthSummary(agent, health);
                 const healthTone = getHealthTone(health);
                 return (
                   <div key={agent.id} className="agent-card" data-state={agent.state}>
@@ -509,7 +515,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                               }
                             }}
                           >
-                            {getRoleIcon(agent.role)}
+                            <AgentAvatar agent={agent} size={20} />
                           </span>
                         )}
                         <div className="agent-meta">
@@ -524,8 +530,8 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                         >
                           {agent.state}
                         </span>
-                        <span className="badge agent-list-health-badge" data-health={healthTone} title={health.reason ?? health.label}>
-                          {health.icon}{!health.stateDerived && ` ${health.label}`}
+                        <span className="badge agent-list-health-badge" data-health={healthTone} title={healthSummary.title}>
+                          {health.icon}{healthSummary.label ? ` ${healthSummary.label}` : ""}
                         </span>
                         <span className="badge text-secondary">
                           {getRoleLabel(agent.role)}
@@ -535,7 +541,16 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
 
                     <div className="agent-card-body">
                       {agent.state === "error" && agent.lastError ? (
-                        <CollapsibleErrorDisplay errorText={agent.lastError} />
+                        <AgentErrorIndicator
+                          errorText={agent.lastError}
+                          issueContext={{
+                            surface: "AgentListModal list",
+                            agentId: agent.id,
+                            agentName: agent.name,
+                            agentState: agent.state,
+                            taskId: agent.taskId,
+                          }}
+                        />
                       ) : null}
                       {agent.taskId && (
                         <div className="agent-task">
@@ -583,7 +598,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
@@ -603,11 +618,10 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
-                            disabled={transitioningAgentIds.has(agent.id)}
-                            title="Stop"
+                            onClick={() => void handleDelete(agent.id, agent.name)}
+                            title="Delete"
                           >
-                            <Square size={14} /> Stop
+                            <Trash2 size={14} /> Delete
                           </button>
                         </>
                       )}
@@ -623,7 +637,7 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
@@ -643,30 +657,11 @@ export function AgentListModal({ isOpen, onClose, addToast, projectId }: AgentLi
                           </button>
                           <button
                             className="btn btn--sm btn--danger"
-                            onClick={() => void handleStateChange(agent.id, "terminated")}
+                            onClick={() => void handleStateChange(agent.id, "paused")}
                             disabled={transitioningAgentIds.has(agent.id)}
                             title="Stop"
                           >
                             <Square size={14} /> Stop
-                          </button>
-                        </>
-                      )}
-                      {agent.state === "terminated" && (
-                        <>
-                          <button
-                            className="btn btn--sm btn-task-create"
-                            onClick={() => void handleStateChange(agent.id, "active")}
-                            disabled={transitioningAgentIds.has(agent.id)}
-                            title="Start"
-                          >
-                            <Play size={14} /> Start
-                          </button>
-                          <button
-                            className="btn btn--sm btn--danger"
-                            onClick={() => void handleDelete(agent.id, agent.name)}
-                            title="Delete"
-                          >
-                            <Trash2 size={14} /> Delete
                           </button>
                         </>
                       )}

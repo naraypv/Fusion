@@ -14,7 +14,10 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import type { Database } from "./db.js";
 import { fromJson, toJsonNullable } from "./db.js";
-import { validateMessageMetadata, type Message, type MessageCreateInput, type MessageFilter, type MessageType, type Mailbox, type ParticipantType } from "./types.js";
+import { createLogger } from "./logger.js";
+import { DASHBOARD_USER_ID, normalizeMessageParticipant, validateMessageMetadata, type Message, type MessageCreateInput, type MessageFilter, type MessageType, type Mailbox, type ParticipantType } from "./types.js";
+
+const messageStoreLog = createLogger("message-store");
 
 // ── Event Types ─────────────────────────────────────────────────────
 
@@ -69,8 +72,6 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
   private stmtGetById!: ReturnType<Database["prepare"]>;
   private stmtUpdateRead!: ReturnType<Database["prepare"]>;
   private stmtDelete!: ReturnType<Database["prepare"]>;
-  private stmtCountUnread!: ReturnType<Database["prepare"]>;
-  private stmtGetLastMessage!: ReturnType<Database["prepare"]>;
 
   constructor(
     private db: Database,
@@ -96,14 +97,6 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
 
     this.stmtDelete = this.db.prepare(`
       DELETE FROM messages WHERE id = ?
-    `);
-
-    this.stmtCountUnread = this.db.prepare(`
-      SELECT COUNT(*) as count FROM messages WHERE toId = ? AND toType = ? AND read = 0
-    `);
-
-    this.stmtGetLastMessage = this.db.prepare(`
-      SELECT * FROM messages WHERE toId = ? AND toType = ? ORDER BY createdAt DESC, rowid DESC LIMIT 1
     `);
   }
 
@@ -141,15 +134,15 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     const now = new Date().toISOString();
     const messageId = `msg-${randomUUID().slice(0, 8)}`;
 
-    const fromId = input.fromId ?? "system";
-    const fromType = input.fromType ?? "system";
+    const from = normalizeMessageParticipant(input.fromId ?? "system", input.fromType ?? "system");
+    const to = normalizeMessageParticipant(input.toId, input.toType);
 
     const message: Message = {
       id: messageId,
-      fromId,
-      fromType,
-      toId: input.toId,
-      toType: input.toType,
+      fromId: from.id,
+      fromType: from.type,
+      toId: to.id,
+      toType: to.type,
       content: input.content,
       type: input.type,
       read: false,
@@ -173,6 +166,7 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     );
 
     this.db.bumpLastModified();
+    messageStoreLog.log(`MessageStore emitting message:sent id=${message.id} type=${message.type} fromId=${message.fromId} toId=${message.toId}`);
     this.emit("message:sent", message);
     this.emit("message:received", message);
 
@@ -224,6 +218,13 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     return this.queryMessagesByParticipant("from", ownerId, ownerType, filter);
   }
 
+  private getParticipantIdsForLookup(ownerId: string, ownerType: ParticipantType): string[] {
+    if (ownerType === "user" && ownerId === DASHBOARD_USER_ID) {
+      return [DASHBOARD_USER_ID, "user:dashboard", "User: user:dashboard"];
+    }
+    return [ownerId];
+  }
+
   private queryMessagesByParticipant(
     direction: "to" | "from",
     ownerId: string,
@@ -232,8 +233,12 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
   ): Message[] {
     const idCol = direction === "to" ? "toId" : "fromId";
     const typeCol = direction === "to" ? "toType" : "fromType";
-    const whereClauses: string[] = [`${idCol} = ?`, `${typeCol} = ?`];
-    const params: (string | number)[] = [ownerId, ownerType];
+    const participantIds = this.getParticipantIdsForLookup(ownerId, ownerType);
+    const idPredicate = participantIds.length === 1
+      ? `${idCol} = ?`
+      : `${idCol} IN (${participantIds.map(() => "?").join(", ")})`;
+    const whereClauses: string[] = [idPredicate, `${typeCol} = ?`];
+    const params: (string | number)[] = [...participantIds, ownerType];
 
     if (filter?.type) {
       whereClauses.push("type = ?");
@@ -294,16 +299,21 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     ownerType: ParticipantType,
   ): number {
     const now = new Date().toISOString();
+    const participantIds = this.getParticipantIdsForLookup(ownerId, ownerType);
+    const toIdPredicate = participantIds.length === 1
+      ? "toId = ?"
+      : `toId IN (${participantIds.map(() => "?").join(", ")})`;
+
     // Get count of unread messages before updating
     const unreadRow = this.db.prepare(`
-      SELECT COUNT(*) as count FROM messages WHERE toId = ? AND toType = ? AND read = 0
-    `).get(ownerId, ownerType) as { count: number } | undefined;
+      SELECT COUNT(*) as count FROM messages WHERE ${toIdPredicate} AND toType = ? AND read = 0
+    `).get(...participantIds, ownerType) as { count: number } | undefined;
     const count = unreadRow?.count ?? 0;
 
     // Mark all as read
     this.db.prepare(`
-      UPDATE messages SET read = 1, updatedAt = ? WHERE toId = ? AND toType = ? AND read = 0
-    `).run(now, ownerId, ownerType);
+      UPDATE messages SET read = 1, updatedAt = ? WHERE ${toIdPredicate} AND toType = ? AND read = 0
+    `).run(now, ...participantIds, ownerType);
 
     this.db.bumpLastModified();
     return count;
@@ -336,21 +346,39 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     participantA: { id: string; type: ParticipantType },
     participantB: { id: string; type: ParticipantType },
   ): Message[] {
+    const participantAIds = this.getParticipantIdsForLookup(participantA.id, participantA.type);
+    const participantBIds = this.getParticipantIdsForLookup(participantB.id, participantB.type);
+    const participantAFromPredicate = participantAIds.length === 1
+      ? "fromId = ?"
+      : `fromId IN (${participantAIds.map(() => "?").join(", ")})`;
+    const participantAToPredicate = participantAIds.length === 1
+      ? "toId = ?"
+      : `toId IN (${participantAIds.map(() => "?").join(", ")})`;
+    const participantBFromPredicate = participantBIds.length === 1
+      ? "fromId = ?"
+      : `fromId IN (${participantBIds.map(() => "?").join(", ")})`;
+    const participantBToPredicate = participantBIds.length === 1
+      ? "toId = ?"
+      : `toId IN (${participantBIds.map(() => "?").join(", ")})`;
+
     // Find messages where either participant is sender or receiver
-    // This captures all messages between the two participants
     const rows = this.db.prepare(`
       SELECT * FROM messages
       WHERE (
-        (fromId = ? AND fromType = ? AND toId = ? AND toType = ?)
+        (${participantAFromPredicate} AND fromType = ? AND ${participantBToPredicate} AND toType = ?)
         OR
-        (fromId = ? AND fromType = ? AND toId = ? AND toType = ?)
+        (${participantBFromPredicate} AND fromType = ? AND ${participantAToPredicate} AND toType = ?)
       )
       ORDER BY createdAt ASC
     `).all(
-      participantA.id, participantA.type,
-      participantB.id, participantB.type,
-      participantB.id, participantB.type,
-      participantA.id, participantA.type,
+      ...participantAIds,
+      participantA.type,
+      ...participantBIds,
+      participantB.type,
+      ...participantBIds,
+      participantB.type,
+      ...participantAIds,
+      participantA.type,
     );
 
     return (rows as unknown as MessageRow[]).map((row) => this.rowToMessage(row));
@@ -366,10 +394,19 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     ownerId: string,
     ownerType: ParticipantType,
   ): Mailbox {
-    const unreadRow = this.stmtCountUnread.get(ownerId, ownerType) as { count: number } | undefined;
+    const participantIds = this.getParticipantIdsForLookup(ownerId, ownerType);
+    const toIdPredicate = participantIds.length === 1
+      ? "toId = ?"
+      : `toId IN (${participantIds.map(() => "?").join(", ")})`;
+
+    const unreadRow = this.db.prepare(`
+      SELECT COUNT(*) as count FROM messages WHERE ${toIdPredicate} AND toType = ? AND read = 0
+    `).get(...participantIds, ownerType) as { count: number } | undefined;
     const unreadCount = unreadRow?.count ?? 0;
 
-    const lastRow = this.stmtGetLastMessage.get(ownerId, ownerType) as unknown as MessageRow | undefined;
+    const lastRow = this.db.prepare(`
+      SELECT * FROM messages WHERE ${toIdPredicate} AND toType = ? ORDER BY createdAt DESC, rowid DESC LIMIT 1
+    `).get(...participantIds, ownerType) as unknown as MessageRow | undefined;
     const lastMessage = lastRow ? this.rowToMessage(lastRow) : undefined;
 
     return {
@@ -378,6 +415,32 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
       unreadCount,
       lastMessage,
     };
+  }
+
+  /**
+   * Get all agent-to-agent messages across all agents.
+   * @returns Array of messages (newest first)
+   */
+  getAllAgentToAgentMessages(): Message[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE type = ?
+      ORDER BY createdAt DESC, rowid DESC
+    `).all("agent-to-agent");
+
+    return (rows as unknown as MessageRow[]).map((row) => this.rowToMessage(row));
+  }
+
+  /**
+   * Get unread count across all agent-to-agent messages.
+   */
+  getUnreadAgentToAgentCount(): number {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) as count FROM messages
+      WHERE type = ? AND read = 0
+    `).get("agent-to-agent") as { count: number } | undefined;
+
+    return row?.count ?? 0;
   }
 
   /**

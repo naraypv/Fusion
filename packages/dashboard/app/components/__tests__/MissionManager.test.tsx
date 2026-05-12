@@ -55,6 +55,8 @@ vi.mock("lucide-react", () => ({
   Loader2: ({ className }: any) => <span data-testid="loader-icon" className={className}>Loader</span>,
   Link: () => <span data-testid="link-icon">Link</span>,
   Unlink: () => <span data-testid="unlink-icon">Unlink</span>,
+  ArrowLeft: () => <span data-testid="arrow-left-icon">ArrowLeft</span>,
+  ArrowRight: () => <span data-testid="arrow-right-icon">ArrowRight</span>,
   Play: () => <span data-testid="play-icon">Play</span>,
   Square: () => <span data-testid="square-icon">Square</span>,
   Sparkles: () => <span data-testid="sparkles-icon">Sparkles</span>,
@@ -74,6 +76,7 @@ const mockMissions = [
     title: "Build Auth System",
     description: "Complete authentication flow",
     status: "planning",
+    interviewState: "not_started",
     milestones: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -83,6 +86,7 @@ const mockMissions = [
     title: "API Redesign",
     description: "Redesign the REST API",
     status: "active",
+    interviewState: "not_started",
     autopilotEnabled: true,
     autopilotState: "watching",
     milestones: [],
@@ -775,17 +779,17 @@ describe("MissionManager", () => {
       expect(mobileSpan?.textContent).toBe("Build Auth System");
     });
 
-    it("sidebar header hides title and shows only action buttons", async () => {
+    it("renders the desktop Plan New Mission CTA in the sidebar footer action region", async () => {
       globalThis.fetch = createFetchMock();
       render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
 
       await waitFor(() => {
-        const sidebarTitle = document.querySelector(".mission-manager__sidebar-title");
-        const sidebarActions = document.querySelector(".mission-manager__sidebar-actions");
-        expect(sidebarTitle).toBeInTheDocument();
-        expect(sidebarActions).toBeInTheDocument();
-        expect(screen.getByRole("button", { name: "Plan with AI" })).toBeInTheDocument();
-        expect(screen.getByRole("button", { name: "New Mission" })).toBeInTheDocument();
+        const sidebar = screen.getByTestId("mission-sidebar");
+        const sidebarFooter = within(sidebar).getByTestId("mission-sidebar-footer");
+        const cta = within(sidebarFooter).getByRole("button", { name: "Plan New Mission" });
+
+        expect(cta).toBeInTheDocument();
+        expect(within(sidebar).queryByText("No missions yet")).toBeNull();
       });
     });
   });
@@ -1039,13 +1043,10 @@ describe("MissionManager", () => {
     fireEvent.click(screen.getByTestId("mission-activity-load-more"));
 
     await waitFor(() => {
-      expect(
-        screen.getByText("65 of 65", {
-          selector: ".mission-detail__activity-count",
-        }),
-      ).toBeDefined();
+      const activityCount = document.querySelector(".mission-detail__activity-count");
+      expect(activityCount?.textContent?.trim()).toBe("65 of 65");
       expect(screen.queryByTestId("mission-activity-load-more")).toBeNull();
-    });
+    }, { timeout: 5000 });
   }, 15000);
 
   it("auto-scrolls to latest mission activity on initial load", async () => {
@@ -1382,12 +1383,13 @@ describe("MissionManager", () => {
     });
   });
 
-  it("shows empty state when no missions exist", async () => {
+  it("shows empty state with Plan New Mission CTA when no missions exist", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(mockApiResponse([]));
     render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByText("No missions yet. Create one to start planning.")).toBeDefined();
+      expect(screen.getByText("No missions yet")).toBeDefined();
+      expect(screen.getAllByRole("button", { name: "Plan New Mission" }).length).toBeGreaterThan(0);
     });
   });
 
@@ -1497,7 +1499,7 @@ describe("MissionManager", () => {
     render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "New Mission" })).toBeDefined();
+      expect(screen.getByRole("button", { name: "Plan New Mission" })).toBeDefined();
     });
   });
 
@@ -1575,11 +1577,8 @@ describe("MissionManager", () => {
 
       render(<MissionManager isOpen={true} isInline={true} onClose={vi.fn()} addToast={vi.fn()} />);
 
-      await waitFor(() => {
-        expect(screen.getByText("Build Auth System")).toBeDefined();
-      });
-      fireEvent.click(screen.getByText("Build Auth System"));
-
+      // Inline mode auto-selects the first mission, so the detail view is
+      // already populated; just wait for the detail content to render.
       await waitForDetailLoaded();
       expect(screen.getByTestId("mission-back-btn")).toBeInTheDocument();
       expect(getComputedStyle(screen.getByTestId("mission-back-btn")).display).toBe("none");
@@ -1594,10 +1593,10 @@ describe("MissionManager", () => {
     render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Plan with AI" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Plan New Mission" })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Plan with AI" }));
+    fireEvent.click(screen.getByRole("button", { name: "Plan New Mission" }));
 
     await waitFor(() => {
       expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
@@ -1651,6 +1650,459 @@ describe("MissionManager", () => {
 
     await waitFor(() => {
       expect(screen.queryByText("Plan Mission with AI")).not.toBeInTheDocument();
+    });
+  });
+
+  it("keeps interview-pending rows visible while opened from a resume session", async () => {
+    mockFetchAiSession.mockResolvedValueOnce({
+      id: "session-bg-1",
+      type: "mission_interview",
+      status: "generating",
+      title: "Mission interview",
+      currentQuestion: null,
+      result: null,
+      thinkingOutput: "",
+      error: null,
+      projectId: "project-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    mockFetchAiSessions.mockResolvedValue([
+      {
+        id: "session-bg-1",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Project A transient interview",
+        projectId: "project-a",
+        lockedByTab: null,
+        updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+    ]);
+
+    const missionsWithPersistedInterview = [
+      {
+        id: "M-PERSISTED-INTERVIEW",
+        title: "Persisted mission interview",
+        description: "Mission should stay discoverable while interview waits for input",
+        status: "planning",
+        interviewState: "in_progress",
+        milestones: [],
+        createdAt: "2026-01-05T00:00:00.000Z",
+        updatedAt: "2026-01-05T00:00:00.000Z",
+      },
+      ...mockMissions,
+    ];
+
+    globalThis.fetch = createFetchMockWithHealth(missionsWithPersistedInterview as Array<Record<string, unknown>>, {
+      ...mockMissionHealthById,
+      "M-PERSISTED-INTERVIEW": {
+        missionId: "M-PERSISTED-INTERVIEW",
+        status: "planning",
+        tasksCompleted: 0,
+        tasksFailed: 0,
+        tasksInFlight: 0,
+        totalTasks: 0,
+        estimatedCompletionPercent: 0,
+        autopilotState: "inactive",
+        autopilotEnabled: false,
+      },
+    });
+
+    render(
+      <MissionManager
+        isOpen={true}
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        projectId="project-a"
+        resumeSessionId="session-bg-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
+      expect(screen.getByText("Project A transient interview")).toBeInTheDocument();
+      expect(screen.getByText("Persisted mission interview")).toBeInTheDocument();
+    });
+
+    expect(screen.getByLabelText("Resume interview")).toBeInTheDocument();
+  });
+
+  it("re-shows project-scoped transient interview rows after banner resume is backgrounded on mobile", async () => {
+    mockViewport("mobile");
+
+    const missionsWithPersistedInterview = [
+      {
+        id: "M-PERSISTED-INTERVIEW",
+        title: "Persisted mission interview",
+        description: "Persisted mission row",
+        status: "planning",
+        interviewState: "in_progress",
+        milestones: [],
+        createdAt: "2026-01-06T00:00:00.000Z",
+        updatedAt: "2026-01-06T00:00:00.000Z",
+      },
+      ...mockMissions,
+    ];
+
+    mockFetchAiSession.mockResolvedValueOnce({
+      id: "session-bg-1",
+      type: "mission_interview",
+      status: "generating",
+      title: "Project A transient interview",
+      inputPayload: JSON.stringify({ missionTitle: "Project A transient interview" }),
+      conversationHistory: "[]",
+      currentQuestion: null,
+      result: null,
+      thinkingOutput: "",
+      error: null,
+      projectId: "project-a",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    mockFetchAiSessions.mockResolvedValue([
+      {
+        id: "session-bg-1",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Project A transient interview",
+        projectId: "project-a",
+        lockedByTab: null,
+        updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+      {
+        id: "session-other-project",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Project B transient interview",
+        projectId: "project-b",
+        lockedByTab: null,
+        updatedAt: "2026-01-04T00:00:00.000Z",
+      },
+    ]);
+
+    globalThis.fetch = createFetchMockWithHealth(missionsWithPersistedInterview as Array<Record<string, unknown>>, {
+      ...mockMissionHealthById,
+      "M-PERSISTED-INTERVIEW": {
+        missionId: "M-PERSISTED-INTERVIEW",
+        status: "planning",
+        tasksCompleted: 0,
+        tasksFailed: 0,
+        tasksInFlight: 0,
+        totalTasks: 0,
+        estimatedCompletionPercent: 0,
+        autopilotState: "inactive",
+        autopilotEnabled: false,
+      },
+    });
+
+    render(
+      <MissionManager
+        isOpen={true}
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        projectId="project-a"
+        resumeSessionId="session-bg-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
+      expect(screen.getByText("Preparing next question...")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByLabelText("Send to background"));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Plan Mission with AI")).not.toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Project A transient interview")).toBeInTheDocument();
+      expect(screen.getByText("Persisted mission interview")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText("Project B transient interview")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Resume interview")).toBeInTheDocument();
+    expect(mockFetchAiSessions).toHaveBeenCalledWith("project-a");
+  });
+
+  it("keeps persisted interview-stage missions visible with interview styling and mission selection behavior", async () => {
+    const missionsWithInterview = [
+      {
+        id: "M-INTERVIEW",
+        title: "Reliability planning draft",
+        description: "Should remain visible while interview planning is in progress",
+        status: "planning",
+        interviewState: "in_progress",
+        milestones: [],
+        createdAt: "2026-01-06T00:00:00.000Z",
+        updatedAt: "2026-01-06T00:00:00.000Z",
+      },
+      ...mockMissions,
+    ];
+
+    mockFetchAiSessions.mockResolvedValueOnce([]);
+
+    globalThis.fetch = createFetchMockWithHealth(missionsWithInterview as Array<Record<string, unknown>>, {
+      ...mockMissionHealthById,
+      "M-INTERVIEW": {
+        missionId: "M-INTERVIEW",
+        status: "planning",
+        tasksCompleted: 0,
+        tasksFailed: 0,
+        tasksInFlight: 0,
+        totalTasks: 0,
+        estimatedCompletionPercent: 0,
+        autopilotState: "inactive",
+        autopilotEnabled: false,
+      },
+    });
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    const interviewMissionTitle = await screen.findByText("Reliability planning draft");
+    const interviewMissionRow = interviewMissionTitle.closest(".mission-list__item");
+    expect(interviewMissionRow).toBeTruthy();
+    expect(interviewMissionRow).toHaveClass("mission-list__item--interview");
+
+    expect(within(interviewMissionRow as HTMLElement).getByText("Interview in progress")).toBeInTheDocument();
+    expect(
+      within(interviewMissionRow as HTMLElement).getByText(
+        "Mission interview is still in progress. Open this mission to continue planning.",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(interviewMissionTitle);
+
+    await waitFor(() => {
+      expect(screen.getByText("Database Schema")).toBeInTheDocument();
+    });
+  });
+
+  it("shows in-progress interview sessions in the main mission list without footer resume duplication", async () => {
+    mockFetchAiSessions.mockResolvedValueOnce([
+      {
+        id: "session-awaiting",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Payment workflow planning",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+      {
+        id: "session-generating",
+        type: "mission_interview",
+        status: "generating",
+        title: "Analytics mission drafting",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-04T00:00:00.000Z",
+      },
+      {
+        id: "session-error",
+        type: "mission_interview",
+        status: "error",
+        title: "SRE guardrails",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-05T00:00:00.000Z",
+      },
+      {
+        id: "session-complete",
+        type: "mission_interview",
+        status: "complete",
+        title: "Should not render",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-06T00:00:00.000Z",
+      },
+    ]);
+    mockFetchAiSession.mockResolvedValue({
+      id: "session-awaiting",
+      type: "mission_interview",
+      status: "awaiting_input",
+      title: "Payment workflow planning",
+      inputPayload: JSON.stringify({ missionGoal: "Payment workflow planning" }),
+      conversationHistory: "[]",
+      currentQuestion: JSON.stringify({
+        question: "Which payment providers should be supported first?",
+        kind: "text",
+        key: "provider_scope",
+      }),
+      result: null,
+      thinkingOutput: "",
+      error: null,
+      projectId: null,
+      createdAt: "2026-01-03T00:00:00.000Z",
+      updatedAt: "2026-01-03T00:00:00.000Z",
+    });
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Build Auth System")).toBeInTheDocument();
+      expect(screen.getByText("Payment workflow planning")).toBeInTheDocument();
+      expect(screen.getByText("Analytics mission drafting")).toBeInTheDocument();
+      expect(screen.getByText("SRE guardrails")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText("Should not render")).not.toBeInTheDocument();
+    expect(screen.queryByText(/interview sessions pending/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps persisted interview missions distinct from transient interview sessions", async () => {
+    const missionsWithInterview = [
+      {
+        id: "M-PERSISTED-INTERVIEW",
+        title: "Persisted mission interview",
+        description: "Persisted mission row",
+        status: "planning",
+        interviewState: "in_progress",
+        milestones: [],
+        createdAt: "2026-01-06T00:00:00.000Z",
+        updatedAt: "2026-01-06T00:00:00.000Z",
+      },
+      ...mockMissions,
+    ];
+
+    mockFetchAiSessions.mockResolvedValueOnce([
+      {
+        id: "session-awaiting",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Transient interview session",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+    ]);
+
+    globalThis.fetch = createFetchMockWithHealth(missionsWithInterview as Array<Record<string, unknown>>, {
+      ...mockMissionHealthById,
+      "M-PERSISTED-INTERVIEW": {
+        missionId: "M-PERSISTED-INTERVIEW",
+        status: "planning",
+        tasksCompleted: 0,
+        tasksFailed: 0,
+        tasksInFlight: 0,
+        totalTasks: 0,
+        estimatedCompletionPercent: 0,
+        autopilotState: "inactive",
+        autopilotEnabled: false,
+      },
+    });
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    const persistedTitle = await screen.findByText("Persisted mission interview");
+    const transientTitle = await screen.findByText("Transient interview session");
+
+    const persistedRow = persistedTitle.closest(".mission-list__item");
+    const transientRow = transientTitle.closest(".mission-list__item");
+
+    expect(persistedRow).toBeTruthy();
+    expect(transientRow).toBeTruthy();
+    expect(persistedRow).not.toBe(transientRow);
+
+    expect(within(persistedRow as HTMLElement).getByText("Interview in progress")).toBeInTheDocument();
+    expect(within(transientRow as HTMLElement).getByText("Awaiting input")).toBeInTheDocument();
+    expect(screen.queryByText(/interview sessions pending/i)).not.toBeInTheDocument();
+
+  });
+
+  it("only shows in-progress interview sessions scoped to the active project", async () => {
+    mockFetchAiSessions.mockResolvedValueOnce([
+      {
+        id: "session-project-a",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Project A Interview",
+        projectId: "project-a",
+        lockedByTab: null,
+        updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+      {
+        id: "session-project-b",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Project B Interview",
+        projectId: "project-b",
+        lockedByTab: null,
+        updatedAt: "2026-01-04T00:00:00.000Z",
+      },
+      {
+        id: "session-unscoped",
+        type: "mission_interview",
+        status: "awaiting_input",
+        title: "Unscoped Interview",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-05T00:00:00.000Z",
+      },
+    ]);
+    globalThis.fetch = createFetchMock();
+
+    render(
+      <MissionManager
+        isOpen={true}
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        projectId="project-a"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Project A Interview")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText("Project B Interview")).not.toBeInTheDocument();
+    expect(screen.queryByText("Unscoped Interview")).not.toBeInTheDocument();
+    expect(mockFetchAiSessions).toHaveBeenCalledWith("project-a");
+  });
+  it("exposes retry action for errored interview sessions from the mission list", async () => {
+    mockFetchAiSessions.mockResolvedValueOnce([
+      {
+        id: "session-error",
+        type: "mission_interview",
+        status: "error",
+        title: "Mission in error",
+        projectId: null,
+        lockedByTab: null,
+        updatedAt: "2026-01-05T00:00:00.000Z",
+      },
+    ]);
+    mockFetchAiSession.mockResolvedValue({
+      id: "session-error",
+      type: "mission_interview",
+      status: "error",
+      title: "Mission in error",
+      inputPayload: "{}",
+      conversationHistory: "[]",
+      currentQuestion: null,
+      result: null,
+      thinkingOutput: "",
+      error: "Planning failed",
+      projectId: null,
+      createdAt: "2026-01-05T00:00:00.000Z",
+      updatedAt: "2026-01-05T00:00:00.000Z",
+    });
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Retry interview")).toBeInTheDocument();
+      expect(screen.getByText("Needs retry")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByLabelText("Retry interview"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
     });
   });
 
@@ -2958,12 +3410,11 @@ describe("MissionManager", () => {
       await waitFor(() => expect(document.querySelector(".mission-manager__detail-pane .mission-confirm-panel")).toBeTruthy());
     });
 
-    it("renders sidebar header title and compact add buttons", async () => {
+    it("renders sidebar header with Plan New Mission CTA button", async () => {
       globalThis.fetch = createFetchMock();
       render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
-      await waitFor(() => expect(document.querySelector(".mission-manager__sidebar-title")?.textContent).toBe("Missions"));
-      expect(screen.getByLabelText("Plan with AI")).toBeInTheDocument();
-      expect(screen.getByLabelText("New Mission")).toBeInTheDocument();
+      await waitFor(() => expect(document.querySelector(".mission-manager__sidebar-cta")).toBeInTheDocument());
+      expect(screen.getByLabelText("Plan New Mission")).toBeInTheDocument();
     });
   });
 
@@ -3232,6 +3683,28 @@ describe("MissionManager", () => {
   });
 
   describe("mobile stacked layout", () => {
+    it("shows a single top-of-list Plan New Mission CTA above mission cards", async () => {
+      mockViewport("mobile");
+      globalThis.fetch = createFetchMock();
+      render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+      await waitFor(() => expect(screen.getByText("Build Auth System")).toBeInTheDocument());
+
+      const missionList = document.querySelector(".mission-list") as HTMLElement;
+      const topAction = missionList.querySelector(".mission-list__top-action") as HTMLElement;
+      expect(topAction).toBeInTheDocument();
+
+      const missionItems = missionList.querySelectorAll(".mission-list__item");
+      expect(missionItems.length).toBeGreaterThan(0);
+      const firstItem = missionItems[0] as HTMLElement;
+      expect(topAction.compareDocumentPosition(firstItem) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+      const topCtas = missionList.querySelectorAll(".mission-list__primary-cta");
+      expect(topCtas).toHaveLength(1);
+      expect(topCtas[0]).toHaveTextContent("Plan New Mission");
+      expect(document.querySelector(".mission-list__footer-actions")).toBeNull();
+    });
+
     it("renders stacked body on mobile and hides desktop split", async () => {
       mockViewport("mobile");
       globalThis.fetch = createDetailFetchMock();

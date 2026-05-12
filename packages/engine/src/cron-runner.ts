@@ -2,6 +2,9 @@ import { exec } from "node:child_process";
 
 import {
   resolveProjectDefaultModel,
+  runScheduledEvalBatch,
+  resolveTaskEvaluationSettings,
+  isEvalsExperimentalEnabled,
   type TaskStore,
   type AutomationStore,
   type ScheduledTask,
@@ -10,10 +13,12 @@ import {
   type AutomationStepResult,
   type Column,
   type TaskCreateInput,
+  type TaskDetail,
 } from "@fusion/core";
 import { createLogger } from "./logger.js";
 import { defaultShell } from "./shell-utils.js";
 import { createFnAgent, promptWithFallback } from "./pi.js";
+import { HybridEvaluatorService } from "./evaluator.js";
 
 const log = createLogger("cron-runner");
 
@@ -128,6 +133,58 @@ export function isInProcessBackupCommand(command: string | undefined): boolean {
   return true;
 }
 
+export function isInProcessMemoryBackupCommand(command: string | undefined): boolean {
+  if (!command) return false;
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  if (SHELL_METACHARACTERS_REGEX.test(trimmed)) return false;
+
+  const tokens = trimmed.split(/\s+/).map((tok) => tok.toLowerCase());
+  let cursor = 0;
+
+  if (tokens[cursor] === "npx") {
+    cursor += 1;
+    while (cursor < tokens.length) {
+      const tok = tokens[cursor];
+      if (tok === undefined || !tok.startsWith("-")) break;
+      const takesValue = (tok === "-p" || tok === "--package")
+        && cursor + 1 < tokens.length
+        && tokens[cursor + 1] !== undefined
+        && !tokens[cursor + 1]!.startsWith("-");
+      cursor += takesValue ? 2 : 1;
+    }
+  }
+
+  const binary = tokens[cursor];
+  if (!binary || !FUSION_BINARY_TOKENS.has(binary)) return false;
+  cursor += 1;
+
+  if (tokens[cursor] !== "memory-backup") return false;
+  cursor += 1;
+  if (tokens[cursor] !== "--create") return false;
+  cursor += 1;
+
+  for (; cursor < tokens.length; cursor += 1) {
+    const tok = tokens[cursor];
+    if (!tok) continue;
+    if (!tok.startsWith("-")) return false;
+  }
+
+  return true;
+}
+
+export function isInProcessScheduledEvalCommand(command: string | undefined): boolean {
+  if (!command) return false;
+  const trimmed = command.trim();
+  if (!trimmed || SHELL_METACHARACTERS_REGEX.test(trimmed)) return false;
+  const tokens = trimmed.split(/\s+/).map((tok) => tok.toLowerCase());
+  return tokens.length >= 3
+    && FUSION_BINARY_TOKENS.has(tokens[0] ?? "")
+    && tokens[1] === "eval"
+    && tokens[2] === "--scheduled-batch"
+    && tokens.slice(3).every((tok) => tok.startsWith("-"));
+}
+
 /** Default execution timeout: 5 minutes. */
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 /** Maximum output buffer: 1 MB. */
@@ -150,6 +207,10 @@ export type AiPromptExecutor = (
 ) => Promise<string>;
 
 export interface CronRunnerOptions {
+  /** Project working directory used for in-process evaluator sessions */
+  workingDirectory?: string;
+  /** Project id for scheduled eval batch persistence */
+  projectId?: string;
   /** Polling interval in milliseconds. Default: 60000 (60s). Minimum: 10000 (10s). */
   pollIntervalMs?: number;
   /** Optional AI prompt executor. When not provided, ai-prompt steps return a configuration error. */
@@ -391,6 +452,14 @@ export class CronRunner {
       return this.executeBackupInProcess(schedule, startedAt);
     }
 
+    if (isInProcessMemoryBackupCommand(schedule.command)) {
+      return this.executeMemoryBackupInProcess(schedule, startedAt);
+    }
+
+    if (isInProcessScheduledEvalCommand(schedule.command)) {
+      return this.executeScheduledEvalInProcess(schedule, startedAt);
+    }
+
     try {
       const timeoutMs = schedule.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       const { stdout, stderr } = await execCommand(schedule.command, {
@@ -453,11 +522,72 @@ export class CronRunner {
     };
   }
 
+  private async executeMemoryBackupInProcess(
+    schedule: ScheduledTask,
+    startedAt: string,
+  ): Promise<AutomationRunResult> {
+    const action = await this.runMemoryBackupActionInProcess();
+    if (action.success) {
+      log.log(`✓ ${schedule.name} completed in-process`);
+    } else {
+      log.warn(`✗ ${schedule.name} in-process memory backup ${action.error ? `threw: ${action.error}` : `reported failure: ${action.output}`}`);
+    }
+    return {
+      success: action.success,
+      output: action.output,
+      error: action.error,
+      startedAt,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
   /**
    * Shared in-process backup execution used by both the legacy-command path
    * and the command-step path. Returns the success/output/error tuple in
    * a shape that callers can wrap into either a run or a step result.
    */
+  private async executeScheduledEvalInProcess(
+    schedule: ScheduledTask,
+    startedAt: string,
+  ): Promise<AutomationRunResult> {
+    const settings = await this.store.getSettings();
+    if (!isEvalsExperimentalEnabled(settings)) {
+      return {
+        success: false,
+        output: "evals-experimental-disabled",
+        error: "Evals experimental feature is disabled",
+        startedAt,
+        completedAt: new Date().toISOString(),
+      };
+    }
+    const evalSettings = resolveTaskEvaluationSettings(settings);
+    const evaluator = new HybridEvaluatorService({ cwd: this.options.workingDirectory ?? process.cwd(), store: this.store });
+
+    const result = await runScheduledEvalBatch({
+      store: this.store,
+      projectId: this.options.projectId ?? "default-project",
+      startedAt,
+      evaluator: async ({ task, run }) => {
+        const taskDetail = await this.store.getTask(task.id);
+        if (!taskDetail) {
+          throw new Error(`Task not found for evaluation: ${task.id}`);
+        }
+        return evaluator.evaluateTask(taskDetail as TaskDetail, { runId: run.id, startedAt: run.startedAt ?? startedAt }, settings, {
+          provider: evalSettings.taskEvaluationProvider,
+          modelId: evalSettings.taskEvaluationModelId,
+        });
+      },
+    });
+
+    return {
+      success: result.status === "completed",
+      output: JSON.stringify(result),
+      error: result.status === "failed" ? "Scheduled eval batch failed" : undefined,
+      startedAt,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
   private async runBackupActionInProcess(): Promise<{
     success: boolean;
     output: string;
@@ -468,6 +598,27 @@ export class CronRunner {
       const fusionDir = this.store.getFusionDir();
       const settings = await this.store.getSettings();
       const result = await runBackupCommand(fusionDir, settings);
+      return {
+        success: result.success,
+        output: truncateOutput(result.output ?? "", ""),
+        error: result.success ? undefined : result.output,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, output: "", error: message };
+    }
+  }
+
+  private async runMemoryBackupActionInProcess(): Promise<{
+    success: boolean;
+    output: string;
+    error: string | undefined;
+  }> {
+    try {
+      const { runMemoryBackupCommand } = await import("@fusion/core");
+      const fusionDir = this.store.getFusionDir();
+      const settings = await this.store.getSettings();
+      const result = await runMemoryBackupCommand(fusionDir, settings);
       return {
         success: result.success,
         output: truncateOutput(result.output ?? "", ""),
@@ -602,6 +753,20 @@ export class CronRunner {
     // to spawning a stale `runfusion.ai` binary.
     if (isInProcessBackupCommand(step.command)) {
       const action = await this.runBackupActionInProcess();
+      return {
+        stepId: step.id,
+        stepName: step.name,
+        stepIndex,
+        success: action.success,
+        output: action.output,
+        error: action.error,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      };
+    }
+
+    if (isInProcessMemoryBackupCommand(step.command)) {
+      const action = await this.runMemoryBackupActionInProcess();
       return {
         stepId: step.id,
         stepName: step.name,

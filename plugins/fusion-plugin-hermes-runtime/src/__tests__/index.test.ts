@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { mockResolveCli } = vi.hoisted(() => ({
+const { mockResolveCli, mockInstallFusionSkill } = vi.hoisted(() => ({
   mockResolveCli: vi.fn().mockReturnValue({
     binaryPath: "hermes",
     model: undefined,
@@ -9,23 +9,32 @@ const { mockResolveCli } = vi.hoisted(() => ({
     yolo: false,
     cliTimeoutMs: 300_000,
   }),
+  mockInstallFusionSkill: vi.fn().mockReturnValue({
+    outcome: "installed",
+    sourceDir: "/tmp/source",
+    targetDir: "/tmp/target",
+  }),
 }));
 
 vi.mock("../cli-spawn.js", async () => {
-  const actual = await vi.importActual<typeof import("../cli-spawn.js")>(
-    "../cli-spawn.js",
-  );
+  const actual = await vi.importActual<typeof import("../cli-spawn.js")>("../cli-spawn.js");
   return {
     ...actual,
     resolveCliSettings: mockResolveCli,
   };
 });
 
-import plugin, {
-  hermesRuntimeMetadata,
-  hermesRuntimeFactory,
-  HERMES_RUNTIME_ID,
-} from "../index.js";
+vi.mock("../fusion-skill-install.js", async () => {
+  const actual = await vi.importActual<typeof import("../fusion-skill-install.js")>(
+    "../fusion-skill-install.js",
+  );
+  return {
+    ...actual,
+    installFusionSkillIntoHermesHome: mockInstallFusionSkill,
+  };
+});
+
+import plugin, { HERMES_RUNTIME_ID, hermesRuntimeFactory, hermesRuntimeMetadata } from "../index.js";
 import { HermesRuntimeAdapter } from "../runtime-adapter.js";
 
 function createMockContext(settings: Record<string, unknown> = {}) {
@@ -48,6 +57,12 @@ describe("hermes-runtime plugin", () => {
       maxTurns: 12,
       yolo: false,
       cliTimeoutMs: 300_000,
+      profile: undefined,
+    });
+    mockInstallFusionSkill.mockReturnValue({
+      outcome: "installed",
+      sourceDir: "/tmp/source",
+      targetDir: "/tmp/target",
     });
   });
 
@@ -73,13 +88,33 @@ describe("hermes-runtime plugin", () => {
       maxTurns: 12,
       yolo: false,
       cliTimeoutMs: 300_000,
+      profile: undefined,
     });
+
     const ctx = createMockContext({ binaryPath: "/opt/homebrew/bin/hermes" });
     await plugin.hooks!.onLoad!(ctx as any);
+
     expect(mockResolveCli).toHaveBeenCalledWith(ctx.settings);
-    expect(ctx.logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("/opt/homebrew/bin/hermes"),
-    );
+    expect(mockInstallFusionSkill).toHaveBeenCalledWith({ profile: undefined });
+    expect(ctx.logger.info).toHaveBeenCalledWith(expect.stringContaining("fusionSkill=installed"));
+    expect(ctx.emitEvent).toHaveBeenCalledWith("hermes-runtime:loaded", {
+      runtimeId: "hermes",
+      version: plugin.manifest.version,
+    });
+  });
+
+  it("onLoad warns but continues when skill install warns", async () => {
+    mockInstallFusionSkill.mockReturnValue({
+      outcome: "warning",
+      sourceDir: null,
+      targetDir: "/tmp/target",
+      reason: "missing skill source",
+    });
+
+    const ctx = createMockContext();
+    await plugin.hooks!.onLoad!(ctx as any);
+
+    expect(ctx.logger.warn).toHaveBeenCalledWith(expect.stringContaining("auto-install warning"));
     expect(ctx.emitEvent).toHaveBeenCalledWith("hermes-runtime:loaded", {
       runtimeId: "hermes",
       version: plugin.manifest.version,

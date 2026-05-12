@@ -4,6 +4,7 @@ import {
   DEFAULT_PROJECT_SETTINGS,
   GLOBAL_SETTINGS_KEYS,
   PROJECT_SETTINGS_KEYS,
+  isGlobalOnlySettingsKey,
   isGlobalSettingsKey,
   isProjectSettingsKey,
 } from "../types.js";
@@ -58,7 +59,14 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("remoteAccess")).toBe(true);
     expect(isGlobalSettingsKey("persistAgentToolOutput")).toBe(true);
     expect(isProjectSettingsKey("persistAgentToolOutput")).toBe(false);
+    expect(isGlobalSettingsKey("persistAgentThinkingLog")).toBe(true);
+    expect(isProjectSettingsKey("persistAgentThinkingLog")).toBe(false);
+    expect(isGlobalOnlySettingsKey("persistAgentThinkingLog")).toBe(true);
     expect(isGlobalSettingsKey("researchSettings")).toBe(false);
+  });
+
+  it("defaults persisted thinking logs to disabled", () => {
+    expect(DEFAULT_GLOBAL_SETTINGS.persistAgentThinkingLog).toBe(false);
   });
 
   it("includes heartbeatMultiplier in project defaults", () => {
@@ -67,6 +75,36 @@ describe("settings key parity", () => {
 
   it("defaults completionDocumentationMode to off", () => {
     expect(DEFAULT_PROJECT_SETTINGS.completionDocumentationMode).toBe("off");
+  });
+
+  it("keeps task stuck timeout active by default without coupling to workflow step timeout", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.taskStuckTimeoutMs).toBe(600_000);
+    expect(DEFAULT_PROJECT_SETTINGS.workflowStepTimeoutMs).toBe(360_000);
+  });
+
+  it("defaults stale high fan-out blocker escalation age threshold", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.staleHighFanoutBlockerAgeThresholdMs).toBe(2 * 60 * 60 * 1000);
+    expect(isProjectSettingsKey("staleHighFanoutBlockerAgeThresholdMs")).toBe(true);
+    expect(isGlobalSettingsKey("staleHighFanoutBlockerAgeThresholdMs")).toBe(false);
+  });
+
+  it("keeps github tracking keys in expected scopes with documented defaults", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.githubTrackingEnabledByDefault).toBe(false);
+    expect(DEFAULT_PROJECT_SETTINGS.githubTrackingDefaultRepo).toBeUndefined();
+    expect(DEFAULT_PROJECT_SETTINGS.githubAuthMode).toBe("gh-cli");
+    expect(DEFAULT_PROJECT_SETTINGS.githubAuthToken).toBeUndefined();
+    expect(DEFAULT_GLOBAL_SETTINGS.githubTrackingDefaultRepo).toBeUndefined();
+
+    expect(isProjectSettingsKey("githubTrackingEnabledByDefault")).toBe(true);
+    expect(isGlobalSettingsKey("githubTrackingEnabledByDefault")).toBe(false);
+    expect(isProjectSettingsKey("githubAuthMode")).toBe(true);
+    expect(isGlobalSettingsKey("githubAuthMode")).toBe(false);
+    expect(isProjectSettingsKey("githubAuthToken")).toBe(true);
+    expect(isGlobalSettingsKey("githubAuthToken")).toBe(false);
+    expect(isProjectSettingsKey("githubTrackingDefaultRepo")).toBe(true);
+    expect(isGlobalSettingsKey("githubTrackingDefaultRepo")).toBe(true);
+    expect(isGlobalOnlySettingsKey("githubTrackingDefaultRepo")).toBe(false);
+    expect(isGlobalOnlySettingsKey("themeMode")).toBe(true);
   });
 
   it("keeps remoteAccess scoped to global settings only", () => {
@@ -89,10 +127,10 @@ describe("settings key parity", () => {
     expect((DEFAULT_PROJECT_SETTINGS as Record<string, unknown>).experimentalFeatures).toBeUndefined();
   });
 
-  it("No key appears in both GLOBAL_SETTINGS_KEYS and PROJECT_SETTINGS_KEYS", () => {
+  it("only intentional shared keys appear in both global and project scopes", () => {
     const projectKeySet = new Set(PROJECT_SETTINGS_KEYS as readonly string[]);
     const overlap = (GLOBAL_SETTINGS_KEYS as readonly string[]).filter((key) => projectKeySet.has(key));
-    expect(overlap).toEqual([]);
+    expect(overlap).toEqual(["githubTrackingDefaultRepo"]);
   });
 });
 
@@ -120,6 +158,22 @@ describe("research global key parity regression (FN-3313)", () => {
 });
 
 // ── Model Lane Key Parity Regression Tests (FN-1729) ────────────────────────
+
+describe("eval settings parity regression (FN-3393)", () => {
+  it("keeps evalSettings project-scoped with expected defaults", () => {
+    expect(isProjectSettingsKey("evalSettings")).toBe(true);
+    expect(isGlobalSettingsKey("evalSettings")).toBe(false);
+
+    expect(DEFAULT_PROJECT_SETTINGS.evalSettings).toEqual({
+      enabled: false,
+      intervalMs: 86_400_000,
+      evaluatorProvider: undefined,
+      evaluatorModelId: undefined,
+      followUpPolicy: "suggest-only",
+      retentionDays: 30,
+    });
+  });
+});
 
 describe("model lane key parity regression (FN-1729)", () => {
   // All model lane provider/modelId pairs that should exist

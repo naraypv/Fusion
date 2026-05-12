@@ -159,6 +159,21 @@ describe("core modals mobile css coverage", () => {
     expect(mobileBlock).toContain("overflow-y: auto;");
   });
 
+  it("GitManagerModal: mobile fullscreen block includes explicit overlay class and keyboard viewport rule", () => {
+    const css = loadAllAppCss();
+    const mobileBlock = getMainMobileBlock(css);
+
+    expect(mobileBlock).toContain(".modal-overlay.git-manager-modal-overlay,");
+    expect(mobileBlock).toContain(".modal.gm-modal[style*=\"--keyboard-overlap\"]");
+
+    const keyboardRule = mobileBlock.match(/\.modal\.gm-modal\[style\*=\"--keyboard-overlap\"\]\s*\{[^}]+\}/s);
+    expect(keyboardRule).not.toBeNull();
+    expect(keyboardRule![0]).toContain("height: var(--vv-height, 100dvh)");
+    expect(keyboardRule![0]).toContain("min-height: var(--vv-height, 100dvh)");
+    expect(keyboardRule![0]).toContain("max-height: var(--vv-height, 100dvh)");
+    expect(keyboardRule![0]).toContain("translateY(var(--vv-offset-top, 0px))");
+  });
+
   it("GitManagerModal: changes rows/actions wrap without widening viewport on mobile", () => {
     const css = loadAllAppCss();
     const mobileBlock = getMainMobileBlock(css);
@@ -176,6 +191,22 @@ describe("core modals mobile css coverage", () => {
     const fileSectionRule = mobileBlock.match(/\.gm-file-section\s*\{[^}]+\}/s);
     expect(fileSectionRule).not.toBeNull();
     expect(fileSectionRule![0]).toContain("max-width: 100%");
+  });
+
+  it("GitManagerModal: file sections and file lists keep independent scrolling constraints", () => {
+    const css = loadAllAppCss();
+
+    const fileSectionRule = css.match(/\.gm-file-section\s*\{[^}]+\}/s);
+    expect(fileSectionRule).not.toBeNull();
+    expect(fileSectionRule![0]).toContain("display: flex");
+    expect(fileSectionRule![0]).toContain("flex-direction: column");
+    expect(fileSectionRule![0]).toContain("min-height: 0");
+
+    const fileListRule = css.match(/\.gm-file-list\s*\{[^}]+\}/s);
+    expect(fileListRule).not.toBeNull();
+    expect(fileListRule![0]).toContain("overflow-y: auto");
+    expect(fileListRule![0]).toContain("overscroll-behavior: contain");
+    expect(fileListRule![0]).toContain("-webkit-overflow-scrolling: touch");
   });
 
   it("GitManagerModal: modal uses full-screen viewport sizing on mobile (641-768px range)", () => {
@@ -214,7 +245,7 @@ describe("core modals mobile css coverage", () => {
 
     expect(menuBlock).toContain("max-height");
     expect(menuBlock).toContain("overflow-y: auto");
-    expect(menuBlock).toContain("max-width: calc(100vw - 28px)");
+    expect(menuBlock).toContain("max-width: calc(100vw - calc(var(--space-lg) + var(--space-md)))");
   });
 
   it("TaskDetailModal: mobile back control keeps token-based touch-target sizing", () => {
@@ -265,6 +296,28 @@ describe("core modals mobile css coverage", () => {
     );
     expect(fullscreenBlockMatch).not.toBeNull();
     expect(fullscreenBlockMatch![0]).toContain("max-height: unset");
+  });
+
+  it("AgentErrorDetailsModal: mobile fills fullscreen container and keeps inner scrolling log region", () => {
+    const css = loadAllAppCss();
+    const mobileBlock = getMainMobileBlock(css);
+
+    const modalRuleMatch = mobileBlock.match(/\.agent-error-modal\s*\{[^}]+\}/s);
+    expect(modalRuleMatch).not.toBeNull();
+    expect(modalRuleMatch![0]).toContain("height: 100%");
+    expect(modalRuleMatch![0]).toContain("max-height: 100%");
+    expect(modalRuleMatch![0]).toContain("min-height: 0");
+
+    const contentRuleMatch = css.match(/\.agent-error-modal__content\s*\{[^}]+\}/s);
+    expect(contentRuleMatch).not.toBeNull();
+    expect(contentRuleMatch![0]).toContain("overflow: hidden");
+    expect(contentRuleMatch![0]).toContain("display: flex");
+
+    const errorRuleMatch = mobileBlock.match(/\.agent-error-modal__error\s*\{[^}]+\}/s);
+    expect(errorRuleMatch).not.toBeNull();
+    expect(errorRuleMatch![0]).toContain("max-height: none");
+    expect(errorRuleMatch![0]).toContain("-webkit-overflow-scrolling: touch");
+    expect(errorRuleMatch![0]).toContain("overscroll-behavior: contain");
   });
 
   it("NewTaskModal: quick fields buttons meet 36px touch target on mobile", () => {

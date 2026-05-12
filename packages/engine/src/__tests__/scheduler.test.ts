@@ -244,7 +244,7 @@ describe("Scheduler", () => {
       await flushAsyncWork();
 
       // Verify schedule() was called (moveTask should be called since task can start)
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("resets mergeRetries when dispatching a task to in-progress", async () => {
@@ -282,7 +282,7 @@ describe("Scheduler", () => {
         "FN-001",
         expect.objectContaining({ mergeRetries: 0 }),
       );
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("registers task:moved event listener", () => {
@@ -335,7 +335,232 @@ describe("Scheduler", () => {
       await flushAsyncWork();
 
       // Verify schedule() was called - FN-002 should now be able to start
-      expect(store.moveTask).toHaveBeenCalledWith("FN-002", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-002", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+    });
+
+    it.each(["done", "archived"] as const)("FN-3895: clears blockedBy when blocker moves to %s", async (to) => {
+      const dependent = createMockTask({ id: "FN-3799", column: "todo", blockedBy: "FN-3885" });
+      const blocker = createMockTask({ id: "FN-3885", column: to });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependent]),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+        updateTask: vi.fn().mockResolvedValue(undefined),
+      });
+
+      new Scheduler(store);
+      const onCalls = (store.on as any).mock.calls;
+      const movedHandler = onCalls.find((call: any) => call[0] === "task:moved")?.[1];
+
+      await movedHandler({ task: blocker, from: "in-review", to });
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-3799", { blockedBy: null, status: null });
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-3799",
+        `Auto-unblocked: blocker FN-3885 reached ${to}`,
+      );
+    });
+
+    it("FN-3895: does not clear blockedBy for non-terminal transitions", async () => {
+      const dependent = createMockTask({ id: "FN-3799", column: "todo", blockedBy: "FN-3885" });
+      const blocker = createMockTask({ id: "FN-3885", column: "in-review" });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependent]),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blocker, from: "in-progress", to: "in-review" });
+
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-3799", { blockedBy: null, status: null });
+    });
+
+    it("FN-3895: does not clear blockedBy for tasks blocked by a different task", async () => {
+      const dependent = createMockTask({ id: "FN-3799", column: "todo", blockedBy: "FN-4000" });
+      const blocker = createMockTask({ id: "FN-3885", column: "done" });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependent]),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blocker, from: "in-review", to: "done" });
+
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-3799", { blockedBy: null, status: null });
+    });
+
+    it("FN-3895: skips event-driven unblock when enginePaused is true", async () => {
+      const dependent = createMockTask({ id: "FN-3799", column: "todo", blockedBy: "FN-3885" });
+      const blocker = createMockTask({ id: "FN-3885", column: "done" });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependent]),
+        getSettings: vi.fn().mockResolvedValue({ enginePaused: true, globalPause: false }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blocker, from: "in-review", to: "done" });
+
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-3799", { blockedBy: null, status: null });
+    });
+
+    it("FN-3895: unblocks FN-3799 and FN-3811 once FN-3885 reaches done", async () => {
+      const dependentA = createMockTask({ id: "FN-3799", column: "todo", blockedBy: "FN-3885" });
+      const dependentB = createMockTask({ id: "FN-3811", column: "todo", blockedBy: "FN-3885" });
+      const blocker = createMockTask({ id: "FN-3885", column: "done" });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependentA, dependentB]),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blocker, from: "in-review", to: "done" });
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-3799", { blockedBy: null, status: null });
+      expect(store.updateTask).toHaveBeenCalledWith("FN-3811", { blockedBy: null, status: null });
+    });
+
+    it("FN-3908: unblocks queued multi-dependency task when moved blocker archives and remaining deps are satisfied", async () => {
+      const dependent = createMockTask({
+        id: "FN-3170",
+        column: "todo",
+        status: "queued",
+        blockedBy: undefined,
+        dependencies: ["FN-3168", "FN-3169"],
+      });
+      const blockerA = createMockTask({ id: "FN-3168", column: "archived" });
+      const blockerB = createMockTask({ id: "FN-3169", column: "done" });
+      const allTasks = [dependent, blockerA, blockerB];
+      const store = createMockStore({
+        listTasks: vi.fn(async (options?: { column?: string }) =>
+          options?.column === "todo" ? [dependent] : allTasks,
+        ),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blockerA, from: "in-review", to: "archived" });
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-3170", { blockedBy: null, status: null });
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-3170",
+        "Auto-unblocked: blocker FN-3168 reached archived — all dependencies satisfied",
+      );
+    });
+
+    it("FN-3908: repoints blockedBy when moved blocker is done but another dependency remains unresolved", async () => {
+      const dependent = createMockTask({
+        id: "FN-3170",
+        column: "todo",
+        status: "queued",
+        blockedBy: "FN-3168",
+        dependencies: ["FN-3168", "FN-3169"],
+      });
+      const blockerA = createMockTask({ id: "FN-3168", column: "done" });
+      const blockerB = createMockTask({ id: "FN-3169", column: "in-progress" });
+      const allTasks = [dependent, blockerA, blockerB];
+      const store = createMockStore({
+        listTasks: vi.fn(async (options?: { column?: string }) =>
+          options?.column === "todo" ? [dependent] : allTasks,
+        ),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4 }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blockerA, from: "in-progress", to: "done" });
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-3170", { status: "queued", blockedBy: "FN-3169" });
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-3170", { blockedBy: null, status: null });
+    });
+
+    it.each([
+      { globalPause: true, enginePaused: false },
+      { globalPause: false, enginePaused: true },
+    ])("FN-3908: skips event-driven dependency reconciliation when pauses are active", async (settings) => {
+      const dependent = createMockTask({
+        id: "FN-3170",
+        column: "todo",
+        status: "queued",
+        blockedBy: undefined,
+        dependencies: ["FN-3168"],
+      });
+      const blocker = createMockTask({ id: "FN-3168", column: "archived" });
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue([dependent, blocker]),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 2, maxWorktrees: 4, ...settings }),
+      });
+
+      new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: blocker, from: "in-review", to: "archived" });
+
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-3170", { blockedBy: null, status: null });
+    });
+
+    it("FN-3924: does not repoint cleared dependency blocker to unrelated overlap task", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const dep = createMockTask({ id: "FN-DEP", column: "done" });
+      const unrelated = createMockTask({
+        id: "FN-3170",
+        column: "in-review",
+        worktree: "/test/project/.worktrees/fn-3170",
+      });
+      const dependent = createMockTask({
+        id: "FN-3919",
+        column: "todo",
+        status: "queued",
+        blockedBy: "FN-DEP",
+        dependencies: ["FN-DEP"],
+      });
+      const tasks = [dep, unrelated, dependent];
+
+      const listTasks = vi.fn(async (options?: { column?: string; includeArchived?: boolean }) => {
+        if (options?.column === "todo") {
+          return tasks.filter((task) => task.column === "todo");
+        }
+        return tasks;
+      });
+
+      const updateTask = vi.fn(async (id: string, patch: Partial<Task>) => {
+        const task = tasks.find((candidate) => candidate.id === id);
+        if (task) Object.assign(task, patch);
+        return (task ?? createMockTask({ id })) as Task;
+      });
+
+      const store = createMockStore({
+        listTasks,
+        getTask: vi.fn(async (id: string) => (tasks.find((task) => task.id === id) ?? createMockTask({ id })) as any),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 2,
+          maxWorktrees: 4,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: vi.fn(async (taskId: string): Promise<string[]> => {
+          if (taskId === "FN-3170") return ["packages/dashboard/app/App.tsx"];
+          if (taskId === "FN-3919") return ["packages/dashboard/app/App.tsx"];
+          return ["packages/core/src/index.ts"];
+        }),
+        updateTask,
+        moveTask: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const scheduler = new Scheduler(store);
+      const movedHandler = (store.on as any).mock.calls.find((call: any) => call[0] === "task:moved")?.[1];
+      await movedHandler({ task: dep, from: "in-progress", to: "done" });
+
+      expect(updateTask).toHaveBeenCalledWith("FN-3919", { blockedBy: null, status: null });
+
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(updateTask).not.toHaveBeenCalledWith("FN-3919", { status: "queued", blockedBy: "FN-3170" });
+      expect(tasks.find((task) => task.id === "FN-3919")?.blockedBy ?? null).toBeNull();
     });
 
     it("does not trigger scheduling for non-done task:moved events", async () => {
@@ -406,7 +631,7 @@ describe("Scheduler", () => {
       await flushAsyncWork();
 
       // Verify schedule() was called — task in todo should be scheduled
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
   });
 
@@ -450,7 +675,7 @@ describe("Scheduler", () => {
       await flushAsyncWork();
 
       // Should have triggered scheduling and moved the task to in-progress
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("does not trigger scheduling on unpause if scheduler is not running", async () => {
@@ -618,6 +843,31 @@ describe("Scheduler", () => {
       // With 4 in-progress and maxWorktrees=4, no new tasks should start
       expect(store.moveTask).not.toHaveBeenCalled();
     });
+
+    it("FN-3908: logs queued concurrency reason once per unchanged state", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-001", column: "todo", dependencies: [] }),
+        createMockTask({ id: "FN-002", column: "todo", dependencies: [] }),
+      ];
+
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({ maxConcurrent: 1, maxWorktrees: 4 }),
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+      await scheduler.schedule();
+
+      const concurrencyReasonCalls = (store.logEntry as ReturnType<typeof vi.fn>).mock.calls.filter(
+        (call: unknown[]) => call[0] === "FN-002" && String(call[1]).includes("queued — concurrency limit reached"),
+      );
+      expect(concurrencyReasonCalls).toHaveLength(1);
+    });
   });
 
   describe("priority-aware todo dispatch", () => {
@@ -702,7 +952,7 @@ describe("Scheduler", () => {
       await scheduler.schedule();
 
       // Dependency-blocked urgent task should be queued, not started.
-      expect(updateTask).toHaveBeenCalledWith("FN-100", { status: "queued" });
+      expect(updateTask).toHaveBeenCalledWith("FN-100", { status: "queued", blockedBy: "FN-900" });
       // Overlap-blocked urgent task should be queued with blocker id.
       expect(updateTask).toHaveBeenCalledWith("FN-103", { status: "queued", blockedBy: "FN-001" });
       // Paused and recovery-gated urgent tasks never enter scheduling.
@@ -710,7 +960,7 @@ describe("Scheduler", () => {
       expect(moveTask).not.toHaveBeenCalledWith("FN-102", "in-progress");
 
       // Lower-priority ready task still runs.
-      expect(moveTask).toHaveBeenCalledWith("FN-104", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-104", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
       // Overlap-blocked urgent task must not run.
       expect(moveTask).not.toHaveBeenCalledWith("FN-103", "in-progress");
     });
@@ -751,7 +1001,7 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(moveTask).toHaveBeenCalledWith("FN-002", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-002", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
       expect(updateTask).not.toHaveBeenCalledWith("FN-002", { status: "queued", blockedBy: "FN-001" });
     });
 
@@ -789,8 +1039,82 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(moveTask).toHaveBeenCalledWith("FN-002", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-002", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
       expect(updateTask).not.toHaveBeenCalledWith("FN-002", { status: "queued", blockedBy: "FN-001" });
+    });
+
+    it("excludes paused in-review tasks from active scopes", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-001", column: "in-review", paused: true, worktree: "/test/project/.worktrees/fn-001" }),
+        createMockTask({ id: "FN-002", column: "todo" }),
+      ];
+
+      const parseScopeMock = vi.fn(async (taskId: string): Promise<string[]> => {
+        if (taskId === "FN-001") return ["src/foo.ts"];
+        if (taskId === "FN-002") return ["src/foo.ts"];
+        return [];
+      });
+
+      const updateTask = vi.fn().mockResolvedValue(undefined);
+      const moveTask = vi.fn().mockResolvedValue(undefined);
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 2,
+          maxWorktrees: 4,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: parseScopeMock,
+        updateTask,
+        moveTask,
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(moveTask).toHaveBeenCalledWith("FN-002", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+      expect(updateTask).not.toHaveBeenCalledWith("FN-002", { status: "queued", blockedBy: "FN-001" });
+    });
+
+    it("blocks todo when overlapping in-review task is not paused", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-001", column: "in-review", worktree: "/test/project/.worktrees/fn-001" }),
+        createMockTask({ id: "FN-002", column: "todo" }),
+      ];
+
+      const parseScopeMock = vi.fn(async (taskId: string): Promise<string[]> => {
+        if (taskId === "FN-001") return ["src/foo.ts"];
+        if (taskId === "FN-002") return ["src/foo.ts"];
+        return [];
+      });
+
+      const updateTask = vi.fn().mockResolvedValue(undefined);
+      const moveTask = vi.fn().mockResolvedValue(undefined);
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 2,
+          maxWorktrees: 4,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: parseScopeMock,
+        updateTask,
+        moveTask,
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(updateTask).toHaveBeenCalledWith("FN-002", { status: "queued", blockedBy: "FN-001" });
+      expect(moveTask).not.toHaveBeenCalledWith("FN-002", "in-progress");
     });
 
     it("still blocks overlap for non-ignored paths", async () => {
@@ -832,6 +1156,125 @@ describe("Scheduler", () => {
     });
   });
 
+  describe("blockedBy stability — FN-3899", () => {
+    it("preserves a still-valid queued blocker instead of repointing to another active task", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-A", column: "in-progress" }),
+        createMockTask({ id: "FN-B", column: "in-progress" }),
+        createMockTask({ id: "FN-T", column: "todo", status: "queued", blockedBy: "FN-B" }),
+      ];
+
+      const parseScopeMock = vi.fn(async (taskId: string): Promise<string[]> => {
+        if (taskId === "FN-A") return ["packages/engine/src/merger.ts", "packages/dashboard/app/components/Header.tsx"];
+        if (taskId === "FN-B") return ["packages/dashboard/app/App.tsx"];
+        if (taskId === "FN-T") return ["packages/dashboard/app/App.tsx"];
+        return [];
+      });
+
+      const updateTask = vi.fn().mockResolvedValue(undefined);
+      const moveTask = vi.fn().mockResolvedValue(undefined);
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 10,
+          maxWorktrees: 10,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: parseScopeMock,
+        updateTask,
+        moveTask,
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(updateTask).not.toHaveBeenCalledWith("FN-T", { status: "queued", blockedBy: "FN-A" });
+      expect(moveTask).not.toHaveBeenCalledWith("FN-T", "in-progress", expect.anything());
+    });
+
+    it("recomputes stale queued blockers when the recorded blocker is no longer overlapping", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-A", column: "in-progress" }),
+        createMockTask({ id: "FN-B", column: "in-progress" }),
+        createMockTask({ id: "FN-T", column: "todo", status: "queued", blockedBy: "FN-A" }),
+      ];
+
+      const parseScopeMock = vi.fn(async (taskId: string): Promise<string[]> => {
+        if (taskId === "FN-A") return ["packages/engine/src/merger.ts"];
+        if (taskId === "FN-B") return ["packages/dashboard/app/App.tsx"];
+        if (taskId === "FN-T") return ["packages/dashboard/app/App.tsx"];
+        return [];
+      });
+
+      const updateTask = vi.fn().mockResolvedValue(undefined);
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 10,
+          maxWorktrees: 10,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: parseScopeMock,
+        updateTask,
+        moveTask: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(updateTask).toHaveBeenCalledWith("FN-T", { status: "queued", blockedBy: "FN-B" });
+    });
+
+    it("does not stamp blockedBy for todos without overlap, including empty scopes", async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(readFile).mockResolvedValue("# Task\nDo something");
+
+      const tasks = [
+        createMockTask({ id: "FN-A", column: "in-progress" }),
+        createMockTask({ id: "FN-T1", column: "todo" }),
+        createMockTask({ id: "FN-T2", column: "todo" }),
+      ];
+
+      const parseScopeMock = vi.fn(async (taskId: string): Promise<string[]> => {
+        if (taskId === "FN-A") return ["packages/engine/src/merger.ts"];
+        if (taskId === "FN-T1") return ["packages/dashboard/app/App.tsx"];
+        if (taskId === "FN-T2") return [];
+        return [];
+      });
+
+      const updateTask = vi.fn().mockResolvedValue(undefined);
+      const moveTask = vi.fn().mockResolvedValue(undefined);
+      const store = createMockStore({
+        listTasks: vi.fn().mockResolvedValue(tasks),
+        getSettings: vi.fn().mockResolvedValue({
+          maxConcurrent: 10,
+          maxWorktrees: 10,
+          groupOverlappingFiles: true,
+        }),
+        parseFileScopeFromPrompt: parseScopeMock,
+        updateTask,
+        moveTask,
+      });
+
+      const scheduler = new Scheduler(store);
+      (scheduler as any).running = true;
+      await scheduler.schedule();
+
+      expect(updateTask).not.toHaveBeenCalledWith("FN-T1", { status: "queued", blockedBy: "FN-A" });
+      expect(updateTask).not.toHaveBeenCalledWith("FN-T2", { status: "queued", blockedBy: "FN-A" });
+      expect(moveTask).toHaveBeenCalledWith("FN-T1", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+      expect(moveTask).toHaveBeenCalledWith("FN-T2", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+    });
+  });
+
   describe("worktree reservation", () => {
     it("assigns a planned worktree path before moving a task to in-progress", async () => {
       vi.mocked(existsSync).mockReturnValue(true);
@@ -854,13 +1297,12 @@ describe("Scheduler", () => {
       expect(updateTask).toHaveBeenCalledWith("FN-010", {
         status: null,
         blockedBy: null,
-        baseBranch: undefined,
-        worktree: "/test/project/.worktrees/fn-010",
+        executionStartBranch: undefined,
         effectiveNodeId: null,
         effectiveNodeSource: "local",
         mergeRetries: 0,
       });
-      expect(moveTask).toHaveBeenCalledWith("FN-010", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-010", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
       expect(updateTask.mock.invocationCallOrder[0]).toBeLessThan(moveTask.mock.invocationCallOrder[0]);
     });
 
@@ -893,8 +1335,7 @@ describe("Scheduler", () => {
       expect(updateTask).toHaveBeenNthCalledWith(1, "FN-011", {
         status: null,
         blockedBy: null,
-        baseBranch: undefined,
-        worktree: "/test/project/.worktrees/amber-aspen",
+        executionStartBranch: undefined,
         effectiveNodeId: null,
         effectiveNodeSource: "local",
         mergeRetries: 0,
@@ -902,8 +1343,7 @@ describe("Scheduler", () => {
       expect(updateTask).toHaveBeenNthCalledWith(2, "FN-012", {
         status: null,
         blockedBy: null,
-        baseBranch: undefined,
-        worktree: "/test/project/.worktrees/amber-aspen-2",
+        executionStartBranch: undefined,
         effectiveNodeId: null,
         effectiveNodeSource: "local",
         mergeRetries: 0,
@@ -1035,7 +1475,7 @@ describe("Scheduler", () => {
       // Flush any remaining microtasks
       await new Promise(resolve => setTimeout(resolve, 0));
 
-      expect(moveTask).toHaveBeenCalledWith("FN-010", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-010", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
       expect(moveTask).not.toHaveBeenCalledWith("FN-010", "triage");
     });
 
@@ -1217,7 +1657,7 @@ describe("Scheduler", () => {
         expect.any(String)
       );
       // Should move to in-progress (since deps are satisfied and concurrency allows)
-      expect(moveTask).toHaveBeenCalledWith("FN-004", "in-progress");
+      expect(moveTask).toHaveBeenCalledWith("FN-004", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("does not validate filesystem for tasks with unmet dependencies", async () => {
@@ -1251,13 +1691,30 @@ describe("Scheduler", () => {
 
       // Task with unmet deps should be queued, not validated
       // Since KB-006 is not done, KB-005 should not be validated
-      expect(updateTask).toHaveBeenCalledWith("FN-005", { status: "queued" });
+      expect(updateTask).toHaveBeenCalledWith("FN-005", { status: "queued", blockedBy: "FN-006" });
       // No filesystem validation should occur (no move to triage)
       expect(moveTask).not.toHaveBeenCalledWith("FN-005", "triage");
     });
   });
 
   describe("pr monitoring", () => {
+    it("hydrates PR monitoring with startup memoized slim reads", async () => {
+      const prMonitor = {
+        startMonitoring: vi.fn(),
+        stopMonitoring: vi.fn(),
+        updatePrInfo: vi.fn(),
+        getTrackedPrs: vi.fn().mockReturnValue(new Map()),
+        stopAll: vi.fn(),
+      } as unknown as PrMonitor;
+
+      const store = createMockStore();
+      const scheduler = new Scheduler(store, {});
+      scheduler.configurePrMonitoring({ prMonitor });
+      await flushAsyncWork();
+
+      expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false, startupMemo: true });
+    });
+
     it("stops monitoring when task moves out of in-review based on from column", () => {
       const prMonitor = {
         startMonitoring: vi.fn(),
@@ -1956,7 +2413,7 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(store.moveTask).toHaveBeenCalledWith("FN-100", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-100", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("schedules tasks without sliceId regardless of mission state", async () => {
@@ -1981,7 +2438,7 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(store.moveTask).toHaveBeenCalledWith("FN-100", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-100", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
   });
 
@@ -2037,7 +2494,7 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(store.moveTask).toHaveBeenCalledWith("FN-011", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-011", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
 
     it("picks up todo tasks without nextRecoveryAt normally", async () => {
@@ -2063,7 +2520,7 @@ describe("Scheduler", () => {
       (scheduler as any).running = true;
       await scheduler.schedule();
 
-      expect(store.moveTask).toHaveBeenCalledWith("FN-012", "in-progress");
+      expect(store.moveTask).toHaveBeenCalledWith("FN-012", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
     });
   });
 

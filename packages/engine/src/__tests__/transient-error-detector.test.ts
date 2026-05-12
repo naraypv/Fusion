@@ -3,6 +3,9 @@ import {
   isTransientError,
   classifyError,
   isSilentTransientError,
+  extractMissingModulePath,
+  isOperatorActionableAgentError,
+  isStaleWorktreeModuleResolutionError,
   TRANSIENT_ERROR_PATTERNS,
 } from "../transient-error-detector.js";
 import { isUsageLimitError } from "../usage-limit-detector.js";
@@ -90,6 +93,19 @@ describe("Transient Error Detector", () => {
       expect(isTransientError("operation was aborted")).toBe(true);
       expect(isTransientError("This operation was aborted")).toBe(true);
       expect(isTransientError("OPERATION WAS ABORTED")).toBe(true);
+    });
+
+    it("matches pi-ai Codex WebSocket transport drops", () => {
+      // Bare "WebSocket error" — pi-ai falls back to this when the ErrorEvent
+      // has no `message`. The diagnostic patch tags the model id onto it.
+      expect(isTransientError("WebSocket error")).toBe(true);
+      expect(isTransientError("WebSocket error (model=openai/gpt-5-codex)")).toBe(true);
+      // "WebSocket closed <code> <reason>" from extractWebSocketCloseError.
+      expect(isTransientError("WebSocket closed 1006")).toBe(true);
+      expect(isTransientError("WebSocket closed 1011 internal error")).toBe(true);
+      expect(isTransientError("WebSocket closed")).toBe(true);
+      // Half-open stream that ended before response.completed.
+      expect(isTransientError("WebSocket stream closed before response.completed")).toBe(true);
     });
 
     it("matches OpenAI/Codex structured server_error payloads", () => {
@@ -222,6 +238,49 @@ describe("Transient Error Detector", () => {
       TRANSIENT_ERROR_PATTERNS.forEach((pattern) => {
         expect(pattern.flags).toContain("i");
       });
+    });
+  });
+
+  describe("isStaleWorktreeModuleResolutionError", () => {
+    it("returns true for cannot-find-module node_modules imported-from stale worktree signature", () => {
+      const message =
+        "Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/me/Projects/kb/.worktrees/deleted/node_modules/@runfusion/fusion/dist/bin.js' imported from /Users/me/Projects/kb/.worktrees/deleted/packages/engine/src/pi.ts";
+      expect(isStaleWorktreeModuleResolutionError(message)).toBe(true);
+    });
+
+    it("returns false for other missing-module errors without stale-path signature", () => {
+      expect(isStaleWorktreeModuleResolutionError("Cannot find module 'vitest'")).toBe(false);
+      expect(isStaleWorktreeModuleResolutionError("socket hang up")).toBe(false);
+    });
+  });
+
+  describe("extractMissingModulePath", () => {
+    it("extracts the missing node_modules path from stale signature", () => {
+      const message =
+        "Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/me/Projects/kb/.worktrees/deleted/node_modules/@runfusion/fusion/dist/bin.js' imported from /Users/me/Projects/kb/.worktrees/deleted/packages/engine/src/pi.ts";
+      expect(extractMissingModulePath(message)).toBe(
+        "/Users/me/Projects/kb/.worktrees/deleted/node_modules/@runfusion/fusion/dist/bin.js",
+      );
+    });
+
+    it("returns null when no stale module path is present", () => {
+      expect(extractMissingModulePath("Cannot find module 'vitest'")).toBeNull();
+      expect(extractMissingModulePath("socket hang up")).toBeNull();
+    });
+  });
+
+  describe("isOperatorActionableAgentError", () => {
+    it("returns true for credential/model/billing errors", () => {
+      expect(isOperatorActionableAgentError("invalid api key")).toBe(true);
+      expect(isOperatorActionableAgentError("Authentication failed for provider")).toBe(true);
+      expect(isOperatorActionableAgentError("model gpt-x not found")).toBe(true);
+      expect(isOperatorActionableAgentError("missing OPENAI_API_KEY")).toBe(true);
+      expect(isOperatorActionableAgentError("billing issue: quota exceeded")).toBe(true);
+    });
+
+    it("returns false for transient network errors", () => {
+      expect(isOperatorActionableAgentError("socket hang up")).toBe(false);
+      expect(isOperatorActionableAgentError("upstream connect error")).toBe(false);
     });
   });
 

@@ -43,7 +43,7 @@ function makeInteractiveData(opts: {
     regeneratePersistentToken: () => Promise<{ maskedToken?: string; tokenType: "persistent"; expiresAt: null }>;
     generateShortLivedToken: (ttlMs: number) => Promise<{ token?: string; tokenType: "short-lived"; expiresAt: string | null }>;
     getRemoteUrl: (tokenType: "persistent" | "short-lived", ttlMs?: number) => Promise<{ url: string; tokenType: "persistent" | "short-lived"; expiresAt: string | null }>;
-    getQrPayload: (tokenType: "persistent" | "short-lived", ttlMs?: number) => Promise<{ url: string; expiresAt: string | null; format: "text" | "image/svg"; data?: string }>;
+    getQrPayload: (tokenType: "persistent" | "short-lived", ttlMs?: number, format?: "text" | "terminal" | "image/svg") => Promise<{ url: string; expiresAt: string | null; format: "text" | "image/svg" | "terminal"; data?: string }>;
   }>;
 } = {}) {
   const projects = opts.projects ?? [];
@@ -166,8 +166,15 @@ async function flushFrames() {
   await Promise.resolve();
 }
 
+async function waitForFrameUpdateAfterInput() {
+  // Ink can schedule the frame triggered by stdin on the next timer tick.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await flushFrames();
+}
+
 async function focusSettingsDetailPane(stdin: { write: (chunk: string) => void }, lastFrame: () => string | undefined) {
   stdin.write("\u001b[C");
+  await waitForFrameUpdateAfterInput();
   await waitForFrameContains(lastFrame, "[C/V/X/P/L/U/K/R] remote actions");
 }
 
@@ -429,7 +436,10 @@ describe("Settings view", () => {
     const controller = newController();
     controller.setSystemInfo(makeSystemInfo());
     let remoteState: "stopped" | "starting" | "running" | "error" = "running";
-    const activateProvider = vi.fn(async () => {});
+    let remoteProvider: "tailscale" | "cloudflare" | null = "tailscale";
+    const activateProvider = vi.fn(async (provider: "tailscale" | "cloudflare") => {
+      remoteProvider = provider;
+    });
     const settings: SettingsValues = {
       maxConcurrent: 1,
       maxWorktrees: 2,
@@ -441,13 +451,13 @@ describe("Settings view", () => {
       remoteActiveProvider: "cloudflare",
       remoteShortLivedEnabled: true,
       remoteShortLivedTtlMs: 600000,
-      remoteStatus: { provider: "cloudflare", state: "running", url: "https://remote.example.com", lastError: null },
+      remoteStatus: { provider: remoteProvider, state: "running", url: "https://remote.example.com", lastError: null },
     };
     controller.setInteractiveData(makeInteractiveData({
       settings,
       remote: {
         activateProvider,
-        getStatus: async () => ({ provider: "cloudflare", state: remoteState, url: "https://remote.example.com", lastError: null }),
+        getStatus: async () => ({ provider: remoteProvider, state: remoteState, url: "https://remote.example.com", lastError: null }),
         startTunnel: async () => {
           remoteState = "starting";
         },
@@ -723,6 +733,38 @@ describe("StatsPanel memory row", () => {
     expect(pctIndex).toBeGreaterThanOrEqual(0);
     expect(usedIndex).toBeGreaterThanOrEqual(0);
     expect(pctIndex).toBeLessThan(usedIndex);
+
+    rendered.unmount();
+  });
+});
+
+describe("Narrow status-mode mouse policy", () => {
+  it("enables mouse mode on Logs and disables it again on System", async () => {
+    const controller = newController();
+    controller.setSystemInfo(makeSystemInfo());
+    controller.log("entry", "scope");
+
+    const rendered = render(renderDashboardAppNode(controller));
+    setTerminalSize(rendered, 60, 24);
+    rendered.rerender(renderDashboardAppNode(controller));
+
+    await vi.waitFor(() => {
+      expect(controller.getSnapshot().mouseEnabled).toBe(false);
+    });
+
+    rendered.stdin.write("2");
+    await vi.waitFor(() => {
+      const snapshot = controller.getSnapshot();
+      expect(snapshot.activeSection).toBe("logs");
+      expect(snapshot.mouseEnabled).toBe(true);
+    });
+
+    rendered.stdin.write("1");
+    await vi.waitFor(() => {
+      const snapshot = controller.getSnapshot();
+      expect(snapshot.activeSection).toBe("system");
+      expect(snapshot.mouseEnabled).toBe(false);
+    });
 
     rendered.unmount();
   });

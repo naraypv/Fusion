@@ -1,6 +1,7 @@
 import {
   DEFAULT_GLOBAL_SETTINGS,
   GLOBAL_SETTINGS_KEYS,
+  PROJECT_SETTINGS_KEYS,
   QMD_INSTALL_COMMAND,
   MemoryBackendError,
   buildInsightExtractionPrompt,
@@ -41,12 +42,14 @@ import {
   writeProjectMemoryFile,
   updatePiExtensionDisabledIds,
 } from "@fusion/core";
-import { createFnAgent as engineCreateFnAgent } from "@fusion/engine";
+import { createFnAgent as engineCreateFnAgent, getActiveNotificationService } from "@fusion/engine";
 import QRCode from "qrcode";
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
 import { ApiError, badRequest } from "../api-error.js";
+import { resolveGithubTrackingAuth } from "../github-auth.js";
 import { generateRemoteToken, issueRemoteAuthToken, maskRemoteToken } from "../remote-auth.js";
 import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js";
 import type { ApiRoutesContext } from "./types.js";
@@ -374,10 +377,20 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       const { store: scopedStore } = await getProjectContext(req);
       const settings = await scopedStore.getSettingsFast();
       const prAuthAvailable = (isGhAvailable() && isGhAuthenticated()) || Boolean(githubToken);
+      const trackingAuthResolution = resolveGithubTrackingAuth({
+        projectSettings: {
+          githubAuthMode: settings.githubAuthMode,
+          githubAuthToken: settings.githubAuthToken,
+        },
+        globalSettings: {},
+        env: process.env,
+      });
       // Inject server-side configuration flags
       res.json({
         ...settings,
         prAuthAvailable,
+        trackingAuthAvailable: trackingAuthResolution.ok,
+        trackingAuthReason: trackingAuthResolution.ok ? null : trackingAuthResolution.reason,
       });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -393,11 +406,18 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       // Strip server-owned fields that should never be persisted to config.json.
       // These are computed server-side and injected only on GET /settings.
        
-      const { githubTokenConfigured, prAuthAvailable, ...clientSettings } = req.body;
+      const {
+        githubTokenConfigured,
+        prAuthAvailable,
+        trackingAuthAvailable,
+        trackingAuthReason,
+        ...clientSettings
+      } = req.body;
 
       // Reject global-only fields with a helpful error pointing to the correct endpoint
       const globalKeySet = new Set<string>(GLOBAL_SETTINGS_KEYS);
-      const globalFieldsFound = Object.keys(clientSettings).filter((k) => globalKeySet.has(k));
+      const projectKeySet = new Set<string>(PROJECT_SETTINGS_KEYS);
+      const globalFieldsFound = Object.keys(clientSettings).filter((k) => globalKeySet.has(k) && !projectKeySet.has(k));
       if (globalFieldsFound.length > 0) {
         throw badRequest(`Cannot update global settings via this endpoint. Use PUT /settings/global instead. Global fields found: ${globalFieldsFound.join(", ")}`);
       }
@@ -437,6 +457,39 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
           throw badRequest("unavailableNodePolicy must be one of: block, fallback-local");
         }
         clientSettings.unavailableNodePolicy = validatedUnavailableNodePolicy;
+      }
+
+      const evalSettings = clientSettings.evalSettings as Record<string, unknown> | null | undefined;
+      if (evalSettings !== undefined && evalSettings !== null) {
+        if (typeof evalSettings !== "object" || Array.isArray(evalSettings)) {
+          throw badRequest("evalSettings must be an object");
+        }
+
+        const allowedFollowUpPolicies = ["disabled", "suggest-only", "auto-create"];
+        const intervalMs = evalSettings.intervalMs;
+        if (intervalMs !== undefined && intervalMs !== null) {
+          if (typeof intervalMs !== "number" || !Number.isInteger(intervalMs) || intervalMs < 60_000 || intervalMs > 604_800_000) {
+            throw badRequest("evalSettings.intervalMs must be an integer between 60000 and 604800000");
+          }
+        }
+
+        const retentionDays = evalSettings.retentionDays;
+        if (retentionDays !== undefined && retentionDays !== null) {
+          if (typeof retentionDays !== "number" || !Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 365) {
+            throw badRequest("evalSettings.retentionDays must be an integer between 1 and 365");
+          }
+        }
+
+        const followUpPolicy = evalSettings.followUpPolicy;
+        if (followUpPolicy !== undefined && !allowedFollowUpPolicies.includes(String(followUpPolicy))) {
+          throw badRequest("evalSettings.followUpPolicy must be one of: disabled, suggest-only, auto-create");
+        }
+
+        const hasEvaluatorProvider = evalSettings.evaluatorProvider !== undefined && evalSettings.evaluatorProvider !== null && String(evalSettings.evaluatorProvider).trim() !== "";
+        const hasEvaluatorModelId = evalSettings.evaluatorModelId !== undefined && evalSettings.evaluatorModelId !== null && String(evalSettings.evaluatorModelId).trim() !== "";
+        if (hasEvaluatorProvider !== hasEvaluatorModelId) {
+          throw badRequest("evalSettings.evaluatorProvider and evalSettings.evaluatorModelId must be provided together or both omitted");
+        }
       }
 
       // Validate memoryBackendType if provided - must be string or null (for explicit clear)
@@ -1866,6 +1919,43 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       const settings = await scopedStore.getSettings();
 
       if (providerId === "ntfy") {
+        const requestedMessageEventType = config.messageEventType ?? body.messageEventType;
+        if (requestedMessageEventType !== undefined) {
+          if (
+            requestedMessageEventType !== "message:agent-to-user"
+            && requestedMessageEventType !== "message:agent-to-agent"
+          ) {
+            throw badRequest("messageEventType must be message:agent-to-user or message:agent-to-agent");
+          }
+
+          const notificationService = getActiveNotificationService();
+          if (!notificationService) {
+            throw new ApiError(502, "Notification service is not active");
+          }
+
+          try {
+            const messageType = requestedMessageEventType.split(":")[1] ?? "agent-to-user";
+            await notificationService.dispatch(requestedMessageEventType, {
+              taskId: undefined,
+              taskTitle: undefined,
+              event: requestedMessageEventType,
+              metadata: {
+                messageId: `test-${crypto.randomUUID()}`,
+                fromId: "system",
+                fromType: "agent",
+                toId: "user",
+                toType: "user",
+                type: messageType,
+                preview: "Fusion test message notification",
+              },
+            });
+            res.json({ success: true });
+            return;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new ApiError(502, `Failed to dispatch message notification: ${message}`);
+          }
+        }
         if (!settings.ntfyEnabled) {
           throw badRequest("ntfy notifications are not enabled");
         }

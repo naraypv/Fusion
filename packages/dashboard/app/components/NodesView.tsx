@@ -4,6 +4,7 @@ import "./NodesView.css";
 import { useNodes } from "../hooks/useNodes";
 import { useProjects } from "../hooks/useProjects";
 import { useNodeSettingsSync, computeSyncState } from "../hooks/useNodeSettingsSync";
+import { useMeshState } from "../hooks/useMeshState";
 import type { ManagedDockerNodeInfo, NodeInfo, NodeUpdateInput } from "../api";
 import { NodeCard } from "./NodeCard";
 import { MeshTopology } from "./MeshTopology";
@@ -31,8 +32,10 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
     healthCheck,
     patchDockerConfig,
     fetchDockerDiff,
+    discoverRemoteProjects,
   } = useNodes();
-  const { projects } = useProjects();
+  const { projects, refresh: refreshProjects } = useProjects();
+  const { meshState, loading: meshLoading, error: meshError } = useMeshState();
   const { syncStatusMap, pushSettings, pullSettings, syncAuth, trackNode, getAuthSyncState, getAuthProviders } = useNodeSettingsSync();
   const {
     dockerNodes,
@@ -74,7 +77,8 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
 
   const handleRegister = useCallback(async (input: AddNodeInput) => {
     await register(input);
-  }, [register]);
+    await refreshProjects();
+  }, [refreshProjects, register]);
 
   const handleCreateDockerNode = useCallback(async (input: ManagedDockerNodeInput) => {
     try {
@@ -194,14 +198,13 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
         </div>
       </div>
 
-      {error && <div className="nodes-view-error">{error}</div>}
-
+      {(error || meshError) && <div className="nodes-view-error">{error ?? meshError}</div>}
 
       {/* Mesh Topology Visualization */}
-      {!loading && nodes.length > 0 && (
+      {!meshLoading && meshState.length > 0 && (
         <section className="nodes-view-topology" aria-label="Mesh Topology">
           <h3 className="nodes-view-section-title">Mesh Topology</h3>
-          <MeshTopology nodes={nodes} />
+          <MeshTopology nodes={meshState} />
         </section>
       )}
 
@@ -248,7 +251,9 @@ export function NodesView({ addToast, onClose }: NodesViewProps) {
         isOpen={addModalOpen}
         onClose={() => setAddModalOpen(false)}
         onSubmit={handleRegister}
+        onDiscoverRemoteProjects={discoverRemoteProjects}
         addToast={addToast}
+        projects={projects}
       />
 
       <DockerNodeOnboardingModal

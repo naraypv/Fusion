@@ -1,6 +1,13 @@
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
 import type { Request, Response } from "express";
 import type { Agent, AgentCapability, AgentUpdateInput, TaskStore } from "@fusion/core";
-import { getDefaultHeartbeatProcedurePath } from "@fusion/core";
+import {
+  ApprovalRequestStore,
+  getDefaultHeartbeatProcedurePath,
+  isAgentPermissionPolicyPresetId,
+  normalizeAgentPermissionPolicyFromPreset,
+} from "@fusion/core";
 import { ApiError, badRequest, notFound } from "../api-error.js";
 import type { ApiRoutesContext } from "./types.js";
 import { ensureDefaultHeartbeatProcedureFile, HEARTBEAT_PROCEDURE } from "@fusion/engine";
@@ -8,7 +15,16 @@ import { ensureDefaultHeartbeatProcedureFile, HEARTBEAT_PROCEDURE } from "@fusio
 interface AgentCoreRouteDeps {
   sanitizeAgentTaskLinks: (agents: Agent[], scopedStore: TaskStore) => Promise<Agent[]>;
   validateAgentInstructionsPayload: (instructionsPath: unknown, instructionsText: unknown) => boolean;
+  upload: import("multer").Multer;
 }
+
+const AVATAR_MIME_TO_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 
 function isCompatibleDefaultHeartbeatPath(path: string | undefined, agent: Agent): boolean {
   const trimmed = path?.trim();
@@ -23,6 +39,29 @@ function isCompatibleDefaultHeartbeatPath(path: string | undefined, agent: Agent
   }
   const safeId = (agent.id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent");
   return new RegExp(`^\\.fusion/agents/[^/]+-${safeId}/HEARTBEAT\\.md$`).test(trimmed);
+}
+
+function withPendingApprovalCounts<T extends Agent>(agents: T[], scopedStore: TaskStore): Array<T & { pendingApprovalCount: number }> {
+  try {
+    const approvalStore = new ApprovalRequestStore(scopedStore.getDatabase());
+    const pendingRequests = approvalStore.list({ status: "pending", limit: Number.MAX_SAFE_INTEGER, offset: 0 });
+    const counts = new Map<string, number>();
+
+    for (const request of pendingRequests) {
+      const agentId = request.requester.actorId;
+      counts.set(agentId, (counts.get(agentId) ?? 0) + 1);
+    }
+
+    return agents.map((agent) => ({
+      ...agent,
+      pendingApprovalCount: counts.get(agent.id) ?? 0,
+    }));
+  } catch {
+    return agents.map((agent) => ({
+      ...agent,
+      pendingApprovalCount: 0,
+    }));
+  }
 }
 
 export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: AgentCoreRouteDeps): void {
@@ -52,9 +91,9 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
       const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
       await agentStore.init();
 
-      const agents = await agentStore.listAgents(filter as { state?: "idle" | "active" | "paused" | "terminated"; role?: AgentCapability; includeEphemeral?: boolean });
+      const agents = await agentStore.listAgents(filter as { state?: "idle" | "active" | "running" | "paused" | "error"; role?: AgentCapability; includeEphemeral?: boolean });
       const sanitizedAgents = await sanitizeAgentTaskLinks(agents, scopedStore);
-      res.json(sanitizedAgents);
+      res.json(withPendingApprovalCounts(sanitizedAgents, scopedStore));
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -78,6 +117,7 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
         reportsTo,
         runtimeConfig,
         permissions,
+        permissionPolicy,
         instructionsPath,
         instructionsText,
         soul,
@@ -109,6 +149,16 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
       }
       if (permissions !== undefined && (typeof permissions !== "object" || permissions === null || Array.isArray(permissions))) {
         throw badRequest("permissions must be an object");
+      }
+      let normalizedPermissionPolicy;
+      if (permissionPolicy !== undefined && permissionPolicy !== null) {
+        if (typeof permissionPolicy !== "object" || Array.isArray(permissionPolicy)) {
+          throw badRequest("permissionPolicy must be an object");
+        }
+        if (typeof permissionPolicy.presetId !== "string" || !isAgentPermissionPolicyPresetId(permissionPolicy.presetId)) {
+          throw badRequest("permissionPolicy.presetId must be one of: unrestricted, approval-required, locked-down");
+        }
+        normalizedPermissionPolicy = normalizeAgentPermissionPolicyFromPreset(permissionPolicy.presetId);
       }
       if (!validateAgentInstructionsPayload(instructionsPath, instructionsText)) {
         return;
@@ -165,6 +215,7 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
           reportsTo: reportsTo ?? undefined,
           runtimeConfig,
           permissions,
+          permissionPolicy: normalizedPermissionPolicy,
           instructionsPath: instructionsPath ?? undefined,
           instructionsText: instructionsText ?? undefined,
           soul: soul ?? undefined,
@@ -210,7 +261,7 @@ export function registerAgentCoreListCreateRoutes(ctx: ApiRoutesContext, deps: A
 
 export function registerAgentCoreRoutes(ctx: ApiRoutesContext, deps: AgentCoreRouteDeps): void {
   const { router, getProjectContext, rethrowAsApiError } = ctx;
-  const { sanitizeAgentTaskLinks, validateAgentInstructionsPayload } = deps;
+  const { sanitizeAgentTaskLinks, validateAgentInstructionsPayload, upload } = deps;
 
   /**
    * GET /api/agents/stats
@@ -318,10 +369,147 @@ export function registerAgentCoreRoutes(ctx: ApiRoutesContext, deps: AgentCoreRo
       }
       // Sanitize taskId for single-agent responses (omit if linked task is terminal)
       const [sanitizedAgent] = await sanitizeAgentTaskLinks([agent], scopedStore);
-      res.json(sanitizedAgent);
+      const [agentWithPendingApprovals] = withPendingApprovalCounts([sanitizedAgent], scopedStore);
+      res.json(agentWithPendingApprovals);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * POST /api/agents/:id/avatar
+   * Upload agent avatar image.
+   */
+  router.post("/agents/:id/avatar", upload.single("file") as import("express").RequestHandler, async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const { AgentStore } = await import("@fusion/core");
+      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
+      await agentStore.init();
+
+      const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      if (!agentId) {
+        throw badRequest("Agent id is required");
+      }
+      const agent = await agentStore.getAgent(agentId);
+      if (!agent) {
+        throw notFound("Agent not found");
+      }
+      if (!req.file) {
+        throw badRequest("No file provided");
+      }
+      if (req.file.size > MAX_AVATAR_BYTES) {
+        throw badRequest("File too large (max 2MB)");
+      }
+      const ext = AVATAR_MIME_TO_EXT[req.file.mimetype];
+      if (!ext) {
+        throw badRequest("Invalid mime type");
+      }
+
+      const agentDir = path.join(scopedStore.getFusionDir(), "agents", agent.id);
+      await mkdir(agentDir, { recursive: true });
+      const entries = await readdir(agentDir);
+      await Promise.all(entries.filter((entry) => entry.startsWith("avatar.")).map((entry) => rm(path.join(agentDir, entry), { force: true })));
+      await writeFile(path.join(agentDir, `avatar.${ext}`), req.file.buffer);
+
+      const updated = await agentStore.updateAgent(agent.id, { imageUrl: `/api/agents/${agent.id}/avatar` });
+      res.setHeader("Cache-Control", "no-store");
+      res.json(updated);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      if ((err instanceof Error ? err.message : String(err)).includes("not found")) {
+        throw notFound(err instanceof Error ? err.message : String(err));
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * GET /api/agents/:id/avatar
+   * Serve agent avatar image.
+   */
+  router.get("/agents/:id/avatar", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const { AgentStore } = await import("@fusion/core");
+      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
+      await agentStore.init();
+
+      const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      if (!agentId) {
+        throw badRequest("Agent id is required");
+      }
+      const agent = await agentStore.getAgent(agentId);
+      if (!agent) {
+        throw notFound("Agent not found");
+      }
+
+      const agentDir = path.join(scopedStore.getFusionDir(), "agents", agent.id);
+      const entries = await readdir(agentDir).catch(() => [] as string[]);
+      const avatarFile = entries.find((entry) => entry.startsWith("avatar."));
+      if (!avatarFile) {
+        throw notFound("Avatar not found");
+      }
+
+      const ext = avatarFile.split(".").pop() ?? "";
+      const mimeType = Object.entries(AVATAR_MIME_TO_EXT).find(([, value]) => value === ext)?.[0];
+      if (!mimeType) {
+        throw notFound("Avatar not found");
+      }
+
+      const fileBuffer = await readFile(path.join(agentDir, avatarFile));
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      res.send(fileBuffer);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      if ((err instanceof Error ? err.message : String(err)).includes("not found")) {
+        throw notFound(err instanceof Error ? err.message : String(err));
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * DELETE /api/agents/:id/avatar
+   * Remove agent avatar image.
+   */
+  router.delete("/agents/:id/avatar", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const { AgentStore } = await import("@fusion/core");
+      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
+      await agentStore.init();
+
+      const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      if (!agentId) {
+        throw badRequest("Agent id is required");
+      }
+      const agent = await agentStore.getAgent(agentId);
+      if (!agent) {
+        throw notFound("Agent not found");
+      }
+
+      const agentDir = path.join(scopedStore.getFusionDir(), "agents", agent.id);
+      const entries = await readdir(agentDir).catch(() => [] as string[]);
+      await Promise.all(entries.filter((entry) => entry.startsWith("avatar.")).map((entry) => rm(path.join(agentDir, entry), { force: true })));
+
+      const updated = await agentStore.updateAgent(agent.id, { imageUrl: undefined });
+      res.setHeader("Cache-Control", "no-store");
+      res.json(updated);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      if ((err instanceof Error ? err.message : String(err)).includes("not found")) {
+        throw notFound(err instanceof Error ? err.message : String(err));
       }
       rethrowAsApiError(err);
     }
@@ -371,6 +559,13 @@ export function registerAgentCoreRoutes(ctx: ApiRoutesContext, deps: AgentCoreRo
         updates.icon = body.icon ?? undefined;
       }
 
+      if ("imageUrl" in body) {
+        if (body.imageUrl !== null && typeof body.imageUrl !== "string") {
+          throw badRequest("imageUrl must be a string");
+        }
+        updates.imageUrl = body.imageUrl ?? undefined;
+      }
+
       if ("reportsTo" in body) {
         if (body.reportsTo !== null && typeof body.reportsTo !== "string") {
           throw badRequest("reportsTo must be a string");
@@ -397,6 +592,20 @@ export function registerAgentCoreRoutes(ctx: ApiRoutesContext, deps: AgentCoreRo
           throw badRequest("permissions must be an object");
         }
         updates.permissions = body.permissions ?? undefined;
+      }
+
+      if ("permissionPolicy" in body) {
+        if (body.permissionPolicy !== null) {
+          if (typeof body.permissionPolicy !== "object" || Array.isArray(body.permissionPolicy)) {
+            throw badRequest("permissionPolicy must be an object");
+          }
+          if (typeof body.permissionPolicy.presetId !== "string" || !isAgentPermissionPolicyPresetId(body.permissionPolicy.presetId)) {
+            throw badRequest("permissionPolicy.presetId must be one of: unrestricted, approval-required, locked-down");
+          }
+          updates.permissionPolicy = normalizeAgentPermissionPolicyFromPreset(body.permissionPolicy.presetId);
+        } else {
+          updates.permissionPolicy = undefined;
+        }
       }
 
       if ("totalInputTokens" in body) {

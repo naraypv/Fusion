@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TodoModal } from "../TodoModal";
 
 const mockTodoView = vi.fn();
@@ -64,13 +64,29 @@ describe("TodoModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("passes projectId and addToast through to TodoView", () => {
-    render(<TodoModal onClose={onClose} addToast={addToast} projectId="proj-1" />);
-
-    expect(screen.getByTestId("todo-view-content")).toBeInTheDocument();
-    expect(mockTodoView).toHaveBeenCalledWith(
-      expect.objectContaining({ projectId: "proj-1", addToast }),
+  it("passes expected props through the lazy-loaded TodoView", async () => {
+    const onPlanningMode = vi.fn();
+    render(
+      <TodoModal
+        onClose={onClose}
+        addToast={addToast}
+        projectId="proj-1"
+        onPlanningMode={onPlanningMode}
+      />,
     );
+
+    expect(await screen.findByTestId("todo-view-content")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockTodoView).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: "proj-1",
+          addToast,
+          onPlanningMode,
+          onClose,
+          mobileKeyboardActive: false,
+        }),
+      );
+    });
   });
 
   describe("mobile keyboard behavior", () => {
@@ -91,6 +107,7 @@ describe("TodoModal", () => {
       expect(style.getPropertyValue("--keyboard-overlap")).toBe("250px");
       expect(style.getPropertyValue("--vv-offset-top")).toBe("40px");
       expect(style.getPropertyValue("--vv-height")).toBe("450px");
+      expect(mockTodoView).toHaveBeenCalledWith(expect.objectContaining({ mobileKeyboardActive: true }));
     });
 
     it("does not apply keyboard CSS variables when keyboard is closed", () => {
@@ -110,6 +127,7 @@ describe("TodoModal", () => {
       expect(style.getPropertyValue("--keyboard-overlap")).toBe("");
       expect(style.getPropertyValue("--vv-offset-top")).toBe("");
       expect(style.getPropertyValue("--vv-height")).toBe("");
+      expect(mockTodoView).toHaveBeenCalledWith(expect.objectContaining({ mobileKeyboardActive: false }));
     });
   });
 });

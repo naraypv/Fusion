@@ -23,7 +23,7 @@
      the indicator (PWA standalone) and the bar meets the executor status bar
      flush — its `bottom` already adds these same terms. */
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + var(--standalone-bottom-gap));
-  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--shadow-md);
 }
 
 @media (max-width: 768px) {
@@ -83,6 +83,17 @@
   height: 22px;
 }
 
+.mobile-nav-tab-icon-wrapper {
+  position: relative;
+  display: inline-flex;
+}
+
+.mobile-nav-chat-unread-dot {
+  position: absolute;
+  top: calc(var(--space-xs) * -1);
+  right: calc(var(--space-xs) * -1);
+}
+
 .mobile-nav-tab-label {
   max-width: 100%;
   overflow: hidden;
@@ -114,7 +125,7 @@
   position: fixed;
   inset: 0;
   z-index: 90;
-  background: rgba(0, 0, 0, 0.5);
+  background: color-mix(in srgb, var(--bg) 50%, transparent);
   animation: mobile-more-backdrop-in 0.2s ease;
 }
 
@@ -164,6 +175,15 @@
   letter-spacing: 0.05em;
 }
 
+.mobile-more-shell-connection {
+  padding: 0 16px 12px;
+}
+
+.mobile-more-shell-connection .shell-connection-status {
+  width: 100%;
+  justify-content: flex-start;
+}
+
 .mobile-more-item {
   display: flex;
   align-items: center;
@@ -182,7 +202,7 @@
 }
 
 .mobile-more-item:active {
-  background: var(--surface-hover);
+  background: var(--surface-hover, color-mix(in srgb, var(--text) 6%, transparent));
 }
 
 .mobile-more-item svg {

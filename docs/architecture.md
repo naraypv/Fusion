@@ -16,7 +16,64 @@ At a high level, Fusion is split into:
 - **Dashboard API + SPA** (`@fusion/dashboard`)
 - **CLI + Pi extension** (`@runfusion/fusion`)
 - **Desktop shell** (`@fusion/desktop`)
+- **Mobile shell** (`@fusion/mobile`)
 - **Terminal dashboard** (part of `@runfusion/fusion` — see `packages/cli/src/commands/dashboard-tui/`)
+
+Native shells expose a shared host-neutral bridge at `window.fusionShell` for first-run shell onboarding, connection profile persistence, and active shell mode/profile state. The dashboard consumes `window.fusionShell` when present and degrades cleanly in plain web/PWA mode.
+
+The dashboard also has a canonical host-context bootstrap layer (`packages/dashboard/app/shell-host.ts`) that normalizes launch metadata into one discriminated union:
+- `{ kind: "browser" }`
+- `{ kind: "desktop-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+- `{ kind: "mobile-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+
+Detection priority is deterministic: explicit bootstrapped global from shell handoff → shell handoff query params → desktop fallback via `window.fusionAPI` presence → browser fallback. Shell-only query params are stripped at bootstrap via `history.replaceState`.
+
+React consumers read this through `ShellHostProvider` / `useShellHostContext` (`packages/dashboard/app/context/ShellHostContext.tsx`). Do not add ad-hoc host checks in components.
+
+Dashboard chrome now resolves connection-management capabilities through `packages/dashboard/app/shell-native.ts` (`getShellConnectionNativeResult`) and renders status/actions via `ShellConnectionStatus`. Components should receive derived props from App-level wiring, not read `window.fusionAPI`/`window.fusionShell` directly.
+
+Important distinction: `NodeContext.isRemote` indicates browsing a remote mesh node inside the current dashboard instance; shell host `mode: "remote"` indicates how native desktop/mobile launched into this dashboard server. These are separate axes and must not be conflated in UI or routing logic.
+
+### `window.fusionShell` bridge contract
+
+Canonical dashboard-side types live in `packages/dashboard/app/types/native-shell.d.ts`.
+
+Shared bridge methods used by dashboard/mobile/desktop flows:
+- `getState()`
+- `listProfiles()`
+- `saveProfile(profile)`
+- `deleteProfile(profileId)`
+- `setActiveProfile(profileId)`
+- `setDesktopMode(mode)`
+- `startQrScan()`
+- `openConnectionManager()`
+- `subscribe(listener)`
+
+Shared shell state contract (`ShellConnectionState`):
+- `host` (`"web" | "mobile-shell" | "desktop-shell"`)
+- `desktopMode` (`"local" | "remote"`, optional)
+- `activeProfileId`
+- `profiles`
+- `localServer` (`status`, optional `port`, optional `error`)
+
+Desktop-specific bootstrap extension:
+- Electron preload also exposes `getDesktopModeState()` for first-run desktop mode selection (`{ isFirstRun, desktopMode }`).
+- Electron preload exposes `window.fusionAPI.openConnectionManager()` as the renderer-safe desktop entry point for opening native connection management.
+- The dashboard itself does **not** depend on that preload-only helper for steady-state rendering; it consumes shared shell state via `ShellContext` (`packages/dashboard/app/context/ShellContext.tsx`).
+
+Persistence ownership by host:
+- **Mobile shell** persists connection profiles + active profile with Capacitor Preferences (`packages/mobile/src/plugins/connection-profiles.ts`).
+- **Desktop shell** persists shell settings in app-owned JSON at `app.getPath("userData")/shell-connections.json` (`packages/desktop/src/shell-settings.ts`).
+
+These are shell-owned persistence layers, intentionally separate from Fusion project/global settings.
+
+### Shell contract regression matrix (FN-3409)
+
+Cross-package automated tests now lock:
+- **Mobile shell**: first-run remote onboarding inputs (QR/manual + optional token), saved-profile edit/switch, and restore-on-reinit persistence.
+- **Desktop shell**: first-run/last-used mode restore, local-vs-remote startup behavior, and preload bridge channel compatibility for connection management.
+- **Dashboard shell awareness**: canonical per-viewport connection-manager entry placement, browser-safe fallback (no shell-only controls), and host-context/native-helper resolution without ad-hoc window bridge access.
+- **Sensitive data handling**: dashboard-facing native status surfaces expose profile label/origin metadata only; auth tokens are not surfaced.
 
 ### High-level runtime diagram
 
@@ -117,15 +174,10 @@ Concrete references:
 - **Database adapter**: `packages/core/src/db.ts`
   - SQLite (`node:sqlite`) with WAL mode + foreign keys
   - JSON helpers: `toJson`, `toJsonNullable`, `fromJson`
-  - Core schema tables include: `tasks`, `config`, `workflow_steps`, `activityLog`, `archivedTasks`, `automations`, `agents`, `agentHeartbeats`, `task_documents`, `task_document_revisions`, mission hierarchy tables (`missions`, `milestones`, `slices`, `mission_features`, `mission_events`), plugin/routine tables (`plugins`, `routines`), roadmap tables (`roadmaps`, `roadmap_milestones`, `roadmap_features`), insight tables (`project_insights`, `project_insight_runs`), todo tables (`todo_lists`, `todo_items`), `__meta`
+  - Core schema tables include: `tasks`, `config`, `workflow_steps`, `activityLog`, `archivedTasks`, `automations`, `agents`, `agentHeartbeats`, approval tables (`approval_requests`, `approval_request_audit_events`), `task_documents`, `task_document_revisions`, mission hierarchy tables (`missions`, `milestones`, `slices`, `mission_features`, `mission_events`), plugin/routine tables (`plugins`, `routines`), roadmap tables (`roadmaps`, `roadmap_milestones`, `roadmap_features`), insight tables (`project_insights`, `project_insight_runs`), research tables (`research_runs`, `research_exports`, `research_run_events`), eval tables (`eval_runs`, `eval_task_results`, `eval_run_events`), todo tables (`todo_lists`, `todo_items`), `__meta`
   - Migration-created tables include: `ai_sessions`, `messages`, `agentRatings`, `chat_sessions`, `chat_messages`, `runAuditEvents`, `mission_contract_assertions`, `mission_feature_assertions`, `mission_validator_runs`, `mission_validator_failures`, `mission_fix_feature_lineage`
   - `ai_sessions.status` lifecycle includes `draft` (pre-start planning session), then `generating`, `awaiting_input`, terminal `complete` / `error`
-- **Standalone roadmap model**: `packages/core/src/roadmap-types.ts`, `roadmap-ordering.ts`, `roadmap-store.ts`
-  - Roadmap-first entity types (`Roadmap`, `RoadmapMilestone`, `RoadmapFeature`)
-  - Pure ordering helpers for contiguous 0-based milestone/feature order and deterministic cross-milestone feature moves
-  - `RoadmapStore` for CRUD operations, deterministic ordering, and atomic reorder/move operations
-  - Dashboard API routes in `packages/dashboard/src/roadmap-routes.ts`
-  - Exported from `@fusion/core` for downstream persistence/API/UI work
+- **Roadmap feature ownership**: roadmap contracts, ordering/handoff helpers, persistence, routes, and dashboard UI live in `plugins/fusion-plugin-roadmap` (package `@fusion-plugin-examples/roadmap`, plugin id `fusion-plugin-roadmap`) rather than dashboard/core ownership.
 - **CentralCore**: `packages/core/src/central-core.ts`
   - Global project registry, health, central activity feed, global concurrency
   - Backed by `packages/core/src/central-db.ts` (`~/.fusion/fusion-central.db`)
@@ -133,20 +185,110 @@ Concrete references:
   - `AgentStore` (`agent-store.ts`) — filesystem-based agent metadata + heartbeat run history
   - `MissionStore` (`mission-store.ts`) — mission/milestone/slice/feature hierarchy
   - `AutomationStore` (`automation-store.ts`) — scheduled jobs with global/project scope isolation
-  - `MessageStore` (`message-store.ts`) — mailbox/inbox/outbox messaging
+  - `MessageStore` (`message-store.ts`) — SQLite-backed mailbox/inbox/outbox messaging
+  - `ApprovalRequestStore` (`approval-request-store.ts`) — durable approval request lifecycle + append-only audit events
   - `ChatStore` (`chat-store.ts`) — session/message persistence for agent chat
   - `InsightStore` (`insight-store.ts`) — project insight persistence + dedupe/run tracking
   - `ReflectionStore` (`reflection-store.ts`) — agent reflection records and performance snapshots
   - `PluginStore` (`plugin-store.ts`) — plugin registry/state/settings persistence
   - `RoutineStore` (`routine-store.ts`) — recurring routine definitions and run history
-  - `RoadmapStore` (`roadmap-store.ts`) — standalone roadmap CRUD with deterministic ordering and atomic reorder/move operations
   - `TodoStore` (`todo-store.ts`) — project-scoped todo lists/items with completion, reorder, and composite list+items queries
+  - `EvalStore` (`eval-store.ts`) — eval run persistence, per-task eval results with durable snapshots, and append-only run event trails
+
+### Approval request system (`ApprovalRequestStore`)
+
+Schema (migration 68 in `db.ts`) adds two tables:
+
+- `approval_requests`
+  - Identity/lifecycle: `id`, `status`, `requestedAt`, `decidedAt`, `completedAt`, `createdAt`, `updatedAt`
+  - Requester snapshot: `requesterActorId`, `requesterActorType`, `requesterActorName`
+  - Target action payload: `targetActionCategory`, `targetActionOperation`, `targetActionSummary`, `targetResourceType`, `targetResourceId`, `targetContext` (JSON text)
+  - Optional runtime linkage: `taskId`, `runId`
+  - Indexes: `idxApprovalRequestsStatusCreatedAt (status, createdAt)`, `idxApprovalRequestsRequesterCreatedAt (requesterActorId, createdAt)`, `idxApprovalRequestsTaskCreatedAt (taskId, createdAt)`
+- `approval_request_audit_events`
+  - `id`, `requestId`, `eventType`, actor snapshot (`actorId`, `actorType`, `actorName`), optional `note`, `createdAt`
+  - `requestId` is a foreign key to `approval_requests(id)` with `ON DELETE CASCADE`
+  - Index: `idxApprovalRequestAuditRequestCreatedAt (requestId, createdAt, id)`
+
+Store API (`packages/core/src/approval-request-store.ts`):
+
+Dashboard approval endpoints (`packages/dashboard/src/routes/register-approval-routes.ts`):
+- `GET /api/approvals`
+- `GET /api/approvals/:id`
+- `POST /api/approvals/:id/decision`
+
+Runtime flow: engine action gate creates/reuses request → pauses task/agent with `pauseReason="awaiting-approval"` → approver calls decision endpoint (`decision: approve|deny`) → request transitions (`pending→approved|denied`) → route resumes matching paused task/agent best-effort → next tool retry consumes `approved` exactly once (then `completed`) or returns structured denial.
+
+Provisioning note: durable `fn_agent_create` / `fn_agent_delete` approvals use `agent_provisioning` policy handling on this same decision route; `fn_spawn_agent` stays under action-gate `task_agent_mutation` because spawned children are ephemeral runtime workers.
+
+- `create(input: ApprovalRequestCreateInput)` — inserts a `pending` request and appends a `created` audit event
+- `get(id)` — returns one request or `null`
+- `list(input?: ApprovalRequestListInput)` — filters by `status`, `requesterActorId`, `taskId`, `runId`; ordered `createdAt DESC, id DESC`; paginated by `limit`/`offset`
+- `decide(requestId, status, input: ApprovalRequestDecisionInput)` — applies `pending -> approved|denied`, stamps `decidedAt`, appends `approved`/`denied` audit event
+- `markCompleted(requestId, input: ApprovalRequestCompletionInput)` — applies `approved -> completed`, stamps `completedAt`, appends `completed` audit event
+- `getAuditHistory(requestId)` — returns append-only audit rows ordered `createdAt ASC, rowid ASC`
+
+Lifecycle contract (`types.ts` `isValidApprovalRequestTransition`):
+
+- Primary forward paths: `pending -> approved -> completed` and `pending -> denied`
+- Direct `pending -> completed` and all transitions from `denied`/`completed` (except no-op self-transition) are rejected
+- Same-state transitions (`from === to`) are treated as valid by the helper even though the intended lifecycle is forward-only
+
+### Mesh state read path for dashboard topology
+
+- `GET /api/mesh/state` in `packages/dashboard/src/routes/register-mesh-routes.ts` is the authoritative dashboard/API read path for topology.
+- Default behavior aggregates a deduped cluster snapshot from the local node plus reachable peers (`includeRemote !== false`) while preserving node-local last-known entries when peers are unreachable.
+- `includeRemote=false` is the non-recursive local-only path used for peer fan-out, so cross-node aggregation never recursively calls remote aggregated endpoints.
+- Route registration reuses the shared `options?.centralCore` instance when available instead of creating per-request `CentralCore` instances, preserving shared mesh state continuity.
+- Nodes UI topology consumes a dedicated `useMeshState` hook that unwraps the `/api/mesh/state` snapshot into `NodeMeshState[]`; `MeshTopology` renders peer relationships directly from each node's `knownPeers` (including remote↔remote links) without fabricating local-star fallback edges.
+
+### Shared mesh-state snapshot helpers
+
+`packages/core/src/shared-mesh-state.ts` defines a common snapshot envelope for non-task mesh state export/apply:
+- Envelope fields: `version`, `exportedAt`, `checksum`, `payload`
+- Checksum rule: `sha256(JSON.stringify(payloadWithoutChecksum))`
+- Payload families:
+  - `TaskMetadataSnapshot` (`tasks` structured metadata only)
+  - `MissionHierarchySnapshot` (`missions`, `milestones`, `slices`, `features`, `missionEvents`, `assertions`, `featureAssertionLinks`)
+  - `AgentSnapshot` (`agents`, `blockedStates`)
+  - `AgentRunSnapshot` (`runs`)
+  - `ActivityLogSnapshot` (`entries`)
+  - `RunAuditSnapshot` (`entries`)
+  - `ProjectSettingsSnapshot` (`global`, `projects`)
+  - `AuthMaterialSnapshot` (`providerAuth`, with API-key and OAuth credential shapes)
+
+Intentional exclusions from shared snapshots:
+- Task/agent blob contents (`PROMPT.md`, task document bodies, attachment bytes, JSONL run logs)
+- Instruction-bundle file contents
+- Node-local runtime handles and paths (for example worktree/session-file handles)
 
 ### Chat System
 
 - `ChatStore` (`packages/core/src/chat-store.ts`) and `chat-types.ts` provide session-oriented chat state (`chat_sessions`, `chat_messages` tables)
 - Dashboard chat UX lives in `packages/dashboard/app/components/ChatView.tsx` and hooks `useChat.ts` / `useQuickChat.ts`
-- Chat message submission uses SSE streaming responses from dashboard chat routes
+- Main `useChat` session restore/recovery must not reset the active thread during session-list refresh or `chat:session:updated` metadata churn while a response is in flight.
+- `chat_sessions.inFlightGeneration` stores a durable JSON snapshot while generation is active: latest streamed text/thinking, tool-call state, and `replayFromEventId` for SSE resume.
+- `ChatManager.sendMessage()` updates that snapshot during streaming (debounced) and clears it on done/error/cancel so stale partial state does not survive completion.
+- When the active session is still generating after reload/reconnect (`isGenerating: true`), `useChat`/`useQuickChat` hydrate the UI from `inFlightGeneration` immediately, then reconnect `/api/chat/sessions/:id/stream` with `Last-Event-ID = replayFromEventId` to avoid re-appending already-known deltas.
+- Chat message submission uses SSE streaming responses from dashboard chat routes.
+- Main-chat optimistic user sends are reconciled against persisted SSE user echoes by content + temp-id replacement, so one user send cannot survive as a duplicate history entry after stream completion.
+- `streamChatResponse()` must flush trailing buffered SSE data on EOF even without a final newline, so terminal `done`/`error` events are not dropped at chunk boundaries.
+- Chat generation ownership is isolated by `generationId` (`ChatManager.beginGeneration` + `ChatStreamManager` subscription filters + route preallocation), preventing stale generation terminal events from leaking into a newer active request.
+
+#### Chat Rooms (Dashboard)
+
+- The Rooms tab in `packages/dashboard/app/components/ChatView.tsx` is wired through `useChatRooms` (`packages/dashboard/app/hooks/useChatRooms.ts`).
+- `useChatRooms` owns room list fetch/sort, active-room selection, member+message hydration, room creation/deletion, and room message sends.
+- The hook subscribes to `/api/events` and consumes `chat:room:created`, `chat:room:updated`, `chat:room:deleted`, `chat:room:member:added`, `chat:room:member:removed`, `chat:room:message:added`, `chat:room:message:updated`, and `chat:room:message:deleted` to keep UI state in sync.
+- Room messages persist through `POST /api/chat/rooms/:id/messages`; the route persists the user message first, then calls `ChatManager.sendRoomMessage(...)` to orchestrate room-member responders and persist assistant room replies with `chatStore.addRoomMessage(...)` (including `senderAgentId` for each responder).
+- `sendRoomMessage(...)` uses existing room-member + mention resolution rules: mentioned members are direct responders, non-mentioned members are ambient responders (capped by `ROOM_AMBIENT_MAX_RESPONDERS`), and non-member mentions are handled explicitly by the manager instead of silently disappearing.
+- Room-reply generation is now non-silent on failure: if a room has members but no active responders can be resolved, or all responder generations fail/return empty output, `sendRoomMessage(...)` throws `RoomReplyGenerationError` and the route surfaces HTTP 502 instead of returning a silent user-only success.
+- `useChatRooms.sendRoomMessage()` now follows direct-chat style optimistic UX: append a temporary local user room message before `POST /api/chat/rooms/:id/messages`, reconcile that temp entry to the persisted user message on success, then refresh authoritative transcript state while continuing `chat:room:message:*` live SSE updates.
+- On failures, `useChatRooms.sendRoomMessage()` performs state reconciliation (rollback temp entry or replace with persisted transcript when POST partially succeeded) and rethrows; `ChatView` owns the single user-facing toast and keeps composer text for retry.
+- Mention UI in rooms keeps direct-chat behavior unchanged while adding room affordances:
+  - `AgentMentionPopup` receives room membership context and shows members first with a `status-dot` member indicator (`aria-label="Room member"`).
+  - With an empty mention filter in room mode, only room members are listed; a hint row prompts the user to type to search non-members.
+  - Mention chips rendered in room messages (`ChatView` and `QuickChatFAB`) mark non-members via `chat-mention-chip--non-member`, including `title`/`aria-label` text (`Not a member of {roomName}`) and muted warning-token styling.
 
 ### Agent Companies
 
@@ -164,6 +306,10 @@ Concrete references:
   - persisted failure classification (`cancelled`, `timed_out`, `retryable_transient`, `non_retryable`) and retry lineage metadata
   - append-only durable event trail in `project_insight_run_events`
 - Dashboard routes (`insights-routes.ts`) consume the core executor/store APIs for run start, cancel, retry, and event inspection (`/api/insights/runs/:id/events`)
+- `POST /api/insights/run` preserves the single-active-run guarantee while adding orphan recovery for stale `pending|running` rows:
+  - a conflicting active row is only auto-recovered when there is no in-memory controller ownership (`activeRunControllers` has no entry) **and** run age (`startedAt ?? createdAt`) exceeds the grace window (`ORPHAN_GRACE_MS = 30_000`)
+  - recovered rows are durably marked `failed` with lifecycle terminal metadata (`terminalReason=failed`, `terminalCause=orphaned_active_run_recovered`, `failureClass=non_retryable`, `retryable=false`) and warning/status events appended to `project_insight_run_events`
+  - true live conflicts continue returning HTTP 409 with structured payload details `{ code: "ACTIVE_RUN_CONFLICT", activeRunId, activeRunStatus, trigger }` so the dashboard can hydrate and display the existing active run instead of surfacing a raw backend exception
 - `POST /api/insights/:id/create-task` remains a draft-payload endpoint (returns `suggestedTitle`/`suggestedDescription`); the dashboard `InsightsView` now uses that payload to create a real task through the normal app task-creation path (`column: triage`, `sourceType: dashboard_ui`, source metadata indicating insights origin)
 - Backed by `project_insights`, `project_insight_runs`, and `project_insight_run_events`
 
@@ -182,11 +328,42 @@ Concrete references:
   - Provider substitution must remain data-driven: source metadata can carry provider identity, and fetching should resolve providers per source rather than relying on provider ordering.
 - **Boundary note:** research and insights are parallel subsystems sharing host infrastructure, not one table/store family.
 
+### Task Evaluations
+
+- `EvalStore` (`eval-store.ts`, `eval-types.ts`) persists eval runs and task-level eval outcomes.
+- Dashboard/API surface is implemented under `/api/evals` (`packages/dashboard/src/evals-routes.ts`) with `EvalsView.tsx` in the app.
+- Backed by `eval_runs`, `eval_task_results`, and `eval_run_events`.
+- Data model stores structured scoring/evidence/signal payloads plus durable `taskSnapshot` metadata so historical eval results remain readable even if the live task row later changes or is removed.
+- Lifecycle safeguards mirror other core stores: deterministic list ordering, transition guards, terminal immutability for run rows, and active-run conflict protection for scheduled/task-completion triggers.
+- `eval_task_results` enforces one row per `(runId, taskId)` via a unique index; store writes use upsert semantics to keep reruns idempotent.
+- Canonical scoring contract is documented in `docs/evals.md`; authoritative score computation is centralized in `packages/core/src/eval-scoring.ts`.
+
+Scoring authority boundary:
+- Authoritative fields: `categoryScores[].finalScore`, `categoryScores[].band`, `categoryScores[].weight`, and `overallScore` (derived by `computeOverallScore`).
+- Advisory/model-authored fields: category `aiScore`, category `rationale`, category `evidence`, and `overallRationale` text.
+- Evaluator code (`packages/engine/src/evaluator.ts`) may provide AI category inputs, but must route final score computation through core helpers (`normalizeCategoryScore`, `computeOverallScore`) and must not persist AI-provided overall numbers as source of truth.
+
+Hybrid evaluator pipeline (FN-3389/FN-3391):
+- **Batch selection:** `runScheduledEvalBatch` in core computes a deterministic completed-task window (`windowStartExclusive` → `windowEndInclusive`) from the last completed scheduled run.
+- **Signal summary:** `collectDeterministicSignals` (`eval-signal-collector.ts`) normalizes timing/workflow/review/log/commit summaries with stable fallbacks for missing metadata.
+- **Evidence harvesting:** `collectTaskEvaluationEvidence` (`packages/engine/src/evaluator-evidence.ts`) reads existing task-store/git surfaces (`workflowStepResults`, documents, task activity log, agent logs, run-audit events, merge/PR metadata) and emits a bounded `TaskEvaluationEvidenceBundle` with fixed source-group ordering.
+- **AI review:** `HybridEvaluatorService` (`packages/engine/src/evaluator.ts`) injects deterministic signals plus a dedicated `## Evidence` bundle section into a strict JSON prompt, runs a read-only AI session, validates the JSON payload, and merges AI advisory fields into persisted eval output while preserving core score authority.
+- **Follow-up policy engine:** `packages/engine/src/eval-followups.ts` normalizes raw evaluator drafts into canonical follow-up suggestions, applies deterministic suppression/dedupe rules, and (policy permitting) materializes triage tasks through `TaskStore.createTask()` with source provenance back to the parent task and eval run/suggestion IDs.
+- **Persistence boundary:** eval rows persist normalized evidence refs plus bounded excerpts/IDs (not full raw logs or unbounded command output) and structured follow-up lifecycle state (`suggested`/`suppressed`/`created`) including suppression reason or created task linkage. Source drill-down stays in original task/agent/run-audit stores and git history.
+- **Model resolution (temporary):** evaluator model selection first uses an explicit run override pair (`provider` + `modelId` together only), then falls back to the existing validator lane (`resolveValidatorSettingsModel`) until FN-3393 introduces dedicated evaluator settings.
+- **Scheduled execution wiring:** CronRunner intercepts the sentinel command `fn eval --scheduled-batch` and executes in-process, invoking `runScheduledEvalBatch` with `HybridEvaluatorService`; `ProjectEngine` syncs scheduled eval automation on startup and on relevant settings changes.
+
 ### Plugin System
 
-- `PluginStore` (`plugin-store.ts`) stores plugin installation state and settings (`plugins` table)
-- `PluginLoader` (`plugin-loader.ts`) loads/unloads plugin modules and emits lifecycle events
+- `PluginStore` (`plugin-store.ts`) is a facade over two persistence scopes:
+  - **Global install metadata** in central DB table `plugin_installs` (`~/.fusion/fusion-central.db`) including manifest/path/settings/schema/dependencies
+  - **Per-project runtime state** in central DB table `project_plugin_states` keyed by normalized project path (`enabled`, `state`, `error`)
+- Legacy project-local `plugins` rows in `.fusion/fusion.db` are migrated lazily on plugin-store init/read; migration is idempotent and keeps newest `updatedAt` install metadata as global canonical data while preserving per-project enablement rows
+- Post-FN-3722, the project-local `plugins` table is legacy read-only migration input; any new install writer targeting it is a bug
+- `TaskStore.getPluginStore()` now propagates the configured `globalSettingsDir`/central directory so all CLI and dashboard install paths resolve the same central DB
+- `PluginLoader` (`plugin-loader.ts`) loads/unloads plugin modules using the effective per-project plugin state
 - Plugin contributions now include both embedded `uiSlots` and top-level `dashboardViews`
+- Executor runtime contributions can be provided via `executorRuntimeEnv(taskCtx, ctx)`; see the canonical plugin-authoring contract in [`docs/PLUGIN_AUTHORING.md` §4 "`executorRuntimeEnv`: task-scoped executor subprocess environment"](./PLUGIN_AUTHORING.md#executorruntimeenv-task-scoped-executor-subprocess-environment). The engine applies these task-scoped overlays only to executor-spawned user commands, never to git plumbing subprocesses.
 - Discovery endpoints:
   - `GET /api/plugins/ui-slots`
   - `GET /api/plugins/dashboard-views`
@@ -196,6 +373,18 @@ Concrete references:
 
 - `prompt-overrides.ts` defines prompt key catalogs and per-role override validation
 - Provides override resolution/validation helpers (`resolvePrompt`, `resolveRolePrompts`, `assertValidPromptOverrideMap`)
+
+### Plugin Prompt Contributions
+
+- Plugin prompt contributions are filtered per surface through `PluginRunner.getPromptContributionsForSurface(surface)`.
+- Prompt assembly uses `buildPluginPromptSection(surface, pluginRunner)` in `packages/engine/src/agent-instructions.ts`.
+- Supported prompt surfaces:
+  - `executor-system`
+  - `executor-task`
+  - `triage`
+  - `reviewer`
+  - `heartbeat`
+- Integration points append the built plugin section to the role-specific system/task prompt only when contributions exist, preserving existing prompts when no plugins contribute.
 
 ### Agent Permissions
 
@@ -237,11 +426,13 @@ Key roadmap invariants:
 - repair/normalization uses deterministic tie-breakers: `orderIndex ASC`, `createdAt ASC`, `id ASC`
 - cross-milestone feature moves must renumber both the source and destination milestone deterministically
 
-**Roadmap REST API endpoints (`/api/roadmaps`):**
+**Roadmap frontend API contract (plugin namespace):**
+- Canonical frontend namespace: `/api/plugins/fusion-plugin-roadmap/roadmaps`
 - Roadmaps: `GET /`, `POST /`, `GET /:roadmapId`, `PATCH /:roadmapId`, `DELETE /:roadmapId`
 - Milestones: `GET /:roadmapId/milestones`, `POST /:roadmapId/milestones`, `PATCH /milestones/:milestoneId`, `DELETE /milestones/:milestoneId`, `POST /:roadmapId/milestones/reorder`
 - Features: `GET /milestones/:milestoneId/features`, `POST /milestones/:milestoneId/features`, `PATCH /features/:featureId`, `DELETE /features/:featureId`, `POST /milestones/:milestoneId/features/reorder`, `POST /features/:featureId/move`
 - Export/Handoff: `GET /:roadmapId/export`, `GET /:roadmapId/handoff`, `GET /:roadmapId/handoff/mission`, `GET /:roadmapId/milestones/:milestoneId/features/:featureId/handoff/task`
+- Canonical roadmap REST namespace is plugin-scoped (`/api/plugins/fusion-plugin-roadmap/...`), while dashboard maintains a temporary `/api/roadmaps` compatibility mount that delegates to plugin-owned handlers during migration.
 
 **Database schema:**
 - `roadmaps` — roadmap metadata (id, title, description, timestamps)
@@ -259,6 +450,36 @@ From `packages/core/src/index.ts` exports (selected high-impact modules):
 - **Node/system infrastructure**: `node-connection.ts`, `node-discovery.ts`, `system-metrics.ts`, `migration-orchestrator.ts`
 - **Identity/version/extensions**: `daemon-token.ts`, `app-version.ts`, `pi-extensions.ts`
 - **Agent companies import/export**: `agent-companies-parser.ts`, `agent-companies-exporter.ts`, `agent-companies-types.ts`
+
+### Docker Node Provisioning
+
+Fusion has a managed Docker node provisioning subsystem spanning `@fusion/core` services and dashboard routes.
+
+**Core services:**
+- `DockerClientService` (`packages/core/src/docker-client.ts`)
+  - Creates Dockerode clients from host settings.
+  - Supports default local daemon, named Docker `context`, or explicit `host` with optional TLS fields.
+  - Host/TLS inputs: `context`, `host`, `tlsVerify`, `tlsCaPath`, `tlsCertPath`, `tlsKeyPath`.
+- `DockerProvisioningService` (`packages/core/src/docker-provisioning.ts`)
+  - Handles initial container lifecycle actions (provision/deprovision/start/stop/restart/status).
+  - Provisioning creates and starts a container first, then route-level orchestration registers metadata/node records.
+- `MeshConfigGenerator` (`packages/core/src/mesh-config-generator.ts`)
+  - Generates mesh env/config, applies config by recreating the container, registers the node into mesh state, then health-checks until online or timeout.
+
+**Route boundary (dashboard):**
+- `register-docker-provisioning-routes.ts` owns initial container lifecycle endpoints (`/api/docker/provision`, `/api/docker/deprovision`, and per-container start/stop/restart/status).
+- `register-docker-node-routes.ts` owns managed-node metadata + mesh configuration endpoints (for example `/api/docker/nodes/:managedId/apply-mesh-config` and mesh-status checks) after a container is provisioned.
+
+**Provisioning lifecycle (implemented flow):**
+1. **Container provisioning**: dashboard provisioning route calls `DockerProvisioningService.provision()` to create/start a managed container.
+2. **Mesh config generation**: `MeshConfigGenerator.generateConfig()` resolves API key, reachable URL, and mesh env vars.
+3. **Mesh config application**: `MeshConfigGenerator.applyConfig()` calls `DockerClientService.recreateContainer()` so env vars are applied to a recreated container.
+4. **Node registration**: `MeshConfigGenerator.registerInMesh()` creates/links a remote `NodeConfig` entry.
+5. **Health check**: mesh registration flow polls `checkNodeHealth()` until online or timeout.
+
+**Port convention:**
+- Managed Docker mesh-node containers default to **`4041`** (`DEFAULT_CONTAINER_PORT` in `mesh-config-generator.ts`).
+- **`4040` remains reserved** for the production dashboard and should not be documented as the managed mesh-node default.
 
 ### Memory System
 
@@ -308,6 +529,10 @@ const backend = resolveMemoryBackend(settings);
 **QMD Backend Behavior:**
 The QMD backend (`qmd`) delegates read/write I/O to the file backend and schedules background QMD index refreshes. For search, it attempts QMD query first and falls back to local `.fusion/memory/` file search when QMD is unavailable, errors, or returns no matches.
 
+QMD-backed memory behavior also applies to agent-private memory workspaces under `.fusion/agent-memory/{agentId}/`:
+- Agent memory search normalizes QMD hit paths (including `qmd://...`, absolute paths, and relative filenames) into canonical readable workspace paths (`MEMORY.md`, `DREAMS.md`, `YYYY-MM-DD.md`) so results can be passed directly into `fn_memory_get`.
+- Agent-memory writes from tool and non-tool paths (including `processAgentMemoryDreams()`) schedule agent-specific QMD refreshes so new dreams/long-term updates remain discoverable without manual reindexing.
+
 **Dashboard API:**
 - `GET /api/memory/backend` — Returns current backend status and capabilities
 
@@ -327,6 +552,14 @@ See [Memory Plugin Contract](./memory-plugin-contract.md) for the full plan.
 
 ### Scheduling and execution
 - `Scheduler` (`scheduler.ts`) — dependency-aware task scheduling that dispatches eligible todo tasks by priority first, then FIFO (`createdAt` ascending) within each priority tier.
+  - `blockedBy` invariant (FN-3924): the field is only durable when it references a current unresolved explicit dependency (or, for dependency-free tasks, an active overlap blocker). If no current blocker remains, scheduler/event reconciliation clears `blockedBy` to `null` and re-evaluates from live task state.
+
+#### BlockedBy stamping invariants
+- Scheduler writes overlap-based `blockedBy` only when overlap gating is active and there is a live overlapping active scope; otherwise overlap logic does not stamp blockers.
+- Stamping is sticky when valid (FN-3899): if a todo task is already `queued` behind a blocker that is still active and still overlaps, the scheduler preserves that blocker and skips rewrites.
+- When the blocker must change, selection is deterministic: active overlap candidates are ordered by task ID and the first overlapping task is chosen, removing tick-order churn.
+- Writes are idempotent: scheduler updates `status/blockedBy` only when values change, reducing per-tick churn and audit noise.
+- Self-healing remains responsible for terminal/missing blocker cleanup (`clearStaleBlockedBy()`), while scheduler overlap stamping now focuses on stable active-overlap attribution.
 - `StepSessionExecutor` (`step-session-executor.ts`) — per-step sessions + parallel wave execution
 - `TaskCompletion` (`task-completion.ts`) — completion gate helpers
 - `SpecStaleness` (`spec-staleness.ts`) — stale spec detection utilities
@@ -348,6 +581,13 @@ See [Memory Plugin Contract](./memory-plugin-contract.md) for the full plan.
 - `AgentRuntime` (`agent-runtime.ts`) — runtime adapter interface contract
 - `RuntimeResolution` (`runtime-resolution.ts`) — runtime selection and fallback logic
 - `AgentSessionHelpers` (`agent-session-helpers.ts`) — runtime-aware session creation helpers
+- `AgentActionGate` (`agent-action-gate.ts`) — permanent-agent runtime action classification + policy disposition decisions (shared classification source: `packages/engine/src/gating-classifications.ts`)
+
+Runtime action-gate flow (v1):
+- Tool execution wrappers in `pi.ts` compose `wrapToolsWithBoundary()` and `wrapToolsWithActionGate()`.
+- Non-ephemeral agents receive `AgentActionGateContext` from executor/heartbeat session creation.
+- `block` and `require-approval` dispositions intercept before tool side effects.
+- `require-approval` persists durable requests via `ApprovalRequestStore`, reusing pending requests by dedupe key in `targetAction.context.approvalDedupeKey`.
 
 ### Concurrency, recovery, and resiliency
 - `AgentSemaphore` (`concurrency.ts`) — slot acquisition
@@ -357,7 +597,13 @@ See [Memory Plugin Contract](./memory-plugin-contract.md) for the full plan.
 - `TransientErrorDetector` (`transient-error-detector.ts`) — retriable error classification
 - `SelfHealingManager` (`self-healing.ts`) — auto-unpause/maintenance recovery actions
   - `recoverGhostReviewTasks()` is a fallback only for idle, non-terminal `in-review` states. Terminal/actionable states (notably `status: "failed"`) are preserved and **not** auto-kicked back to `todo`.
+  - `recoverMissingWorktreeReviewFailures()` is a narrow failed-review recovery: only `status: "failed"` `in-review` tasks with the explicit session-start signature `Refusing to start coding agent in missing worktree:` (from `assertValidWorktreeSession()`) are requeued. Recovery clears stale session metadata (`worktree`, `branch`, `sessionFile`, transient failure state), preserves valid step progress/retry counters, logs the auto-recovery reason, and moves the task back to `todo` for a clean retry.
   - `recoverMergeableReviewTasks()` only re-enqueues truly eligible tasks; retry-exhausted review tasks are skipped to avoid re-enqueue/no-op loops that keep refreshing `updatedAt`.
+  - `recoverAlreadyMergedReviewTasks()` auto-finalizes retry-exhausted `in-review` tasks when self-healing can prove their work already landed on the merge target, but it still honors `getTaskMergeBlocker()` before `in-review` → `done`. If a blocker remains (for example, incomplete steps), the task is surfaced in stable `in-review/failed` state with a blocker error instead of entering an auto-finalize loop.
+  - No-`fn_task_done` recovery classification is normalized across executor, restart recovery, and self-healing: detection keys on executor-emitted `"without calling fn_task_done"` strings (while still tolerating legacy `task_done` wording), then applies the bounded ladder deterministically (in-session retries → bounded todo requeues with preserved progress when appropriate → terminal surfaced failure when budget is exhausted).
+  - `clearStaleBlockedBy()` clears `blockedBy` (and transient `status`) on todo tasks when their blocker is missing, done, archived, paused in-review, or failed in-review with merge retries exhausted. FN-3924 extends this with a dependency-integrity guard: if a task has explicit dependencies and `blockedBy` is not one of the currently unresolved deps, the stale marker is cleared. This repairs rows corrupted by historical overlap re-stamping and lets scheduler re-evaluate from live dependency state.
+  - Together, `recoverAlreadyMergedReviewTasks()`, `clearStaleBlockedBy()`, and paused-aware in-review scheduling prevent merge-deadlock loops by finalizing already-landed work, clearing stale dependency blockers, and avoiding paused review cards re-blocking overlap dispatch.
+  - Merge commit attribution is ownership-aware: a `mergeDetails.commitSha` is trusted only when reachable from `HEAD` **and** attributable to the task via `Fusion-Task-Id` trailer or task-ID-bearing subject. Reachable-but-unowned SHAs are rejected to prevent sibling done tasks from sharing misleading merge metadata.
 - `ProjectEngine` settings lifecycle handlers (`project-engine.ts`) treat `enginePaused` as a soft pause: clearing it dispatches runtime resume and, when `autoMerge` is enabled, performs an `in-review` eligibility sweep to requeue mergeable review tasks.
 - `UsageLimitPauser` (`usage-limit-detector.ts`) and `withRateLimitRetry` (`rate-limit-retry.ts`)
 
@@ -370,9 +616,11 @@ See [Memory Plugin Contract](./memory-plugin-contract.md) for the full plan.
 - `RunAudit` (`run-audit.ts`) — mutation audit tracking (DB/git/filesystem)
 - `Notifier` (`notifier.ts`) — legacy ntfy compatibility shim (`NtfyNotifier`) plus shared ntfy helpers
   - Runtime ownership: `NtfyNotifier` no longer owns an independent task-lifecycle listener graph; `ProjectEngine` injects the canonical `NotificationService` instance so task lifecycle notifications (`task:moved`, `task:updated`, `task:merged`) are emitted through a single path.
+  - Merge dedup safety: `ProjectEngine.start()` is idempotent, so repeated start calls do not wire a second `NotificationService`/`NtfyNotifier` pair. A successful merge therefore emits exactly one canonical `merged` ntfy lifecycle notification per task.
   - Compatibility scope: `NtfyNotifier` remains responsible for gridlock-only compatibility notifications (`notifyGridlock`) and legacy helper APIs.
   - Legacy gridlock ntfy delivery is cooldown-throttled: first detection notifies immediately, subsequent detections are suppressed for 15 minutes (even if blocked-task membership changes), and the cooldown resets as soon as gridlock fully clears.
 - `NotificationService` (`notification/notification-service.ts`) — provider lifecycle + event dispatch orchestration
+  - Subscribes to task lifecycle events plus mailbox and memory events. `message:sent` dispatches `message:agent-to-user` and `message:agent-to-agent` notification events (with message metadata for deep-links), and manual `POST /api/memory/dream` processing emits `store.emit("memory:dreams-processed", payload)` when new DREAMS content is written.
 - `NotificationProvider` interface (`@fusion/core` `notification/provider.ts`) — pluggable provider contract
 - Built-in providers: `NtfyNotificationProvider` (`notification/ntfy-provider.ts`), `WebhookNotificationProvider` (`notification/webhook-provider.ts`)
 - `AgentReflection` (`agent-reflection.ts`) — reflection extraction and persistence
@@ -386,6 +634,50 @@ Implemented in `agent-heartbeat.ts`:
 ### Node/mesh runtime services
 - `NodeHealthMonitor` (`node-health-monitor.ts`) — remote node liveness/metrics checks
 - `PeerExchangeService` (`peer-exchange-service.ts`) — peer sync orchestration
+- `MeshLeaseManager` (`mesh-lease-manager.ts`) — canonical abandoned-lease detection + recovery path
+
+### Outage ownership boundaries (degraded reads + queued write replay)
+- `CentralCore` owns durable outage state in central persistence (`meshSharedSnapshots` + `meshWriteQueue`) and exposes stable assertion methods: `recordMeshSnapshot`, `getLatestMeshSnapshot`, `enqueueMeshWrite`, `listPendingMeshWrites`, `markMeshWriteReplayStarted`, `markMeshWriteApplied`, `markMeshWriteFailed`, and `getMeshDegradedReadState`.
+- `PeerExchangeService` owns retryability classification for sync/apply failures, queue insertion for retryable failures, replay execution (`replayPendingWritesForNode(targetNodeId)`), and observable sync results (`queuedWriteId`, `replaySummary`) for partition/replay assertions.
+- `NodeHealthMonitor` provides liveness transitions as replay hints only via deterministic recovery callback `onNodeRecovered(nodeId, previousStatus)`; `online` is a trigger to attempt replay, not proof that replay succeeded.
+- Dashboard mesh routes (`register-mesh-routes.ts`) preserve `GET /api/mesh/state` array shape and attach per-node degraded `readState` metadata so stale fallback data is explicit during partitions.
+
+### Mesh task lease ownership and recovery
+
+Task ownership is persisted in shared task metadata so all nodes agree on one canonical lease view. The persisted lease fields are:
+
+- `checkedOutBy` — owning agent id (compatibility field)
+- `checkedOutAt` — lease acquisition timestamp (compatibility field)
+- `checkoutNodeId` — owning node id
+- `checkoutRunId` — active owning heartbeat/executor run id when known
+- `checkoutLeaseRenewedAt` — last successful lease renewal timestamp
+- `checkoutLeaseEpoch` — monotonic fencing generation used to reject stale owners after recovery
+
+`AgentStore.checkoutTask()` remains the compatibility entrypoint for ownership claims, but lease replacement is fenced by epoch semantics: only the same live owner can renew idempotently, and stale owner replacement is performed only through the recovery path.
+
+`MeshLeaseManager.recoverAbandonedLease(taskId, reason, context)` is the single canonical abandoned-work path used by scheduler/self-healing/runtime orchestration. Recovery validates staleness, bumps `checkoutLeaseEpoch`, clears active-owner fields, logs the reason, and re-queues work for scheduler visibility.
+
+A lease is recoverable only when there is **no active local executor session for that task** and either:
+
+1. the owning node is `offline` or `error`, or
+2. the owner heartbeat/run age exceeds `max(agentHeartbeatTimeoutMs * 2, 120_000)` measured against the most recent lease renewal timestamp.
+- Canonical replication/write-coordination contract: [`docs/shared-mesh-protocol.md`](./shared-mesh-protocol.md)
+  - Defines protocol versioning, write classes, quorum/ack semantics, lease epochs/fencing, offline queue/replay, reconciliation outcomes, restart recovery hooks, and degraded-read staleness metadata.
+  - Existing `/api/mesh/sync` and settings-sync payloads remain the active exchange primitives while follow-on runtime tasks implement full v1 coordinator/quorum behavior.
+- Distributed task-ID allocation (`packages/core/src/distributed-task-id.ts`) is the first mesh-aware coordinated write primitive.
+  - Durable state lives in SQLite tables `distributed_task_id_state` (prefix sequence + authoritative committed count) and `distributed_task_id_reservations` (reservation lifecycle rows).
+  - Reserve/commit/abort execute under a process-local lock and a single SQLite transaction. Lazy reservation expiry cleanup runs inside those same transactions.
+  - Default reservation TTL is `15 * 60 * 1000` ms (15 minutes). Expired/aborted reservations are **burned IDs** and are never reissued.
+  - `committedClusterTaskCount` from allocator state is the only authoritative cluster-wide committed-task count. Local task-row counts and ID suffix math are not authoritative.
+  - Mesh allocator write routes (`/api/mesh/task-ids/reserve|commit|abort`) return `503` when the coordinator node is unreachable; they never fall back to local-only cluster ID issuance.
+- Cluster task creation now uses a strong-write reserve → create → replicate → commit/abort sequence.
+  - Ordinary local task creation (`TaskStore.createTask()`, duplicate, and refine flows) now allocates IDs through the same distributed reserve/commit/abort lifecycle owned by `TaskStore`.
+  - `POST /api/tasks` uses the store-owned allocator path for local creates rather than maintaining a separate route-local allocator implementation.
+  - `POST /api/tasks` reserves a distributed ID, creates the authoritative local task with that reserved ID, then POSTs authenticated replication payloads to peer nodes.
+  - Creation self-heals stale ID overlap state: if a reserved `FN-*` collides with an existing task (`Task ID already exists...` or replicated-create collision), the route aborts that reservation, cleans up partial local state, reserves the next ID, and retries up to a bounded limit.
+  - Replica apply uses `TaskStore.applyReplicatedTaskCreate(...)`, which is idempotent by task ID: replaying the same payload returns the existing task without creating duplicates.
+  - If an incoming replicated payload conflicts with a different existing task record for the same ID, the apply path returns a deterministic collision error instead of overwriting data.
+  - Any replication/coordinator failure aborts the reservation and returns write failure (`503`), so this path does not report success for local-only partial writes.
 - Process lifecycle ownership:
   - `fn serve` / `fn dashboard` start a single process-level `PeerExchangeService` and stop it during shutdown.
   - `CentralCore.startDiscovery()` is invoked from CLI startup only after HTTP bind completes so discovery advertises the actual listening port.
@@ -455,8 +747,9 @@ Key server capabilities:
   - Note: this **hyphenated `dev-server-*` family is the canonical runtime owner** today; see `docs/dev-server-module-boundary-audit.md` for the FN-2212 boundary/consolidation audit covering parallel `devserver-*` modules.
 - Plugin management routes (`plugin-routes.ts`)
 - Insights routes (`insights-routes.ts`)
+- Evals routes (`evals-routes.ts`) — `/api/evals` read surface for eval result listing/filtering, drill-down detail, and eval run metadata
 - Research routes (`research-routes.ts`) — `/api/research` surface for runs, details, cancel/retry, exports, create-task, and attach-task actions; supports graceful degradation envelopes via availability payloads when capabilities are unavailable
-- Roadmap routes (`roadmap-routes.ts`)
+- Plugin-defined roadmap routes under `plugin-routes.ts` dispatch (`/api/plugins/fusion-plugin-roadmap/...`)
 - Project-scoped store reuse via `project-store-resolver.ts`
 - Rate limiting (`rate-limit.ts`)
 - Static SPA hosting (Vite build output)
@@ -477,11 +770,23 @@ Key server capabilities:
   - Canonical maintainer contract (ownership/lifecycle/scoping/pitfalls and shared-vs-dedicated stream boundaries): [`docs/dashboard-realtime.md`](./dashboard-realtime.md)
 - **Chat streaming**: `/api/chat/sessions/:id/messages` (`routes.ts` + `chat.ts`)
   - Streams assistant responses as SSE events for chat sessions
+  - `done` events include the authoritative persisted assistant message snapshot (`message`) so clients can render final output even when incremental `text` deltas are absent
 - **Chat session queries**: `/api/chat/sessions` (`routes.ts`)
   - Existing list behavior is unchanged (`status=active|archived|all` returns an array)
   - Quick Chat resume uses targeted lookup params: `agentId`, optional `modelProvider` + `modelId`, plus `resume=1`
   - Validation requires `modelProvider` and `modelId` together; partial model pairs return `400`
   - Targeted lookup returns only the newest matching active session (or `null`) to avoid scanning every active session client-side
+- **Chat Room API**: `/api/chat/rooms*` (`register-chat-room-routes.ts`)
+  - `GET /api/chat/rooms` → `200 { rooms }`; query supports `projectId`, `status`, and `agentId`
+  - `POST /api/chat/rooms` → `201 { room, members }`; validates `name`, returns `409` on slug collisions
+  - `GET/PATCH/DELETE /api/chat/rooms/:id` → room read/update/delete (`404` for unknown room)
+  - `GET/POST/DELETE /api/chat/rooms/:id/members[/:agentId]` → member list/add/remove (`400` for invalid body, `404` for unknown room/member)
+  - `GET /api/chat/rooms/:id/messages` + `POST /api/chat/rooms/:id/messages` + `DELETE /api/chat/rooms/:id/messages/:messageId`
+    - Room message POST persists the user room message (`201 { message }`), rejects non-null `senderAgentId` for user submissions, then triggers server-side room responder execution that persists assistant room replies via `chatStore.addRoomMessage(...)`
+  - `POST /api/chat/rooms/:id/messages/:messageId/attachments` records attachment metadata on an existing room message
+  - Error contract follows existing API patterns: `400` validation failures, `404` missing resources, `409` duplicate-slug conflicts, `503` when chat store is unavailable
+  - SSE fan-out on `/api/events` now includes: `chat:room:created`, `chat:room:updated`, `chat:room:deleted`, `chat:room:member:added`, `chat:room:member:removed`, `chat:room:message:added`, `chat:room:message:updated`, `chat:room:message:deleted`
+  - **Room test coverage (planned):** FN-3812 tracks the contract-first test matrix for room creation/switching, persisted history, mention routing, and hybrid responder behavior. See `.fusion/tasks/FN-3812/test-plan.md` plus scaffold files: `packages/core/src/__tests__/chat-store.rooms.test.ts`, `packages/dashboard/src/__tests__/chat.rooms.test.ts`, `packages/dashboard/src/__tests__/chat-routes.rooms.test.ts`, and `packages/dashboard/app/components/__tests__/ChatView.rooms.test.tsx`.
 - **Task log stream**: `/api/tasks/:id/logs/stream` (`server.ts`)
   - SSE endpoint for live task log streaming with project scope resolution
 - **Dev-server stream**: `/api/dev-server/logs/stream` (`dev-server-routes.ts`)
@@ -501,7 +806,7 @@ Key server capabilities:
 - Task detail surface is shared through `TaskDetailContent` (exported from `TaskDetailModal.tsx`): desktop/tablet `ListView` renders it inline in the split right pane, while mobile and non-list entry points continue using `TaskDetailModal`.
 - In desktop split mode, `ListView` now uses a compact sidebar-first control layout (count/actions/summary chips + collapsible "View options" panel) to keep list controls dense alongside the inline detail pane; mobile keeps the card-first flow with a toolbar "View options" entry point for the same visibility/filter toggles.
 - Chat system UI: `ChatView.tsx`, `QuickChatFAB.tsx`
-- Planning/roadmap/insight UI: `MissionManager.tsx`, `RoadmapsView.tsx`, `TodoView.tsx`, `InsightsView.tsx`, `DocumentsView.tsx`
+- Planning/insight UI: `MissionManager.tsx`, `TodoView.tsx`, `InsightsView.tsx`, `DocumentsView.tsx` (roadmap view is plugin-owned)
 - Dev server UI: `DevServerView.tsx` (controls + status/log panel + embedded preview with iframe fallback messaging)
 
 ### CSS Architecture
@@ -519,7 +824,7 @@ The dashboard's CSS is split between a consolidated global stylesheet and modula
 
 **Lazy-loaded views** (bundle size optimization):
 The following 15 views are lazy-loaded via `React.lazy()` with `<Suspense fallback={null}>`:
-- `AgentsView`, `RoadmapsView`, `TodoView`, `NodesView`, `ChatView`, `MemoryView`, `ResearchView`
+- `AgentsView`, `TodoView`, `NodesView`, `ChatView`, `MemoryView`, `ResearchView`
 - `DevServerView`, `InsightsView`, `DocumentsView`, `SkillsView`
 - `SetupWizardModal`, `PluginManager`, `PiExtensionsManager`, `AgentDetailView
 
@@ -529,21 +834,52 @@ A `prefetchLazyViews()` function runs once on mount via `requestIdleCallback` to
 - Task + realtime: `useTasks.ts`, `useBadgeWebSocket.ts`, `useAiSessionSync.ts`
 - Chat: `useChat.ts`, `useQuickChat.ts`
 - Documents/insights/memory: `useDocuments.ts`, `useInsights.ts`, `useMemoryBackendStatus.ts`, `useMemoryData.ts`
-- Planning/roadmaps: `useRoadmaps.ts`
+- Plugin roadmap state/hooks: owned by `plugins/fusion-plugin-roadmap/src/dashboard/*`
 - Dev server: `useDevServer.ts` (status hydration, command controls, reconnect stream handling, project-scope reset)
 - Project/agents/setup: `useProjects.ts`, `useCurrentProject.ts`, `useAgents.ts`, `useSetupReadiness.ts`
 - UX/platform helpers: `useFavorites.ts`, `useAuthOnboarding.ts`, `useDeepLink.ts`, `useTerminal.ts`
 
 ### Planning and decomposition features
-- Backend planners: `planning.ts`, `subtask-breakdown.ts`, `roadmap-suggestions.ts`
+- Backend planners: `planning.ts`, `subtask-breakdown.ts` (roadmap suggestion generation is plugin-owned)
 - UI modals: `PlanningModeModal.tsx`, `SubtaskBreakdownModal.tsx`, milestone interview flows
 - Multi-task creation endpoints are wired under planning/subtask routes in `routes.ts`
 
 ### Health and monitoring endpoints
 - **Health check**: `GET /api/health`
   - Returns liveness status for load balancers and monitoring
-  - Response: `{ status: "ok", version: string, uptime: number }`
+  - Response: `{ status: "ok" | "degraded", version: string, uptime: number, database: { corruptionDetected: boolean, integrityCheckPending: boolean, integrityCheckLastRunAt: string | null } }`
+  - Startup does not block on full `PRAGMA integrity_check(100)`; Fusion schedules it in the background shortly after boot.
+  - Background integrity checks are deduplicated process-wide per on-disk SQLite path: multiple `Database` instances sharing the same `fusion.db` join one shared run, and each instance still updates `database.integrityCheckPending`, `database.integrityCheckLastRunAt`, and `database.corruptionDetected` from the shared result.
   - No authentication required
+
+### Custom Provider endpoints
+
+Custom-provider settings routes are registered in `register-custom-provider-routes.ts`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/custom-providers` | List configured custom providers from global settings with API keys masked in the response payload. |
+| POST | `/api/custom-providers` | Create a custom provider (`name`, `apiType`, `baseUrl`, optional `apiKey` and `models`) and return the new provider with masked API key. |
+| PUT | `/api/custom-providers/:id` | Update an existing custom provider by ID (partial updates supported) and return the sanitized provider payload. |
+| DELETE | `/api/custom-providers/:id` | Delete a custom provider by ID and return a success envelope. |
+
+### Project/node path-mapping endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/projects/:id/path-mappings` | List persisted per-node absolute paths for a project (`projectNodePathMappings` rows keyed by `projectId` + `nodeId`). |
+| GET | `/api/projects/:id/path-mappings/:nodeId` | Fetch one project↔node mapping row. |
+| PUT | `/api/projects/:id/path-mappings/:nodeId` | Upsert one mapping row (`path` body field must be absolute). |
+| DELETE | `/api/projects/:id/path-mappings/:nodeId` | Delete one mapping row if present. |
+| GET | `/api/nodes/:id/path-mappings` | List all project mappings known for a node. |
+
+This API surface is intentionally separate from `projects.nodeId` (runtime host placement metadata) and from task-level routing defaults (`defaultNodeId` / `Task.nodeId`).
+
+Dashboard node onboarding (`AddNodeModal` → `useNodes.register`) uses a two-phase flow:
+1. Register node metadata first via `POST /api/nodes`.
+2. Persist selected project↔node path mappings with per-project `PUT /api/projects/:id/path-mappings/:nodeId` upserts.
+
+The client treats mapping persistence as part of onboarding success. If mapping writes fail after node creation, onboarding attempts rollback via `DELETE /api/nodes/:id` and refreshes node state to avoid a silent half-configured node.
 
 ### Node settings sync and update-check endpoints
 
@@ -553,13 +889,28 @@ A `prefetchLazyViews()` function runs once on mount via `requestIdleCallback` to
 | POST | `/api/nodes/:id/settings/push` | Push local settings to a remote node. |
 | POST | `/api/nodes/:id/settings/pull` | Pull settings from a remote node. |
 | GET | `/api/nodes/:id/settings/sync-status` | Get sync status and diff summary. |
-| POST | `/api/nodes/:id/auth/sync` | Sync model auth credentials. |
+| POST | `/api/nodes/:id/auth/sync` | Sync model auth snapshots (push/pull, checksum/version validated). |
 | POST | `/api/settings/sync-receive` | Receive pushed settings (inbound). |
-| POST | `/api/settings/auth-receive` | Receive auth credentials (inbound). |
-| GET | `/api/settings/auth-export` | Export local auth credentials. |
+| POST | `/api/settings/auth-receive` | Receive `AuthMaterialSnapshot` and persist via auth storage. |
+| GET | `/api/settings/auth-export` | Export local `AuthMaterialSnapshot`. |
 | GET | `/api/update-check` | Read cached/TTL-guarded npm update status for `@runfusion/fusion` (respects `updateCheckEnabled`). |
 | POST | `/api/update-check/refresh` | Clear cached update data and force a fresh npm update check. |
 | GET | `/api/updates/check` | Perform an on-demand npm registry check for the latest `@runfusion/fusion` version (no cache). |
+
+### Docker provisioning endpoints
+
+Initial container provisioning and lifecycle routes are registered by `register-docker-provisioning-routes.ts`.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/docker/provision` | Provision and start a managed Docker container. |
+| POST | `/api/docker/deprovision` | Stop/remove a managed Docker container. |
+| POST | `/api/docker/containers/:containerId/start` | Start an existing container. |
+| POST | `/api/docker/containers/:containerId/stop` | Stop a running container. |
+| POST | `/api/docker/containers/:containerId/restart` | Restart a container. |
+| GET | `/api/docker/containers/:containerId/status` | Read runtime status for a container. |
+
+Mesh configuration and post-provision managed-node operations are registered separately in `register-docker-node-routes.ts` (for example `/api/docker/nodes/:managedId/apply-mesh-config` and `/api/docker/nodes/:managedId/mesh-status`).
 
 ### Run Audit API
 The run-audit system records every mutation performed by the engine across three domains:
@@ -627,7 +978,7 @@ SQLite schema is initialized in `packages/core/src/db.ts` and uses:
 ### Central storage (multi-project)
 - **Central DB**: `~/.fusion/fusion-central.db`
 - Schema in `packages/core/src/central-db.ts`
-  - `projects`, `projectHealth`, `centralActivityLog`, `globalConcurrency`, `nodes`, `peerNodes`, `settingsSyncState`, `__meta`
+  - `projects`, `projectHealth`, `centralActivityLog`, `globalConcurrency`, `nodes`, `peerNodes`, `projectNodePathMappings`, `settingsSyncState`, `__meta`
 
 ### Memory files
 - OpenClaw-style memory workspace:
@@ -638,8 +989,9 @@ SQLite schema is initialized in `packages/core/src/db.ts` and uses:
 
 ### File-based side stores
 Some data remains intentionally filesystem-based:
-- Agents: `.fusion/agents/*` (`AgentStore`)
-- Messages: `.fusion/messages/*` (`MessageStore`)
+- Agent instruction bundles and heartbeat markdown: `.fusion/agents/*` (`AgentStore`)
+
+Agent/message/approval metadata and history now persist in SQLite tables.
 
 ### Migration from legacy file storage
 - Detection + migration: `packages/core/src/db-migrate.ts`
@@ -713,6 +1065,7 @@ Fusion has two complementary agent models:
 - `.fusion/agents/{id}-heartbeats.jsonl`
 - `.fusion/agents/{id}-keys.jsonl`
 - `.fusion/agents/{id}-revisions.jsonl`
+- `.fusion/agents/{id}/avatar.{ext}` (uploaded avatar image file, served via `/api/agents/:id/avatar`)
 
 ### Agent spawning from executor
 `TaskExecutor` supports hierarchical child agents via:
@@ -746,10 +1099,12 @@ Multi-project orchestration spans core + engine.
   - Unified central activity feed
   - Global concurrency state
   - Node registry (`local` / `remote`)
+  - Per-project/per-node working-directory mappings (`projectNodePathMappings`)
 
 ### Engine orchestration
 - `HybridExecutor` (`packages/engine/src/hybrid-executor.ts`) is the top-level orchestrator
 - `ProjectManager` instantiates per-project runtimes and forwards events with project attribution
+- Runtime startup/update resolves `ProjectRuntimeConfig.workingDirectory` through `CentralCore.resolveLocalProjectWorkingDirectory()` / `resolveProjectWorkingDirectory(projectId,nodeId)` using exact `projectNodePathMappings` rows for the active node; missing mappings are hard failures (no fallback to `RegisteredProject.path`).
 
 ### Runtime abstraction
 Defined in `project-runtime.ts`:
@@ -802,6 +1157,15 @@ Task dispatch routing is resolved in two layers:
 
 ### Dispatch flow in scheduler
 
+Within `Scheduler.schedule()` dispatch for `todo` tasks now runs node gates in this order:
+
+1. `resolveEffectiveNode()` chooses routing source (`task-override`, `project-default`, `local`).
+2. If a node is selected, `validateNodeDispatch` checks for a persisted `(projectId, nodeId)` working-directory mapping (`CentralCore.getProjectNodePath`).
+3. Missing/blank mappings block dispatch (task stays in `todo`) and log `Execution blocked: project has no path mapping for node <id>`.
+4. Only after mapping validation passes does `applyUnavailableNodePolicy()` evaluate node health and optional `fallback-local` behavior.
+
+This preserves a clear separation between configuration correctness (mapping exists) and runtime health/failover policy.
+
 ### Unavailable-node policy
 
 `unavailableNodePolicy` is a validated/stored project setting (`block` default, `fallback-local` allowed) and is enforced during scheduler dispatch when both conditions are true:
@@ -821,6 +1185,49 @@ Behavior summary:
 
 `TaskStore.updateTask()` applies this guard before persisting `nodeId` changes.
 
+### Task commit-association API (`GET /api/tasks/:id/commit-associations`)
+
+Dashboard session-diff route registration (`packages/dashboard/src/routes/register-session-diff-routes.ts`) now exposes lineage commit associations for task detail views:
+
+- **Route:** `GET /api/tasks/:id/commit-associations`
+- **Project scoping:** uses `getProjectContext(req)` so reads are project-aware like adjacent task diff endpoints.
+- **404 behavior:** returns `{ error: "Task not found" }` for unknown task ids.
+- **Response contract:**
+
+```json
+{
+  "taskId": "FN-1234",
+  "lineageId": "uuid-or-null",
+  "associations": [
+    {
+      "commitSha": "abc123...",
+      "commitSubject": "feat(FN-1234): ...",
+      "authoredAt": "2026-05-11T02:00:00.000Z",
+      "matchedBy": "canonical-lineage-trailer | legacy-task-id-trailer | legacy-subject | manual-reconciliation",
+      "confidence": "canonical | legacy | ambiguous",
+      "taskIdSnapshot": "FN-1234",
+      "note": "optional reconciliation note"
+    }
+  ]
+}
+```
+
+`confidence` is a consumer-facing interpretation aid:
+- `canonical` = immutable lineage trailer match (highest confidence)
+- `legacy` = recovered via legacy task-id/subject matching
+- `ambiguous` = manual reconciliation where historical task-id attribution could be misleading
+
+### Task branch field plumbing (`branch` + `baseBranch`)
+
+Task create/update now preserves both branch fields end-to-end:
+- **Request validation/normalization (dashboard route layer):** `packages/dashboard/src/routes/register-task-workflow-routes.ts`
+  - `POST /api/tasks` accepts `branch` and `baseBranch` as string values.
+  - `PATCH /api/tasks/:id` accepts `branch` and `baseBranch` as `string | null` for PATCH-style updates, trims string inputs, and treats empty strings as clears (`null`).
+  - Route handlers reject non-string/non-null payloads with `400`.
+- **Durable persistence (core store layer):** `packages/core/src/store.ts`
+  - `TaskStore.createTask()` persists both `branch` and `baseBranch` on task creation.
+  - `TaskStore.updateTask()` preserves existing PATCH semantics where explicit `null` clears either field.
+  - Fields round-trip through JSON and SQLite persistence via the shared task contract in `packages/core/src/types.ts`.
 
 ### Routing activity visibility
 
@@ -866,6 +1273,55 @@ Settings are split by scope.
 
 Git behavior is implemented primarily in engine executor/merger + dashboard/CLI git APIs.
 
+### Git REST API endpoints
+
+Git dashboard routes are registered in `register-git-github.ts`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/git/remotes` | List GitHub remotes parsed from `git remote -v` output. |
+| GET | `/api/git/remotes/detailed` | List all remotes with fetch/push URLs. |
+| POST | `/api/git/remotes` | Add a new remote (`name`, `url`). |
+| DELETE | `/api/git/remotes/:name` | Remove an existing remote by name. |
+| PATCH | `/api/git/remotes/:name` | Rename a remote (`newName`). |
+| PUT | `/api/git/remotes/:name/url` | Update a remote URL. |
+| GET | `/api/git/status` | Return branch, short commit, dirty state, and ahead/behind counts. |
+| GET | `/api/git/commits` | Return recent commits (`?limit=` capped at 100). |
+| GET | `/api/git/commits/:hash/diff` | Return commit stat + patch for a validated commit hash. |
+| GET | `/api/git/commits/ahead` | Return local commits ahead of upstream (empty when upstream is not configured). |
+| GET | `/api/git/remotes/:name/commits` | Return commits for a remote ref (`?ref=` optional, `?limit=` max 50, with remote HEAD/main/master fallback resolution). |
+| GET | `/api/git/branches` | List local branches with current/tracking metadata and last commit date. |
+| GET | `/api/git/branches/:name/commits` | Return commits for a branch (`?limit=` default 10, max 100). |
+| GET | `/api/git/worktrees` | List worktrees with branch/path metadata and task association when available. |
+| POST | `/api/git/branches` | Create a branch from HEAD or an optional base ref. |
+| POST | `/api/git/branches/:name/checkout` | Checkout an existing branch. |
+| DELETE | `/api/git/branches/:name` | Delete a branch (`?force=true` allows deleting unmerged branches). |
+| POST | `/api/git/fetch` | Fetch from a remote (`remote` defaults to `origin`). |
+| POST | `/api/git/pull` | Pull the current branch (`rebase` boolean optional) and return structured conflict metadata on merge/rebase conflicts. |
+| POST | `/api/git/push` | Push the current branch. |
+| GET | `/api/git/stashes` | List stash entries. |
+| GET | `/api/git/stashes/:index/diff` | Return stash stat + patch for a validated stash index (404 when missing). |
+| POST | `/api/git/stashes` | Create a stash with an optional message. |
+| POST | `/api/git/stashes/:index/apply` | Apply a stash by index (optionally drop after apply via `drop: true`). |
+| DELETE | `/api/git/stashes/:index` | Drop a stash by index. |
+| GET | `/api/git/diff` | Return unstaged working-tree diff text. |
+| GET | `/api/git/diff/file` | Return staged or unstaged diff for one file (`path` + `staged=true|false` query required). |
+| GET | `/api/git/changes` | Return staged and unstaged file change summary. |
+| POST | `/api/git/stage` | Stage specified files. |
+| POST | `/api/git/unstage` | Unstage specified files. |
+| POST | `/api/git/commit` | Create a commit from staged changes with a required message. |
+| POST | `/api/git/discard` | Discard working-tree changes for specified files. |
+
+### GitHub tracking lifecycle (task creation + existing-task edits)
+
+Fusion attempts GitHub issue creation when per-task tracking is explicitly enabled (`task.githubTracking.enabled === true`) and the task is currently unlinked. This runs during task creation flows and during existing-task PATCH updates whenever the post-update task is still enabled+unlinked (not only `githubTracking` field edits), allowing previously skipped/unlinked tasks to recover on later updates. The lifecycle resolves the repo in priority order: task override (`repoOverride`) → project `githubTrackingDefaultRepo` → global `githubTrackingDefaultRepo`. If no repo resolves, task create/update still succeeds and an activity entry records the skip reason. GitHub API/CLI failures are best-effort only (swallowed with warning), so task updates are never blocked by GitHub availability.
+
+When Fusion does create a tracking issue, it formats the title as `[FN-XXXX] Task title` and sends a short plain-text body prefixed with `Fusion task: FN-XXXX`. The body is a bounded summary snippet (not full task prompt content), and Fusion does not include any hyperlink back to the local dashboard. Manual unlink requests (`githubTracking.issue: null`) do not recreate an issue in that same PATCH request, and disable updates do not create issues. Auth resolution remains strict-mode (`token` vs `gh-cli`) but now defensively accepts merged settings shapes where auth keys may appear in global-merged payloads.
+
+When a tracked task later moves to `in-progress` or `done`, Fusion posts one short lifecycle comment on the linked tracking issue. These comments include the Fusion task ID as plain text (`Fusion task: FN-XXXX`) and never link back to the Fusion app. No comment is posted for any other transition.
+
+When a tracked task transitions into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`. When a task transitions out of `done` into any active column (`triage`, `todo`, `in-progress`, `in-review`), Fusion reopens it with `state_reason: reopened`. Moves from `done` to `archived` leave the issue closed. Tasks without `githubTracking.enabled` or without a linked issue are unaffected, and GitHub failures are logged to task activity without blocking the move.
+
 ### Worktree model
 - Each active task runs in isolated worktree under `.worktrees/*`
 - Executor creates branches like `fusion/{task-id}` (`executor.ts`)
@@ -874,7 +1330,25 @@ Git behavior is implemented primarily in engine executor/merger + dashboard/CLI 
 ### Merge strategies
 - Setting type: `MergeStrategy = "direct" | "pull-request"` (`types.ts`)
 - `aiMergeTask()` in `merger.ts` performs merge flow
+- `merger.ts` also exposes a test-only `__test__` helper object for internal merger unit/integration coverage (for example autostash orphan cleanup behavior)
 - Supports workflow-step execution after merge (post-merge phase)
+- Deterministic verification now runs a bootstrap preamble (`node scripts/ensure-test-artifacts.mjs`) before configured `testCommand`/`buildCommand`, then self-heals Vite `Failed to resolve entry for package "@fusion/..."` workspace-entry faults by rebuilding the missing package once and retrying the failed command. If that retry still reports the same missing-entry fault, merger raises a typed environment fault and `ProjectEngine` leaves the task in-review (no verificationFailureCount increment or in-progress bounce) so the next recovery sweep can retry after other runs rebuild artifacts.
+
+#### Autostash lifecycle
+- Before destructive merge prep, `stashUnrelatedRootDirChanges()` snapshots dirty root-dir edits into `fusion-merger-autostash:<taskId>:<ts>` (plus optional `race-rescue-*` stashes for late writes).
+- During verification-fix finalize fallback, `commitOrAmendMergeWithFixes()` now snapshots any still-dirty root-dir state into `fusion-merger-autostash:<taskId>:finalize-reset:<ts>` *before* its hard reset/clean recovery path, preventing silent mixed-worktree leftovers from being discarded.
+- In `aiMergeTask` cleanup, `restoreUnrelatedRootDirChanges()` attempts restore; then `dropAutostashHandle()` runs on every terminal path and drops primary + race-rescue stashes when restoration succeeded or content is no longer live.
+- If restore fails with unresolved developer work (`failed`/`conflict-needs-manual`), cleanup uses a keep-if-live rule so still-live stashes are preserved for manual recovery.
+- `sweepAutostashOrphans()` keeps its subsumed/live classification for prior-run leftovers, and `sweepStaleAutostashes()` adds an age-based backstop that drops `fusion-merger-autostash:*` entries older than the configured threshold (default 24h).
+
+#### Stash Recovery surface
+- Orphans are typically residual `fusion-merger-autostash:*` entries from older merge runs where restore could not safely complete.
+- Existing task-scoped surfacing remains: merger warnings still log to `mergerLog.warn` and `store.logEntry` for the active merge task.
+- New global surfacing adds `merger:autostashOrphans` TaskStore events, engine helpers (`listAutostashOrphans`, `getAutostashDiff`, `applyAutostashBySha`, `dropAutostashBySha`), and dashboard API endpoints under `/api/stash-recovery/*`.
+- `merger:autostashOrphans` records now include provenance fields (`sourcePhase`, `detectedByTaskId`, `detectedAt`) so operators can attribute leftovers to the merge phase and surfacing task/session.
+- `ProjectEngine` consumes the orphan event stream and auto-creates deduplicated `sourceType: "recovery"` follow-up tasks keyed by `sourceParentTaskId` for live leftovers, so repeated detections do not spam the board.
+- Dashboard operators can inspect orphan counts, review diffs, apply stashes, and explicitly drop entries with confirmation.
+- Decision: recovery stays user-gated. Auto-apply was rejected because clean-tree checks are racy, stash placement is ambiguous after source task merge, and apply conflicts can produce hard-to-untangle state. `sweepAutostashOrphans` continues to auto-drop only subsumed entries while preserving live developer work.
 
 ### Conflict handling
 `merger.ts` includes conflict classification and auto-resolution helpers:
@@ -929,3 +1403,24 @@ Git behavior is implemented primarily in engine executor/merger + dashboard/CLI 
 - **Multi-project orchestrator:** `packages/engine/src/hybrid-executor.ts`
 - **Task routing resolver:** `packages/engine/src/effective-node.ts`
 - **Node override guard:** `packages/core/src/node-override-guard.ts`
+
+### PR-backed Review tab state and same-task revision flow
+
+Pull-request auto-merge tasks persist structured review metadata on the task as `reviewState`.
+
+- `reviewState.source`: `"pull-request"` or `"reviewer-agent"`
+- `reviewState.summary`: review decision, reviewer states, required checks, and blocking reasons
+- `reviewState.items`: normalized per-review/per-comment records keyed by stable GitHub IDs
+- `reviewState.addressing`: per-item lifecycle records (`queued`, `in-progress`, `addressed`, `failed`) with timestamps and optional `stale`
+
+API flow:
+
+1. `GET /api/tasks/:id/review` returns canonical `TaskReviewData` (`mode`, `refreshable`, `fetchedAt`, `summary`, `items[]`) for modal load.
+2. `POST /api/tasks/:id/review/refresh` returns the same `TaskReviewData` shape after re-fetching source data (GitHub PR mode or reviewer-agent direct mode).
+3. `POST /api/tasks/:id/review/address` records selected review items as queued, appends a deterministic `**PR Review Revision Request**` steering comment payload, clears transient failure/session state, and requeues the same task to `todo` for same-task revision.
+
+UI contract boundary:
+
+- `PrSection` owns branch/PR lifecycle metadata and automation status.
+- `TaskReviewTab` owns review decisions, detailed review items, selection, and addressing progress.
+- `TaskComments` remains separate for general discussion.

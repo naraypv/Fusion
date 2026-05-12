@@ -869,6 +869,131 @@ describe("Automation routes", () => {
       );
     });
 
+    it("create-task automation step attempts tracking issue creation and links metadata", async () => {
+      const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+        owner: "task",
+        repo: "repo",
+        number: 17,
+        htmlUrl: "https://github.com/task/repo/issues/17",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const mockStore = createMockAutomationStore();
+      mockStore.getSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-task",
+            type: "create-task",
+            name: "Create tracked task",
+            taskTitle: "Tracked report",
+            taskDescription: "Create tracked report",
+            taskColumn: "todo",
+          },
+        ],
+      });
+
+      const linkGithubIssue = vi.fn().mockResolvedValue(undefined);
+      const recordActivity = vi.fn().mockResolvedValue(undefined);
+      const { app, store } = buildApp(mockStore);
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        githubTrackingDefaultRepo: "task/repo",
+        githubAuthMode: "token",
+        githubAuthToken: "tok",
+      });
+      (store.getGlobalSettingsStore as ReturnType<typeof vi.fn>).mockReturnValue({ getSettings: vi.fn().mockResolvedValue({}) });
+      (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "FN-9002",
+        title: "Tracked report",
+        description: "Create tracked report",
+        githubTracking: { enabled: true },
+      });
+      (store as unknown as { linkGithubIssue: typeof linkGithubIssue }).linkGithubIssue = linkGithubIssue;
+      (store as unknown as { recordActivity: typeof recordActivity }).recordActivity = recordActivity;
+
+      const res = await REQUEST(app, "POST", "/api/automations/sched-001/run");
+
+      expect(res.status).toBe(200);
+      expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "task", repo: "repo" }));
+      expect(linkGithubIssue).toHaveBeenCalledWith("FN-9002", expect.objectContaining({ owner: "task", repo: "repo", number: 17 }));
+      expect(recordActivity).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ type: "github-issue-created" }) }));
+      createIssueSpy.mockRestore();
+    });
+
+    it("create-task automation step keeps success when tracking issue creation fails", async () => {
+      const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockRejectedValue(new Error("github down"));
+      const mockStore = createMockAutomationStore();
+      mockStore.getSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-task",
+            type: "create-task",
+            name: "Create tracked task",
+            taskDescription: "Create tracked report",
+          },
+        ],
+      });
+
+      const { app, store } = buildApp(mockStore);
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        githubTrackingDefaultRepo: "task/repo",
+        githubAuthMode: "token",
+        githubAuthToken: "tok",
+      });
+      (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "FN-9003",
+        description: "Create tracked report",
+        githubTracking: { enabled: true },
+      });
+
+      const res = await REQUEST(app, "POST", "/api/automations/sched-001/run");
+
+      expect(res.status).toBe(200);
+      expect(res.body.result.stepResults[0]).toEqual(expect.objectContaining({ success: true }));
+      expect(createIssueSpy).toHaveBeenCalledTimes(1);
+      createIssueSpy.mockRestore();
+    });
+    it("does not create tracking issue in automation create-task when task already linked", async () => {
+      const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue");
+      const mockStore = createMockAutomationStore();
+      mockStore.getSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-task",
+            type: "create-task",
+            name: "Create tracked task",
+            taskDescription: "Create tracked report",
+          },
+        ],
+      });
+
+      const { app, store } = buildApp(mockStore);
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+        githubTrackingDefaultRepo: "task/repo",
+        githubAuthMode: "token",
+        githubAuthToken: "tok",
+      });
+      (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "FN-9004",
+        description: "Create tracked report",
+        githubTracking: {
+          enabled: true,
+          issue: { owner: "task", repo: "repo", number: 3, url: "https://github.com/task/repo/issues/3" },
+        },
+      });
+
+      const res = await REQUEST(app, "POST", "/api/automations/sched-001/run");
+
+      expect(res.status).toBe(200);
+      expect(res.body.result.stepResults[0]).toEqual(expect.objectContaining({ success: true }));
+      expect(createIssueSpy).not.toHaveBeenCalled();
+      createIssueSpy.mockRestore();
+    });
+
     it("respects continueOnFailure for create-task failures", async () => {
       const mockStore = createMockAutomationStore();
       mockStore.getSchedule.mockResolvedValue({

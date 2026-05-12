@@ -1,4 +1,9 @@
 import type { ResearchEnabledSources, Settings } from "./types.js";
+import { isExperimentalFeatureEnabled } from "./experimental-features.js";
+
+export function isResearchExperimentalEnabled(settings: Partial<Settings> | undefined): boolean {
+  return isExperimentalFeatureEnabled(settings, "researchView");
+}
 
 export interface ResolvedResearchSettings {
   enabled: boolean;
@@ -15,6 +20,8 @@ export interface ResolvedResearchSettings {
   defaultExportFormat: "markdown" | "json";
 }
 
+const DEFAULT_SEARCH_PROVIDER = "builtin";
+
 const FALLBACK_SOURCES: ResearchEnabledSources = {
   webSearch: true,
   pageFetch: true,
@@ -29,7 +36,11 @@ export function resolveResearchSettings(settings: Partial<Settings> | undefined)
 
   return {
     enabled: projectSettings?.enabled ?? settings?.researchEnabled ?? settings?.researchGlobalEnabled ?? true,
-    searchProvider: projectSettings?.searchProvider ?? globalDefaults?.searchProvider,
+    searchProvider:
+      projectSettings?.searchProvider ??
+      globalDefaults?.searchProvider ??
+      settings?.researchGlobalWebSearchProvider ??
+      DEFAULT_SEARCH_PROVIDER,
     synthesisProvider: projectSettings?.synthesisProvider ?? globalDefaults?.synthesisProvider,
     synthesisModelId: projectSettings?.synthesisModelId ?? globalDefaults?.synthesisModelId,
     enabledSources: {

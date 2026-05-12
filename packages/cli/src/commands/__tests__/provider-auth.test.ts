@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tempWorkspace } from "@fusion/test-utils";
-import { MultiAccountAuthStore } from "@fusion/core";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "../provider-auth.js";
 
 function makeAuthStorage(credentials: Record<string, { type: string; key?: string; access?: string; refresh?: string; expires?: number }> = {}) {
@@ -149,8 +148,8 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
     expect(await storage.getApiKey("openai-codex")).toBe("legacy-access-token");
   });
 
-  describe("Anthropic reclassification from OAuth to API key", () => {
-    it("filters anthropic out of getOAuthProviders even when upstream reports it as OAuth", () => {
+  describe("Anthropic provider classification", () => {
+    it("keeps anthropic in getOAuthProviders when upstream reports it as OAuth", () => {
       const fusionAuth = makeAuthStorage();
       fusionAuth.getOAuthProviders = vi.fn(() => [
         { id: "anthropic", name: "Anthropic" },
@@ -162,11 +161,11 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
       const oauthProviders = wrapped.getOAuthProviders();
 
       const oauthIds = oauthProviders.map((p) => p.id);
-      expect(oauthIds).not.toContain("anthropic");
+      expect(oauthIds).toContain("anthropic");
       expect(oauthIds).toContain("github-copilot");
     });
 
-    it("includes anthropic in getApiKeyProviders with correct display name", () => {
+    it("does not duplicate anthropic in getApiKeyProviders when OAuth-backed", () => {
       const fusionAuth = makeAuthStorage();
       fusionAuth.getOAuthProviders = vi.fn(() => [
         { id: "anthropic", name: "Anthropic" },
@@ -177,8 +176,7 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
       const apiKeyProviders = wrapped.getApiKeyProviders();
 
       const anthropic = apiKeyProviders.find((p) => p.id === "anthropic");
-      expect(anthropic).toBeDefined();
-      expect(anthropic!.name).toBe("Anthropic");
+      expect(anthropic).toBeUndefined();
     });
 
     it("stores anthropic credentials as api_key type", () => {
@@ -197,7 +195,7 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
       });
     });
 
-  it("detects anthropic as authenticated via hasApiKey after storing API key", () => {
+    it("detects anthropic as authenticated via hasApiKey after storing API key", () => {
       const fusionAuth = makeAuthStorage({
         anthropic: { type: "api_key", key: "sk-ant-api03-test" },
       });
@@ -212,54 +210,136 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
     });
   });
 
-  it("records API-key providers as multi-account credentials and reports duplicate keys", async () => {
-    const tempDir = tempWorkspace("fusion-provider-auth-accounts-");
-    const accountStore = new MultiAccountAuthStore(join(tempDir, "accounts.json"));
-    const fusionAuth = makeAuthStorage();
-    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+  describe("logout with fallback credentials", () => {
+    it("hides fallback credentials after logout", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+      });
 
-    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [], accountStore);
-    const first = wrapped.setApiKey("minimax", "minimax-key-1")!;
-    const duplicate = wrapped.setApiKey("minimax", "minimax-key-1")!;
-    const second = wrapped.setApiKey("minimax", "minimax-key-2")!;
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
 
-    expect(first.status).toBe("added");
-    expect(duplicate.status).toBe("same-account");
-    expect(second.status).toBe("added");
-    expect(wrapped.listAccounts?.("minimax")).toHaveLength(2);
-    expect(await wrapped.getApiKey("minimax")).toBe("minimax-key-1");
-  });
+      // Before logout, fallback credentials are visible
+      expect(merged.has("anthropic")).toBe(true);
+      expect(merged.hasAuth("anthropic")).toBe(true);
+      expect(merged.get("anthropic")).toEqual({ type: "api_key", key: "claude-access-token" });
 
-  it("captures completed OAuth logins as multi-account credentials", async () => {
-    const tempDir = tempWorkspace("fusion-provider-auth-oauth-accounts-");
-    const accountStore = new MultiAccountAuthStore(join(tempDir, "accounts.json"));
-    const credentials: Record<string, { type: string; access?: string; refresh?: string; expires?: number; accountId?: string }> = {};
-    const fusionAuth = makeAuthStorage(credentials as any);
-    fusionAuth.getOAuthProviders = vi.fn(() => [{ id: "openai-codex", name: "OpenAI Codex" }]);
-    fusionAuth.login = vi.fn(async (provider: string, callbacks: { onAuth: (info: { url: string }) => void }) => {
-      callbacks.onAuth({ url: "https://auth.example.com/login" });
-      credentials[provider] = {
-        type: "oauth",
-        access: "access-token",
-        refresh: "refresh-token",
-        expires: Date.now() + 60_000,
-        accountId: "acct-oauth",
-      };
-    });
-    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+      // Log out
+      merged.logout("anthropic");
 
-    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [], accountStore);
-    const result = await wrapped.login("openai-codex", {
-      onAuth: vi.fn(),
-      onPrompt: vi.fn(),
-    });
-    const duplicate = await wrapped.login("openai-codex", {
-      onAuth: vi.fn(),
-      onPrompt: vi.fn(),
+      // After logout, fallback credentials are hidden
+      expect(merged.has("anthropic")).toBe(false);
+      expect(merged.hasAuth("anthropic")).toBe(false);
+      expect(merged.get("anthropic")).toBeUndefined();
     });
 
-    expect(result?.status).toBe("added");
-    expect(duplicate?.status).toBe("same-account");
-    expect(wrapped.listAccounts?.("openai-codex")).toHaveLength(1);
+    it("does not resurrect fallback credentials on reload after logout", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      // reload() should NOT bring back the fallback credential
+      merged.reload();
+
+      expect(merged.has("anthropic")).toBe(false);
+      expect(merged.hasAuth("anthropic")).toBe(false);
+    });
+
+    it("excludes logged-out providers from getAll()", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+        openrouter: { type: "api_key", key: "openrouter-key" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      const all = merged.getAll();
+      expect("anthropic" in all).toBe(false);
+      expect("openrouter" in all).toBe(true);
+    });
+
+    it("excludes logged-out providers from list()", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+        openrouter: { type: "api_key", key: "openrouter-key" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      expect(merged.list()).not.toContain("anthropic");
+      expect(merged.list()).toContain("openrouter");
+    });
+
+    it("hides fallback getApiKey after logout", async () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+
+      expect(await merged.getApiKey("anthropic")).toBe("claude-access-token");
+
+      merged.logout("anthropic");
+
+      expect(await merged.getApiKey("anthropic")).toBeUndefined();
+    });
+
+    it("re-enables fallback credentials after re-authentication via set()", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      // Re-authenticate
+      merged.set("anthropic", { type: "api_key", key: "new-key" });
+
+      // Provider is visible again (from primary storage)
+      expect(merged.has("anthropic")).toBe(true);
+    });
+
+    it("only hides the logged-out provider, not other fallback providers", () => {
+      const fusionAuth = makeAuthStorage();
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+        openrouter: { type: "api_key", key: "openrouter-key" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      // anthropic is hidden
+      expect(merged.hasAuth("anthropic")).toBe(false);
+      // openrouter is still visible
+      expect(merged.hasAuth("openrouter")).toBe(true);
+    });
+
+    it("returns false for hasAuth even when underlying storage reports auth via env var", () => {
+      // Simulate the real AuthStorage which checks env vars in hasAuth
+      const fusionAuth = makeAuthStorage();
+      fusionAuth.hasAuth = vi.fn(() => true); // env var would make this true
+      const fallbackAuth = makeAuthStorage({
+        anthropic: { type: "api_key", key: "claude-access-token" },
+      });
+
+      const merged = mergeAuthStorageReads(fusionAuth, [fallbackAuth]);
+      merged.logout("anthropic");
+
+      // Even though the underlying storage reports hasAuth=true (env var),
+      // the logged-out provider must still return false
+      expect(merged.hasAuth("anthropic")).toBe(false);
+      expect(merged.has("anthropic")).toBe(false);
+    });
   });
 });

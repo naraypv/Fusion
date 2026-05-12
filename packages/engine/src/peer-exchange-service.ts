@@ -1,4 +1,11 @@
-import type { CentralCore, GlobalSettings, SettingsSyncPayload } from "@fusion/core";
+import type {
+  CentralCore,
+  GlobalSettings,
+  MeshWriteReplaySummary,
+  SettingsSyncPayload,
+  SharedMeshStatePayload,
+} from "@fusion/core";
+import { isRetryableMeshWriteFailure } from "@fusion/core";
 import type { NodeConfig, PeerSyncRequest, PeerSyncResponse } from "@fusion/core";
 import { peerExchangeLog } from "./logger.js";
 
@@ -13,6 +20,8 @@ export interface PeerExchangeServiceOptions {
   settingsSyncThrottleMs?: number;
   /** Global settings to include in settings sync. Required when settingsSyncEnabled is true. */
   globalSettings?: GlobalSettings;
+  /** When true, include auth material in shared-state exchanges. Default: false. */
+  settingsSyncAuth?: boolean;
   /** Provider auth credentials to include in settings sync. */
   providerAuth?: Record<string, { type: "api_key" | "oauth"; key?: string; accessToken?: string; authenticated?: boolean }>;
 }
@@ -35,6 +44,8 @@ export interface SyncResult {
   settingsApplied?: boolean;
   /** The settings version (checksum) observed on the remote node. */
   settingsVersion?: string;
+  queuedWriteId?: string;
+  replaySummary?: MeshWriteReplaySummary;
 }
 
 /**
@@ -57,8 +68,12 @@ export class PeerExchangeService {
   private lastSettingsSyncByNode = new Map<string, { version: string; timestamp: number }>();
   /** Cached settings payload from the last successful getSettingsForSync call. */
   private cachedSettingsPayload: SettingsSyncPayload | null = null;
+  /** Cached shared-state settings/auth payload built from canonical snapshots. */
+  private cachedSharedStatePayload: SharedMeshStatePayload | null = null;
   /** Global settings provided via options. */
   private globalSettings?: GlobalSettings;
+  /** Whether auth snapshot exchange is enabled. */
+  private settingsSyncAuth: boolean;
   /** Provider auth credentials provided via options. */
   private providerAuth?: Record<string, { type: "api_key" | "oauth"; key?: string; accessToken?: string; authenticated?: boolean }>;
 
@@ -74,6 +89,7 @@ export class PeerExchangeService {
     this.settingsSyncEnabled = options.settingsSyncEnabled ?? false;
     this.settingsSyncThrottleMs = options.settingsSyncThrottleMs ?? 300_000; // 5 minutes default
     this.globalSettings = options.globalSettings;
+    this.settingsSyncAuth = options.settingsSyncAuth ?? false;
     this.providerAuth = options.providerAuth;
   }
 
@@ -87,6 +103,7 @@ export class PeerExchangeService {
     this.globalSettings = settings;
     // Invalidate cache to ensure fresh payload on next sync
     this.cachedSettingsPayload = null;
+    this.cachedSharedStatePayload = null;
   }
 
   /**
@@ -309,6 +326,7 @@ export class PeerExchangeService {
 
           if (shouldIncludeSettings) {
             request.settings = this.cachedSettingsPayload;
+            request.sharedState = await this.getSharedStateSettingsBundle();
           }
         } catch (err) {
           // Log error but continue with peer sync
@@ -343,12 +361,15 @@ export class PeerExchangeService {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
+          const errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+          const queuedWriteId = await this.enqueueRetryableSyncWrite(node, request, response.status, errorMessage);
           return {
             nodeId: node.id,
             success: false,
             added: 0,
             updated: 0,
-            error: `HTTP ${response.status}: ${response.statusText}`,
+            error: errorMessage,
+            queuedWriteId,
           };
         }
 
@@ -359,45 +380,46 @@ export class PeerExchangeService {
         const mergeResult = await this.centralCore.mergePeers(peerResponse.knownPeers);
 
         // ── Process remote settings if included in response ──
-        if (peerResponse.settings && this.settingsSyncEnabled) {
-          settingsVersion = peerResponse.settings.checksum;
+        if (this.settingsSyncEnabled && (peerResponse.sharedState || peerResponse.settings)) {
+          const remoteChecksum =
+            peerResponse.sharedState?.projectSettings?.checksum ??
+            peerResponse.settings?.checksum;
+          settingsVersion = remoteChecksum;
 
-          // Check if we should apply remote settings
-          // Apply if remote checksum is different from our cached checksum
           const localChecksum = this.cachedSettingsPayload?.checksum ?? "";
 
-          if (peerResponse.settings.checksum !== localChecksum) {
+          if (remoteChecksum && remoteChecksum !== localChecksum) {
             try {
-              const applyResult = await this.centralCore.applyRemoteSettings(peerResponse.settings);
+              const applyResult = await this.applyRemoteSharedState(peerResponse.sharedState, peerResponse.settings);
 
               if (applyResult.success) {
                 settingsApplied = true;
                 peerExchangeLog.log(
-                  `Applied remote settings from ${node.name} (version: ${peerResponse.settings.checksum}, ` +
-                  `global: ${applyResult.globalCount}, projects: ${applyResult.projectCount}, auth: ${applyResult.authCount})`
+                  `Applied remote settings from ${node.name} (version: ${remoteChecksum}, ` +
+                    `global: ${applyResult.globalCount}, projects: ${applyResult.projectCount}, auth: ${applyResult.authCount})`,
                 );
                 // Invalidate cache to ensure fresh data on next sync
                 this.cachedSettingsPayload = null;
+                this.cachedSharedStatePayload = null;
               } else {
-                peerExchangeLog.warn(
-                  `Failed to apply remote settings from ${node.name}: ${applyResult.error}`
-                );
+                peerExchangeLog.warn(`Failed to apply remote settings from ${node.name}: ${applyResult.error}`);
               }
             } catch (err) {
               const error = err instanceof Error ? err.message : String(err);
               peerExchangeLog.warn(`Settings sync error with ${node.name}: ${error}`);
             }
-          } else {
+          } else if (remoteChecksum) {
             peerExchangeLog.log(
-              `Remote settings from ${node.name} are up-to-date (version: ${peerResponse.settings.checksum})`
+              `Remote settings from ${node.name} are up-to-date (version: ${remoteChecksum})`,
             );
           }
 
-          // Update throttle tracking
-          this.lastSettingsSyncByNode.set(node.id, {
-            version: peerResponse.settings.checksum,
-            timestamp: Date.now(),
-          });
+          if (remoteChecksum) {
+            this.lastSettingsSyncByNode.set(node.id, {
+              version: remoteChecksum,
+              timestamp: Date.now(),
+            });
+          }
         }
 
         peerExchangeLog.log(
@@ -405,11 +427,14 @@ export class PeerExchangeService {
           `${peerResponse.newPeers.length} new to sender`
         );
 
+        const replaySummary = await this.replayPendingWritesForNode(node.id);
+
         const result: SyncResult = {
           nodeId: node.id,
           success: true,
           added: mergeResult.added.length,
           updated: mergeResult.updated.length,
+          replaySummary,
         };
 
         // Only include settings fields when settingsSyncEnabled is true
@@ -425,10 +450,134 @@ export class PeerExchangeService {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("abort")) {
-        return { nodeId: node.id, success: false, added: 0, updated: 0, error: "Timeout (10s)" };
-      }
-      return { nodeId: node.id, success: false, added: 0, updated: 0, error: message };
+      const normalizedMessage = message.includes("abort") ? "Timeout (10s)" : message;
+      const queuedWriteId = await this.enqueueRetryableSyncWrite(node, undefined, undefined, normalizedMessage);
+      return { nodeId: node.id, success: false, added: 0, updated: 0, error: normalizedMessage, queuedWriteId };
     }
+  }
+
+  async replayPendingWritesForNode(targetNodeId: string): Promise<MeshWriteReplaySummary> {
+    const node = await this.centralCore.getNode(targetNodeId);
+    if (!node?.url) {
+      return { replayed: 0, applied: 0, failed: 0, queuedWriteIds: [] };
+    }
+
+    const pending = await this.centralCore.listPendingMeshWrites({ targetNodeId, status: "pending" });
+    let applied = 0;
+    let failed = 0;
+
+    for (const entry of pending) {
+      await this.centralCore.markMeshWriteReplayStarted(entry.id);
+      try {
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (node.apiKey) headers.Authorization = `Bearer ${node.apiKey}`;
+        const response = await fetch(`${node.url}/api/mesh/sync`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(entry.payload?.request ?? {}),
+        });
+        if (!response.ok) {
+          await this.centralCore.markMeshWriteFailed(entry.id, { lastError: `HTTP ${response.status}: ${response.statusText}` });
+          failed += 1;
+          continue;
+        }
+        await this.centralCore.markMeshWriteApplied(entry.id, {});
+        applied += 1;
+      } catch (error) {
+        await this.centralCore.markMeshWriteFailed(entry.id, {
+          lastError: error instanceof Error ? error.message : String(error),
+        });
+        failed += 1;
+      }
+    }
+
+    return {
+      replayed: pending.length,
+      applied,
+      failed,
+      queuedWriteIds: pending.map((entry) => entry.id),
+    };
+  }
+
+  private async enqueueRetryableSyncWrite(
+    node: NodeConfig,
+    request: PeerSyncRequest | undefined,
+    statusCode: number | undefined,
+    message: string,
+  ): Promise<string | undefined> {
+    if (!isRetryableMeshWriteFailure(statusCode, message)) {
+      return undefined;
+    }
+
+    const localNode = (await this.centralCore.listNodes()).find((n) => n.type === "local");
+    if (!localNode) {
+      return undefined;
+    }
+
+    const entry = await this.centralCore.enqueueMeshWrite({
+      originNodeId: localNode.id,
+      targetNodeId: node.id,
+      projectId: null,
+      scope: "mesh.sync",
+      entityType: "shared-state-sync",
+      entityId: node.id,
+      operation: "sync",
+      payload: {
+        request: request ?? {},
+        error: message,
+      },
+      intentVersion: "1.0",
+    });
+
+    return entry.id;
+  }
+
+  private async getSharedStateSettingsBundle(): Promise<SharedMeshStatePayload | undefined> {
+    if (this.cachedSharedStatePayload) {
+      return this.cachedSharedStatePayload;
+    }
+    const globalSettings = this.globalSettings ?? {};
+    const core = this.centralCore as CentralCore & {
+      getProjectSettingsSnapshot?: (settings: GlobalSettings) => Promise<SharedMeshStatePayload["projectSettings"]>;
+      getAuthMaterialSnapshot?: (
+        providerAuth?: Record<string, { type: "api_key" | "oauth"; key?: string; accessToken?: string; authenticated?: boolean }>,
+      ) => SharedMeshStatePayload["authMaterial"];
+    };
+    if (!core.getProjectSettingsSnapshot || !core.getAuthMaterialSnapshot) {
+      return undefined;
+    }
+    const projectSettings = await core.getProjectSettingsSnapshot(globalSettings);
+    const authMaterial = this.settingsSyncAuth ? core.getAuthMaterialSnapshot(this.providerAuth) : undefined;
+    this.cachedSharedStatePayload = { projectSettings, authMaterial };
+    return this.cachedSharedStatePayload;
+  }
+
+  private async applyRemoteSharedState(
+    sharedState: SharedMeshStatePayload | undefined,
+    fallbackSettings: SettingsSyncPayload | undefined,
+  ): Promise<{ success: boolean; globalCount: number; projectCount: number; authCount: number; error?: string }> {
+    const core = this.centralCore as CentralCore & {
+      applyProjectSettingsSnapshot?: (snapshot: NonNullable<SharedMeshStatePayload["projectSettings"]>) => Promise<{ success: boolean; globalCount: number; projectCount: number; authCount: number; error?: string }>;
+      applyAuthMaterialSnapshot?: (snapshot: NonNullable<SharedMeshStatePayload["authMaterial"]>) => { success?: boolean; authCount?: number; error?: string; providerAuth?: Record<string, unknown> };
+    };
+
+    if (sharedState?.projectSettings && core.applyProjectSettingsSnapshot) {
+      const result = await core.applyProjectSettingsSnapshot(sharedState.projectSettings);
+      if (this.settingsSyncAuth && sharedState.authMaterial && core.applyAuthMaterialSnapshot) {
+        const authResult = core.applyAuthMaterialSnapshot(sharedState.authMaterial);
+        const authCount =
+          typeof authResult.authCount === "number"
+            ? authResult.authCount
+            : Object.keys(sharedState.authMaterial.payload.providerAuth ?? {}).length;
+        return { ...result, authCount: Math.max(result.authCount, authCount) };
+      }
+      return result;
+    }
+
+    if (fallbackSettings) {
+      return this.centralCore.applyRemoteSettings(fallbackSettings);
+    }
+
+    return { success: true, globalCount: 0, projectCount: 0, authCount: 0 };
   }
 }

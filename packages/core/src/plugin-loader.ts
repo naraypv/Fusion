@@ -10,10 +10,11 @@
  */
 
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
-import { copyFile, rm } from "node:fs/promises";
+import { copyFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { EventEmitter } from "node:events";
 import type { TaskStore } from "./store.js";
+import type { WorkflowStepTemplate } from "./types.js";
 import { PluginStore } from "./plugin-store.js";
 import type {
   FusionPlugin,
@@ -22,9 +23,11 @@ import type {
   PluginToolDefinition,
   PluginRouteDefinition,
   PluginUiSlotDefinition,
+  PluginUiContributionDefinition,
   PluginDashboardViewDefinition,
   PluginOnSchemaInit,
   PluginRuntimeRegistration,
+  CliProviderContribution,
   PluginInstallation,
   PluginSkillContribution,
   PluginWorkflowStepContribution,
@@ -32,14 +35,15 @@ import type {
   PluginPromptContributions,
   PluginSetupManifest,
   PluginSetupHooks,
+  PluginSetupCheckResult,
 } from "./plugin-types.js";
-import { validatePluginManifest } from "./plugin-types.js";
+import { normalizePluginUiContributionDefinition, validatePluginManifest } from "./plugin-types.js";
 import { createLogger } from "./logger.js";
 import { getCreateAiSessionFactory } from "./ai-engine-loader.js";
+import { scanPluginSecurity } from "./plugin-security-scan.js";
 
 // Minimum Fusion version for plugin compatibility checks (can be expanded later)
 const MINIMUM_FUSION_VERSION = "0.1.0";
-const log = createLogger("plugin-loader");
 let moduleImportVersion = 0;
 
 export interface PluginLoaderOptions {
@@ -97,6 +101,7 @@ export class PluginLoader extends EventEmitter<{
   /** Cache of dynamically imported modules */
   private loadedModules: Map<string, unknown> = new Map();
 
+  private readonly log = createLogger("plugin-loader");
 
   constructor(private options: PluginLoaderOptions) {
     super();
@@ -109,25 +114,32 @@ export class PluginLoader extends EventEmitter<{
   // ── Context Creation ───────────────────────────────────────────────
 
   private async createContext(plugin: FusionPlugin): Promise<PluginContext> {
+    return this.createRouteContext(plugin.manifest.id);
+  }
+
+  async createRouteContext(
+    pluginId: string,
+    overrides?: Partial<Pick<PluginContext, "taskStore" | "settings" | "resolveProjectTaskStore">>,
+  ): Promise<PluginContext> {
     const createAiSession = await getCreateAiSessionFactory();
     if (process.env.DEBUG?.includes("plugins")) {
-      log.log(
+      this.log.log(
         createAiSession
-          ? `[plugin:${plugin.manifest.id}] createAiSession available`
-          : `[plugin:${plugin.manifest.id}] createAiSession unavailable`,
+          ? `[plugin:${pluginId}] createAiSession available`
+          : `[plugin:${pluginId}] createAiSession unavailable`,
       );
     }
 
     return {
-      pluginId: plugin.manifest.id,
-      taskStore: this.options.taskStore,
-      settings: await this.getPluginSettings(plugin.manifest.id),
-      logger: this.createLogger(plugin.manifest.id),
+      pluginId,
+      taskStore: overrides?.taskStore ?? this.options.taskStore,
+      settings: overrides?.settings ?? await this.getPluginSettings(pluginId),
+      logger: this.createLogger(pluginId),
       createAiSession,
+      resolveProjectTaskStore: overrides?.resolveProjectTaskStore,
       emitEvent: (event: string, data: unknown) => {
-        this.emit("plugin:error", { pluginId: plugin.manifest.id, error: new Error(`Custom event: ${event}`) });
-        // Custom events are logged but not surfaced as errors
-        log.log(`[plugin:${plugin.manifest.id}] Custom event: ${event}`, data);
+        this.emit("plugin:error", { pluginId, error: new Error(`Custom event: ${event}`) });
+        this.log.log(`[plugin:${pluginId}] Custom event: ${event}`, data);
       },
     };
   }
@@ -171,7 +183,7 @@ export class PluginLoader extends EventEmitter<{
 
     // Skip disabled plugins
     if (!installation.enabled) {
-      log.log(`Skipping disabled plugin: ${pluginId}`);
+      this.log.log(`Skipping disabled plugin: ${pluginId}`);
       throw Object.assign(new Error(`Plugin "${pluginId}" is disabled`), {
         code: "PLUGIN_DISABLED",
       });
@@ -179,7 +191,7 @@ export class PluginLoader extends EventEmitter<{
 
     // Skip already loaded plugins
     if (this.plugins.has(pluginId)) {
-      log.log(`Plugin already loaded: ${pluginId}`);
+      this.log.log(`Plugin already loaded: ${pluginId}`);
       return this.plugins.get(pluginId)!;
     }
 
@@ -187,6 +199,18 @@ export class PluginLoader extends EventEmitter<{
     const pluginPath = this.resolvePluginPath(installation.path);
 
     try {
+      if (installation.aiScanOnLoad) {
+        const scanResult = await scanPluginSecurity({ pluginId, pluginPath });
+        await this.options.pluginStore.updatePlugin(pluginId, { lastSecurityScan: scanResult });
+
+        if (["blocked", "error", "unavailable"].includes(scanResult.verdict)) {
+          const errorMessage = `Security scan ${scanResult.verdict}: ${scanResult.summary}`;
+          await this.options.pluginStore.updatePluginState(pluginId, "error", errorMessage);
+          this.emit("plugin:error", { pluginId, error: new Error(errorMessage) });
+          throw new Error(errorMessage);
+        }
+      }
+
       // Dynamic import the plugin - always bypass cache to get fresh code
       // Our loadedModules cache is cleared on stop, but Node.js ESM cache persists
       const mod = await this.importPluginModule(pluginPath, true);
@@ -206,7 +230,7 @@ export class PluginLoader extends EventEmitter<{
           plugin.manifest.fusionVersion,
         );
         if (!compatible) {
-          log.warn(
+          this.log.warn(
             `Plugin ${pluginId} requires Fusion ${plugin.manifest.fusionVersion}, minimum is ${MINIMUM_FUSION_VERSION}`,
           );
         }
@@ -300,11 +324,7 @@ export class PluginLoader extends EventEmitter<{
       const baseName = basename(path, ext);
       const reloadedPath = resolve(dirname(path), `.${baseName}.reload-${moduleImportVersion}${ext}`);
       await copyFile(path, reloadedPath);
-      try {
-        mod = await import(pathToFileURL(reloadedPath).href);
-      } finally {
-        await rm(reloadedPath, { force: true }).catch(() => undefined);
-      }
+      mod = await import(pathToFileURL(reloadedPath).href);
     } else {
       mod = await import(moduleUrl);
     }
@@ -318,7 +338,7 @@ export class PluginLoader extends EventEmitter<{
    */
   private invalidateModuleCache(path: string): void {
     this.loadedModules.delete(path);
-    log.log(`Module cache invalidated for: ${path}`);
+    this.log.log(`Module cache invalidated for: ${path}`);
   }
 
   /**
@@ -346,17 +366,18 @@ export class PluginLoader extends EventEmitter<{
     const installation = await this.options.pluginStore.getPlugin(pluginId);
     const pluginPath = this.resolvePluginPath(installation.path);
 
-    log.log(`Reloading plugin: ${pluginId}`);
+    this.log.log(`Reloading plugin: ${pluginId}`);
 
     // Call onUnload with timeout
     try {
+      const ctx = await this.createContext(oldPlugin);
       await this.withTimeout(
-        this.safeCallHook(oldPlugin, "onUnload", []),
+        this.safeCallHook(oldPlugin, "onUnload", [ctx]),
         timeoutMs,
         `onUnload timeout for ${pluginId}`,
       );
     } catch (err) {
-      log.warn(`onUnload for ${pluginId} timed out or failed:`, err);
+      this.log.warn(`onUnload for ${pluginId} timed out or failed:`, err);
       // Continue with reload despite onUnload issues
     }
 
@@ -396,13 +417,13 @@ export class PluginLoader extends EventEmitter<{
       // State is already "started", no need to update store
       // (avoiding started -> started transition which is disallowed)
 
-      log.log(`Plugin ${pluginId} reloaded successfully`);
+      this.log.log(`Plugin ${pluginId} reloaded successfully`);
 
       this.emit("plugin:reloaded", { pluginId, plugin: newPlugin });
       return newPlugin;
     } catch (err) {
       // Rollback: restore old plugin
-      log.error(`Reload failed for ${pluginId}, rolling back:`, err);
+      this.log.error(`Reload failed for ${pluginId}, rolling back:`, err);
 
       try {
         // Restore old plugin
@@ -419,10 +440,10 @@ export class PluginLoader extends EventEmitter<{
         // Update store state back to started
         await this.options.pluginStore.updatePluginState(pluginId, "started");
 
-        log.warn(`Rollback successful for ${pluginId}`);
+        this.log.warn(`Rollback successful for ${pluginId}`);
       } catch (rollbackErr) {
         // Rollback also failed - remove plugin and set error state
-        log.error(
+        this.log.error(
           `Rollback failed for ${pluginId}, removing plugin:`,
           rollbackErr,
         );
@@ -555,7 +576,7 @@ export class PluginLoader extends EventEmitter<{
       } catch (err) {
         if ((err as { code?: string }).code !== "PLUGIN_DISABLED") {
           errors++;
-          log.error(
+          this.log.error(
             `Failed to load plugin ${installation.id}:`,
             err,
           );
@@ -611,7 +632,7 @@ export class PluginLoader extends EventEmitter<{
   async stopPlugin(pluginId: string): Promise<void> {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
-      log.log(`Plugin not loaded: ${pluginId}`);
+      this.log.log(`Plugin not loaded: ${pluginId}`);
       return;
     }
 
@@ -621,13 +642,14 @@ export class PluginLoader extends EventEmitter<{
 
     try {
       // Call onUnload hook
+      const ctx = await this.createContext(plugin);
       await this.withTimeout(
-        this.safeCallHook(plugin, "onUnload", []),
+        this.safeCallHook(plugin, "onUnload", [ctx]),
         5000,
         `onUnload timeout for ${pluginId}`,
       );
     } catch (err) {
-      log.error(`Error in onUnload for ${pluginId}:`, err);
+      this.log.error(`Error in onUnload for ${pluginId}:`, err);
     }
 
     // Update state
@@ -672,7 +694,7 @@ export class PluginLoader extends EventEmitter<{
       try {
         await this.stopPlugin(plugin.id);
       } catch (err) {
-        log.error(`Error stopping plugin ${plugin.id}:`, err);
+        this.log.error(`Error stopping plugin ${plugin.id}:`, err);
       }
     }
   }
@@ -694,7 +716,7 @@ export class PluginLoader extends EventEmitter<{
       try {
         await this.safeCallHook(plugin, hookName, args);
       } catch (err) {
-        log.error(
+        this.log.error(
           `Error in ${hookName} hook for ${pluginId}:`,
           err,
         );
@@ -740,6 +762,89 @@ export class PluginLoader extends EventEmitter<{
     const result = fn(...args);
     if (result instanceof Promise) {
       await result;
+    }
+  }
+
+  async checkPluginSetup(pluginId: string): Promise<PluginSetupCheckResult> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      throw new Error(`Plugin "${pluginId}" is not loaded`);
+    }
+
+    if (!plugin.setup) {
+      return { status: "installed" };
+    }
+
+    const timeout = plugin.setup.manifest.defaultTimeoutMs ?? 30_000;
+
+    try {
+      const ctx = await this.createContext(plugin);
+      return await this.withTimeout(
+        plugin.setup.hooks.checkSetup(ctx),
+        timeout,
+        `Setup check for "${pluginId}" timed out after ${timeout}ms`,
+      );
+    } catch (error) {
+      return {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async installPluginSetup(pluginId: string): Promise<void> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      throw new Error(`Plugin "${pluginId}" is not loaded`);
+    }
+
+    if (!plugin.setup?.hooks.install) {
+      throw new Error(`Plugin "${pluginId}" has no install hook`);
+    }
+
+    const timeout = plugin.setup.manifest.defaultTimeoutMs ?? 120_000;
+    const ctx = await this.createContext(plugin);
+
+    try {
+      await this.withTimeout(
+        plugin.setup.hooks.install(ctx),
+        timeout,
+        `Install command for "${pluginId}" timed out after ${timeout}ms`,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.includes(`timed out after ${timeout}ms`)) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Install hook failed for "${pluginId}": ${message}`);
+    }
+  }
+
+  async uninstallPluginSetup(pluginId: string): Promise<void> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      throw new Error(`Plugin "${pluginId}" is not loaded`);
+    }
+
+    if (!plugin.setup?.hooks.uninstall) {
+      return;
+    }
+
+    const timeout = plugin.setup.manifest.defaultTimeoutMs ?? 60_000;
+    const ctx = await this.createContext(plugin);
+
+    try {
+      await this.withTimeout(
+        plugin.setup.hooks.uninstall(ctx),
+        timeout,
+        `Uninstall command for "${pluginId}" timed out after ${timeout}ms`,
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.includes(`timed out after ${timeout}ms`)) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Uninstall hook failed for "${pluginId}": ${message}`);
     }
   }
 
@@ -803,6 +908,31 @@ export class PluginLoader extends EventEmitter<{
 
 
   /**
+   * Get all structured UI contributions from loaded plugins.
+   */
+  getPluginUiContributions(): Array<{ pluginId: string; contribution: PluginUiContributionDefinition }> {
+    const contributions: Array<{ pluginId: string; contribution: PluginUiContributionDefinition }> = [];
+    for (const [pluginId, plugin] of this.plugins) {
+      if (plugin.uiContributions) {
+        for (const contribution of plugin.uiContributions) {
+          contributions.push({
+            pluginId,
+            contribution: normalizePluginUiContributionDefinition(contribution),
+          });
+        }
+      }
+    }
+
+    return contributions.sort((a, b) => {
+      const orderA = a.contribution.order ?? Number.MAX_SAFE_INTEGER;
+      const orderB = b.contribution.order ?? Number.MAX_SAFE_INTEGER;
+      if (orderA !== orderB) return orderA - orderB;
+      if (a.pluginId !== b.pluginId) return a.pluginId.localeCompare(b.pluginId);
+      return a.contribution.contributionId.localeCompare(b.contribution.contributionId);
+    });
+  }
+
+  /**
    * Get all top-level dashboard view definitions from loaded plugins.
    */
   getPluginDashboardViews(): Array<{ pluginId: string; view: PluginDashboardViewDefinition }> {
@@ -845,6 +975,20 @@ export class PluginLoader extends EventEmitter<{
   }
 
   /**
+   * Get all CLI-backed provider contributions from loaded plugins.
+   */
+  getCliProviderContributions(): Array<{ pluginId: string; contribution: CliProviderContribution }> {
+    const contributions: Array<{ pluginId: string; contribution: CliProviderContribution }> = [];
+    for (const [pluginId, plugin] of this.plugins) {
+      if (!plugin.cliProviders) continue;
+      for (const contribution of plugin.cliProviders) {
+        contributions.push({ pluginId, contribution });
+      }
+    }
+    return contributions;
+  }
+
+  /**
    * Get all skill contributions from loaded plugins.
    */
   getPluginSkills(): Array<{ pluginId: string; skill: PluginSkillContribution }> {
@@ -872,6 +1016,24 @@ export class PluginLoader extends EventEmitter<{
       }
     }
     return steps;
+  }
+
+  /**
+   * Get all workflow step templates derived from loaded plugin contributions.
+   */
+  getPluginWorkflowStepTemplates(): Array<{ pluginId: string; template: WorkflowStepTemplate }> {
+    return this.getPluginWorkflowSteps().map(({ pluginId, step }) => ({
+      pluginId,
+      template: {
+        id: `plugin:${pluginId}:${step.stepId}`,
+        name: step.name,
+        description: step.description,
+        prompt: step.prompt ?? "",
+        toolMode: step.toolMode,
+        category: "Plugin",
+        icon: "puzzle",
+      },
+    }));
   }
 
   /**

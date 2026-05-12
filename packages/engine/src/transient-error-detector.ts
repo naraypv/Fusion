@@ -64,6 +64,15 @@ export const TRANSIENT_ERROR_PATTERNS: RegExp[] = [
   /"type":"server_error"/i,
   /"code":"server_error"/i,
   /An error occurred while processing your request\./i,
+
+  // pi-ai openai-codex-responses WebSocket transport errors. The provider holds
+  // a long-lived WebSocket to the Codex backend; transient drops surface as
+  // bare "WebSocket error" / "WebSocket closed <code> <reason>" / a half-open
+  // stream that ended before `response.completed`. All three are network-layer
+  // hiccups, not task defects — retry them.
+  /WebSocket error\b/i,
+  /WebSocket closed\b/i,
+  /WebSocket stream closed before response\.completed/i,
 ];
 
 /**
@@ -159,4 +168,47 @@ export function classifyError(errorMessage: string): "transient" | "usage-limit"
 
   // Default to permanent (mark as failed)
   return "permanent";
+}
+
+const STALE_WORKTREE_MODULE_RESOLUTION_PATTERN = /Cannot find module\s+['"][^'"]*node_modules[^'"]*['"][\s\S]*imported from\s+/i;
+const STALE_WORKTREE_MODULE_PATH_PATTERN = /Cannot find module\s+['"]([^'"]*node_modules[^'"]*)['"]/i;
+
+export function isStaleWorktreeModuleResolutionError(errorMessage: string): boolean {
+  if (!errorMessage || typeof errorMessage !== "string") {
+    return false;
+  }
+  return STALE_WORKTREE_MODULE_RESOLUTION_PATTERN.test(errorMessage);
+}
+
+export function extractMissingModulePath(errorMessage: string): string | null {
+  if (!errorMessage || typeof errorMessage !== "string") {
+    return null;
+  }
+  const match = errorMessage.match(STALE_WORKTREE_MODULE_PATH_PATTERN);
+  if (!match?.[1]) {
+    return null;
+  }
+  return match[1];
+}
+
+const OPERATOR_ACTIONABLE_AGENT_ERROR_PATTERNS: RegExp[] = [
+  /invalid api key/i,
+  /authentication failed/i,
+  /unauthorized/i,
+  /forbidden/i,
+  /insufficient permissions?/i,
+  /model .* not found/i,
+  /unknown model/i,
+  /no such model/i,
+  /credential/i,
+  /missing .*key/i,
+  /billing/i,
+  /quota exceeded/i,
+];
+
+export function isOperatorActionableAgentError(errorMessage: string): boolean {
+  if (!errorMessage || typeof errorMessage !== "string") {
+    return false;
+  }
+  return OPERATOR_ACTIONABLE_AGENT_ERROR_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }

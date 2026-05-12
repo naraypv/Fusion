@@ -1,5 +1,5 @@
 import "./ScriptsModal.css";
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, type CSSProperties } from "react";
 import type { Task } from "@fusion/core";
 import { getErrorMessage } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
@@ -7,6 +7,9 @@ import { useConfirm } from "../hooks/useConfirm";
 import { getPathBasename } from "../utils/pathDisplay";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
+import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
+import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
+import { useViewportMode } from "../hooks/useViewportMode";
 import type {
   GitStatus,
   GitCommit,
@@ -35,6 +38,7 @@ import {
   createStash,
   applyStash,
   dropStash,
+  fetchStashDiff,
   fetchFileChanges,
   stageFiles,
   unstageFiles,
@@ -176,12 +180,37 @@ interface GitManagerModalProps {
 
 export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, projectId }: GitManagerModalProps) {
   const confirmContext = useConfirm();
+  const viewportMode = useViewportMode();
+  useMobileScrollLock(isOpen);
+  const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } = useMobileKeyboard({
+    enabled: viewportMode === "mobile",
+  });
+  const keyboardStyle: CSSProperties = keyboardOpen
+    ? ({
+        "--keyboard-overlap": `${keyboardOverlap}px`,
+        "--vv-offset-top": `${viewportOffsetTop}px`,
+        ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
+      } as CSSProperties)
+    : {};
+  const handleClose = useCallback(() => {
+    if (viewportMode === "mobile") {
+      const activeElement = document.activeElement;
+      if (activeElement instanceof HTMLElement) {
+        activeElement.blur();
+      }
+      window.scrollTo(0, 0);
+      requestAnimationFrame(() => {
+        window.scrollTo(0, 0);
+      });
+    }
+    onClose();
+  }, [onClose, viewportMode]);
   const [activeSection, setActiveSection] = useState<SectionId>("status");
   const [loading, setLoading] = useState(false);
   const [sectionError, setSectionError] = useState<string | null>(null);
   const modalRef = useRef<HTMLDivElement>(null);
   useModalResizePersist(modalRef, isOpen, "fusion:git-modal-size");
-  const overlayDismissProps = useOverlayDismiss(onClose);
+  const overlayDismissProps = useOverlayDismiss(handleClose);
   const copyToClipboard = useCopyToClipboard(addToast);
 
   // ── Status state
@@ -225,6 +254,11 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
   const [stashes, setStashes] = useState<GitStash[]>([]);
   const [stashMessage, setStashMessage] = useState("");
   const [stashLoading, setStashLoading] = useState<string | null>(null);
+  const [expandedStashIndex, setExpandedStashIndex] = useState<number | null>(null);
+  const [stashDiff, setStashDiff] = useState<{ stat: string; patch: string } | null>(null);
+  const [loadingStashDiff, setLoadingStashDiff] = useState(false);
+  const [stashDiffError, setStashDiffError] = useState<string | null>(null);
+  const stashDiffRequestIdRef = useRef(0);
 
   // ── Remotes state
   const [remoteLoading, setRemoteLoading] = useState<string | null>(null);
@@ -272,6 +306,10 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
         case "stashes": {
           const stashesData = await fetchGitStashList(projectId);
           setStashes(stashesData);
+          setExpandedStashIndex(null);
+          setStashDiff(null);
+          setStashDiffError(null);
+          stashDiffRequestIdRef.current += 1;
           break;
         }
         case "remotes": {
@@ -300,7 +338,7 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     if (!isOpen) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        handleClose();
         return;
       }
       // Arrow key navigation between sections
@@ -316,7 +354,7 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     };
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
-  }, [isOpen, onClose, activeSection]);
+  }, [isOpen, handleClose, activeSection]);
 
   // ── Changes Handlers ────────────────────────────────────────────
 
@@ -630,9 +668,18 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
 
   // ── Stash Handlers ──────────────────────────────────────────────
 
+  const resetStashDiffState = useCallback(() => {
+    stashDiffRequestIdRef.current += 1;
+    setExpandedStashIndex(null);
+    setStashDiff(null);
+    setStashDiffError(null);
+    setLoadingStashDiff(false);
+  }, []);
+
   const handleCreateStash = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setStashLoading("create");
+    resetStashDiffState();
     try {
       await createStash(stashMessage.trim() || undefined, projectId);
       addToast("Changes stashed", "success");
@@ -644,10 +691,11 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     } finally {
       setStashLoading(null);
     }
-  }, [stashMessage, addToast, projectId]);
+  }, [stashMessage, addToast, projectId, resetStashDiffState]);
 
   const handleApplyStash = useCallback(async (index: number, drop: boolean = false) => {
     setStashLoading(`apply-${index}`);
+    resetStashDiffState();
     try {
       await applyStash(index, drop, projectId);
       addToast(drop ? "Stash popped" : "Stash applied", "success");
@@ -658,7 +706,7 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     } finally {
       setStashLoading(null);
     }
-  }, [addToast, projectId]);
+  }, [addToast, projectId, resetStashDiffState]);
 
   const handleDropStash = useCallback(async (index: number) => {
     const shouldDrop = await confirmContext.confirm({
@@ -668,6 +716,7 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     });
     if (!shouldDrop) return;
     setStashLoading(`drop-${index}`);
+    resetStashDiffState();
     try {
       await dropStash(index, projectId);
       addToast("Stash dropped", "success");
@@ -678,7 +727,38 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     } finally {
       setStashLoading(null);
     }
-  }, [addToast, projectId, confirmContext]);
+  }, [addToast, projectId, confirmContext, resetStashDiffState]);
+
+  const handleToggleStashDiff = useCallback(async (index: number) => {
+    if (expandedStashIndex === index) {
+      resetStashDiffState();
+      return;
+    }
+
+    const requestId = stashDiffRequestIdRef.current + 1;
+    stashDiffRequestIdRef.current = requestId;
+    setExpandedStashIndex(index);
+    setStashDiff(null);
+    setStashDiffError(null);
+    setLoadingStashDiff(true);
+    try {
+      const diff = await fetchStashDiff(index, projectId);
+      if (stashDiffRequestIdRef.current !== requestId) {
+        return;
+      }
+      setStashDiff(diff);
+    } catch (err) {
+      if (stashDiffRequestIdRef.current !== requestId) {
+        return;
+      }
+      setStashDiff(null);
+      setStashDiffError(getErrorMessage(err) || "Failed to load stash diff");
+    } finally {
+      if (stashDiffRequestIdRef.current === requestId) {
+        setLoadingStashDiff(false);
+      }
+    }
+  }, [expandedStashIndex, projectId, resetStashDiffState]);
 
   // ── Remote Handlers ─────────────────────────────────────────────
 
@@ -697,15 +777,16 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
     }
   }, [addToast, projectId]);
 
-  const handlePull = useCallback(async () => {
+  const handlePull = useCallback(async (options?: { rebase?: boolean }) => {
     setRemoteLoading("pull");
     try {
-      const result = await pullBranch(projectId);
+      const result = await pullBranch(options, projectId);
       setLastRemoteResult(result);
       if (result.conflict) {
         addToast("Merge conflict detected. Resolve manually.", "error");
       } else {
-        addToast(result.message || "Pull completed", "success");
+        const fallbackMessage = options?.rebase ? "Pull --rebase completed" : "Pull completed";
+        addToast(result.message || fallbackMessage, "success");
       }
       const statusData = await fetchGitStatus(projectId);
       setStatus(statusData);
@@ -741,8 +822,8 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
   if (!isOpen) return null;
 
   return (
-    <div className="modal-overlay open" {...overlayDismissProps} role="dialog" aria-modal="true">
-      <div className="modal gm-modal" ref={modalRef}>
+    <div className="modal-overlay open git-manager-modal-overlay" {...overlayDismissProps} role="dialog" aria-modal="true">
+      <div className="modal gm-modal" ref={modalRef} style={keyboardStyle}>
         <div className="modal-header">
           <h3>
             <FolderGit2 size={18} style={{ marginRight: 8, verticalAlign: "middle" }} />
@@ -757,7 +838,7 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
             >
               <RefreshCw size={14} className={loading ? "spin" : ""} />
             </button>
-            <button className="modal-close" onClick={onClose} aria-label="Close">
+            <button className="modal-close" onClick={handleClose} aria-label="Close">
               <X size={18} />
             </button>
           </div>
@@ -890,7 +971,12 @@ export function GitManagerModal({ isOpen, onClose, tasks: _tasks, addToast, proj
                 onCreateStash={handleCreateStash}
                 onApplyStash={handleApplyStash}
                 onDropStash={handleDropStash}
+                onToggleStashDiff={handleToggleStashDiff}
                 stashLoading={stashLoading}
+                expandedStashIndex={expandedStashIndex}
+                stashDiff={stashDiff}
+                loadingStashDiff={loadingStashDiff}
+                stashDiffError={stashDiffError}
               />
             )}
 
@@ -1089,7 +1175,7 @@ function ChangesPanel({
             )}
           </div>
         </div>
-        <div className="gm-file-list">
+        <div className="gm-file-list gm-file-list-unstaged" data-testid="gm-file-list-unstaged">
           {unstagedFiles.length === 0 ? (
             <div className="gm-empty">No unstaged changes</div>
           ) : (
@@ -1161,7 +1247,7 @@ function ChangesPanel({
             )}
           </div>
         </div>
-        <div className="gm-file-list">
+        <div className="gm-file-list gm-file-list-staged" data-testid="gm-file-list-staged">
           {stagedFiles.length === 0 ? (
             <div className="gm-empty">No staged changes</div>
           ) : (
@@ -1372,6 +1458,7 @@ function CommitsPanel({
                       </div>
                     ) : commitDiff ? (
                       <>
+                        {commit.body && <div className="gm-commit-message-full">{commit.body}</div>}
                         {commitDiff.stat && <pre className="gm-diff-stat">{commitDiff.stat}</pre>}
                         <pre className="gm-diff-patch">{commitDiff.patch}</pre>
                       </>
@@ -1591,6 +1678,9 @@ function BranchesPanel({
                                 </div>
                               ) : branchCommitDiff ? (
                                 <>
+                                  {(commit.body || commit.message) && (
+                                    <div className="gm-commit-message-full">{commit.body || commit.message}</div>
+                                  )}
                                   {branchCommitDiff.stat && <pre className="gm-diff-stat">{branchCommitDiff.stat}</pre>}
                                   <pre className="gm-diff-patch">{branchCommitDiff.patch}</pre>
                                 </>
@@ -1666,7 +1756,12 @@ function StashesPanel({
   onCreateStash,
   onApplyStash,
   onDropStash,
+  onToggleStashDiff,
   stashLoading,
+  expandedStashIndex,
+  stashDiff,
+  loadingStashDiff,
+  stashDiffError,
 }: {
   stashes: GitStash[];
   stashMessage: string;
@@ -1674,7 +1769,12 @@ function StashesPanel({
   onCreateStash: (e: React.FormEvent) => void;
   onApplyStash: (index: number, drop?: boolean) => void;
   onDropStash: (index: number) => void;
+  onToggleStashDiff: (index: number) => void;
   stashLoading: string | null;
+  expandedStashIndex: number | null;
+  stashDiff: { stat: string; patch: string } | null;
+  loadingStashDiff: boolean;
+  stashDiffError: string | null;
 }) {
   return (
     <div className="gm-panel" data-testid="stashes-panel">
@@ -1712,53 +1812,80 @@ function StashesPanel({
         ) : (
           stashes.map((stash) => (
             <div key={stash.index} className="gm-stash-item">
-              <div className="gm-stash-info">
-                <span className="gm-stash-ref">stash@{`{${stash.index}}`}</span>
-                <span className="gm-stash-message">{stash.message}</span>
-                <div className="gm-stash-meta">
-                  {stash.branch && (
-                    <span className="gm-stash-branch">
-                      <GitBranchIcon size={12} />
-                      {stash.branch}
-                    </span>
-                  )}
-                  <span>{relativeDate(stash.date)}</span>
+              <div className="gm-stash-header">
+                <div className="gm-stash-info">
+                  <span className="gm-stash-ref">stash@{`{${stash.index}}`}</span>
+                  <span className="gm-stash-message">{stash.message}</span>
+                  <div className="gm-stash-meta">
+                    {stash.branch && (
+                      <span className="gm-stash-branch">
+                        <GitBranchIcon size={12} />
+                        {stash.branch}
+                      </span>
+                    )}
+                    <span>{relativeDate(stash.date)}</span>
+                  </div>
+                </div>
+                <div className="gm-stash-actions">
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => onToggleStashDiff(stash.index)}
+                    disabled={stashLoading !== null}
+                  >
+                    {expandedStashIndex === stash.index ? "Hide" : "View"}
+                  </button>
+                  <button
+                    className="btn btn-sm btn-primary"
+                    onClick={() => onApplyStash(stash.index, false)}
+                    disabled={stashLoading !== null}
+                    title="Apply stash (keep)"
+                  >
+                    {stashLoading === `apply-${stash.index}` ? (
+                      <Loader2 size={14} className="spin" />
+                    ) : (
+                      "Apply"
+                    )}
+                  </button>
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => onApplyStash(stash.index, true)}
+                    disabled={stashLoading !== null}
+                    title="Pop stash (apply and drop)"
+                  >
+                    Pop
+                  </button>
+                  <button
+                    className="btn btn-sm btn-danger"
+                    onClick={() => onDropStash(stash.index)}
+                    disabled={stashLoading !== null}
+                    title="Drop stash"
+                  >
+                    {stashLoading === `drop-${stash.index}` ? (
+                      <Loader2 size={14} className="spin" />
+                    ) : (
+                      <Trash2 size={14} />
+                    )}
+                  </button>
                 </div>
               </div>
-              <div className="gm-stash-actions">
-                <button
-                  className="btn btn-sm btn-primary"
-                  onClick={() => onApplyStash(stash.index, false)}
-                  disabled={stashLoading !== null}
-                  title="Apply stash (keep)"
-                >
-                  {stashLoading === `apply-${stash.index}` ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    "Apply"
-                  )}
-                </button>
-                <button
-                  className="btn btn-sm"
-                  onClick={() => onApplyStash(stash.index, true)}
-                  disabled={stashLoading !== null}
-                  title="Pop stash (apply and drop)"
-                >
-                  Pop
-                </button>
-                <button
-                  className="btn btn-sm btn-danger"
-                  onClick={() => onDropStash(stash.index)}
-                  disabled={stashLoading !== null}
-                  title="Drop stash"
-                >
-                  {stashLoading === `drop-${stash.index}` ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <Trash2 size={14} />
-                  )}
-                </button>
-              </div>
+
+              {expandedStashIndex === stash.index && (
+                <div className="gm-stash-diff">
+                  {loadingStashDiff ? (
+                    <div className="gm-diff-loading">
+                      <Loader2 size={14} className="spin" />
+                      Loading stash diff…
+                    </div>
+                  ) : stashDiffError ? (
+                    <div className="gm-diff-error">{stashDiffError}</div>
+                  ) : stashDiff ? (
+                    <div className="gm-diff-viewer">
+                      {stashDiff.stat && <pre className="gm-diff-stat">{stashDiff.stat}</pre>}
+                      <pre className="gm-diff-patch">{stashDiff.patch}</pre>
+                    </div>
+                  ) : null}
+                </div>
+              )}
             </div>
           ))
         )}
@@ -1783,7 +1910,7 @@ function RemotesPanel({
   remoteLoading: string | null;
   lastRemoteResult: GitFetchResult | GitPullResult | GitPushResult | null;
   onFetch: () => void;
-  onPull: () => void;
+  onPull: (options?: { rebase?: boolean }) => void;
   onPush: () => void;
   addToast: (message: string, type?: ToastType) => void;
   projectId?: string;
@@ -1807,6 +1934,8 @@ function RemotesPanel({
   const [editUrlValue, setEditUrlValue] = useState("");
   const [editNameValue, setEditNameValue] = useState("");
   const [showAddForm, setShowAddForm] = useState(false);
+  const [pullMenuOpen, setPullMenuOpen] = useState(false);
+  const pullSplitRef = useRef<HTMLDivElement | null>(null);
 
   // Ahead commits (local commits to push)
   const [aheadCommits, setAheadCommits] = useState<GitCommit[]>([]);
@@ -1817,9 +1946,42 @@ function RemotesPanel({
   const [remoteCommits, setRemoteCommits] = useState<GitCommit[]>([]);
   const [loadingRemoteCommits, setLoadingRemoteCommits] = useState(false);
   const [remoteCommitsError, setRemoteCommitsError] = useState<string | null>(null);
+  const remoteCommitsRequestIdRef = useRef(0);
 
   // Derived state for selected remote
   const selectedRemoteData = remotes.find((r) => r.name === selectedRemote);
+
+  useEffect(() => {
+    if (remoteLoading !== null || loading) {
+      setPullMenuOpen(false);
+    }
+  }, [remoteLoading, loading]);
+
+  useEffect(() => {
+    if (!pullMenuOpen) {
+      return;
+    }
+
+    const handleDocumentClick = (event: MouseEvent) => {
+      if (!pullSplitRef.current?.contains(event.target as Node)) {
+        setPullMenuOpen(false);
+      }
+    };
+
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPullMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleDocumentClick);
+    document.addEventListener("keydown", handleDocumentKeyDown);
+
+    return () => {
+      document.removeEventListener("mousedown", handleDocumentClick);
+      document.removeEventListener("keydown", handleDocumentKeyDown);
+    };
+  }, [pullMenuOpen]);
 
   // Inline commit diff expansion (one per list context)
   const [expandedAheadCommit, setExpandedAheadCommit] = useState<string | null>(null);
@@ -1863,6 +2025,12 @@ function RemotesPanel({
     }
   }, [selectedRemote]);
 
+  // Refresh selected remote commits after successful sync operations.
+  useEffect(() => {
+    if (!selectedRemote || !lastRemoteResult) return;
+    loadRemoteCommits(selectedRemote);
+  }, [selectedRemote, lastRemoteResult]);
+
   // Clear selected remote if it was removed from the list
   useEffect(() => {
     if (selectedRemote && !remotes.find((r) => r.name === selectedRemote)) {
@@ -1896,16 +2064,26 @@ function RemotesPanel({
   };
 
   const loadRemoteCommits = async (remoteName: string) => {
+    const requestId = remoteCommitsRequestIdRef.current + 1;
+    remoteCommitsRequestIdRef.current = requestId;
     setLoadingRemoteCommits(true);
     setRemoteCommitsError(null);
     try {
       const commits = await fetchRemoteCommits(remoteName, undefined, 10, projectId);
+      if (remoteCommitsRequestIdRef.current !== requestId) {
+        return;
+      }
       setRemoteCommits(commits);
     } catch (err) {
+      if (remoteCommitsRequestIdRef.current !== requestId) {
+        return;
+      }
       setRemoteCommitsError(getErrorMessage(err) || "Failed to load remote commits");
       setRemoteCommits([]);
     } finally {
-      setLoadingRemoteCommits(false);
+      if (remoteCommitsRequestIdRef.current === requestId) {
+        setLoadingRemoteCommits(false);
+      }
     }
   };
 
@@ -2174,18 +2352,57 @@ function RemotesPanel({
                     )}
                     Fetch
                   </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={onPull}
-                    disabled={remoteLoading !== null || loading}
-                  >
-                    {remoteLoading === "pull" ? (
-                      <Loader2 size={14} className="spin" />
-                    ) : (
-                      <GitPullRequest size={14} />
-                    )}
-                    Pull
-                  </button>
+                  <div className="gm-pull-split" ref={pullSplitRef}>
+                    <button
+                      className="btn btn-primary gm-pull-split-main"
+                      onClick={() => {
+                        setPullMenuOpen(false);
+                        onPull({ rebase: false });
+                      }}
+                      disabled={remoteLoading !== null || loading}
+                    >
+                      {remoteLoading === "pull" ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <GitPullRequest size={14} />
+                      )}
+                      Pull
+                    </button>
+                    <button
+                      className="btn btn-primary btn-icon gm-pull-split-toggle"
+                      onClick={() => setPullMenuOpen((open) => !open)}
+                      disabled={remoteLoading !== null || loading}
+                      aria-label="Pull options"
+                      aria-haspopup="menu"
+                      aria-expanded={pullMenuOpen}
+                    >
+                      <ChevronDown size={14} />
+                    </button>
+                    {pullMenuOpen ? (
+                      <div className="gm-pull-menu" role="menu" aria-label="Pull options menu">
+                        <button
+                          className="gm-pull-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            setPullMenuOpen(false);
+                            onPull({ rebase: false });
+                          }}
+                        >
+                          Pull
+                        </button>
+                        <button
+                          className="gm-pull-menu-item"
+                          role="menuitem"
+                          onClick={() => {
+                            setPullMenuOpen(false);
+                            onPull({ rebase: true });
+                          }}
+                        >
+                          Pull --rebase
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
                   <button
                     className="btn btn-primary"
                     onClick={onPush}
@@ -2381,8 +2598,8 @@ function RemotesPanel({
                                 </div>
                               ) : aheadCommitDiff ? (
                                 <>
-                                  {commit.message && (
-                                    <div className="gm-commit-message-full">{commit.message}</div>
+                                  {(commit.body || commit.message) && (
+                                    <div className="gm-commit-message-full">{commit.body || commit.message}</div>
                                   )}
                                   {aheadCommitDiff.stat && <pre className="gm-diff-stat">{aheadCommitDiff.stat}</pre>}
                                   <pre className="gm-diff-patch">{aheadCommitDiff.patch}</pre>
@@ -2468,8 +2685,8 @@ function RemotesPanel({
                               </div>
                             ) : remoteCommitDiff ? (
                               <>
-                                {commit.message && (
-                                  <div className="gm-commit-message-full">{commit.message}</div>
+                                {(commit.body || commit.message) && (
+                                  <div className="gm-commit-message-full">{commit.body || commit.message}</div>
                                 )}
                                 {remoteCommitDiff.stat && <pre className="gm-diff-stat">{remoteCommitDiff.stat}</pre>}
                                 <pre className="gm-diff-patch">{remoteCommitDiff.patch}</pre>

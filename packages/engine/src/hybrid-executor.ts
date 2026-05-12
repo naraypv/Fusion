@@ -114,7 +114,7 @@ export interface HybridExecutorOptions {
  *
  * await executor.addProject({
  *   projectId: project.id,
- *   workingDirectory: project.path,
+ *   workingDirectory: await central.resolveLocalProjectWorkingDirectory(project.id),
  *   isolationMode: "in-process",
  *   maxConcurrent: 2,
  *   maxWorktrees: 4,
@@ -178,9 +178,13 @@ export class HybridExecutor extends EventEmitter<HybridExecutorEvents> {
     for (const project of projects) {
       if (project.status === "active" || project.status === "initializing") {
         try {
+          const workingDirectory = await this.centralCore.resolveLocalProjectWorkingDirectory(
+            project.id,
+          );
+
           await this.addProject({
             projectId: project.id,
-            workingDirectory: project.path,
+            workingDirectory,
             isolationMode: project.isolationMode,
             maxConcurrent: project.settings?.maxConcurrent ?? 2,
             maxWorktrees: project.settings?.maxWorktrees ?? 4,
@@ -275,10 +279,13 @@ export class HybridExecutor extends EventEmitter<HybridExecutorEvents> {
       );
 
       const project = await this.centralCore.getProject(projectId);
-      const workingDirectory = config.workingDirectory ?? project?.path;
-      if (!workingDirectory) {
+      if (!project) {
         throw new Error(`Project not found in CentralCore: ${projectId}`);
       }
+
+      const workingDirectory =
+        config.workingDirectory ??
+        (await this.centralCore.resolveLocalProjectWorkingDirectory(projectId));
 
       // Stop old runtime
       await this.projectManager.removeProject(projectId);

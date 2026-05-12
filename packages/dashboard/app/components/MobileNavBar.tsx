@@ -1,5 +1,5 @@
 import "./MobileNavBar.css";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Activity,
   Bot,
@@ -12,6 +12,7 @@ import {
   Folder,
   GitBranch,
   Grid3X3,
+  History,
   LayoutGrid,
   Lightbulb,
   Loader2,
@@ -27,14 +28,13 @@ import {
   Target,
   Terminal,
   Workflow,
-  Map,
   Zap,
 } from "lucide-react";
 import { fetchScripts } from "../api";
 import type { PluginDashboardViewEntry } from "../api";
 import { useViewportMode } from "./Header";
 import type { TaskView } from "../hooks/useViewState";
-import { buildPluginTaskViewId } from "../plugins/pluginViewRegistry";
+import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
 
 export interface MobileNavBarProps {
@@ -54,6 +54,9 @@ export interface MobileNavBarProps {
   onOpenSystemStats?: () => void;
   onOpenMailbox?: () => void;
   mailboxUnreadCount?: number;
+  mailboxPendingApprovalCount?: number;
+  chatHasUnreadResponse?: boolean;
+  stashOrphanCount?: number;
   onOpenGitManager?: () => void;
   onOpenWorkflowSteps?: () => void;
   onOpenSchedules?: () => void;
@@ -75,16 +78,17 @@ export interface MobileNavBarProps {
   /** Experimental feature flags controlling visibility of nav items. */
   experimentalFeatures?: {
     insights?: boolean;
-    roadmap?: boolean;
     memoryView?: boolean;
     devServer?: boolean;
     devServerView?: boolean;
     todoView?: boolean;
     researchView?: boolean;
+    evalsView?: boolean;
     nodesView?: boolean;
   };
   onOpenNodes?: () => void;
   pluginDashboardViews?: PluginDashboardViewEntry[];
+  shellConnectionControl?: ReactNode;
 }
 
 function GitHubLogo({ size = 20 }: { size?: number }) {
@@ -116,6 +120,9 @@ export function MobileNavBar({
   onOpenSystemStats,
   onOpenMailbox,
   mailboxUnreadCount = 0,
+  mailboxPendingApprovalCount = 0,
+  chatHasUnreadResponse = false,
+  stashOrphanCount = 0,
   onOpenGitManager,
   onOpenWorkflowSteps,
   onOpenSchedules,
@@ -136,6 +143,7 @@ export function MobileNavBar({
   experimentalFeatures,
   onOpenNodes,
   pluginDashboardViews = [],
+  shellConnectionControl,
 }: MobileNavBarProps) {
   const mode = useViewportMode();
   const [isMoreOpen, setIsMoreOpen] = useState(false);
@@ -200,32 +208,18 @@ export function MobileNavBar({
 
   const planningHandler = activePlanningSessionCount > 0 && onResumePlanning ? onResumePlanning : onOpenPlanning;
 
-  const hasRoadmapsPluginView = pluginDashboardViews.some((entry) => entry.pluginId === "fusion-plugin-roadmap");
-  const roadmapEnabled = Boolean(experimentalFeatures?.roadmap) && !hasRoadmapsPluginView;
   const skillsEnabled = Boolean(showSkillsTab);
   const todoViewEnabled = Boolean(experimentalFeatures?.todoView);
 
   // Keep a maximum of one optional primary tab visible at once to preserve touch-target width.
   // Overflowed destinations remain available in the More sheet.
-  const showRoadmapsTopLevel = roadmapEnabled && (!skillsEnabled || view === "roadmaps");
-  const showSkillsTopLevel = skillsEnabled && (!roadmapEnabled || view !== "roadmaps");
+  const showSkillsTopLevel = skillsEnabled;
   const showSkillsInMore = skillsEnabled && !showSkillsTopLevel;
-  const isDependencyGraphView = (entry: PluginDashboardViewEntry): boolean => (
-    entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph"
-  );
   const sortedPrimaryPluginViews = pluginDashboardViews
     .filter((entry) => entry.view.placement === "primary")
     .sort((a, b) => (a.view.order ?? Number.MAX_SAFE_INTEGER) - (b.view.order ?? Number.MAX_SAFE_INTEGER));
-  const dependencyGraphPluginView = pluginDashboardViews.find(isDependencyGraphView) ?? null;
-  // Keep plugin-provided top-level tabs constrained on mobile so fixed tabs retain
-  // reasonable touch-target width. Additional primary plugin destinations overflow into More.
-  // FN-3235: Always surface the dependency graph destination as the first plugin top-level tab
-  // on mobile so task graph navigation has a clear entry point.
-  const prioritizedPrimaryPluginViews = dependencyGraphPluginView
-    ? [dependencyGraphPluginView, ...sortedPrimaryPluginViews.filter((entry) => !isDependencyGraphView(entry))]
-    : sortedPrimaryPluginViews;
   const MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS = 1;
-  const topLevelPrimaryPluginViews = prioritizedPrimaryPluginViews.slice(0, MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS);
+  const topLevelPrimaryPluginViews = sortedPrimaryPluginViews.slice(0, MAX_PRIMARY_PLUGIN_TOP_LEVEL_TABS);
   const topLevelPluginViewKeys = new Set(
     topLevelPrimaryPluginViews.map((entry) => `${entry.pluginId}:${entry.view.viewId}`),
   );
@@ -235,15 +229,17 @@ export function MobileNavBar({
 
   const isMoreActive =
     view === "documents"
+    || (Boolean(experimentalFeatures?.evalsView) && view === "evals")
     || view === "research"
     || view === "insights"
     || view === "memory"
     || view === "devserver"
     || view === "dev-server"
     || (todosOpen && todoViewEnabled)
-    || (view === "roadmaps" && !showRoadmapsTopLevel)
     || (view === "skills" && !showSkillsTopLevel)
-    || (view.startsWith("plugin:") && !topLevelPrimaryPluginViews.some((entry) => buildPluginTaskViewId(entry.pluginId, entry.view.viewId) === view));
+    || view === "graph"
+    || view === "stash-recovery"
+    || (isPluginViewId(view) && !topLevelPrimaryPluginViews.some((entry) => buildPluginTaskViewId(entry.pluginId, entry.view.viewId) === view));
 
   return (
     <>
@@ -303,7 +299,12 @@ export function MobileNavBar({
           aria-selected={view === "chat"}
           onClick={() => onChangeView("chat")}
         >
-          <MessageSquare />
+          <span className="mobile-nav-tab-icon-wrapper">
+            <MessageSquare />
+            {chatHasUnreadResponse && view !== "chat" && (
+              <span className="status-dot status-dot--pending mobile-nav-chat-unread-dot" aria-label="Unread chat response" />
+            )}
+          </span>
           <span className="mobile-nav-tab-label">Chat</span>
         </button>
 
@@ -316,7 +317,12 @@ export function MobileNavBar({
           aria-selected={view === "mailbox"}
           onClick={() => onChangeView("mailbox")}
         >
-          <Mail />
+          <span className="mobile-nav-tab-icon-wrapper">
+            <Mail />
+            {mailboxPendingApprovalCount > 0 && view !== "mailbox" && (
+              <span className="status-dot status-dot--pending mobile-nav-chat-unread-dot" aria-label="Pending approvals" />
+            )}
+          </span>
           <span className="mobile-nav-tab-label">Mailbox</span>
           {mailboxUnreadCount > 0 && (
             <span className="mobile-nav-tab-badge">{formatCount(mailboxUnreadCount)}</span>
@@ -337,19 +343,6 @@ export function MobileNavBar({
           </button>
         )}
 
-        {showRoadmapsTopLevel && (
-          <button
-            type="button"
-            className={`mobile-nav-tab${view === "roadmaps" ? " mobile-nav-tab--active" : ""}`}
-            data-testid="mobile-nav-tab-roadmaps"
-            role="tab"
-            aria-selected={view === "roadmaps"}
-            onClick={() => onChangeView("roadmaps")}
-          >
-            <Map />
-            <span className="mobile-nav-tab-label">Roadmaps</span>
-          </button>
-        )}
 
         {topLevelPrimaryPluginViews.map((entry) => {
           const pluginTaskView = buildPluginTaskViewId(entry.pluginId, entry.view.viewId);
@@ -358,11 +351,11 @@ export function MobileNavBar({
             <button
               key={`${entry.pluginId}:${entry.view.viewId}`}
               type="button"
-              className={`mobile-nav-tab${view === pluginTaskView ? " mobile-nav-tab--active" : ""}`}
+              className={`mobile-nav-tab${view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph") ? " mobile-nav-tab--active" : ""}`}
               data-testid={`mobile-nav-tab-plugin-${entry.pluginId}-${entry.view.viewId}`}
               role="tab"
-              aria-selected={view === pluginTaskView}
-              onClick={() => onChangeView(pluginTaskView)}
+              aria-selected={view === pluginTaskView || (view === "graph" && entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph")}
+              onClick={() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView)}
             >
               <PluginIcon />
               <span className="mobile-nav-tab-label">{entry.view.label}</span>
@@ -393,6 +386,12 @@ export function MobileNavBar({
             <div className="mobile-more-sheet-handle" />
             <div className="mobile-more-sheet-title">Navigate</div>
 
+            {shellConnectionControl ? (
+              <div className="mobile-more-shell-connection" data-testid="mobile-more-shell-connection">
+                {shellConnectionControl}
+              </div>
+            ) : null}
+
             <button
               type="button"
               className="mobile-more-item"
@@ -403,6 +402,9 @@ export function MobileNavBar({
               <span>Mailbox</span>
               {mailboxUnreadCount > 0 && (
                 <span className="mobile-more-item-badge mobile-more-item-badge--unread">{formatCount(mailboxUnreadCount)}</span>
+              )}
+              {mailboxPendingApprovalCount > 0 && (
+                <span className="mobile-more-item-badge">{formatCount(mailboxPendingApprovalCount)}</span>
               )}
             </button>
 
@@ -604,6 +606,17 @@ export function MobileNavBar({
               <FileText />
               <span>Documents</span>
             </button>
+            {experimentalFeatures?.evalsView && (
+              <button
+                type="button"
+                className="mobile-more-item"
+                data-testid="mobile-more-item-evals"
+                onClick={() => handleMoreAction(() => onChangeView("evals"))}
+              >
+                <Target />
+                <span>Evals</span>
+              </button>
+            )}
 
             {showSkillsInMore && (
               <button
@@ -617,17 +630,18 @@ export function MobileNavBar({
               </button>
             )}
 
-            {roadmapEnabled && (
-              <button
-                type="button"
-                className="mobile-more-item"
-                data-testid="mobile-more-item-roadmaps"
-                onClick={() => handleMoreAction(() => onChangeView("roadmaps"))}
-              >
-                <Map />
-                <span>Roadmaps</span>
-              </button>
-            )}
+
+
+            <button
+              type="button"
+              className="mobile-more-item"
+              data-testid="mobile-more-item-stash-recovery"
+              onClick={() => handleMoreAction(() => onChangeView("stash-recovery"))}
+            >
+              <History />
+              <span>Stash Recovery</span>
+              {stashOrphanCount > 0 ? <span className="mobile-more-item-badge">{formatCount(stashOrphanCount)}</span> : null}
+            </button>
 
             {experimentalFeatures?.researchView && (
               <button
@@ -712,7 +726,7 @@ export function MobileNavBar({
                     type="button"
                     className="mobile-more-item"
                     data-testid={`mobile-more-item-plugin-${entry.pluginId}-${entry.view.viewId}`}
-                    onClick={() => handleMoreAction(() => onChangeView(pluginTaskView))}
+                    onClick={() => handleMoreAction(() => onChangeView(entry.pluginId === "fusion-plugin-dependency-graph" && entry.view.viewId === "graph" ? "graph" : pluginTaskView))}
                   >
                     <PluginIcon />
                     <span>{entry.view.label}</span>

@@ -24,7 +24,6 @@ import {
   Activity,
   FileText,
   RefreshCw,
-  AlertCircle,
 } from "lucide-react";
 import type { ToastType } from "../hooks/useToast";
 import { useViewportMode } from "../hooks/useViewportMode";
@@ -97,6 +96,11 @@ import {
 } from "../api";
 import type { AutopilotState } from "./mission-types";
 
+const MISSION_SIDEBAR_DEFAULT_WIDTH = 300;
+const MISSION_SIDEBAR_MIN_WIDTH = 220;
+const MISSION_SIDEBAR_MAX_WIDTH = 560;
+const MISSION_SIDEBAR_STORAGE_KEY = "fusion:mission-sidebar-width";
+
 interface MissionManagerProps {
   isOpen: boolean;
   isInline?: boolean;
@@ -141,6 +145,7 @@ const featureStatusColors: Record<FeatureStatus, { bg: string; text: string }> =
   triaged: { bg: "var(--feature-triaged-bg)", text: "var(--feature-triaged-text)" },
   "in-progress": { bg: "var(--feature-in-progress-bg)", text: "var(--feature-in-progress-text)" },
   done: { bg: "var(--feature-done-bg)", text: "var(--feature-done-text)" },
+  blocked: { bg: "var(--mission-blocked-bg)", text: "var(--mission-blocked-text)" },
 };
 
 const autopilotStateColors: Record<AutopilotState, { bg: string; text: string }> = {
@@ -168,6 +173,28 @@ const validationStateColors: Record<string, { bg: string; text: string }> = {
 };
 
 const featureRetryBudgetMax = 3;
+const missionInterviewListStatuses: ReadonlySet<AiSessionSummary["status"]> = new Set([
+  "generating",
+  "awaiting_input",
+  "error",
+]);
+
+function getInterviewStatusLabel(status: AiSessionSummary["status"]): string {
+  switch (status) {
+    case "generating":
+      return "Generating plan";
+    case "awaiting_input":
+      return "Awaiting input";
+    case "error":
+      return "Needs retry";
+    default:
+      return status;
+  }
+}
+
+function getInterviewActionLabel(status: AiSessionSummary["status"]): string {
+  return status === "error" ? "Retry interview" : "Resume interview";
+}
 
 /** Get the plan state for a milestone (derived from interviewState) */
 function getMilestonePlanState(interviewState?: string): "not_started" | "planned" | "needs_update" {
@@ -438,6 +465,72 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const isMobile = useViewportMode() === "mobile";
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return MISSION_SIDEBAR_DEFAULT_WIDTH;
+    const stored = window.localStorage.getItem(MISSION_SIDEBAR_STORAGE_KEY);
+    const parsed = stored ? Number(stored) : NaN;
+    if (!Number.isFinite(parsed)) return MISSION_SIDEBAR_DEFAULT_WIDTH;
+    return Math.max(MISSION_SIDEBAR_MIN_WIDTH, Math.min(MISSION_SIDEBAR_MAX_WIDTH, parsed));
+  });
+
+  const persistSidebarWidth = useCallback((width: number) => {
+    try {
+      window.localStorage.setItem(MISSION_SIDEBAR_STORAGE_KEY, String(width));
+    } catch {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  const handleSidebarResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (isMobile) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const handle = event.currentTarget;
+    if (typeof handle.setPointerCapture === "function") {
+      handle.setPointerCapture(event.pointerId);
+    }
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    let latestWidth = startWidth;
+    document.body.style.userSelect = "none";
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const nextWidth = Math.max(
+        MISSION_SIDEBAR_MIN_WIDTH,
+        Math.min(MISSION_SIDEBAR_MAX_WIDTH, startWidth + deltaX),
+      );
+      latestWidth = nextWidth;
+      setSidebarWidth(nextWidth);
+    };
+
+    const onPointerUp = (upEvent: PointerEvent) => {
+      if (typeof handle.releasePointerCapture === "function") {
+        handle.releasePointerCapture(upEvent.pointerId);
+      }
+      document.body.style.userSelect = "";
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerup", onPointerUp);
+      persistSidebarWidth(latestWidth);
+    };
+
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+  }, [isMobile, persistSidebarWidth, sidebarWidth]);
+
+  const handleSidebarResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (isMobile) return;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const step = event.shiftKey ? 50 : 10;
+    const delta = event.key === "ArrowLeft" ? -step : step;
+    const nextWidth = Math.max(
+      MISSION_SIDEBAR_MIN_WIDTH,
+      Math.min(MISSION_SIDEBAR_MAX_WIDTH, sidebarWidth + delta),
+    );
+    setSidebarWidth(nextWidth);
+    persistSidebarWidth(nextWidth);
+  }, [isMobile, persistSidebarWidth, sidebarWidth]);
 
   // Form states
   const [isCreatingMission, setIsCreatingMission] = useState(false);
@@ -473,7 +566,10 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   // Pending mission interview sessions (for resume prompt after page reload)
   const [pendingInterviewSessions, setPendingInterviewSessions] = useState<AiSessionSummary[]>([]);
   const [localResumeSessionId, setLocalResumeSessionId] = useState<string | undefined>(undefined);
-  const effectiveResumeSessionId = localResumeSessionId ?? resumeSessionId;
+  const dismissedResumeSessionIdRef = useRef<string | null>(null);
+  const effectiveResumeSessionId =
+    localResumeSessionId ??
+    (resumeSessionId && dismissedResumeSessionIdRef.current === resumeSessionId ? undefined : resumeSessionId);
 
   // Milestone/Slice interview modal
   const [interviewTarget, setInterviewTarget] = useState<{
@@ -497,15 +593,28 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     }
   }, [isActive, effectiveResumeSessionId]);
 
+  // If parent requests a different resume session, allow it to open again.
+  useEffect(() => {
+    if (resumeSessionId && dismissedResumeSessionIdRef.current !== resumeSessionId) {
+      dismissedResumeSessionIdRef.current = null;
+    }
+  }, [resumeSessionId]);
+
   // Detect pending mission interview sessions for resume prompt
   useEffect(() => {
-    if (!isActive || effectiveResumeSessionId) return;
+    if (!isActive) return;
     let cancelled = false;
     fetchAiSessions(projectId).then((sessions) => {
       if (cancelled) return;
-      const pending = sessions.filter(
-        (s) => s.type === "mission_interview" && (s.status === "awaiting_input" || s.status === "error"),
-      );
+      const pending = sessions.filter((s) => {
+        if (s.type !== "mission_interview" || !missionInterviewListStatuses.has(s.status)) {
+          return false;
+        }
+        if (projectId) {
+          return s.projectId === projectId;
+        }
+        return s.projectId == null;
+      });
       setPendingInterviewSessions(pending);
     }).catch((err) => {
       console.warn("[MissionManager] Failed to fetch pending interview sessions:", err);
@@ -674,6 +783,12 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     try {
       setDetailLoading(true);
       const data = await fetchMission(missionId, projectId);
+      // Guard against malformed responses (e.g. test fetch fallbacks): without
+      // a milestones array the detail view crashes on `.milestones.length`.
+      if (!data || !Array.isArray((data as MissionWithHierarchy).milestones)) {
+        setDetailLoading(false);
+        return;
+      }
       setSelectedMission(data);
       // Auto-expand first milestone and slice
       if (data.milestones.length > 0) {
@@ -800,6 +915,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
 
       setMissionEvents((prev) => {
         if (!append) {
+          missionEventsRef.current = incomingEvents;
           return incomingEvents;
         }
 
@@ -810,6 +926,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
             merged.push(event);
           }
         }
+        missionEventsRef.current = merged;
         return merged;
       });
 
@@ -860,6 +977,25 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   useEffect(() => {
     if (!isActive) {
       targetLoadedRef.current = null;
+    }
+  }, [isActive]);
+
+  // Default-select the first mission once the list loads (inline desktop view).
+  // Gated on `isInline` so the standalone modal flow (and unit tests that
+  // render without isInline) keep the explicit "select a mission" empty state.
+  const defaultSelectedRef = useRef(false);
+  useEffect(() => {
+    if (!isActive || !isInline || isMobile || loading) return;
+    if (defaultSelectedRef.current) return;
+    if (selectedMission || targetMissionId) return;
+    if (missions.length === 0) return;
+    defaultSelectedRef.current = true;
+    loadMissionDetail(missions[0].id);
+  }, [isActive, isInline, isMobile, loading, missions, selectedMission, targetMissionId, loadMissionDetail]);
+
+  useEffect(() => {
+    if (!isActive) {
+      defaultSelectedRef.current = false;
     }
   }, [isActive]);
 
@@ -1115,12 +1251,6 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   ]);
 
   // Mission handlers
-  const handleCreateMission = useCallback(() => {
-    setIsCreatingMission(true);
-    setEditingMissionId(null);
-    setMissionForm(EMPTY_MISSION_FORM);
-  }, []);
-
   const handleEditMission = useCallback((mission: Mission) => {
     setEditingMissionId(mission.id);
     setIsCreatingMission(false);
@@ -3379,7 +3509,60 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     );
   };
 
-  const renderMissionListItems = () => missions.map((mission) => {
+  const handleResumeInterviewSession = (sessionId: string) => {
+    setLocalResumeSessionId(sessionId);
+    setShowInterviewModal(true);
+  };
+
+  const handleInterviewModalClose = () => {
+    dismissedResumeSessionIdRef.current = effectiveResumeSessionId ?? null;
+    setLocalResumeSessionId(undefined);
+    setShowInterviewModal(false);
+  };
+
+  const renderInterviewSessionItems = () => pendingInterviewSessions.map((session) => {
+    const isErrored = session.status === "error";
+    const isGenerating = session.status === "generating";
+
+    return (
+      <div
+        key={session.id}
+        className="mission-list__item mission-list__item--interview"
+        onClick={() => handleResumeInterviewSession(session.id)}
+      >
+        <div className="mission-list__item-content">
+          <div className="mission-list__item-header">
+            <Sparkles size={16} className="mission-list__item-icon" />
+            <span className="mission-list__item-title">{session.title || "Mission interview"}</span>
+          </div>
+          <div className="mission-list__item-tags">
+            <span className={`mission-status-badge mission-status-badge--sm mission-interview-status mission-interview-status--${session.status}`}>
+              {getInterviewStatusLabel(session.status)}
+            </span>
+          </div>
+          <p className="mission-list__item-description">
+            {isGenerating
+              ? "Generating mission hierarchy from interview context."
+              : isErrored
+                ? "Interview hit an error. Retry from this list item."
+                : "Interview is waiting for your next response."}
+          </p>
+        </div>
+        <div className="mission-list__item-actions" onClick={(event) => event.stopPropagation()}>
+          <button
+            className={`mission-icon-btn ${isErrored ? "mission-icon-btn--danger" : "mission-icon-btn--success"}`}
+            onClick={() => handleResumeInterviewSession(session.id)}
+            title={getInterviewActionLabel(session.status)}
+            aria-label={getInterviewActionLabel(session.status)}
+          >
+            {isGenerating ? <Loader2 size={14} className="spinner" /> : isErrored ? <RefreshCw size={14} /> : <Sparkles size={14} />}
+          </button>
+        </div>
+      </div>
+    );
+  });
+
+  const renderMissionListItems = (missionList: MissionWithSummary[], options?: { interviewStyle?: boolean }) => missionList.map((mission) => {
     const m = mission;
     const isSelected = selectedMission?.id === m.id;
     const statusColors = missionStatusColors[m.status as MissionStatus] || { bg: "", text: "" };
@@ -3392,21 +3575,20 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     const tasksFailed = health?.tasksFailed ?? 0;
     const progressPercent = health?.estimatedCompletionPercent ?? summary?.progressPercent ?? 0;
     const showSummaryBlock = hasContent || totalTasks > 0 || tasksFailed > 0 || Boolean(health?.lastActivityAt);
-
-    const activeSliceLabel = m.status === "active" && (health?.currentMilestoneId || health?.currentSliceId)
-      ? "Current milestone/slice in progress"
-      : null;
+    const isInterviewStyle = options?.interviewStyle === true;
 
     return (
       <div
         key={m.id}
-        className={`mission-list__item ${isSelected ? "mission-list__item--selected" : ""}`}
+        className={`mission-list__item ${isSelected ? "mission-list__item--selected" : ""} ${isInterviewStyle ? "mission-list__item--interview" : ""}`}
         onClick={() => handleSelectMission(mission)}
       >
         <div className="mission-list__item-content">
           <div className="mission-list__item-header">
             <Target size={16} className="mission-list__item-icon" />
             <span className="mission-list__item-title">{m.title}</span>
+          </div>
+          <div className="mission-list__item-tags">
             {mission.autopilotEnabled && (
               <span title="Autopilot enabled"><Zap size={12} className="mission-list__item-autopilot-icon" /></span>
             )}
@@ -3424,13 +3606,17 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
             >
               {m.status}
             </span>
+            {isInterviewStyle && (
+              <span className="mission-status-badge mission-status-badge--sm mission-interview-status mission-interview-status--awaiting_input">
+                Interview in progress
+              </span>
+            )}
           </div>
-          {m.description && (
+          {isInterviewStyle ? (
+            <p className="mission-list__item-description">Mission interview is still in progress. Open this mission to continue planning.</p>
+          ) : m.description ? (
             <p className="mission-list__item-description">{m.description}</p>
-          )}
-          {activeSliceLabel && (
-            <p className="mission-list__item-active-slice">Active: {activeSliceLabel}</p>
-          )}
+          ) : null}
           {showSummaryBlock && (
             <div className="mission-list__item-summary">
               {hasContent && (
@@ -3459,15 +3645,19 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                   {tasksFailed} failed
                 </button>
               )}
-              <span className="mission-relative-time" data-testid={`mission-last-activity-${m.id}`}>
-                Activity {getRelativeTime(health?.lastActivityAt)}
-              </span>
               <div className={`mission-list__item-progress mission-list__item-progress--${healthState}`}>
                 <div
                   className="mission-list__item-progress-bar"
                   style={{ width: `${progressPercent}%` }}
                 />
               </div>
+            </div>
+          )}
+          {showSummaryBlock && (
+            <div className="mission-list__item-activity">
+              <span className="mission-relative-time" data-testid={`mission-last-activity-${m.id}`}>
+                Activity {getRelativeTime(health?.lastActivityAt)}
+              </span>
             </div>
           )}
         </div>
@@ -3518,8 +3708,14 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     );
   });
 
-  const renderMissionListContent = ({ hideBottomButtons = false }: { hideBottomButtons?: boolean } = {}) => (
-            <div className="mission-list">
+  const renderMissionListContent = ({ hideBottomButtons = false }: { hideBottomButtons?: boolean } = {}) => {
+    const persistedInterviewMissions = missions.filter((mission) => mission.interviewState === "in_progress");
+    const standardMissions = missions.filter((mission) => mission.interviewState !== "in_progress");
+    const showMobileTopPlanButton = isMobile && missions.length > 0 && !isCreatingMission;
+    const showBottomPlanButton = !hideBottomButtons && !showMobileTopPlanButton;
+
+    return (
+      <div className="mission-list">
               {/* Create mission form */}
               {isCreatingMission && (
                 <div className="mission-form-card">
@@ -3549,8 +3745,22 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 </div>
               )}
 
-              {/* Mission items */}
-              {renderMissionListItems()}
+              {showMobileTopPlanButton && (
+                <div className="mission-list__top-action">
+                  <button
+                    className="btn btn-sm btn-task-create mission-list__primary-cta"
+                    onClick={() => setShowInterviewModal(true)}
+                  >
+                    <Sparkles size={14} />
+                    Plan New Mission
+                  </button>
+                </div>
+              )}
+
+              {/* Mission and interview items */}
+              {renderMissionListItems(persistedInterviewMissions, { interviewStyle: true })}
+              {renderMissionListItems(standardMissions)}
+              {renderInterviewSessionItems()}
 
               {/* Edit mission form */}
               {editingMissionId && (
@@ -3602,56 +3812,39 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
               )}
 
               {missions.length === 0 && !isCreatingMission && (
-                <div className="mission-manager__empty mission-manager__empty--large">
+                <div className="mission-manager__empty mission-manager__empty--large mission-manager__empty--mission">
                   <Target size={32} />
-                  <span>No missions yet. Create one to start planning.</span>
+                  <h3 className="mission-manager__empty-title">No missions yet</h3>
+                  <p className="mission-manager__empty-body">
+                    Missions are large initiatives that bundle milestones, slices, and features into a
+                    single plan. Plan a mission to break down a goal end-to-end and let agents work
+                    through it autopilot-style.
+                  </p>
+                  <button
+                    className="btn btn-sm btn-primary mission-manager__empty-cta"
+                    onClick={() => setShowInterviewModal(true)}
+                  >
+                    <Sparkles size={14} />
+                    Plan New Mission
+                  </button>
                 </div>
               )}
 
               {!isCreatingMission && (
                 <div className="mission-list__footer">
-                  {pendingInterviewSessions.length > 0 && (
-                    <div className="mission-resume-prompt">
-                      <AlertCircle size={16} />
-                      <span>
-                        {pendingInterviewSessions.length === 1
-                          ? `Resume "${pendingInterviewSessions[0].title}"?`
-                          : `${pendingInterviewSessions.length} interview sessions pending`}
-                      </span>
-                      <div className="mission-list__resume-actions">
-                        {pendingInterviewSessions.map((s) => (
-                          <button
-                            key={s.id}
-                            className="mission-add-btn"
-                            onClick={() => {
-                              setLocalResumeSessionId(s.id);
-                              setShowInterviewModal(true);
-                              setPendingInterviewSessions([]);
-                            }}
-                          >
-                            {s.status === "error" ? <RefreshCw size={14} /> : <Sparkles size={14} />}
-                            {s.status === "error" ? "Retry" : "Resume"}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {!hideBottomButtons && (
+                  {showBottomPlanButton && (
                     <div className="mission-list__footer-actions">
                       <button className="mission-add-btn" onClick={() => setShowInterviewModal(true)}>
                         <Sparkles size={16} />
-                        Plan with AI
-                      </button>
-                      <button className="mission-add-btn" onClick={handleCreateMission}>
-                        <Plus size={16} />
-                        New Mission
+                        Plan New Mission
                       </button>
                     </div>
                   )}
                 </div>
               )}
             </div>
-  );
+    );
+  };
 
   const renderDeleteConfirmPanel = () => (
     <div className="mission-confirm-panel mission-confirm-panel--danger">
@@ -3789,28 +3982,12 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
         </div>
       ) : (
         <div className="mission-manager__split">
-          <aside className="mission-manager__sidebar" data-testid="mission-sidebar" aria-label="Mission list">
-            <div className="mission-manager__sidebar-header">
-              <span className="mission-manager__sidebar-title">Missions</span>
-              <div className="mission-manager__sidebar-actions">
-                <button
-                  className="mission-add-btn mission-add-btn--sm"
-                  onClick={() => setShowInterviewModal(true)}
-                  title="Plan with AI"
-                  aria-label="Plan with AI"
-                >
-                  <Sparkles size={14} />
-                </button>
-                <button
-                  className="mission-add-btn mission-add-btn--sm"
-                  onClick={handleCreateMission}
-                  title="New Mission"
-                  aria-label="New Mission"
-                >
-                  <Plus size={14} />
-                </button>
-              </div>
-            </div>
+          <aside
+            className="mission-manager__sidebar"
+            data-testid="mission-sidebar"
+            aria-label="Mission list"
+            style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
+          >
             <div className="mission-manager__sidebar-list">
               {loading ? (
                 <div className="mission-manager__loading">
@@ -3821,7 +3998,33 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 renderMissionListContent({ hideBottomButtons: true })
               )}
             </div>
+            <div className="mission-manager__sidebar-footer" data-testid="mission-sidebar-footer">
+              <button
+                className="btn btn-primary mission-manager__sidebar-cta"
+                onClick={() => setShowInterviewModal(true)}
+                title="Plan New Mission"
+                aria-label="Plan New Mission"
+              >
+                <Sparkles size={14} />
+                Plan New Mission
+              </button>
+            </div>
           </aside>
+
+          {!isMobile && (
+            <div
+              className="mission-manager__sidebar-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuemin={MISSION_SIDEBAR_MIN_WIDTH}
+              aria-valuemax={MISSION_SIDEBAR_MAX_WIDTH}
+              aria-valuenow={sidebarWidth}
+              aria-label="Resize mission sidebar"
+              tabIndex={0}
+              onPointerDown={handleSidebarResizeStart}
+              onKeyDown={handleSidebarResizeKeyDown}
+            />
+          )}
 
           <div className="mission-manager__detail-pane">
             {detailLoading ? (
@@ -3848,7 +4051,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const interviewModal = (
     <MissionInterviewModal
       isOpen={showInterviewModal}
-      onClose={() => setShowInterviewModal(false)}
+      onClose={handleInterviewModalClose}
       onMissionCreated={() => {
         loadMissions();
         addToast("Mission created from AI interview", "success");

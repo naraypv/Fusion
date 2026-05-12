@@ -7,11 +7,10 @@ import {
   isProjectSettingsKey,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
-  resolveRouteAllLlmCallsViaDspy,
   resolveTitleSummarizerSettingsModel,
 } from "@fusion/core";
-import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, ModelFallbackChainEntry, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, addCliAccountProvider } from "../api";
+import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemoteDetailed, RemoteSettings, RemoteStatus, UpdateCheckResponse } from "../api";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
@@ -27,7 +26,7 @@ import { useModalResizePersist } from "../hooks/useModalResizePersist";
 const PluginManager = lazy(() => import("./PluginManager").then((m) => ({ default: m.PluginManager })));
 const PiExtensionsManager = lazy(() => import("./PiExtensionsManager").then((m) => ({ default: m.PiExtensionsManager })));
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
-import { CliAccountProviderCard } from "./CliAccountProviderCard";
+import { CursorCliProviderCard } from "./CursorCliProviderCard";
 import { CliBinaryPanel } from "./CliBinaryPanel";
 import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
 import { HermesRuntimeCard } from "./HermesRuntimeCard";
@@ -66,28 +65,6 @@ function getNodeStatusLabel(status: "online" | "offline" | "connecting" | "error
   if (status === "connecting") return "Connecting";
   if (status === "error") return "Error";
   return "Offline";
-}
-
-function areStringRecordsEqual(left: Record<string, string>, right: Record<string, string>): boolean {
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => left[key] === right[key]);
-}
-
-function areManualCodeRecordsEqual(
-  left: Record<string, ManualOAuthCodeInfo>,
-  right: Record<string, ManualOAuthCodeInfo>,
-): boolean {
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => {
-    const leftConfig = left[key];
-    const rightConfig = right[key];
-    return Boolean(rightConfig)
-      && leftConfig.prompt === rightConfig.prompt
-      && leftConfig.placeholder === rightConfig.placeholder
-      && leftConfig.helpText === rightConfig.helpText;
-  });
 }
 
 /**
@@ -206,7 +183,6 @@ type SettingsSection = {
 const MOBILE_SETTINGS_MEDIA_QUERY = "(max-width: 768px)";
 const DEFAULT_MEMORY_EDITOR_PATH = ".fusion/memory/DREAMS.md";
 const MEMORY_FILE_OPTION_LABEL_MAX_CHARS = 72;
-const MODEL_FALLBACK_CHAIN_SLOT_COUNT = 10;
 
 function truncateMiddle(value: string, maxChars: number): string {
   if (value.length <= maxChars) {
@@ -224,37 +200,6 @@ function formatMemoryFileOptionLabel(file: MemoryFileInfo): string {
   return truncateMiddle(fullLabel, MEMORY_FILE_OPTION_LABEL_MAX_CHARS);
 }
 
-function accountResultToast(result: AuthProvider["lastLoginResult"] | undefined): { message: string; type: ToastType } {
-  if (!result) {
-    return { message: "Login successful", type: "success" };
-  }
-
-  return {
-    message: result.message,
-    type: result.status === "same-account" ? "warning" : "success",
-  };
-}
-
-const REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS = new Set([
-  "openai-codex",
-  "codex",
-  "anthropic",
-  "claude-cli",
-  "cursor",
-  "minimax",
-  "google-gemini-cli",
-]);
-
-function canAddAnotherAuthAccount(provider: AuthProvider): boolean {
-  return provider.supportsMultipleAccounts === true
-    || (provider.accountCount ?? 0) > 0
-    || REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS.has(provider.id);
-}
-
-function fallbackChainSlots(chain: ModelFallbackChainEntry[] | undefined): ModelFallbackChainEntry[] {
-  return Array.from({ length: MODEL_FALLBACK_CHAIN_SLOT_COUNT }, (_unused, index) => chain?.[index] ?? {});
-}
-
 const SETTINGS_SECTIONS: SettingsSection[] = [
   // Account group (scope-less items — independent of settings storage)
   { id: "__account_header", label: "Account", scope: undefined, isGroupHeader: true },
@@ -267,7 +212,6 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "notifications", label: "Notifications", scope: "global" },
   { id: "node-sync", label: "Node Sync", scope: "global" },
   { id: "global-models", label: "Models", scope: "global" },
-  { id: "dspy-global", label: "DSPy", scope: "global" },
   { id: "research-global", label: "Research Defaults", scope: "global" },
   { id: "experimental", label: "Experimental Features", scope: "global" },
   { id: "remote", label: "Remote Access", scope: "global" },
@@ -282,8 +226,8 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "__project_header", label: "Project", scope: undefined, isGroupHeader: true },
   { id: "general", label: "Project General", scope: "project" },
   { id: "project-models", label: "Project Models", scope: "project" },
-  { id: "dspy-project", label: "DSPy", scope: "project" },
   { id: "scheduling", label: "Scheduling", scope: "project" },
+  { id: "scheduled-evals", label: "Scheduled Evals", scope: "project" },
   { id: "node-routing", label: "Node Routing", scope: "project" },
   { id: "worktrees", label: "Worktrees", scope: "project" },
   { id: "commands", label: "Commands", scope: "project" },
@@ -306,6 +250,9 @@ const DEFAULT_NTFY_EVENTS: NtfyNotificationEvent[] = [
   "planning-awaiting-input",
   "gridlock",
   "fallback-used",
+  "memory-dreams-processed",
+  "message:agent-to-user",
+  "message:agent-to-agent",
 ];
 
 const NOTIFICATION_EVENT_OPTIONS: Array<{ event: NtfyNotificationEvent; label: string; description: string }> = [
@@ -317,6 +264,9 @@ const NOTIFICATION_EVENT_OPTIONS: Array<{ event: NtfyNotificationEvent; label: s
   { event: "planning-awaiting-input", label: "Planning needs input", description: "When planning mode is waiting for your response to continue" },
   { event: "gridlock", label: "Pipeline gridlocked", description: "When all schedulable todo tasks are blocked and work cannot advance" },
   { event: "fallback-used", label: "Fallback model used (recovered)", description: "When Fusion recovers from a retryable model failure by switching to a fallback model" },
+  { event: "memory-dreams-processed", label: "DREAMS.md entry added", description: "When manual dream processing writes a new entry to project or agent DREAMS.md" },
+  { event: "message:agent-to-user", label: "Agent → user message", description: "An agent sent you a direct message" },
+  { event: "message:agent-to-agent", label: "Agent → agent message", description: "Agents are talking to each other (including replies)" },
 ];
 
 /** Well-known experimental feature flags with display labels.
@@ -334,6 +284,8 @@ const KNOWN_EXPERIMENTAL_FEATURES: Record<string, string> = {
   devServerView: "Dev Server",
   todoView: "Todo List",
   researchView: "Research View",
+  evalsView: "Evals View",
+  chatRooms: "Chat Rooms",
   agentOnboarding: "Planning-style Agent Onboarding",
 };
 
@@ -503,6 +455,7 @@ export function SettingsModal({
   const experimentalFeatures = form.experimentalFeatures ?? {};
   const remoteAccessEnabled = isExperimentalFeatureEnabled(experimentalFeatures, "remoteAccess");
   const researchViewEnabled = isExperimentalFeatureEnabled(experimentalFeatures, "researchView");
+  const evalsViewEnabled = isExperimentalFeatureEnabled(experimentalFeatures, "evalsView");
   const visibleSections = SETTINGS_SECTIONS.filter((section) => {
     if (section.id === "remote") {
       return remoteAccessEnabled;
@@ -510,6 +463,10 @@ export function SettingsModal({
 
     if (section.id === "research-global" || section.id === "research-project") {
       return researchViewEnabled;
+    }
+
+    if (section.id === "scheduled-evals") {
+      return evalsViewEnabled;
     }
 
     return true;
@@ -530,10 +487,15 @@ export function SettingsModal({
       return;
     }
 
+    if (activeSection === "scheduled-evals" && !evalsViewEnabled) {
+      setActiveSection(firstVisibleSectionId);
+      return;
+    }
+
     if (!visibleSections.some((section) => section.id === activeSection)) {
       setActiveSection(firstVisibleSectionId);
     }
-  }, [activeSection, remoteAccessEnabled, researchViewEnabled, firstVisibleSectionId, visibleSections]);
+  }, [activeSection, remoteAccessEnabled, researchViewEnabled, evalsViewEnabled, firstVisibleSectionId, visibleSections]);
 
   // Auth state (independent of the settings save flow)
   const [authProviders, setAuthProviders] = useState<AuthProvider[]>([]);
@@ -555,6 +517,7 @@ export function SettingsModal({
 
   // Test notification state
   const [testNotificationLoading, setTestNotificationLoading] = useState<Record<string, boolean>>({});
+  const [testNotificationResult, setTestNotificationResult] = useState<Record<string, { status: "success" | "error"; message: string }>>({});
   const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
   const [presetDraft, setPresetDraft] = useState<ModelPreset | null>(null);
 
@@ -760,6 +723,12 @@ export function SettingsModal({
       setAuthProviders(visibleProviders);
       setLoginInstructions((prev) => {
         const next: Record<string, string> = {};
+        for (const [providerId, instructions] of Object.entries(prev)) {
+          const provider = visibleProviders.find((candidate) => candidate.id === providerId);
+          if (provider && !provider.authenticated) {
+            next[providerId] = instructions;
+          }
+        }
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.loginInstructions?.trim()) {
             next[provider.id] = provider.loginInstructions;
@@ -770,13 +739,7 @@ export function SettingsModal({
             next[provider.id] = pending.instructions;
           }
         }
-        for (const [providerId, instructions] of Object.entries(prev)) {
-          const provider = visibleProviders.find((candidate) => candidate.id === providerId);
-          if (provider && provider.loginInProgress && !(providerId in next)) {
-            next[providerId] = instructions;
-          }
-        }
-        return areStringRecordsEqual(prev, next) ? prev : next;
+        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
       });
       setManualCodeConfigs((prev) => {
         const next: Record<string, ManualOAuthCodeInfo> = {};
@@ -792,11 +755,11 @@ export function SettingsModal({
         }
         for (const [providerId, manualCode] of Object.entries(prev)) {
           const provider = visibleProviders.find((candidate) => candidate.id === providerId);
-          if (provider && provider.loginInProgress && !(providerId in next)) {
+          if (provider && !provider.authenticated && provider.loginInProgress) {
             next[providerId] = manualCode;
           }
         }
-        return areManualCodeRecordsEqual(prev, next) ? prev : next;
+        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
       });
     } catch {
       // Silently fail — auth may not be configured
@@ -1049,20 +1012,18 @@ export function SettingsModal({
     });
   }, []);
 
-  const handleLogin = useCallback(async (providerId: string, addAnother = false) => {
+  const handleLogin = useCallback(async (providerId: string) => {
     setAuthActionInProgress(providerId);
     clearAuthLoginUiState(providerId);
-    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
 
     try {
-      const { url, instructions, manualCode } = await loginProvider(providerId, { addAnother });
+      const { url, instructions, manualCode } = await loginProvider(providerId);
       if (instructions?.trim()) {
         setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
       }
       if (manualCode) {
         setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
       }
-      savePendingAuthLoginUiState(providerId, { instructions, manualCode });
       window.open(appendTokenQuery(url), "_blank");
 
       // Poll for auth completion every 2 seconds
@@ -1072,20 +1033,14 @@ export function SettingsModal({
           const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
           setAuthProviders(visibleProviders);
           const provider = visibleProviders.find((p) => p.id === providerId);
-          const result = provider?.lastLoginResult;
-          const addAnotherCompleted =
-            addAnother &&
-            (Boolean(result) || ((provider?.accountCount ?? 0) > startingAccountCount));
-          const loginCompleted = addAnother ? addAnotherCompleted : provider?.authenticated;
-          if (loginCompleted) {
+          if (provider?.authenticated) {
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
             }
             setAuthActionInProgress(null);
             clearAuthLoginUiState(providerId);
-            const toast = accountResultToast(result);
-            addToast(toast.message, toast.type);
+            addToast("Login successful", "success");
             scrollSettingsToTop();
             return;
           }
@@ -1115,7 +1070,7 @@ export function SettingsModal({
       setAuthActionInProgress(null);
       clearAuthLoginUiState(providerId);
     }
-  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
+  }, [addToast, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleSubmitManualCode = useCallback(async (providerId: string) => {
     const code = manualCodeInputs[providerId]?.trim();
@@ -1195,19 +1150,14 @@ export function SettingsModal({
       return next;
     });
     try {
-      const result = await saveApiKey(providerId, key);
+      await saveApiKey(providerId, key);
       setApiKeyInputs((prev) => {
         const next = { ...prev };
         delete next[providerId];
         return next;
       });
       await loadAuthStatus();
-      if (result?.result) {
-        const toast = accountResultToast(result.result);
-        addToast(toast.message, toast.type);
-      } else {
-        addToast("API key saved", "success");
-      }
+      addToast("API key saved", "success");
       scrollSettingsToTop();
     } catch (err) {
       setApiKeyErrors((prev) => ({ ...prev, [providerId]: getErrorMessage(err) || "Failed to save API key" }));
@@ -1215,87 +1165,6 @@ export function SettingsModal({
       setAuthActionInProgress(null);
     }
   }, [apiKeyInputs, addToast, loadAuthStatus, scrollSettingsToTop]);
-
-  const handleAddCliAccount = useCallback(async (providerId: string) => {
-    setAuthActionInProgress(providerId);
-    clearAuthLoginUiState(providerId);
-    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
-    try {
-      const result = await addCliAccountProvider(providerId);
-      if (result.instructions?.trim()) {
-        setLoginInstructions((prev) => ({ ...prev, [providerId]: result.instructions! }));
-      }
-      if (result.manualCode) {
-        setManualCodeConfigs((prev) => ({ ...prev, [providerId]: result.manualCode! }));
-      }
-      savePendingAuthLoginUiState(providerId, {
-        instructions: result.instructions,
-        manualCode: result.manualCode,
-      });
-      if (result.url) {
-        setAuthProviders((prev) => prev.map((provider) =>
-          provider.id === providerId ? { ...provider, loginInProgress: true } : provider,
-        ));
-        window.open(appendTokenQuery(result.url), "_blank");
-
-        pollIntervalRef.current = setInterval(async () => {
-          try {
-            const { providers } = await fetchAuthStatus();
-            const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
-            setAuthProviders(visibleProviders);
-            const provider = visibleProviders.find((p) => p.id === providerId);
-            const loginResult = provider?.lastLoginResult;
-            const loginCompleted =
-              Boolean(loginResult) ||
-              ((provider?.accountCount ?? 0) > startingAccountCount) ||
-              (startingAccountCount === 0 && provider?.authenticated === true);
-
-            if (loginCompleted) {
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setAuthActionInProgress(null);
-              clearAuthLoginUiState(providerId);
-              const toast = accountResultToast(loginResult);
-              addToast(toast.message, toast.type);
-              scrollSettingsToTop();
-              return;
-            }
-
-            if (!provider?.loginInProgress) {
-              if (pollIntervalRef.current) {
-                clearInterval(pollIntervalRef.current);
-                pollIntervalRef.current = null;
-              }
-              setAuthActionInProgress(null);
-              clearAuthLoginUiState(providerId);
-              addToast("CLI login did not complete. Please try again.", "error");
-            }
-          } catch {
-            // Continue polling on transient errors.
-          }
-        }, 2000);
-        return;
-      }
-
-      await loadAuthStatus();
-      const toast = accountResultToast(result.result);
-      addToast(toast.message, toast.type);
-      scrollSettingsToTop();
-    } catch (err) {
-      setAuthActionInProgress(null);
-      clearAuthLoginUiState(providerId);
-      const message = getErrorMessage(err) || "CLI login failed";
-      const isConflict = message.includes("already in progress") || (typeof err === "object" && err !== null && "status" in err && (err as { status?: number }).status === 409);
-      if (isConflict) {
-        addToast("Login already in progress. You can cancel it and retry.", "warning");
-        await loadAuthStatus();
-      } else {
-        addToast(message, "error");
-      }
-    }
-  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleClearApiKey = useCallback(async (providerId: string) => {
     setAuthActionInProgress(providerId);
@@ -1320,8 +1189,8 @@ export function SettingsModal({
     }
   }, [addToast, loadAuthStatus]);
 
-  const handleTestProviderNotification = useCallback(async (providerId: "ntfy" | "webhook") => {
-    if (providerId === "ntfy") {
+  const handleTestProviderNotification = useCallback(async (providerId: "ntfy" | "webhook" | "ntfy-message") => {
+    if (providerId === "ntfy" || providerId === "ntfy-message") {
       if (!form.ntfyEnabled || !form.ntfyTopic || !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)) {
         return;
       }
@@ -1342,6 +1211,11 @@ export function SettingsModal({
     }
 
     setTestNotificationLoading((prev) => ({ ...prev, [providerId]: true }));
+    setTestNotificationResult((prev) => {
+      const next = { ...prev };
+      delete next[providerId];
+      return next;
+    });
     try {
       const config = providerId === "ntfy"
         ? {
@@ -1349,19 +1223,31 @@ export function SettingsModal({
           ntfyTopic: form.ntfyTopic,
           ...(form.ntfyBaseUrl?.trim() ? { ntfyBaseUrl: form.ntfyBaseUrl.trim() } : {}),
         }
-        : {
-          webhookUrl: form.webhookUrl,
-          webhookFormat: form.webhookFormat || "generic",
-        };
-      const result = await testNotification(providerId, config, projectId);
+        : providerId === "ntfy-message"
+          ? { messageEventType: "message:agent-to-user" }
+          : {
+            webhookUrl: form.webhookUrl,
+            webhookFormat: form.webhookFormat || "generic",
+          };
+      const result = await testNotification(providerId === "ntfy-message" ? "ntfy" : providerId, config, projectId);
       if (result.success) {
-        const providerName = providerId === "ntfy" ? "ntfy app" : "webhook endpoint";
-        addToast(`Test notification sent — check your ${providerName}!`, "success");
+        const providerName = providerId === "ntfy"
+          ? "ntfy app"
+          : providerId === "ntfy-message"
+            ? "ntfy app inbox"
+            : "webhook endpoint";
+        const successMessage = `Test notification sent — check your ${providerName}!`;
+        setTestNotificationResult((prev) => ({ ...prev, [providerId]: { status: "success", message: successMessage } }));
+        addToast(successMessage, "success");
       } else {
-        addToast("Failed to send test notification", "error");
+        const failureMessage = "Failed to send test notification";
+        setTestNotificationResult((prev) => ({ ...prev, [providerId]: { status: "error", message: failureMessage } }));
+        addToast(failureMessage, "error");
       }
     } catch (err) {
-      addToast(getErrorMessage(err) || "Failed to send test notification", "error");
+      const failureMessage = getErrorMessage(err) || "Failed to send test notification";
+      setTestNotificationResult((prev) => ({ ...prev, [providerId]: { status: "error", message: failureMessage } }));
+      addToast(failureMessage, "error");
     } finally {
       setTestNotificationLoading((prev) => ({ ...prev, [providerId]: false }));
     }
@@ -1645,119 +1531,6 @@ export function SettingsModal({
     }));
   }
 
-  function updateModelFallbackChainValue(
-    scope: "global" | "project",
-    index: number,
-    value: string,
-  ): void {
-    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
-    setForm((current) => {
-      const next = fallbackChainSlots(current[key]);
-      if (!value) {
-        next[index] = {};
-      } else {
-        const accountMarker = "?account=";
-        const accountIdx = value.indexOf(accountMarker);
-        const modelValue = accountIdx === -1 ? value : value.slice(0, accountIdx);
-        const accountId = accountIdx === -1 ? undefined : decodeURIComponent(value.slice(accountIdx + accountMarker.length));
-        const slashIdx = modelValue.indexOf("/");
-        const provider = modelValue.slice(0, slashIdx);
-        const modelId = modelValue.slice(slashIdx + 1);
-        const selectedModel = availableModels.find((model) =>
-          model.provider === provider &&
-          model.id === modelId &&
-          model.accountId === accountId,
-        );
-        next[index] = {
-          provider,
-          modelId,
-          ...(accountId ? { accountId } : {}),
-          ...(selectedModel?.accountProvider ? { accountProvider: selectedModel.accountProvider } : {}),
-          enabled: true,
-        };
-      }
-      return { ...current, [key]: next };
-    });
-  }
-
-  function renderModelFallbackChain(scope: "global" | "project") {
-    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
-    const slots = fallbackChainSlots(form[key]);
-    return (
-      <div className="settings-fallback-chain">
-        {slots.map((entry, index) => {
-          const value = entry.provider && entry.modelId
-            ? `${entry.provider}/${entry.modelId}${entry.accountId ? `?account=${encodeURIComponent(entry.accountId)}` : ""}`
-            : "";
-          return (
-            <div className="settings-fallback-chain-row" key={`${scope}-fallback-${index}`}>
-              <label htmlFor={`${scope}-fallback-chain-${index}`}>Priority {index + 1}</label>
-              <CustomModelDropdown
-                id={`${scope}-fallback-chain-${index}`}
-                label={`Priority ${index + 1}`}
-                models={availableModels}
-                value={value}
-                onChange={(selected) => updateModelFallbackChainValue(scope, index, selected)}
-                placeholder="No fallback"
-                favoriteProviders={favoriteProviders}
-                onToggleFavorite={handleToggleFavorite}
-                favoriteModels={favoriteModels}
-                onToggleModelFavorite={handleToggleModelFavorite}
-              />
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
-
-  function renderDspyRoutingControls(scope: "global" | "project") {
-    const enabled = scope === "global"
-      ? form.routeAllLlmCallsViaDspy === true
-      : resolveRouteAllLlmCallsViaDspy(form);
-    const inherited = form.routeAllLlmCallsViaDspy === true;
-    return (
-      <>
-        {renderScopeBanner()}
-        <h4 className="settings-section-heading">DSPy Routing</h4>
-        <div className="form-group">
-          <label htmlFor={`${scope}-route-all-llm-calls-via-dspy`} className="checkbox-label">
-            <input
-              id={`${scope}-route-all-llm-calls-via-dspy`}
-              type="checkbox"
-              checked={enabled}
-              onChange={(event) => {
-                const checked = event.target.checked;
-                if (scope === "global") {
-                  setForm((current) => ({ ...current, routeAllLlmCallsViaDspy: checked }));
-                  return;
-                }
-                setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: checked }));
-              }}
-            />
-            Route all LLM calls via DSPy
-          </label>
-          <small>
-            {scope === "global"
-              ? "Applies to all projects unless a project override is set."
-              : inherited && form.projectRouteAllLlmCallsViaDspy === undefined
-                ? "Currently inherited from the global DSPy routing setting."
-                : "Overrides the global DSPy routing setting for this project."}
-          </small>
-        </div>
-        {scope === "project" && form.projectRouteAllLlmCallsViaDspy !== undefined && (
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            onClick={() => setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: undefined }))}
-          >
-            Reset to global
-          </button>
-        )}
-      </>
-    );
-  }
-
   const openOverlapPathPicker = useCallback((index: number) => {
     setOverlapPathPickerIndex(index);
     setOverlapPathPickerPath(".");
@@ -1864,6 +1637,8 @@ export function SettingsModal({
         ...form,
         worktreeInitCommand: form.worktreeInitCommand?.trim() || undefined,
         taskPrefix: form.taskPrefix?.trim() || undefined,
+        githubTrackingDefaultRepo: form.githubTrackingDefaultRepo?.trim() || undefined,
+        githubAuthToken: form.githubAuthToken?.trim() || undefined,
         overlapIgnorePaths: (form.overlapIgnorePaths ?? []).map((path) => path.trim()).filter((path) => path.length > 0),
         experimentalFeatures: normalizeExperimentalFeaturesForSave(form.experimentalFeatures),
       };
@@ -1880,6 +1655,9 @@ export function SettingsModal({
 
       const globalPatch: Partial<GlobalSettings> = {};
       for (const [key, value] of Object.entries(payload)) {
+        if (key === "githubTrackingDefaultRepo" && activeSection !== "global-general") {
+          continue;
+        }
         if (isGlobalSettingsKey(key)) {
           // Implement null-as-delete semantics for global settings:
           // - undefined values are dropped during JSON serialization
@@ -1900,6 +1678,7 @@ export function SettingsModal({
       const projectPatch: Partial<Settings> = {};
       for (const [key, value] of Object.entries(payload)) {
         if (key === "githubTokenConfigured" || key === "prAuthAvailable") continue; // server-only fields
+        if (key === "githubTrackingDefaultRepo" && activeSection === "global-general") continue;
         if (!isProjectSettingsKey(key)) continue;
 
         // Get the initial project-scoped value (null if not set)
@@ -1950,7 +1729,7 @@ export function SettingsModal({
     } catch (err) {
       addToast(getErrorMessage(err), "error");
     }
-  }, [form, globalMaxConcurrent, prefixError, presetDraft, initialValues, initialScopedValues, onClose, addToast, projectId]);
+  }, [form, globalMaxConcurrent, prefixError, presetDraft, initialValues, initialScopedValues, onClose, addToast, projectId, activeSection]);
 
   const handleSaveMemory = useCallback(async () => {
     try {
@@ -2252,6 +2031,20 @@ export function SettingsModal({
                 it hidden even before clicking.
               </small>
             </div>
+            <div className="form-group">
+              <label htmlFor="globalGithubTrackingDefaultRepo">Global default tracking repo</label>
+              <input
+                id="globalGithubTrackingDefaultRepo"
+                type="text"
+                className="input"
+                placeholder="owner/repo"
+                value={form.githubTrackingDefaultRepo ?? ""}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, githubTrackingDefaultRepo: e.target.value || undefined }))
+                }
+              />
+              <small>Projects inherit this value when they do not set a project default tracking repo.</small>
+            </div>
             <CliBinaryPanel />
             <div className="form-group">
               <label htmlFor="persistAgentToolOutput" className="checkbox-label">
@@ -2268,6 +2061,23 @@ export function SettingsModal({
               <div className="settings-field-help">
                 When disabled, tool rows are still logged but detailed tool payloads are omitted.
                 Very large tool payloads may still be clipped even when this stays enabled.
+              </div>
+            </div>
+            <div className="form-group">
+              <label htmlFor="persistAgentThinkingLog" className="checkbox-label">
+                <input
+                  id="persistAgentThinkingLog"
+                  type="checkbox"
+                  checked={form.persistAgentThinkingLog === true}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, persistAgentThinkingLog: e.target.checked }))
+                  }
+                />
+                Save AI thinking/reasoning in agent logs
+              </label>
+              <div className="settings-field-help">
+                When disabled (default), internal thinking deltas are not persisted as log rows.
+                Assistant text output and tool timeline entries are unchanged.
               </div>
             </div>
             <div className="form-group">
@@ -2435,12 +2245,6 @@ export function SettingsModal({
                   />
                   <small>Used automatically if the primary default model hits a retryable provider error like rate limiting or overload.</small>
                 </div>
-
-                <div className="form-group">
-                  <label>Model Fallback Chain</label>
-                  {renderModelFallbackChain("global")}
-                  <small>Priority 1 is tried first, then priority 2 through 10 when a retryable model/provider failure occurs.</small>
-                </div>
               </>
             )}
             {(() => {
@@ -2556,9 +2360,6 @@ export function SettingsModal({
           </>
         );
       }
-
-      case "dspy-global":
-        return renderDspyRoutingControls("global");
 
       case "project-models": {
         const presets = form.modelPresets || [];
@@ -2751,11 +2552,6 @@ export function SettingsModal({
                     onToggleModelFavorite={handleToggleModelFavorite}
                   />
                   <small>Used if the reviewer model fails due to rate limits or provider overload. Defaults to the global fallback model.</small>
-                </div>
-                <div className="form-group">
-                  <label>Project Model Fallback Chain</label>
-                  {renderModelFallbackChain("project")}
-                  <small>When any project fallback slots are set, this ordered chain overrides the global chain for this project.</small>
                 </div>
               </>
             )}
@@ -3102,9 +2898,6 @@ export function SettingsModal({
         );
       }
 
-      case "dspy-project":
-        return renderDspyRoutingControls("project");
-
       case "appearance":
         return (
           <>
@@ -3221,6 +3014,39 @@ export function SettingsModal({
                 }}
               />
               <small>Timeout in minutes for detecting stuck tasks. When a task&apos;s agent session shows no activity for longer than this duration, the task is terminated and retried. Leave empty to disable. Suggested: 10.</small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="staleHighFanoutBlockerAgeThresholdMs">Stale High Fan-out Escalation (hours)</label>
+              <input
+                id="staleHighFanoutBlockerAgeThresholdMs"
+                type="number"
+                min={1}
+                step={1}
+                value={form.staleHighFanoutBlockerAgeThresholdMs ? Math.round(form.staleHighFanoutBlockerAgeThresholdMs / 3600000) : ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const num = Number(val);
+                  setForm((f) => ({
+                    ...f,
+                    staleHighFanoutBlockerAgeThresholdMs: val && num > 0 ? num * 3600000 : undefined,
+                  }));
+                }}
+              />
+              <small>Escalate high fan-out blockers only after they remain in in-progress or in-review for this many hours (age source: columnMovedAt, fallback updatedAt). Default: 2 hours.</small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="preserveProgressOnStuckRequeue" className="checkbox-label">
+                <input
+                  id="preserveProgressOnStuckRequeue"
+                  type="checkbox"
+                  checked={form.preserveProgressOnStuckRequeue !== false}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, preserveProgressOnStuckRequeue: e.target.checked }))
+                  }
+                />
+                Preserve step progress on stuck-task requeue
+              </label>
+              <small>When the stuck detector kills and re-queues a task, keep completed step statuses so the agent can resume from where it left off. Disable to reset every step to pending on each stuck retry. Default: enabled.</small>
             </div>
             <div className="form-group">
               <label htmlFor="specStalenessEnabled" className="checkbox-label">
@@ -3420,6 +3246,141 @@ export function SettingsModal({
             </div>
           </>
         );
+      case "scheduled-evals": {
+        const evalSettings = form.evalSettings ?? {};
+        const isScheduledEvalEnabled = evalSettings.enabled ?? false;
+
+        return (
+          <>
+            {renderScopeBanner()}
+            <h4 className="settings-section-heading">Scheduled Evals</h4>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-enabled" className="checkbox-label">
+                <input
+                  id="scheduled-evals-enabled"
+                  type="checkbox"
+                  checked={isScheduledEvalEnabled}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      evalSettings: {
+                        ...(current.evalSettings ?? {}),
+                        enabled: event.target.checked,
+                      },
+                    }))
+                  }
+                />
+                Enable scheduled eval runs for this project
+              </label>
+            </div>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-interval">Interval (ms)</label>
+              <input
+                id="scheduled-evals-interval"
+                className="input"
+                type="number"
+                min={60000}
+                max={604800000}
+                step={1000}
+                disabled={!isScheduledEvalEnabled}
+                value={evalSettings.intervalMs ?? 86_400_000}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    evalSettings: {
+                      ...(current.evalSettings ?? {}),
+                      intervalMs: event.target.value === "" ? undefined : Number(event.target.value),
+                    },
+                  }))
+                }
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-provider">Evaluator Provider</label>
+              <input
+                id="scheduled-evals-provider"
+                className="input"
+                value={evalSettings.evaluatorProvider ?? ""}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    evalSettings: {
+                      ...(current.evalSettings ?? {}),
+                      evaluatorProvider: event.target.value.trim() === "" ? undefined : event.target.value,
+                    },
+                  }))
+                }
+                placeholder="openai"
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-model">Evaluator Model</label>
+              <input
+                id="scheduled-evals-model"
+                className="input"
+                value={evalSettings.evaluatorModelId ?? ""}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    evalSettings: {
+                      ...(current.evalSettings ?? {}),
+                      evaluatorModelId: event.target.value.trim() === "" ? undefined : event.target.value,
+                    },
+                  }))
+                }
+                placeholder="gpt-5"
+              />
+              <small className="form-text text-muted">
+                Leave provider and model blank to inherit the project validator lane model settings.
+              </small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-follow-up-policy">Follow-up Policy</label>
+              <select
+                id="scheduled-evals-follow-up-policy"
+                className="select"
+                disabled={!isScheduledEvalEnabled}
+                value={evalSettings.followUpPolicy ?? "suggest-only"}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    evalSettings: {
+                      ...(current.evalSettings ?? {}),
+                      followUpPolicy: event.target.value as "disabled" | "suggest-only" | "auto-create",
+                    },
+                  }))
+                }
+              >
+                <option value="disabled">Disabled</option>
+                <option value="suggest-only">Suggest only</option>
+                <option value="auto-create">Auto-create tasks</option>
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="scheduled-evals-retention-days">Retention (days)</label>
+              <input
+                id="scheduled-evals-retention-days"
+                className="input"
+                type="number"
+                min={1}
+                max={365}
+                step={1}
+                disabled={!isScheduledEvalEnabled}
+                value={evalSettings.retentionDays ?? 30}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    evalSettings: {
+                      ...(current.evalSettings ?? {}),
+                      retentionDays: event.target.value === "" ? undefined : Number(event.target.value),
+                    },
+                  }))
+                }
+              />
+            </div>
+          </>
+        );
+      }
       case "node-routing":
         return (
           <>
@@ -3656,6 +3617,40 @@ export function SettingsModal({
               </details>
             </div>
             <div className="form-group">
+              <label htmlFor="verificationFixRetries">Verification auto-fix retries</label>
+              <input
+                id="verificationFixRetries"
+                className="input"
+                type="number"
+                min={0}
+                max={3}
+                step={1}
+                value={form.verificationFixRetries ?? 3}
+                onChange={(e) => {
+                  const rawValue = e.target.value;
+                  if (rawValue === "") {
+                    setForm((f) => ({ ...f, verificationFixRetries: undefined } as SettingsFormState));
+                    return;
+                  }
+
+                  const parsedValue = Number.parseInt(rawValue, 10);
+                  if (!Number.isFinite(parsedValue)) {
+                    setForm((f) => ({ ...f, verificationFixRetries: undefined } as SettingsFormState));
+                    return;
+                  }
+
+                  const clampedValue = Math.max(0, Math.min(3, parsedValue));
+                  setForm((f) => ({ ...f, verificationFixRetries: clampedValue } as SettingsFormState));
+                }}
+              />
+              <details className="settings-option-details">
+                <summary>More details</summary>
+                <small>
+                  Controls in-merge fix attempts after deterministic test/build verification failures (0-3).
+                </small>
+              </details>
+            </div>
+            <div className="form-group">
               <label htmlFor="mergeStrategy">Auto-completion mode</label>
               <select
                 id="mergeStrategy"
@@ -3693,6 +3688,61 @@ export function SettingsModal({
                     When enabled, Fusion holds the PR in In Review until at least one approving GitHub review has been submitted. Useful on free private repos where GitHub&apos;s required-reviewer enforcement isn&apos;t available — without this, a fresh PR with no required checks is treated as immediately mergeable.
                   </small>
                 </details>
+              </div>
+            )}
+            <h4 className="settings-section-heading settings-section-heading--spaced">GitHub Issue Tracking</h4>
+            <div className="form-group">
+              <label htmlFor="githubTrackingEnabledByDefault" className="checkbox-label">
+                <input
+                  id="githubTrackingEnabledByDefault"
+                  type="checkbox"
+                  checked={form.githubTrackingEnabledByDefault ?? false}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, githubTrackingEnabledByDefault: e.target.checked }))
+                  }
+                />
+                Default GitHub tracking ON for new tasks
+              </label>
+            </div>
+            <div className="form-group">
+              <label htmlFor="projectGithubTrackingDefaultRepo">Project default tracking repo</label>
+              <input
+                id="projectGithubTrackingDefaultRepo"
+                type="text"
+                className="input"
+                placeholder="owner/repo"
+                value={form.githubTrackingDefaultRepo ?? ""}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, githubTrackingDefaultRepo: e.target.value || undefined }))
+                }
+              />
+            </div>
+            <div className="form-group">
+              <label htmlFor="githubAuthMode">GitHub auth mode</label>
+              <select
+                id="githubAuthMode"
+                className="select"
+                value={form.githubAuthMode ?? "gh-cli"}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, githubAuthMode: e.target.value as "gh-cli" | "token" }))
+                }
+              >
+                <option value="gh-cli">GitHub CLI (gh auth)</option>
+                <option value="token">Personal access token</option>
+              </select>
+            </div>
+            {(form.githubAuthMode ?? "gh-cli") === "token" && (
+              <div className="form-group">
+                <label htmlFor="githubAuthToken">GitHub personal access token</label>
+                <input
+                  id="githubAuthToken"
+                  type="password"
+                  className="input"
+                  value={form.githubAuthToken ?? ""}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, githubAuthToken: e.target.value || undefined }))
+                  }
+                />
               </div>
             )}
             <div className="form-group">
@@ -4150,26 +4200,26 @@ export function SettingsModal({
                     </small>
                   </div>
                 )}
-                <div className="form-group">
-                <label>{selectedMemoryFile?.label || "Memory Editor"}</label>
-                <small>
-                  {selectedMemoryFile?.layer === "long-term" && "Curated durable decisions, conventions, constraints, and pitfalls promoted from dreams."}
-                  {selectedMemoryFile?.layer === "daily" && "Raw daily observations, open loops, and running context for dream processing."}
-                  {selectedMemoryFile?.layer === "dreams" && "Synthesized patterns and open loops promoted from daily memory."}
-                  {!selectedMemoryFile && "Edits the selected memory file."}
-                </small>
-                <div className="memory-editor-frame">
-                  <FileEditor
-                    content={memoryContent}
-                    onChange={(content) => {
-                      setMemoryContent(content);
-                      setMemoryDirty(true);
-                    }}
-                    readOnly={!isEditingAllowed}
-                    filePath={selectedMemoryPath}
-                  />
+                <div className="form-group memory-editor-form-group">
+                  <label>{selectedMemoryFile?.label || "Memory Editor"}</label>
+                  <small>
+                    {selectedMemoryFile?.layer === "long-term" && "Curated durable decisions, conventions, constraints, and pitfalls promoted from dreams."}
+                    {selectedMemoryFile?.layer === "daily" && "Raw daily observations, open loops, and running context for dream processing."}
+                    {selectedMemoryFile?.layer === "dreams" && "Synthesized patterns and open loops promoted from daily memory."}
+                    {!selectedMemoryFile && "Edits the selected memory file."}
+                  </small>
+                  <div className="memory-editor-frame">
+                    <FileEditor
+                      content={memoryContent}
+                      onChange={(content) => {
+                        setMemoryContent(content);
+                        setMemoryDirty(true);
+                      }}
+                      readOnly={!isEditingAllowed}
+                      filePath={selectedMemoryPath}
+                    />
+                  </div>
                 </div>
-              </div>
               </div>
             )}
 
@@ -4211,32 +4261,108 @@ export function SettingsModal({
         );
       }
       case "research-global": {
-        const providerStatuses = authProviders.filter((provider) => provider.id === "brave" || provider.id === "tavily");
-        const hasMissingResearchCredential = providerStatuses.some((provider) => !provider.authenticated);
-        const hasSearchProvider = Boolean(form.researchGlobalDefaults?.searchProvider?.trim());
+        const resolvedProvider =
+          form.researchGlobalWebSearchProvider ??
+          form.researchGlobalDefaults?.searchProvider ??
+          "builtin";
+        const externalProvider =
+          resolvedProvider === "searxng" ||
+          resolvedProvider === "brave" ||
+          resolvedProvider === "google" ||
+          resolvedProvider === "tavily" ||
+          resolvedProvider === "none";
+        const selectedCredentialProvider =
+          resolvedProvider === "brave" || resolvedProvider === "tavily" ? resolvedProvider : null;
+        const hasMissingResearchCredential = selectedCredentialProvider
+          ? authProviders.some((provider) => provider.id === selectedCredentialProvider && !provider.authenticated)
+          : false;
+
+        const setSearchProvider = (provider: Settings["researchGlobalWebSearchProvider"]) => {
+          setForm((current) => ({
+            ...current,
+            researchGlobalWebSearchProvider: provider,
+            researchGlobalDefaults: {
+              ...(current.researchGlobalDefaults ?? {}),
+              searchProvider: provider,
+            },
+          }));
+        };
 
         return (
           <>
             {renderScopeBanner()}
             <h4 className="settings-section-heading">Research Defaults</h4>
             <div className="form-group">
-              <label htmlFor="research-global-search-provider">Default Search Provider</label>
-              <input
-                id="research-global-search-provider"
-                className="input"
-                value={form.researchGlobalDefaults?.searchProvider ?? ""}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    researchGlobalDefaults: {
-                      ...(current.researchGlobalDefaults ?? {}),
-                      searchProvider: event.target.value || undefined,
-                    },
-                  }))
-                }
-                placeholder="tavily"
-              />
+              <label htmlFor="research-global-provider-builtin" className="checkbox-label">
+                <input
+                  id="research-global-provider-builtin"
+                  type="radio"
+                  name="research-global-search-provider"
+                  checked={!externalProvider}
+                  onChange={() => setSearchProvider("builtin")}
+                />
+                Built-in (uses agent web tools)
+              </label>
+              <small>
+                Searches and fetches use the agent's native WebSearch/WebFetch tools. No API key required.
+              </small>
             </div>
+            <details className="settings-option-details">
+              <summary>Advanced — external search providers</summary>
+              <div className="form-group">
+                <label htmlFor="research-global-search-provider-advanced">Search Provider</label>
+                <select
+                  id="research-global-search-provider-advanced"
+                  className="input"
+                  value={externalProvider ? resolvedProvider : "searxng"}
+                  onChange={(event) =>
+                    setSearchProvider(event.target.value as Settings["researchGlobalWebSearchProvider"])
+                  }
+                >
+                  <option value="searxng">SearXNG</option>
+                  <option value="brave">Brave</option>
+                  <option value="google">Google Custom Search</option>
+                  <option value="tavily">Tavily</option>
+                  <option value="none">None (disable web search)</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="research-global-searxng-url">SearXNG URL</label>
+                <input
+                  id="research-global-searxng-url"
+                  className="input"
+                  value={form.researchGlobalSearxngUrl ?? ""}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      researchGlobalSearxngUrl: event.target.value || undefined,
+                    }))
+                  }
+                  placeholder="https://searx.example.com"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="research-global-google-cx">Google Search CX</label>
+                <input
+                  id="research-global-google-cx"
+                  className="input"
+                  value={form.researchGlobalGoogleSearchCx ?? ""}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      researchGlobalGoogleSearchCx: event.target.value || undefined,
+                    }))
+                  }
+                  placeholder="custom-search-engine-id"
+                />
+              </div>
+              <div className="settings-empty-state" role="note">
+                Configure Brave, Tavily, and Google API keys in Authentication.
+                <button type="button" className="btn btn-sm" onClick={() => setActiveSection("authentication")}>
+                  Open Authentication Settings
+                </button>
+              </div>
+            </details>
             <div className="form-group">
               <label htmlFor="research-global-max-sources">Default Max Sources Per Run</label>
               <input
@@ -4256,14 +4382,9 @@ export function SettingsModal({
                 }
               />
             </div>
-            {!hasSearchProvider && (
-              <div className="settings-empty-state" role="alert">
-                Research defaults are incomplete: choose a default search provider before running research.
-              </div>
-            )}
             {hasMissingResearchCredential && (
               <div className="settings-empty-state" role="alert">
-                Missing credentials for one or more research providers.
+                Missing credentials for the selected research provider.
                 <button type="button" className="btn btn-sm" onClick={() => setActiveSection("authentication")}>
                   Open Authentication
                 </button>
@@ -4559,6 +4680,82 @@ export function SettingsModal({
                 <small className="field-error">Path cannot contain parent directory traversal (..)</small>
               )}
             </div>
+
+            <h4 className="settings-section-heading">Memory Backups</h4>
+            <div className="form-group">
+              <label htmlFor="memoryBackupEnabled" className="checkbox-label">
+                <input
+                  id="memoryBackupEnabled"
+                  type="checkbox"
+                  checked={form.memoryBackupEnabled || false}
+                  onChange={(e) => setForm((f) => ({ ...f, memoryBackupEnabled: e.target.checked }))}
+                />
+                Enable automatic memory backups
+              </label>
+              <small>When enabled, project and agent memory files are backed up automatically on a schedule.</small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="memoryBackupSchedule">Memory Backup Schedule (Cron)</label>
+              <input
+                id="memoryBackupSchedule"
+                type="text"
+                placeholder="0 3 * * *"
+                value={form.memoryBackupSchedule || "0 3 * * *"}
+                onChange={(e) => setForm((f) => ({ ...f, memoryBackupSchedule: e.target.value }))}
+                disabled={!form.memoryBackupEnabled}
+              />
+              <small>Cron expression for memory backup timing. Default: 0 3 * * * (daily at 3 AM).</small>
+              {form.memoryBackupSchedule && !/^[\s\d*,/-]+$/.test(form.memoryBackupSchedule) && (
+                <small className="field-error">Invalid cron expression format</small>
+              )}
+            </div>
+            <div className="form-group">
+              <label htmlFor="memoryBackupRetention">Memory Retention Count</label>
+              <input
+                id="memoryBackupRetention"
+                type="number"
+                min={1}
+                max={100}
+                value={form.memoryBackupRetention ?? ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setForm((f) => ({ ...f, memoryBackupRetention: val === "" ? undefined : Number(val) }));
+                }}
+                disabled={!form.memoryBackupEnabled}
+              />
+              <small>Number of memory backups to keep (oldest are deleted first). Range: 1-100.</small>
+              {form.memoryBackupRetention !== undefined && (form.memoryBackupRetention < 1 || form.memoryBackupRetention > 100) && (
+                <small className="field-error">Must be between 1 and 100</small>
+              )}
+            </div>
+            <div className="form-group">
+              <label htmlFor="memoryBackupDir">Memory Backup Directory</label>
+              <input
+                id="memoryBackupDir"
+                type="text"
+                placeholder=".fusion/backups/memory"
+                value={form.memoryBackupDir || ".fusion/backups/memory"}
+                onChange={(e) => setForm((f) => ({ ...f, memoryBackupDir: e.target.value }))}
+                disabled={!form.memoryBackupEnabled}
+              />
+              <small>Directory for memory backups, relative to project root.</small>
+              {form.memoryBackupDir && form.memoryBackupDir.includes("..") && (
+                <small className="field-error">Path cannot contain parent directory traversal (..)</small>
+              )}
+            </div>
+            <div className="form-group">
+              <label htmlFor="memoryBackupScope">Memory Backup Scope</label>
+              <select
+                id="memoryBackupScope"
+                value={form.memoryBackupScope || "all"}
+                onChange={(e) => setForm((f) => ({ ...f, memoryBackupScope: e.target.value as "project" | "agents" | "all" }))}
+                disabled={!form.memoryBackupEnabled}
+              >
+                <option value="all">All (project + agents)</option>
+                <option value="project">Project only (.fusion/memory)</option>
+                <option value="agents">Agents only (.fusion/agent-memory)</option>
+              </select>
+            </div>
             {backupLoading ? (
               <div className="settings-empty-state">Loading backup info…</div>
             ) : backupInfo ? (
@@ -4739,13 +4936,43 @@ export function SettingsModal({
                       onClick={() => handleTestProviderNotification("ntfy")}
                       disabled={
                         testNotificationLoading["ntfy"] ||
+                        testNotificationLoading["ntfy-message"] ||
+                        !form.ntfyEnabled ||
                         !form.ntfyTopic ||
                         !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
                       }
                     >
                       {testNotificationLoading["ntfy"] ? "Sending…" : "Test notification"}
                     </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => handleTestProviderNotification("ntfy-message")}
+                      disabled={
+                        testNotificationLoading["ntfy"] ||
+                        testNotificationLoading["ntfy-message"] ||
+                        !form.ntfyEnabled ||
+                        !form.ntfyTopic ||
+                        !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
+                      }
+                    >
+                      {testNotificationLoading["ntfy-message"] ? "Sending…" : "Test message notification"}
+                    </button>
                   </div>
+                  {(testNotificationResult["ntfy"] || testNotificationResult["ntfy-message"]) && (
+                    <div className="notification-test-feedback" aria-live="polite">
+                      {testNotificationResult["ntfy"] && (
+                        <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy"].status}`}>
+                          {testNotificationResult["ntfy"].message}
+                        </small>
+                      )}
+                      {testNotificationResult["ntfy-message"] && (
+                        <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy-message"].status}`}>
+                          {testNotificationResult["ntfy-message"].message}
+                        </small>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -4833,6 +5060,13 @@ export function SettingsModal({
                       {testNotificationLoading["webhook"] ? "Sending…" : "Test notification"}
                     </button>
                   </div>
+                  {testNotificationResult["webhook"] && (
+                    <div className="notification-test-feedback" aria-live="polite">
+                      <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["webhook"].status}`}>
+                        {testNotificationResult["webhook"].message}
+                      </small>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -4995,11 +5229,25 @@ export function SettingsModal({
               <div className="remote-provider-selector" role="radiogroup" aria-label="Remote provider">
                 <label className="remote-provider-option">
                   <input type="radio" name="remoteProvider" value="tailscale" checked={activeProvider === "tailscale"} onChange={() => setForm((f) => ({ ...f, remoteActiveProvider: "tailscale" } as SettingsFormState))} />
-                  <span>Tailscale</span>
+                  <span>
+                    <span className="remote-provider-option-content">
+                      <span data-testid="remote-provider-icon-tailscale" aria-hidden="true"><Globe size={16} /></span>
+                      <span>Tailscale</span>
+                    </span>
+                  </span>
                 </label>
                 <label className="remote-provider-option">
                   <input type="radio" name="remoteProvider" value="cloudflare" checked={activeProvider === "cloudflare"} onChange={() => setForm((f) => ({ ...f, remoteActiveProvider: "cloudflare" } as SettingsFormState))} />
-                  <span>Cloudflare</span>
+                  <span>
+                    <span className="remote-provider-option-content">
+                      <span data-testid="remote-provider-icon-cloudflare" aria-hidden="true" className="remote-provider-option-icon">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" data-testid="remote-cloudflare-option-icon">
+                          <path d="M7 16.5h10.8a2.9 2.9 0 0 0 .3-5.8 4.9 4.9 0 0 0-9.3-1.6A3.6 3.6 0 0 0 7 16.5m-1.9 0h3.2a2.5 2.5 0 0 0 .2-5 3.4 3.4 0 0 0-3.4 3.4c0 .6 0 1 .2 1.6" fill="var(--provider-cloudflare)" />
+                        </svg>
+                      </span>
+                      <span>Cloudflare</span>
+                    </span>
+                  </span>
                 </label>
               </div>
               {!activeProvider && <small>Select a provider above to configure remote access.</small>}
@@ -5343,7 +5591,7 @@ export function SettingsModal({
           </>
         );
       case "authentication": {
-        // CLI-backed providers render their own
+        // CLI-backed providers (currently just claude-cli) render their own
         // compact card with Enable/Disable + Test actions — bypassing the
         // OAuth/API-key rendering below. Filter them out of the standard
         // sort and render alongside.
@@ -5362,68 +5610,23 @@ export function SettingsModal({
         // CLI-backed providers live in whichever bucket matches their current
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
-        const cursorProvider = cliAuthProviders.find((p) => p.id === "cursor");
-        const geminiCliProvider = cliAuthProviders.find((p) => p.id === "google-gemini-cli");
+        const cursorCliProvider = cliAuthProviders.find((p) => p.id === "cursor-cli");
         const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
         const claudeCliCard = claudeCliProvider ? (
           <ClaudeCliProviderCard
             compact
             authenticated={claudeCliProvider.authenticated}
-            accounts={claudeCliProvider.accounts}
-            addAccountBusy={authActionInProgress === "claude-cli"}
-            loginInProgress={claudeCliProvider.loginInProgress || authActionInProgress === "claude-cli"}
-            instructions={loginInstructions["claude-cli"]}
-            manualCode={manualCodeConfigs["claude-cli"]}
-            manualCodeValue={manualCodeInputs["claude-cli"] ?? ""}
-            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "claude-cli"}
-            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "claude-cli": value }))}
-            onManualCodeSubmit={() => void handleSubmitManualCode("claude-cli")}
-            onCancelLogin={() => void handleCancelLogin("claude-cli")}
-            onAddAccount={() => {
-              void handleAddCliAccount("claude-cli");
-            }}
             onToggled={() => {
               void loadAuthStatus();
             }}
           />
         ) : null;
-        const cursorCard = cursorProvider ? (
-          <CliAccountProviderCard
-            providerId="cursor"
-            name={cursorProvider.name}
-            authenticated={cursorProvider.authenticated}
-            accounts={cursorProvider.accounts}
-            busy={authActionInProgress === "cursor"}
-            loginInProgress={cursorProvider.loginInProgress || authActionInProgress === "cursor"}
-            instructions={loginInstructions.cursor}
-            manualCode={manualCodeConfigs.cursor}
-            manualCodeValue={manualCodeInputs.cursor ?? ""}
-            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "cursor"}
-            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, cursor: value }))}
-            onManualCodeSubmit={() => void handleSubmitManualCode("cursor")}
-            onCancelLogin={() => void handleCancelLogin("cursor")}
-            onAddAccount={() => {
-              void handleAddCliAccount("cursor");
-            }}
-          />
-        ) : null;
-        const geminiCliCard = geminiCliProvider ? (
-          <CliAccountProviderCard
-            providerId="google-gemini-cli"
-            name={geminiCliProvider.name}
-            authenticated={geminiCliProvider.authenticated}
-            accounts={geminiCliProvider.accounts}
-            busy={authActionInProgress === "google-gemini-cli"}
-            loginInProgress={geminiCliProvider.loginInProgress || authActionInProgress === "google-gemini-cli"}
-            instructions={loginInstructions["google-gemini-cli"]}
-            manualCode={manualCodeConfigs["google-gemini-cli"]}
-            manualCodeValue={manualCodeInputs["google-gemini-cli"] ?? ""}
-            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "google-gemini-cli"}
-            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "google-gemini-cli": value }))}
-            onManualCodeSubmit={() => void handleSubmitManualCode("google-gemini-cli")}
-            onCancelLogin={() => void handleCancelLogin("google-gemini-cli")}
-            onAddAccount={() => {
-              void handleAddCliAccount("google-gemini-cli");
+        const cursorCliCard = cursorCliProvider ? (
+          <CursorCliProviderCard
+            compact
+            authenticated={cursorCliProvider.authenticated}
+            onToggled={() => {
+              void loadAuthStatus();
             }}
           />
         ) : null;
@@ -5439,14 +5642,12 @@ export function SettingsModal({
         const showAuthenticatedGroup =
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
-          || (cursorProvider?.authenticated ?? false)
-          || (geminiCliProvider?.authenticated ?? false)
+          || (cursorCliProvider?.authenticated ?? false)
           || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
-          || (cursorProvider && !cursorProvider.authenticated)
-          || (geminiCliProvider && !geminiCliProvider.authenticated)
+          || (cursorCliProvider && !cursorCliProvider.authenticated)
           || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
           <>
@@ -5480,12 +5681,9 @@ export function SettingsModal({
                 <div className="auth-provider-group">
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
-                  {cursorProvider?.authenticated && cursorCard}
-                  {geminiCliProvider?.authenticated && geminiCliCard}
+                  {cursorCliProvider?.authenticated && cursorCliCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
-                  {authenticatedProviders.map((provider) => {
-                    const canAddAnotherAccount = canAddAnotherAuthAccount(provider);
-                    return (
+                  {authenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card auth-provider-card--authenticated">
                       <div className="auth-provider-header">
                         <div className="auth-provider-info">
@@ -5519,7 +5717,7 @@ export function SettingsModal({
                                 onChange={(e) => setApiKeyInputs((prev) => ({ ...prev, [provider.id]: e.target.value }))}
                                 disabled={authActionInProgress === provider.id}
                               />
-                              {provider.authenticated && (
+                              {provider.authenticated && !apiKeyInputs[provider.id] ? (
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => handleClearApiKey(provider.id)}
@@ -5527,15 +5725,15 @@ export function SettingsModal({
                                 >
                                   Clear
                                 </button>
+                              ) : (
+                                <button
+                                  className="btn btn-primary btn-sm"
+                                  onClick={() => handleSaveApiKey(provider.id)}
+                                  disabled={authActionInProgress === provider.id}
+                                >
+                                  Save
+                                </button>
                               )}
-                              <button
-                                type="button"
-                                className="btn btn-primary btn-sm"
-                                onClick={() => handleSaveApiKey(provider.id)}
-                                disabled={authActionInProgress === provider.id}
-                              >
-                                {provider.authenticated && canAddAnotherAccount ? "Add another account" : "Save"}
-                              </button>
                             </div>
                             {authActionInProgress === provider.id && (
                               <small className="auth-apikey-progress">Saving…</small>
@@ -5548,7 +5746,7 @@ export function SettingsModal({
                           <div>
                             {authActionInProgress === provider.id ? (
                               <button className="btn btn-sm" disabled>
-                                Working…
+                                Logging out…
                               </button>
                             ) : provider.loginInProgress ? (
                               <div className="auth-provider-actions-row">
@@ -5560,73 +5758,25 @@ export function SettingsModal({
                                 </button>
                               </div>
                             ) : (
-                              <div className="auth-provider-actions-row">
-                                {canAddAnotherAccount && (
-                                  <button
-                                    type="button"
-                                    className="btn btn-primary btn-sm"
-                                    onClick={() => handleLogin(provider.id, true)}
-                                  >
-                                    Add another account
-                                  </button>
-                                )}
-                                <button
-                                  type="button"
-                                  className="btn btn-sm"
-                                  onClick={() => handleLogout(provider.id)}
-                                >
-                                  Logout
-                                </button>
-                              </div>
-                            )}
-                            {loginInstructions[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
-                              <LoginInstructions
-                                instructions={loginInstructions[provider.id]}
-                                data-testid={`auth-login-instructions-${provider.id}`}
-                              />
-                            )}
-                            {manualCodeConfigs[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
-                              <OAuthManualCodeForm
-                                value={manualCodeInputs[provider.id] ?? ""}
-                                onChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [provider.id]: value }))}
-                                onSubmit={() => void handleSubmitManualCode(provider.id)}
-                                prompt={manualCodeConfigs[provider.id].prompt}
-                                placeholder={manualCodeConfigs[provider.id].placeholder}
-                                helpText={manualCodeConfigs[provider.id].helpText}
-                                disabled={manualCodeSubmitInProgress === provider.id}
-                                submitLabel={manualCodeSubmitInProgress === provider.id ? "Submitting…" : "Submit code"}
-                                data-testid={`auth-manual-code-${provider.id}`}
-                              />
+                              <button
+                                className="btn btn-sm"
+                                onClick={() => handleLogout(provider.id)}
+                              >
+                                Logout
+                              </button>
                             )}
                           </div>
                         )}
                       </div>
-                      {provider.accounts && provider.accounts.length > 0 && (
-                        <div className="auth-account-list" data-testid={`auth-account-list-${provider.id}`}>
-                          {provider.accounts.map((account) => (
-                            <div key={account.id} className="auth-account-row">
-                              <span className="auth-account-label">{account.label}</span>
-                              {account.accountDisplayHint && (
-                                <span className="auth-account-hint">{account.accountDisplayHint}</span>
-                              )}
-                              <span className={`auth-account-status auth-account-status--${account.status}`}>
-                                {account.status}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
-                    );
-                  })}
+                  ))}
                 </div>
               )}
               {showAvailableGroup && (
                 <div className="auth-provider-group">
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
-                  {cursorProvider && !cursorProvider.authenticated && cursorCard}
-                  {geminiCliProvider && !geminiCliProvider.authenticated && geminiCliCard}
+                  {cursorCliProvider && !cursorCliProvider.authenticated && cursorCliCard}
                   {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card">
@@ -5719,21 +5869,6 @@ export function SettingsModal({
                           </div>
                         )}
                       </div>
-                      {provider.accounts && provider.accounts.length > 0 && (
-                        <div className="auth-account-list" data-testid={`auth-account-list-${provider.id}`}>
-                          {provider.accounts.map((account) => (
-                            <div key={account.id} className="auth-account-row">
-                              <span className="auth-account-label">{account.label}</span>
-                              {account.accountDisplayHint && (
-                                <span className="auth-account-hint">{account.accountDisplayHint}</span>
-                              )}
-                              <span className={`auth-account-status auth-account-status--${account.status}`}>
-                                {account.status}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
                   ))}
                 </div>
@@ -5855,7 +5990,7 @@ export function SettingsModal({
               href="https://github.com/Runfusion/Fusion/discussions"
               target="_blank"
               rel="noopener noreferrer"
-              className="btn btn-sm"
+              className="btn btn-sm settings-header-help-btn"
               aria-label="Help and discussions"
               title="Help and discussions"
             >

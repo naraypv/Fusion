@@ -1,6 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { resolveResearchSettings } from "../research-settings.js";
+import { isResearchExperimentalEnabled, resolveResearchSettings } from "../research-settings.js";
 import type { Settings } from "../types.js";
+
+describe("isResearchExperimentalEnabled", () => {
+  it("returns false when settings are missing", () => {
+    expect(isResearchExperimentalEnabled(undefined)).toBe(false);
+  });
+
+  it("returns false when researchView is false", () => {
+    expect(isResearchExperimentalEnabled({ experimentalFeatures: { researchView: false } as Record<string, boolean> } as Settings)).toBe(false);
+  });
+
+  it("returns true when researchView is true", () => {
+    expect(isResearchExperimentalEnabled({ experimentalFeatures: { researchView: true } as Record<string, boolean> } as Settings)).toBe(true);
+  });
+});
 
 describe("resolveResearchSettings", () => {
   it("resolves global-only defaults", () => {
@@ -81,6 +95,14 @@ describe("resolveResearchSettings", () => {
     expect(resolved.searchProvider).toBe("brave");
   });
 
+  it("honors explicit legacy global search provider opt-out", () => {
+    const resolved = resolveResearchSettings({
+      researchGlobalWebSearchProvider: "none",
+    });
+
+    expect(resolved.searchProvider).toBe("none");
+  });
+
   it("supports null-as-delete semantics for researchSettings object", () => {
     const resolved = resolveResearchSettings({
       researchGlobalDefaults: {
@@ -109,6 +131,7 @@ describe("resolveResearchSettings", () => {
     expect(fromLegacyGlobalTimeout.limits.maxConcurrentRuns).toBe(9);
 
     const hardcodedFallback = resolveResearchSettings({});
+    expect(hardcodedFallback.searchProvider).toBe("builtin");
     expect(hardcodedFallback.limits.maxDurationMs).toBe(300000);
     expect(hardcodedFallback.limits.requestTimeoutMs).toBe(30000);
     expect(hardcodedFallback.defaultExportFormat).toBe("markdown");

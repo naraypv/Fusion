@@ -2,6 +2,54 @@
 
 Web-based dashboard for managing Fusion tasks. Provides a visual kanban board, list view, and git repository management tools.
 
+## Native Shell Embedding (`window.fusionShell`)
+
+When running inside Fusion mobile or desktop shells, the dashboard uses a host-neutral bridge (`window.fusionShell`) for shell connection state and profile management.
+
+- Shell host detection: `web | mobile-shell | desktop-shell`
+- Shell-first onboarding gate: native-shell connection onboarding runs before dashboard model onboarding when needed
+- Connection management: header status + native-shell connection manager for add/edit/delete/switch of saved profiles; desktop also supports local/remote mode switching
+- Browser fallback: when `window.fusionShell` is unavailable, shell profile actions stay disabled/unsupported while dashboard onboarding and core task flows remain stable
+- Desktop local mode handoff uses dynamic local server port resolution (`getServerPort`) while remote mode points to the active remote profile
+- Browser/PWA mode degrades cleanly when `window.fusionShell` is absent
+
+The shared dashboard must use `window.fusionShell` for shell connectivity concerns (not direct Electron or Capacitor globals).
+
+For dashboard chrome, use the centralized helper/component path:
+- `app/shell-native.ts` (`getShellConnectionNativeResult`) for host-aware capability + non-sensitive metadata resolution
+- `app/components/ShellConnectionStatus.tsx` for rendering shell kind/mode/connection summary and action labels
+- App-level wiring should pass derived props into `Header` / `MobileNavBar`; downstream components should not read `window` bridges directly
+
+Desktop connection-management actions must go through `window.fusionAPI.openConnectionManager()` (wrapped by `shell-native.ts`), not ad-hoc renderer IPC calls.
+
+Regression tests lock shell-aware placement and fallback behavior:
+- desktop renders a single header connection-status entry point
+- mobile renders a single More-sheet connection-status entry point
+- browser/no-shell mode renders no shell-only controls and does not throw
+- `ShellConnectionStatus` action control remains a non-submit button (`type="button"`) for form safety
+
+## Canonical dashboard host-context contract
+
+Dashboard host detection is centralized in `app/shell-host.ts` and exposed to React via `ShellHostProvider` (`app/context/ShellHostContext.tsx`).
+
+Canonical contract:
+- `{ kind: "browser" }`
+- `{ kind: "desktop-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+- `{ kind: "mobile-shell", mode?, connectionId?, serverUrl?, canOpenConnectionManager? }`
+
+Bootstrap priority is fixed:
+1. explicit bootstrapped global handoff (`__FUSION_SHELL_HOST_CONTEXT__` / compatibility aliases)
+2. shell handoff query params
+3. desktop fallback via `window.fusionAPI` presence
+4. browser fallback
+
+Shell launch query params are removed after bootstrap. UI components should consume `useShellHostContext()` instead of reading `window` globals directly.
+
+Keep host and node concerns separate:
+- `ShellHostContext.mode` (`local` / `remote`) describes how native shell sessions reached this dashboard instance.
+- `NodeContext.isRemote` describes browsing a remote mesh node from within the dashboard.
+These concepts can coexist and should not replace each other.
+
 ## Features
 
 ### Planning Mode
@@ -18,10 +66,11 @@ AI-guided interactive planning for creating well-specified tasks from high-level
 4. Review the AI-generated summary with:
    - Refinable title and description
    - Size estimate (S/M/L)
+   - Priority selector (`low`, `normal`, `high`, `urgent`)
    - Suggested dependencies from existing tasks
    - Key deliverables checklist
 5. Create the task directly from the summary
-6. Or use **Break into Tasks** to generate multiple subtasks where each description starts with subtask-specific implementation guidance, followed by a separate larger-plan context section (including planning interview context when available)
+6. Or use **Break into Tasks** to generate multiple subtasks where each description starts with subtask-specific implementation guidance, followed by a separate larger-plan context section (including planning interview context when available); each subtask also supports per-subtask priority selection (`low`, `normal`, `high`, `urgent`) before creation
 
 **Features**:
 - **Rate Limiting**: Maximum 5 planning sessions per hour per IP
@@ -81,6 +130,7 @@ Navigation placement in this iteration:
 - **Mobile:** `MobileNavBar` More sheet
 
 `fusion-plugin-dependency-graph` registers `graph` and is host-resolved through an explicit static registry (`app/plugins/pluginViewRegistry.tsx`) for bundle-safe rendering. CLI dashboard/serve/daemon startup now auto-installs this bundled plugin when missing.
+Graph view cards now use the same host-provided `openTaskDetail` flow as board/list cards, so clicking a graph node opens the native task detail modal while preserving plugin-owned graph interactions (drag/pan/highlighting).
 
 ### Mobile Bottom Navigation
 The dashboard now includes a dedicated bottom tab navigation pattern for mobile viewports (`≤768px`) via `MobileNavBar` (`app/components/MobileNavBar.tsx`). This pattern is designed for narrow screens and Capacitor-wrapped app usage where bottom-tab navigation is the primary interaction model.
@@ -214,6 +264,7 @@ A persistent footer status bar at the bottom of the dashboard displays real-time
 - **Stuck**: Count of tasks in "in-progress" with no activity for longer than the project's `taskStuckTimeoutMs` setting (shown only when > 0 and the setting is enabled). Uses the same `isTaskStuck()` predicate as task cards and list rows, so the footer count always matches the visible stuck indicators on the board
 - **Queued**: Count of tasks in "todo" column
 - **In Review**: Count of tasks in "in-review" column
+- **Escalated blocker summary**: FN-3942 surfaces immediate high fan-out blockers (`activeTodoCount >= 5`); FN-3954 upgrades long-lived high fan-out blockers to an explicit **Escalated** summary in the footer, ranked by todo fan-out, active total, age, then task ID.
 - **Executor State**: Current state badge (Idle/Running/Paused)
 - **Last Activity**: Relative timestamp of most recent task event
 
@@ -223,7 +274,8 @@ A persistent footer status bar at the bottom of the dashboard displays real-time
 - **Running**: Engine active with running tasks
 
 **Features**:
-- **Shared task list**: Task counts are derived from the same task list used by the board and list views, so the footer always matches the board state exactly. Stuck task detection uses a shared `isTaskStuck()` utility (see `utils/taskStuck.ts`) so the footer count and individual card/row indicators are always consistent
+- **Shared task list**: Task counts are derived from the same task list used by the board and list views, so the footer always matches the board state exactly. Stuck task detection uses a shared `isTaskStuck()` utility (see `utils/taskStuck.ts`) so the footer count and individual card/row indicators are always consistent.
+- **Age-based escalation**: Task cards keep ordinary `Blocks N` visibility for non-critical chains, show immediate **High fan-out** at `activeTodoCount >= 5`, and only switch to **Escalated** when that high fan-out blocker remains in blocking columns longer than `staleHighFanoutBlockerAgeThresholdMs` (`columnMovedAt ?? updatedAt`). Done/archived downstream tasks never contribute to the threshold.
 - **Footer-safe layout**: Project-view content (board, list view, agents view) automatically reserves space for the fixed footer using a CSS custom property (`--executor-footer-height`). The `project-content--with-footer` wrapper class sets this token to 36px on desktop and 32px on mobile, ensuring all content remains fully visible and scrollable above the status bar
 - Real-time updates via 5-second polling for executor state (globalPause, enginePaused, maxConcurrent)
 - Responsive design: collapses labels on mobile screens (<768px); footer height reduces from 36px to 32px
@@ -247,14 +299,16 @@ Manage AI agents with a dedicated control surface accessible from the main dashb
 **Features**:
 - **Agent-first layout**: The main agent collection (list/board/tree/org) renders first, with summary sections (metrics + active/live panel) below it.
 - **Controls Popup**: Import, state filter, Show system agents toggle, and global Heartbeat Speed are grouped under a compact `Controls` trigger (`aria-haspopup`, `aria-expanded`, Escape/outside-click dismissal).
-- **State Filter**: Styled dropdown to filter agents by state (All States, Idle, Active, Paused, Terminated) with Filter icon, aria-label, and consistent dashboard styling using design tokens (`--radius-sm`, `--border`, `--bg`, `--focus-ring`)
-- **Terminated Agent Filtering**: By default ("All States" filter), terminated agents are automatically hidden from the agent list to reduce clutter from frequently-terminating runtime task-worker agents. Terminated agents remain accessible by explicitly selecting the "Terminated" filter option, enabling intentional inspection and cleanup when needed. This behavior applies to both the main AgentsView and the AgentListModal.
+- **State Filter**: Styled dropdown to filter agents by state (All States, Idle, Active, Running, Paused, Error) with Filter icon, aria-label, and consistent dashboard styling using design tokens (`--radius-sm`, `--border`, `--bg`, `--focus-ring`)
+- **All States Behavior**: The default filter shows all durable agents, including paused and error agents, so stopped/problem agents stay visible without a dedicated terminated bucket. This behavior applies to both the main AgentsView and the AgentListModal.
 - **View Modes**: Board (compact grid) and list (detailed card) layouts, persisted to localStorage
-- **Agent CRUD**: Create agents with name and role (create form's text input and role/type select both use tokenized styling — `var(--surface)`, `var(--text)`, `var(--border)`, `var(--radius-sm)`, `var(--focus-ring)` — for consistent theme-aware rendering across all color themes and light/dark modes), change state, update roles inline, delete idle and terminated agents (active and paused agents must be stopped/terminated first)
-- **Health Monitoring**: Heartbeat-based health status (Healthy, Unresponsive, Starting, Paused, Terminated) using CSS variable references for theme consistency
+- **Agent CRUD**: Create agents with name and role (create form's text input and role/type select both use tokenized styling — `var(--surface)`, `var(--text)`, `var(--border)`, `var(--radius-sm)`, `var(--focus-ring)` — for consistent theme-aware rendering across all color themes and light/dark modes), change state, update roles inline, delete idle and paused agents
+- **AI Interview drafts (experimental)**: Interview-generated drafts now stop on a dedicated read-only review summary before any data is applied to the editable New Agent form. The summary mirrors form-aligned sections and surfaces identity (`name`, `role`, `title`, `icon`, `reportsTo`), starter operating guidance (`instructionsText`) and starter memory (`memory`), personality (`soul`), heartbeat guidance (`heartbeatProcedurePath`, `heartbeatIntervalMs`, `heartbeatEnabled`), and draft-only runtime/model suggestions (`runtimeHint`, `modelHint`), with an explicit apply action required to continue.
+- **Health Monitoring**: Heartbeat-based health status (Healthy, Unresponsive, Starting, Paused, Running, Error) using CSS variable references for theme consistency
+- **Agent Error Details**: Agent collection views now show a compact inline error indicator (instead of raw stack traces) that opens a shared error-details modal with full text, copy action, and a prefilled "Report on GitHub" shortcut
 - **Agent Detail**: Click any agent card to open a detail modal with full agent information. In list view, each agent card also provides an explicit **View Details** action button in the card actions row for clearer discoverability, while the existing clickable identity/header area remains supported. The modal features a compact header with clear visual hierarchy:
   - **Identity area** (left): Agent icon, name, and state/health badges
-  - **Lifecycle controls** (center): Compact action buttons for state transitions (Start, Pause, Resume, Retry, Stop, Delete)
+  - **Lifecycle controls** (center): Compact action buttons for state transitions (Start, Pause, Resume, Retry, Stop→Paused, Delete)
   - **Utility actions** (right): Refresh and Close buttons
   - The compact layout reduces vertical footprint while maintaining all agent-state actions
   - The **Settings** tab includes **editable advanced settings** (heartbeat interval, max retries, task timeout, log level) persisted through `agent.metadata`. Empty fields revert to system defaults, invalid values block save with inline error messages
@@ -454,6 +508,8 @@ The dashboard exposes two automated completion strategies in Settings:
 
 When the merge strategy is **Pull request**:
 
+- Task cards render the PR badge as a direct GitHub link (`#<number>`) that opens the PR in a new tab without triggering the card detail modal
+- The task detail modal surfaces linked PR numbers as direct GitHub links for both in-review and completed tasks (not just inside the in-review PR section)
 - The task's PR section shows whether kb is waiting on checks/reviews or has merged successfully
 - Required checks must pass before kb merges the PR; optional checks do not block auto-merge
 - A blocking review state (for example, active changes requested) prevents auto-merge until cleared

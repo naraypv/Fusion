@@ -5,6 +5,26 @@ import { GitManagerModal } from "../GitManagerModal";
 import type { Task } from "@fusion/core";
 import { loadAllAppCss } from "../../test/cssFixture";
 
+const mockUseViewportMode = vi.fn(() => "desktop");
+const mockUseMobileKeyboard = vi.fn(() => ({
+  keyboardOverlap: 0,
+  viewportHeight: null,
+  viewportOffsetTop: 0,
+  keyboardOpen: false,
+}));
+
+vi.mock("../../hooks/useViewportMode", () => ({
+  useViewportMode: () => mockUseViewportMode(),
+}));
+
+vi.mock("../../hooks/useMobileKeyboard", () => ({
+  useMobileKeyboard: () => mockUseMobileKeyboard(),
+}));
+
+vi.mock("../../hooks/useMobileScrollLock", () => ({
+  useMobileScrollLock: vi.fn(),
+}));
+
 // Mock the API module with all functions
 vi.mock("../../api", async () => {
   return {
@@ -23,6 +43,7 @@ vi.mock("../../api", async () => {
     createStash: vi.fn(),
     applyStash: vi.fn(),
     dropStash: vi.fn(),
+    fetchStashDiff: vi.fn(),
     fetchFileChanges: vi.fn(),
     fetchGitFileDiff: vi.fn(),
     stageFiles: vi.fn(),
@@ -62,6 +83,7 @@ import {
   createStash,
   applyStash,
   dropStash,
+  fetchStashDiff,
   fetchFileChanges,
   fetchGitFileDiff,
   stageFiles,
@@ -114,6 +136,13 @@ const mockTasks: Task[] = [
 describe("GitManagerModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockUseViewportMode.mockReturnValue("desktop");
+    mockUseMobileKeyboard.mockReturnValue({
+      keyboardOverlap: 0,
+      viewportHeight: null,
+      viewportOffsetTop: 0,
+      keyboardOpen: false,
+    });
     mockConfirm.mockReset();
     mockConfirm.mockResolvedValue(true);
 
@@ -130,6 +159,7 @@ describe("GitManagerModal", () => {
         hash: "abc1234def5678",
         shortHash: "abc1234",
         message: "Test commit",
+        body: "Detailed description\n\nMultiple paragraphs.",
         author: "User",
         date: "2026-01-01T00:00:00Z",
         parents: [],
@@ -175,6 +205,10 @@ describe("GitManagerModal", () => {
     (createStash as any).mockResolvedValue({ message: "Stash created" });
     (applyStash as any).mockResolvedValue({ message: "Stash applied" });
     (dropStash as any).mockResolvedValue({ message: "Stash dropped" });
+    (fetchStashDiff as any).mockResolvedValue({
+      stat: " README.md | 2 ++",
+      patch: "diff --git a/README.md b/README.md\n+stash diff",
+    });
     (discardChanges as any).mockResolvedValue({ discarded: ["src/app.ts"] });
     (createBranch as any).mockResolvedValue(undefined);
     (checkoutBranch as any).mockResolvedValue(undefined);
@@ -209,6 +243,39 @@ describe("GitManagerModal", () => {
     await waitFor(() => {
       expect(screen.getByText("Git Manager")).toBeInTheDocument();
     });
+  });
+
+  it("renders git-manager overlay class hook for mobile fullscreen CSS", async () => {
+    const { container } = render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    await waitFor(() => {
+      expect(screen.getByText("Git Manager")).toBeInTheDocument();
+    });
+
+    expect(container.querySelector(".modal-overlay.git-manager-modal-overlay")).toBeTruthy();
+  });
+
+  it("applies mobile keyboard CSS variables to gm-modal when keyboard is open", async () => {
+    mockUseViewportMode.mockReturnValue("mobile");
+    mockUseMobileKeyboard.mockReturnValue({
+      keyboardOverlap: 240,
+      viewportHeight: 620,
+      viewportOffsetTop: 18,
+      keyboardOpen: true,
+    });
+
+    const { container } = render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    await waitFor(() => {
+      expect(screen.getByText("Git Manager")).toBeInTheDocument();
+    });
+
+    const modal = container.querySelector(".modal.gm-modal") as HTMLElement;
+    expect(modal.style.getPropertyValue("--keyboard-overlap")).toBe("240px");
+    expect(modal.style.getPropertyValue("--vv-height")).toBe("620px");
+    expect(modal.style.getPropertyValue("--vv-offset-top")).toBe("18px");
   });
 
   it("renders all navigation sections", async () => {
@@ -357,6 +424,35 @@ describe("GitManagerModal", () => {
       expect(screen.getByText("Unstaged Changes (1)")).toBeInTheDocument();
       expect(screen.getByText("Staged Changes (1)")).toBeInTheDocument();
     });
+  });
+
+  it("keeps separate scroll containers for unstaged and staged file lists", async () => {
+    (fetchFileChanges as any).mockResolvedValue([
+      ...Array.from({ length: 30 }, (_, index) => ({
+        file: `src/unstaged-${index}.ts`,
+        status: "modified",
+        staged: false,
+      })),
+      { file: "src/staged.ts", status: "added", staged: true },
+    ]);
+
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /changes/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Unstaged Changes (30)")).toBeInTheDocument();
+      expect(screen.getByText("Staged Changes (1)")).toBeInTheDocument();
+    });
+
+    const unstagedList = screen.getByTestId("gm-file-list-unstaged");
+    const stagedList = screen.getByTestId("gm-file-list-staged");
+
+    expect(unstagedList).toHaveClass("gm-file-list", "gm-file-list-unstaged");
+    expect(stagedList).toHaveClass("gm-file-list", "gm-file-list-staged");
+    expect(within(unstagedList).getAllByRole("button").length).toBeGreaterThan(10);
+    expect(within(stagedList).getAllByRole("button").length).toBeGreaterThan(0);
   });
 
   it("stages all files when Stage All is clicked", async () => {
@@ -592,6 +688,57 @@ describe("GitManagerModal", () => {
     await waitFor(() => {
       expectLatestCallStartsWith(fetchCommitDiff as any, "abc1234def5678");
     });
+  });
+
+  it("shows commit body when expanding a commit in commits panel", async () => {
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /commits/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Test commit")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Test commit"));
+
+    await waitFor(() => {
+      const fullMessage = document.querySelector(".gm-commit-message-full");
+      expect(fullMessage?.textContent).toContain("Detailed description");
+      expect(fullMessage?.textContent).toContain("Multiple paragraphs.");
+    });
+  });
+
+  it("does not render full message block for commits without body", async () => {
+    (fetchGitCommits as any).mockResolvedValue([
+      {
+        hash: "abc1234def5678",
+        shortHash: "abc1234",
+        message: "Subject only commit",
+        body: "",
+        author: "User",
+        date: "2026-01-01T00:00:00Z",
+        parents: [],
+      },
+    ]);
+
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /commits/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Subject only commit")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Subject only commit"));
+
+    await waitFor(() => {
+      expectLatestCallStartsWith(fetchCommitDiff as any, "abc1234def5678");
+    });
+
+    const expandedDiff = document.querySelector(".gm-commit-diff");
+    expect(expandedDiff?.querySelector(".gm-commit-message-full")).toBeNull();
   });
 
   // ── Branches Panel ─────────────────────────────────────────
@@ -1019,6 +1166,77 @@ describe("GitManagerModal", () => {
     });
   });
 
+  it("views stash contents", async () => {
+    const user = userEvent.setup();
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /stashes/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "View" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "View" }));
+
+    await waitFor(() => {
+      expectLatestCallStartsWith(fetchStashDiff as any, 0);
+      expect(screen.getByText("Hide")).toBeInTheDocument();
+      expect(screen.getByText("README.md | 2 ++")).toBeInTheDocument();
+      expect(screen.getByText(/\+stash diff/)).toBeInTheDocument();
+    });
+  });
+
+  it("shows stash diff loading and error states", async () => {
+    const user = userEvent.setup();
+    let resolveDiff: ((value: { stat: string; patch: string }) => void) | null = null;
+    (fetchStashDiff as any).mockImplementationOnce(
+      () =>
+        new Promise<{ stat: string; patch: string }>((resolve) => {
+          resolveDiff = resolve;
+        })
+    );
+
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /stashes/i }));
+
+    await user.click(await screen.findByRole("button", { name: "View" }));
+    expect(screen.getByText("Loading stash diff…")).toBeInTheDocument();
+
+    resolveDiff?.({ stat: " README.md | 1 +", patch: "diff --git a/README.md b/README.md\n+ok" });
+    await waitFor(() => {
+      expect(screen.getByText("README.md | 1 +")).toBeInTheDocument();
+    });
+
+    (fetchStashDiff as any).mockRejectedValueOnce(new Error("stash diff failed"));
+    await user.click(screen.getByRole("button", { name: "Hide" }));
+    await user.click(screen.getByRole("button", { name: "View" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("stash diff failed")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps stash actions available when viewing stash contents", async () => {
+    const user = userEvent.setup();
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /stashes/i }));
+
+    await user.click(await screen.findByRole("button", { name: "View" }));
+    await user.click(screen.getByText("Apply"));
+    await user.click(screen.getByText("Pop"));
+
+    await waitFor(() => {
+      expect((applyStash as any).mock.calls).toContainEqual([0, false, undefined]);
+      expect((applyStash as any).mock.calls).toContainEqual([0, true, undefined]);
+      expect(screen.getByTitle("Drop stash")).toBeInTheDocument();
+    });
+  });
+
   it("creates a stash", async () => {
     const user = userEvent.setup();
     render(
@@ -1145,20 +1363,103 @@ describe("GitManagerModal", () => {
     });
   });
 
-  it("calls pullBranch when Pull button clicked", async () => {
+  it("calls pullBranch with rebase false when Pull button clicked", async () => {
     const user = userEvent.setup();
     render(
       <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
     );
     fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
 
-    // Wait for sync card and scope button search within it
     const syncCard = await screen.findByTestId("remote-sync-card");
-    const pullButton = within(syncCard).getByRole("button", { name: /pull/i });
+    const pullButton = within(syncCard).getByRole("button", { name: /^pull$/i });
     await user.click(pullButton);
 
     await waitFor(() => {
-      expect(pullBranch).toHaveBeenCalled();
+      expect(pullBranch).toHaveBeenCalledWith({ rebase: false }, undefined);
+    });
+  });
+
+  it("calls pullBranch with rebase true from pull options menu", async () => {
+    const user = userEvent.setup();
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
+
+    const syncCard = await screen.findByTestId("remote-sync-card");
+    await user.click(within(syncCard).getByRole("button", { name: /pull options/i }));
+    await user.click(screen.getByRole("menuitem", { name: /pull --rebase/i }));
+
+    await waitFor(() => {
+      expect(pullBranch).toHaveBeenCalledWith({ rebase: true }, undefined);
+    });
+  });
+
+  it("FN-3753: pull split toggle is narrower than the main Pull button", async () => {
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
+
+    const syncCard = await screen.findByTestId("remote-sync-card");
+    const pullMainButton = within(syncCard).getByRole("button", { name: /^pull$/i });
+    const pullToggleButton = within(syncCard).getByRole("button", { name: /pull options/i });
+
+    expect(pullToggleButton).toHaveClass("gm-pull-split-toggle");
+    expect(pullToggleButton).toHaveClass("btn-icon");
+
+    vi.spyOn(pullMainButton, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 96,
+      height: 36,
+      top: 0,
+      right: 96,
+      bottom: 36,
+      left: 0,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(pullToggleButton, "getBoundingClientRect").mockReturnValue({
+      x: 96,
+      y: 0,
+      width: 36,
+      height: 36,
+      top: 0,
+      right: 132,
+      bottom: 36,
+      left: 96,
+      toJSON: () => ({}),
+    });
+
+    expect(pullToggleButton.getBoundingClientRect().width).toBeLessThan(
+      pullMainButton.getBoundingClientRect().width
+    );
+  });
+
+  it("closes pull options menu on outside click and Escape", async () => {
+    const user = userEvent.setup();
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
+
+    const syncCard = await screen.findByTestId("remote-sync-card");
+    const pullOptionsButton = within(syncCard).getByRole("button", { name: /pull options/i });
+
+    await user.click(pullOptionsButton);
+    expect(screen.getByRole("menu", { name: /pull options menu/i })).toBeInTheDocument();
+
+    await user.click(document.body);
+    await waitFor(() => {
+      expect(screen.queryByRole("menu", { name: /pull options menu/i })).not.toBeInTheDocument();
+    });
+
+    await user.click(pullOptionsButton);
+    expect(screen.getByRole("menu", { name: /pull options menu/i })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("menu", { name: /pull options menu/i })).not.toBeInTheDocument();
     });
   });
 
@@ -1873,6 +2174,71 @@ describe("GitManagerModal", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Network failure")).toBeInTheDocument();
+    });
+  });
+
+  it("refreshes recent remote commits after pull without reopening modal", async () => {
+    const user = userEvent.setup();
+    (fetchRemoteCommits as any)
+      .mockResolvedValueOnce([
+        { hash: "rc1", shortHash: "rc1", message: "Remote commit before pull", author: "Dev", date: "2026-01-01T00:00:00Z", parents: [] },
+      ])
+      .mockResolvedValueOnce([
+        { hash: "rc2", shortHash: "rc2", message: "Remote commit after pull", author: "Dev", date: "2026-01-02T00:00:00Z", parents: [] },
+      ]);
+
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Remote commit before pull")).toBeInTheDocument();
+    });
+
+    const syncCard = screen.getByTestId("remote-sync-card");
+    await user.click(within(syncCard).getByRole("button", { name: /^pull$/i }));
+
+    await waitFor(() => {
+      expect(pullBranch).toHaveBeenCalledWith({ rebase: false }, undefined);
+      expect(fetchRemoteCommits).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Remote commit after pull")).toBeInTheDocument();
+      expect(screen.queryByText("Remote commit before pull")).not.toBeInTheDocument();
+    });
+  });
+
+  it("refreshes recent remote commits after push without reopening modal", async () => {
+    const user = userEvent.setup();
+    let remoteCommitsCallCount = 0;
+    (fetchRemoteCommits as any).mockImplementation(() => {
+      remoteCommitsCallCount += 1;
+      if (remoteCommitsCallCount <= 1) {
+        return Promise.resolve([
+          { hash: "rc10", shortHash: "rc10", message: "Remote commit before push", author: "Dev", date: "2026-01-01T00:00:00Z", parents: [] },
+        ]);
+      }
+      return Promise.resolve([
+        { hash: "rc11", shortHash: "rc11", message: "Remote commit after push", author: "Dev", date: "2026-01-02T00:00:00Z", parents: [] },
+      ]);
+    });
+
+    render(
+      <GitManagerModal isOpen={true} onClose={vi.fn()} tasks={mockTasks} addToast={mockAddToast} />
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /remotes/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Remote commit before push")).toBeInTheDocument();
+    });
+
+    const syncCard = screen.getByTestId("remote-sync-card");
+    await user.click(within(syncCard).getByRole("button", { name: /push/i }));
+
+    await waitFor(() => {
+      expect(pushBranch).toHaveBeenCalled();
+      expect(fetchRemoteCommits).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Remote commit after push")).toBeInTheDocument();
+      expect(screen.queryByText("Remote commit before push")).not.toBeInTheDocument();
     });
   });
 

@@ -286,12 +286,30 @@ describe("TaskCard mobile", () => {
     expectRuleToContain(css, ".card-session-files span", "white-space: nowrap;");
   });
 
-  it("sets .card-edit-btn width and height to 32px in the mobile media block", () => {
+  it("uses tokenized 36px touch targets for TaskCard action buttons in the mobile media block", () => {
     const css = loadAllAppCss();
     const mobileSection = getMainMobileSection(css);
 
-    expectRuleToContain(mobileSection, ".card-edit-btn", "width: 32px;");
-    expectRuleToContain(mobileSection, ".card-edit-btn", "height: 32px;");
+    expectRuleToContain(
+      mobileSection,
+      ".card-edit-btn",
+      "width: calc(var(--space-xl) + var(--space-md));",
+    );
+    expectRuleToContain(
+      mobileSection,
+      ".card-edit-btn",
+      "height: calc(var(--space-xl) + var(--space-md));",
+    );
+    expectRuleToContain(
+      mobileSection,
+      ".card-delete-btn",
+      "width: calc(var(--space-xl) + var(--space-md));",
+    );
+    expectRuleToContain(
+      mobileSection,
+      ".card-delete-btn",
+      "height: calc(var(--space-xl) + var(--space-md));",
+    );
   });
 
   it("opens task detail on quick tap", async () => {

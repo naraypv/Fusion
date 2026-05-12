@@ -1,15 +1,119 @@
 import { createReadStream } from "node:fs";
-import type { TaskStore, Task, TaskDetail, Column } from "@fusion/core";
+import type { TaskStore, Task, TaskDetail, Column, TaskReviewData, TaskReviewItem, TaskReviewSummary } from "@fusion/core";
 import {
   COLUMNS,
   TASK_PRIORITIES,
   VALID_TRANSITIONS,
   isTaskPriority,
+  REPO_OVERRIDE_RE,
   resolveTitleSummarizerSettingsModel,
   validateNodeOverrideChange,
+  canAgentTakeImplementationTaskForExplicitRouting,
+  formatRoleMismatchReason,
+  getCurrentRepo,
 } from "@fusion/core";
+import { GitHubClient } from "../github.js";
+import { maybeCreateTrackingIssue } from "../github-tracking.js";
+import { parseGitHubBadgeUrl } from "./register-git-github.js";
+import { planTaskWorktreePath } from "@fusion/engine";
 import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
 import type { ApiRoutesContext } from "./types.js";
+import { resolveBranchSelection } from "./branch-selection.js";
+
+const REVIEW_BLOCK_RE = /##\s+(Code|Plan)\s+Review:[\s\S]*?(?=\n##\s+(?:Code|Plan)\s+Review:|$)/gi;
+const REVIEW_VERDICT_RE = /###\s+Verdict:\s*(APPROVE|REVISE|RETHINK|UNAVAILABLE)\b/i;
+const REVIEW_STEP_RE = /^(plan|code) review Step (\d+): (APPROVE|REVISE|RETHINK|UNAVAILABLE)\b/i;
+
+function buildReviewerAgentItemId(input: { index: number; reviewType: "plan" | "code"; step?: number; verdict?: string; createdAt?: string }): string {
+  const stepPart = input.step ? `step-${input.step}` : "step-na";
+  const verdictPart = (input.verdict ?? "unknown").toLowerCase();
+  const timePart = (input.createdAt ?? "na").replace(/[:.]/g, "-");
+  return `reviewer-${input.reviewType}-${stepPart}-${verdictPart}-${timePart}-${input.index + 1}`;
+}
+
+async function buildDirectTaskReviewData(task: Task, store: TaskStore): Promise<TaskReviewData> {
+  const agentLogs = await store.getAgentLogs(task.id);
+  const reviewerText = agentLogs.filter((entry) => entry.agent === "reviewer" && entry.type === "text").map((entry) => entry.text).join("\n");
+  const fallbackLogs = (task.log ?? []).filter((entry) => REVIEW_STEP_RE.test(entry.action));
+
+  const items: TaskReviewItem[] = [];
+  const blocks = reviewerText.match(REVIEW_BLOCK_RE) ?? [];
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index] ?? "";
+    const typeMatch = block.match(/##\s+(Code|Plan)\s+Review:/i);
+    const reviewType = typeMatch?.[1]?.toLowerCase() === "plan" ? "plan" : "code";
+    const verdict = block.match(REVIEW_VERDICT_RE)?.[1]?.toUpperCase();
+    const fallback = fallbackLogs[index];
+    const createdAt = fallback?.timestamp ?? task.updatedAt;
+    items.push({
+      itemId: buildReviewerAgentItemId({ index, reviewType, verdict, createdAt }),
+      sourceMode: "reviewer-agent",
+      title: `${reviewType} review ${verdict ?? "feedback"}`,
+      body: block.trim(),
+      author: "reviewer-agent",
+      createdAt,
+      updatedAt: createdAt,
+      reviewState: verdict ?? null,
+      progressStatus: null,
+    });
+  }
+
+  if (items.length === 0) {
+    fallbackLogs.forEach((entry, index) => {
+      const match = entry.action.match(REVIEW_STEP_RE);
+      const reviewType = match?.[1]?.toLowerCase() === "plan" ? "plan" : "code";
+      const verdict = match?.[3]?.toUpperCase();
+      items.push({
+        itemId: buildReviewerAgentItemId({ index, reviewType, step: match?.[2] ? Number.parseInt(match[2], 10) : undefined, verdict, createdAt: entry.timestamp }),
+        sourceMode: "reviewer-agent",
+        title: `${reviewType} review ${verdict ?? "feedback"}`,
+        body: entry.action,
+        author: "reviewer-agent",
+        createdAt: entry.timestamp,
+        updatedAt: entry.timestamp,
+        reviewState: verdict ?? null,
+        progressStatus: null,
+      });
+    });
+  }
+
+  const sorted = [...items].sort((a, b) => Date.parse(b.createdAt ?? "") - Date.parse(a.createdAt ?? ""));
+  const latest = sorted[0];
+  const summary: TaskReviewSummary | null = latest
+    ? {
+        summary: latest.title,
+        verdict: (latest.reviewState as "APPROVE" | "REVISE" | "RETHINK" | "UNAVAILABLE" | null | undefined) ?? undefined,
+      }
+    : null;
+
+  return {
+    mode: "reviewer-agent",
+    refreshable: true,
+    fetchedAt: new Date().toISOString(),
+    summary,
+    items: sorted,
+  };
+}
+
+async function maybeCreateTaskTrackingIssue(taskStore: TaskStore, task: Task, optionsToken?: string): Promise<void> {
+  const projectSettings = await taskStore.getSettings();
+  const globalSettings = (await taskStore.getGlobalSettingsStore?.()?.getSettings?.()) ?? {};
+  const trackingProjectSettings = {
+    ...projectSettings,
+    githubAuthToken: projectSettings.githubAuthToken ?? optionsToken,
+  };
+
+  try {
+    await maybeCreateTrackingIssue(task, {
+      taskStore,
+      projectSettings: trackingProjectSettings,
+      globalSettings,
+      logger: console,
+    });
+  } catch {
+    // best-effort only
+  }
+}
 
 interface TaskWorkflowRouteDeps {
   runtimeLogger: { error: (message: string, data?: Record<string, unknown>) => void; warn: (message: string, data?: Record<string, unknown>) => void };
@@ -94,6 +198,11 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         executionMode,
         priority,
         source,
+        branch,
+        baseBranch,
+        branchSelection,
+        nodeId,
+        githubTracking,
       } = req.body;
       if (!description || typeof description !== "string") {
         throw badRequest("description is required");
@@ -131,6 +240,10 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       // Validate priority if provided.
       if (priority !== undefined && priority !== null && !isTaskPriority(priority)) {
         throw badRequest(`priority must be one of: ${TASK_PRIORITIES.join(", ")}`);
+      }
+
+      if (nodeId !== undefined && nodeId !== null && typeof nodeId !== "string") {
+        throw badRequest("nodeId must be a string");
       }
 
       const executorModel = normalizeModelSelectionPair(validatedModelProvider, validatedModelId);
@@ -183,31 +296,64 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           ? source
           : { sourceType: "api" as const };
 
+      const { branch: normalizedBranch, baseBranch: normalizedBaseBranch } =
+        resolveBranchSelection(branchSelection, branch, baseBranch);
+
+      let validatedGithubTracking: { enabled?: boolean; repoOverride?: string } | undefined;
+      if (githubTracking !== undefined && githubTracking !== null) {
+        if (typeof githubTracking !== "object") {
+          throw badRequest("githubTracking must be an object");
+        }
+        const candidate = githubTracking as { enabled?: unknown; repoOverride?: unknown };
+        if (candidate.enabled !== undefined && typeof candidate.enabled !== "boolean") {
+          throw badRequest("githubTracking.enabled must be a boolean");
+        }
+        if (candidate.repoOverride !== undefined && typeof candidate.repoOverride !== "string") {
+          throw badRequest("githubTracking.repoOverride must be a string");
+        }
+        const trimmedRepoOverride = typeof candidate.repoOverride === "string" ? candidate.repoOverride.trim() : "";
+        if (trimmedRepoOverride.length > 0 && !REPO_OVERRIDE_RE.test(trimmedRepoOverride)) {
+          throw badRequest("githubTracking.repoOverride must be in 'owner/repo' format");
+        }
+        validatedGithubTracking = {
+          ...(candidate.enabled !== undefined ? { enabled: candidate.enabled } : {}),
+          ...(trimmedRepoOverride.length > 0 ? { repoOverride: trimmedRepoOverride } : {}),
+        };
+      }
+
+      const createInput = {
+        title,
+        description,
+        column,
+        dependencies,
+        breakIntoSubtasks,
+        enabledWorkflowSteps,
+        modelPresetId: validateOptionalModelField(modelPresetId, "modelPresetId"),
+        modelProvider: executorModel.provider ?? undefined,
+        modelId: executorModel.modelId ?? undefined,
+        validatorModelProvider: validatorModel.provider ?? undefined,
+        validatorModelId: validatorModel.modelId ?? undefined,
+        planningModelProvider: planningModel.provider ?? undefined,
+        planningModelId: planningModel.modelId ?? undefined,
+        thinkingLevel: thinkingLevel || undefined,
+        summarize,
+        reviewLevel: reviewLevel ?? undefined,
+        executionMode: executionMode || undefined,
+        priority: priority ?? undefined,
+        source: normalizedSource,
+        branch: normalizedBranch,
+        baseBranch: normalizedBaseBranch,
+        ...(typeof nodeId === "string" && nodeId.trim().length > 0 ? { nodeId: nodeId.trim() } : {}),
+        ...(validatedGithubTracking ? { githubTracking: validatedGithubTracking } : {}),
+      };
+
       const task = await scopedStore.createTask(
-        {
-          title,
-          description,
-          column,
-          dependencies,
-          breakIntoSubtasks,
-          enabledWorkflowSteps,
-          modelPresetId: validateOptionalModelField(modelPresetId, "modelPresetId"),
-          modelProvider: executorModel.provider ?? undefined,
-          modelId: executorModel.modelId ?? undefined,
-          validatorModelProvider: validatorModel.provider ?? undefined,
-          validatorModelId: validatorModel.modelId ?? undefined,
-          planningModelProvider: planningModel.provider ?? undefined,
-          planningModelId: planningModel.modelId ?? undefined,
-          thinkingLevel: thinkingLevel || undefined,
-          summarize,
-          reviewLevel: reviewLevel ?? undefined,
-          executionMode: executionMode || undefined,
-          priority: priority ?? undefined,
-          source: normalizedSource,
-        },
-        { onSummarize, settings: { autoSummarizeTitles: settings.autoSummarizeTitles } }
+        createInput,
+        { onSummarize, settings: { autoSummarizeTitles: settings.autoSummarizeTitles } },
       );
+      await maybeCreateTaskTrackingIssue(scopedStore, task, options?.githubToken);
       res.status(201).json(task);
+      return;
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -228,8 +374,29 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (preserveProgress != null && typeof preserveProgress !== "boolean") {
         throw badRequest("preserveProgress must be a boolean");
       }
+
+      // When manually promoting to in-progress, supply an allocator so
+      // moveTask assigns a worktree path under its cross-task allocation
+      // lock. This mirrors scheduler dispatch semantics — without it, a
+      // user-initiated move would land the task in-progress with a stale
+      // (or null) worktree and could collide with another active task.
+      // The executor's createWorktree path will reuse `task.branch` if it
+      // already exists, so any prior committed progress survives even
+      // though the on-disk worktree directory is freshly allocated.
+      let allocateWorktree: ((reservedNames: Set<string>) => string | null) | undefined;
+      if ((column as Column) === "in-progress") {
+        const existing = await scopedStore.getTask(req.params.id);
+        if (existing) {
+          const settings = await scopedStore.getSettings();
+          const rootDir = scopedStore.getRootDir();
+          allocateWorktree = (reservedNames) =>
+            planTaskWorktreePath(existing, rootDir, settings.worktreeNaming, reservedNames);
+        }
+      }
+
       const task = await scopedStore.moveTask(req.params.id, column as Column, {
         preserveProgress,
+        allocateWorktree,
       });
       res.json(task);
     } catch (err: unknown) {
@@ -280,16 +447,35 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         throw badRequest(`Task is not in a retryable state (current status: ${task.status || 'none'})`);
       }
 
-      // In-review retry: keep the task in in-review, clear only error/retry state
-      // so the auto-merge system re-attempts on its next sweep.
+      // In-review retry: distinguish between execution failures (incomplete steps)
+      // and merge failures (all steps done).
       if (isInReviewRetry) {
+        const hasIncompleteSteps =
+          task.steps.length > 0 &&
+          task.steps.some((s: { status: string }) => s.status === "pending" || s.status === "in-progress");
+
+        if (hasIncompleteSteps) {
+          await scopedStore.updateTask(req.params.id, {
+            status: null,
+            error: null,
+            stuckKillCount: 0,
+          });
+          await scopedStore.logEntry(
+            req.params.id,
+            "Retry requested from dashboard (execution failure in-review → todo, preserving progress)",
+          );
+          const updated = await scopedStore.moveTask(req.params.id, "todo", { preserveProgress: true });
+          res.json(updated);
+          return;
+        }
+
         await scopedStore.updateTask(req.params.id, {
           status: null,
           error: null,
           stuckKillCount: 0,
           mergeRetries: 0,
         });
-        await scopedStore.logEntry(req.params.id, "Retry requested from dashboard (in-review retry, mergeRetries reset)");
+        await scopedStore.logEntry(req.params.id, "Retry requested from dashboard (in-review merge retry, mergeRetries reset)");
         const updated = await scopedStore.getTask(req.params.id);
         res.json(updated);
         return;
@@ -1361,7 +1547,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   router.patch("/tasks/:id", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const { title, description, prompt, priority, dependencies, enabledWorkflowSteps, modelProvider, modelId, validatorModelProvider, validatorModelId, planningModelProvider, planningModelId, thinkingLevel, assigneeUserId, reviewLevel, executionMode, sourceIssue, nodeId } = req.body;
+      const { title, description, prompt, priority, dependencies, enabledWorkflowSteps, modelProvider, modelId, validatorModelProvider, validatorModelId, planningModelProvider, planningModelId, thinkingLevel, assigneeUserId, reviewLevel, executionMode, sourceIssue, nodeId, branch, baseBranch, githubTracking } = req.body;
       const hasBodyField = (field: string) => Object.prototype.hasOwnProperty.call(req.body, field);
 
       // Validate model fields are strings or undefined/null
@@ -1473,6 +1659,52 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         }
       }
 
+      const validatePatchBranchField = (value: unknown, fieldName: string): string | null | undefined => {
+        if (value === undefined) return undefined;
+        if (value === null) return null;
+        if (typeof value !== "string") {
+          throw new Error(`${fieldName} must be a string or null`);
+        }
+        const trimmed = value.trim();
+        return trimmed.length > 0 ? trimmed : null;
+      };
+
+      const normalizedBranch = hasBodyField("branch") ? validatePatchBranchField(branch, "branch") : undefined;
+      const normalizedBaseBranch = hasBodyField("baseBranch") ? validatePatchBranchField(baseBranch, "baseBranch") : undefined;
+
+      let validatedGithubTracking: { enabled?: boolean; repoOverride?: string | null; issue?: null } | null | undefined;
+      if (hasBodyField("githubTracking")) {
+        if (githubTracking === null) {
+          validatedGithubTracking = null;
+        } else if (typeof githubTracking !== "object") {
+          throw new Error("githubTracking must be an object or null");
+        } else {
+          const candidate = githubTracking as { enabled?: unknown; repoOverride?: unknown; issue?: unknown };
+          if (candidate.enabled !== undefined && typeof candidate.enabled !== "boolean") {
+            throw new Error("githubTracking.enabled must be a boolean");
+          }
+          if (candidate.repoOverride !== undefined && candidate.repoOverride !== null && typeof candidate.repoOverride !== "string") {
+            throw new Error("githubTracking.repoOverride must be a string or null");
+          }
+          if (typeof candidate.repoOverride === "string") {
+            const trimmed = candidate.repoOverride.trim();
+            if (trimmed.length > 0 && !REPO_OVERRIDE_RE.test(trimmed)) {
+              throw badRequest("githubTracking.repoOverride must be in 'owner/repo' format");
+            }
+          }
+          if (candidate.issue !== undefined && candidate.issue !== null) {
+            throw new Error("githubTracking.issue only supports null for manual unlink");
+          }
+
+          const trimmedRepo = typeof candidate.repoOverride === "string" ? candidate.repoOverride.trim() : candidate.repoOverride;
+          validatedGithubTracking = {
+            ...(candidate.enabled !== undefined ? { enabled: candidate.enabled } : {}),
+            ...(candidate.repoOverride !== undefined ? { repoOverride: typeof trimmedRepo === "string" ? (trimmedRepo.length > 0 ? trimmedRepo : null) : null } : {}),
+            ...(candidate.issue === null ? { issue: null } : {}),
+          };
+        }
+      }
+
       const updates: Parameters<typeof scopedStore.updateTask>[1] = {};
       if (title !== undefined) updates.title = title;
       if (description !== undefined) updates.description = description;
@@ -1492,6 +1724,11 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (hasBodyField("executionMode")) updates.executionMode = executionMode === null ? null : executionMode;
       if (hasBodyField("sourceIssue")) updates.sourceIssue = validatedSourceIssue === undefined ? undefined : validatedSourceIssue;
       if (hasBodyField("nodeId")) updates.nodeId = validatedNodeId;
+      if (hasBodyField("branch")) updates.branch = normalizedBranch;
+      if (hasBodyField("baseBranch")) updates.baseBranch = normalizedBaseBranch;
+      if (hasBodyField("githubTracking")) {
+        (updates as Record<string, unknown>).githubTracking = validatedGithubTracking;
+      }
 
       if (hasBodyField("nodeId") && validatedNodeId !== undefined) {
         const currentTask = await scopedStore.getTask(req.params.id);
@@ -1505,6 +1742,26 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       }
 
       const task = await scopedStore.updateTask(req.params.id, updates);
+
+      const manualUnlinkRequested =
+        hasBodyField("githubTracking") &&
+        validatedGithubTracking !== null &&
+        typeof validatedGithubTracking === "object" &&
+        validatedGithubTracking.issue === null;
+      const shouldAttemptTrackingIssueCreate =
+        !manualUnlinkRequested &&
+        task.githubTracking?.enabled === true &&
+        !task.githubTracking?.issue;
+
+      if (shouldAttemptTrackingIssueCreate) {
+        await maybeCreateTaskTrackingIssue(scopedStore, task, options?.githubToken);
+        const refreshedTask = await scopedStore.getTask(req.params.id, {
+          activityLogLimit: TASK_DETAIL_ACTIVITY_LOG_LIMIT,
+        });
+        res.json(trimTaskDetailActivityLog(refreshedTask));
+        return;
+      }
+
       res.json(task);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -1518,7 +1775,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   // Assign or unassign a task to an explicit agent
   router.patch("/tasks/:id/assign", async (req, res) => {
     try {
-      const { agentId } = req.body as { agentId?: string | null };
+      const { agentId, override } = req.body as { agentId?: string | null; override?: boolean };
       if (agentId !== null && typeof agentId !== "string") {
         throw badRequest("agentId must be a string or null");
       }
@@ -1535,6 +1792,15 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         const agent = await agentStore.getAgent(agentId);
         if (!agent) {
           throw notFound("Agent not found");
+        }
+
+        const targetTask = await scopedStore.getTask(req.params.id);
+        if (!targetTask) {
+          throw notFound("Task not found");
+        }
+
+        if (override !== true && !canAgentTakeImplementationTaskForExplicitRouting(agent, targetTask)) {
+          throw new ApiError(409, formatRoleMismatchReason(agent, targetTask));
         }
       }
 
@@ -1612,6 +1878,204 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       } else {
         rethrowAsApiError(err);
       }
+    }
+  });
+
+  router.get("/tasks/:id/review", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const task = await scopedStore.getTask(req.params.id);
+      let reviewData: TaskReviewData;
+
+      if (task.prInfo) {
+        const badgeParsed = parseGitHubBadgeUrl(task.prInfo.url);
+        const repoInfo = getCurrentRepo(scopedStore.getRootDir());
+        const owner = badgeParsed?.owner ?? repoInfo?.owner;
+        const repo = badgeParsed?.repo ?? repoInfo?.repo;
+        if (!owner || !repo) {
+          throw badRequest("Could not determine GitHub repository for PR review fetch");
+        }
+        reviewData = await new GitHubClient(options?.githubToken ?? process.env.GITHUB_TOKEN).getPrReviewDetails(owner, repo, task.prInfo.number);
+      } else {
+        reviewData = await buildDirectTaskReviewData(task, scopedStore);
+      }
+
+      res.json(reviewData);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw notFound(`Task ${req.params.id} not found`);
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.post("/tasks/:id/review/refresh", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const task = await scopedStore.getTask(req.params.id);
+      let reviewData: TaskReviewData;
+      if (task.prInfo) {
+        const badgeParsed = parseGitHubBadgeUrl(task.prInfo.url);
+        const repoInfo = getCurrentRepo(scopedStore.getRootDir());
+        const owner = badgeParsed?.owner ?? repoInfo?.owner;
+        const repo = badgeParsed?.repo ?? repoInfo?.repo;
+        if (!owner || !repo) {
+          throw badRequest("Could not determine GitHub repository for PR review refresh");
+        }
+        reviewData = await new GitHubClient(options?.githubToken ?? process.env.GITHUB_TOKEN).getPrReviewDetails(owner, repo, task.prInfo.number);
+      } else {
+        reviewData = await buildDirectTaskReviewData(task, scopedStore);
+      }
+      res.json(reviewData);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        throw notFound(`Task ${req.params.id} not found`);
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  // Queue same-task revision pass for selected review items
+  router.post("/tasks/:id/review/address", async (req, res) => {
+    try {
+      const { store: scopedStore } = await getProjectContext(req);
+      const task = await scopedStore.getTask(req.params.id);
+
+      type SelectedReviewItem = {
+        id: string;
+        source: "pr-review" | "reviewer-agent";
+        threadId?: string;
+        filePath?: string;
+        lineNumber?: number;
+        author?: string;
+        summary: string;
+        body: string;
+        url?: string;
+      };
+
+      const selectedItems: SelectedReviewItem[] = Array.isArray(req.body?.selectedItems)
+        ? req.body.selectedItems.filter((value: unknown): value is SelectedReviewItem => {
+            if (!value || typeof value !== "object") return false;
+            const item = value as Record<string, unknown>;
+            return typeof item.id === "string" && item.id.trim().length > 0 && typeof item.summary === "string" && typeof item.body === "string";
+          })
+        : [];
+
+      if (selectedItems.length === 0) {
+        throw badRequest("selectedItems must be a non-empty array of review items");
+      }
+      const unsupportedSource = selectedItems.find((item) => item.source !== "pr-review" && item.source !== "reviewer-agent");
+      if (unsupportedSource) {
+        throw badRequest(`Unsupported review source: ${String(unsupportedSource.source)}`);
+      }
+      if (!task.reviewState) {
+        throw badRequest("Task has no reviewState payload");
+      }
+
+      const now = new Date().toISOString();
+      const selectedSet = new Set(selectedItems.map((item: SelectedReviewItem) => item.id));
+      const sourceById = new Map(selectedItems.map((item: SelectedReviewItem) => [item.id, item.source] as const));
+      const reviewSourceMismatch = task.reviewState.items.find((item: NonNullable<typeof task.reviewState>["items"][number]) => {
+        const selectedSource = sourceById.get(item.id);
+        if (!selectedSource || !task.reviewState) return false;
+        const expectedSource = task.reviewState.source === "pull-request" ? "pr-review" : "reviewer-agent";
+        return selectedSource !== expectedSource;
+      });
+      if (reviewSourceMismatch) {
+        throw badRequest("Selected review source does not match task review mode");
+      }
+      const matchedItems = task.reviewState.items.filter((item: NonNullable<typeof task.reviewState>["items"][number]) => selectedSet.has(item.id));
+      if (matchedItems.length !== selectedSet.size) {
+        throw badRequest("selectedItems must reference existing review items");
+      }
+
+      const modeSummary = `${task.reviewState.source === "pull-request" ? "pull-request" : "reviewer-agent"} · ${selectedItems.length} selected item(s)`;
+      const steeringItems = selectedItems.map((item: SelectedReviewItem, index: number) => {
+        const location = item.filePath ? `${item.filePath}${typeof item.lineNumber === "number" ? `:${item.lineNumber}` : ""}` : undefined;
+        const snippetSource = item.body.trim() || item.summary.trim();
+        const snippet = snippetSource.length > 220 ? `${snippetSource.slice(0, 220)}…` : snippetSource;
+        const urlSuffix = item.url ? ` | url: ${item.url}` : "";
+        return `${index + 1}. source: ${item.source}${location ? ` | location: ${location}` : ""} | "${snippet}"${urlSuffix}`;
+      });
+      const steeringText = ["Selected review feedback to address", modeSummary, ...steeringItems].join("\n");
+
+      const priorAddressingById = new Map(task.reviewState.addressing.map((record) => [record.itemId, record] as const));
+      const nextAddressing = [
+        ...task.reviewState.addressing.filter((record) => !selectedSet.has(record.itemId)),
+        ...selectedItems.map((item: SelectedReviewItem) => {
+          const existing = priorAddressingById.get(item.id);
+          return {
+            itemId: item.id,
+            status: "queued" as const,
+            selectedAt: now,
+            startedAt: undefined,
+            completedAt: undefined,
+            error: undefined,
+            stale: false,
+            snapshot: {
+              itemId: item.id,
+              sourceMode: task.reviewState?.source ?? "pull-request",
+              source: item.source,
+              summary: item.summary,
+              body: item.body,
+              authorLogin: item.author,
+              filePath: item.filePath,
+              lineNumber: item.lineNumber,
+              threadId: item.threadId,
+              url: item.url,
+            },
+            ...(existing ? { startedAt: existing.startedAt, completedAt: existing.completedAt } : {}),
+          };
+        }),
+      ];
+
+      const reviewState = {
+        ...task.reviewState,
+        addressing: nextAddressing,
+      };
+
+      await scopedStore.updateTask(task.id, { reviewState });
+
+      let steeringCommentId: string | null = null;
+      const steeringComment = await scopedStore.addSteeringComment(task.id, steeringText, "user");
+      steeringCommentId = steeringComment.id;
+
+      let updatedTask: Task = await scopedStore.getTask(task.id);
+
+      if (task.column === "in-review") {
+        await scopedStore.updateTask(task.id, {
+          status: null,
+          error: null,
+          sessionFile: null,
+        });
+        const lastDoneStep = [...task.steps]
+          .map((step, index) => ({ step, index }))
+          .reverse()
+          .find(({ step }) => step.status === "done" || step.status === "in-progress");
+        if (lastDoneStep) {
+          await scopedStore.updateStep(task.id, lastDoneStep.index, "pending");
+        }
+        updatedTask = await scopedStore.moveTask(task.id, "in-progress", { preserveProgress: true });
+      }
+
+      const hasActiveSession = Boolean(updatedTask.sessionFile);
+      if (steeringCommentId && updatedTask.column === "in-progress" && updatedTask.assignedAgentId && !hasActiveSession) {
+        await triggerCommentWakeForAssignedAgent(scopedStore, updatedTask, {
+          triggeringCommentType: "steering",
+          triggeringCommentIds: [steeringCommentId],
+          triggerDetail: "review-address",
+        });
+      }
+
+      await scopedStore.logEntry(task.id, "Same-task review revision requested", `${selectedItems.length} item(s) submitted from review tab`);
+      res.json({ task: updatedTask, reviewState });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
     }
   });
 

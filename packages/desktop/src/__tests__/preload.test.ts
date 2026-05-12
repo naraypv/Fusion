@@ -23,26 +23,8 @@ async function importPreloadModule() {
   await import("../preload.ts");
 }
 
-function getFusionApi() {
-  const call = mocks.contextBridge.exposeInMainWorld.mock.calls.find(
-    ([name]) => name === "fusionAPI",
-  ) as [string, {
-    minimize: () => Promise<void>;
-    maximize: () => Promise<boolean>;
-    close: () => Promise<void>;
-    isMaximized: () => Promise<boolean>;
-    getSystemInfo: () => Promise<unknown>;
-    checkForUpdates: () => Promise<unknown>;
-    getServerPort: () => Promise<number | undefined>;
-    updateTrayStatus: (status: string) => Promise<void>;
-    showExportDialog: () => Promise<string | null>;
-    showImportDialog: () => Promise<string | null>;
-    onDeepLink: (callback: (result: unknown) => void) => () => void;
-    onUpdateAvailable: (callback: (info: { version: string }) => void) => () => void;
-    onUpdateDownloaded: (callback: () => void) => () => void;
-  }] | undefined;
-
-  return call?.[1];
+function getExposed<T = unknown>(name: string): T | undefined {
+  return mocks.contextBridge.exposeInMainWorld.mock.calls.find(([key]) => key === name)?.[1] as T | undefined;
 }
 
 describe("preload", () => {
@@ -51,153 +33,87 @@ describe("preload", () => {
     vi.resetModules();
   });
 
-  it("contextBridge.exposeInMainWorld is called with fusionAPI", async () => {
+  it("exposes electronAPI and fusionShell", async () => {
     await importPreloadModule();
 
-    expect(mocks.contextBridge.exposeInMainWorld).toHaveBeenCalledWith(
-      "fusionAPI",
-      expect.any(Object),
-    );
+    expect(getExposed("electronAPI")).toBeTruthy();
+    expect(getExposed("fusionAPI")).toBeTruthy();
+    expect(getExposed("fusionShell")).toBeTruthy();
   });
 
-  it("minimize invokes window:minimize", async () => {
+  it("electronAPI delegates getServerPort to IPC", async () => {
     await importPreloadModule();
+    const api = getExposed<{ getServerPort: () => Promise<number | undefined> }>("electronAPI");
 
-    const api = getFusionApi();
-    await api?.minimize();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("window:minimize");
-  });
-
-  it("maximize invokes window:maximize", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.maximize();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("window:maximize");
-  });
-
-  it("close invokes window:close", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.close();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("window:close");
-  });
-
-  it("isMaximized invokes window:isMaximized", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.isMaximized();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("window:isMaximized");
-  });
-
-  it("getSystemInfo invokes app:getSystemInfo", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.getSystemInfo();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("app:getSystemInfo");
-  });
-
-  it("checkForUpdates invokes app:checkForUpdates", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.checkForUpdates();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("app:checkForUpdates");
-  });
-
-  it("getServerPort invokes app:getServerPort", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
     await api?.getServerPort();
 
     expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("app:getServerPort");
   });
 
-  it("updateTrayStatus invokes tray:updateStatus with status argument", async () => {
+  it("electronAPI launch mode methods delegate to IPC", async () => {
     await importPreloadModule();
+    const api = getExposed<{
+      getDesktopLaunchMode: () => Promise<string>;
+      getDesktopLaunchContext: () => Promise<unknown>;
+      setDesktopLaunchMode: (mode: "choose" | "local" | "remote") => Promise<string>;
+      openConnectionManager: () => Promise<void>;
+    }>("electronAPI");
 
-    const api = getFusionApi();
-    await api?.updateTrayStatus("paused");
+    await api?.getDesktopLaunchMode();
+    await api?.getDesktopLaunchContext();
+    await api?.setDesktopLaunchMode("local");
+    await api?.openConnectionManager();
 
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("tray:updateStatus", "paused");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:getMode");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:getContext");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("desktopLaunchMode:setMode", "local");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:openConnectionManager");
   });
 
-  it("showExportDialog invokes native:showExportDialog", async () => {
+  it("fusionShell delegates connection-management methods to IPC", async () => {
     await importPreloadModule();
+    const shell = getExposed<{
+      getState: () => Promise<unknown>;
+      listProfiles: () => Promise<unknown>;
+      saveProfile: (profile: { name: string; serverUrl: string; authToken?: string | null }) => Promise<unknown>;
+      deleteProfile: (profileId: string) => Promise<void>;
+      setActiveProfile: (profileId: string | null) => Promise<unknown>;
+      getDesktopModeState: () => Promise<unknown>;
+      setDesktopMode: (mode: "local" | "remote") => Promise<unknown>;
+      startQrScan: () => Promise<unknown>;
+      openConnectionManager: () => Promise<void>;
+      subscribe: (listener: (state: unknown) => void) => () => void;
+    }>("fusionShell");
 
-    const api = getFusionApi();
-    await api?.showExportDialog();
+    await shell?.getState();
+    await shell?.listProfiles();
+    await shell?.saveProfile({ name: "Prod", serverUrl: "https://fusion.example.com", authToken: "token" });
+    await shell?.deleteProfile("p1");
+    await shell?.setActiveProfile("p1");
+    await shell?.getDesktopModeState();
+    await shell?.setDesktopMode("local");
+    await shell?.startQrScan();
+    await shell?.openConnectionManager();
 
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("native:showExportDialog");
-  });
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:getState");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:listProfiles");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:saveProfile", {
+      name: "Prod",
+      serverUrl: "https://fusion.example.com",
+      authToken: "token",
+    });
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:deleteProfile", "p1");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:setActiveProfile", "p1");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:getDesktopModeState");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:setDesktopMode", "local");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:startQrScan");
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("shell:openConnectionManager");
 
-  it("showImportDialog invokes native:showImportDialog", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    await api?.showImportDialog();
-
-    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("native:showImportDialog");
-  });
-
-  it("onDeepLink subscribes to deep-link and returns unsubscribe", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    const callback = vi.fn();
-    const unsubscribe = api?.onDeepLink(callback);
-
-    expect(mocks.ipcRenderer.on).toHaveBeenCalledWith("deep-link", expect.any(Function));
+    const unsubscribe = shell?.subscribe(() => undefined);
+    expect(mocks.ipcRenderer.on).toHaveBeenCalledWith("shell:state", expect.any(Function));
 
     unsubscribe?.();
 
-    expect(mocks.ipcRenderer.removeListener).toHaveBeenCalledWith(
-      "deep-link",
-      expect.any(Function),
-    );
-  });
-
-  it("onUpdateAvailable subscribes to update-available and returns unsubscribe", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    const callback = vi.fn();
-    const unsubscribe = api?.onUpdateAvailable(callback);
-
-    expect(mocks.ipcRenderer.on).toHaveBeenCalledWith("update-available", expect.any(Function));
-
-    unsubscribe?.();
-
-    expect(mocks.ipcRenderer.removeListener).toHaveBeenCalledWith(
-      "update-available",
-      expect.any(Function),
-    );
-  });
-
-  it("onUpdateDownloaded subscribes to update-downloaded and returns unsubscribe", async () => {
-    await importPreloadModule();
-
-    const api = getFusionApi();
-    const callback = vi.fn();
-    const unsubscribe = api?.onUpdateDownloaded(callback);
-
-    expect(mocks.ipcRenderer.on).toHaveBeenCalledWith("update-downloaded", expect.any(Function));
-
-    unsubscribe?.();
-
-    expect(mocks.ipcRenderer.removeListener).toHaveBeenCalledWith(
-      "update-downloaded",
-      expect.any(Function),
-    );
+    expect(mocks.ipcRenderer.removeListener).toHaveBeenCalledWith("shell:state", expect.any(Function));
   });
 });

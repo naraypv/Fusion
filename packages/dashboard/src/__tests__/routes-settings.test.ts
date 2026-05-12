@@ -44,11 +44,12 @@ const mockCentralListProjects = vi.fn().mockResolvedValue([]);
 const mockCentralInit = vi.fn().mockResolvedValue(undefined);
 const mockCentralClose = vi.fn().mockResolvedValue(undefined);
 const mockCentralReconcileProjectStatuses = vi.fn().mockResolvedValue(undefined);
-const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile } = vi.hoisted(() => ({
+const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile, mockGetActiveNotificationService } = vi.hoisted(() => ({
   mockPerformUpdateCheck: vi.fn(),
   mockClearUpdateCheckCache: vi.fn(),
   mockExecSync: vi.fn(),
   mockExecFile: vi.fn(),
+  mockGetActiveNotificationService: vi.fn(),
 }));
 
 vi.mock("../update-check.js", async () => {
@@ -141,6 +142,7 @@ vi.mock("@fusion/engine", async () => {
   promptWithFallback: vi.fn(async (session: { prompt: (message: string) => Promise<void> }, prompt: string) => {
     await session.prompt(prompt);
   }),
+  getActiveNotificationService: mockGetActiveNotificationService,
   AgentReflectionService: class MockAgentReflectionService {
     async generateReflection(): Promise<import("@fusion/core").AgentReflection | null> {
       throw new Error("Reflection service unavailable in route tests");
@@ -335,6 +337,8 @@ describe("GET /settings", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.prAuthAvailable).toBe(true);
+    expect(res.body.trackingAuthAvailable).toBe(true);
+    expect(res.body.trackingAuthReason).toBeNull();
     expect(res.body.githubTokenConfigured).toBeUndefined();
   });
 
@@ -359,6 +363,8 @@ describe("GET /settings", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.prAuthAvailable).toBe(false);
+    expect(res.body.trackingAuthAvailable).toBe(false);
+    expect(res.body.trackingAuthReason).toBe("gh_not_installed");
     expect(res.body.githubTokenConfigured).toBeUndefined();
   });
 
@@ -549,7 +555,13 @@ describe("PUT /settings", () => {
       buildApp(),
       "PUT",
       "/api/settings",
-      JSON.stringify({ maxConcurrent: 4, githubTokenConfigured: true, prAuthAvailable: true }),
+      JSON.stringify({
+        maxConcurrent: 4,
+        githubTokenConfigured: true,
+        prAuthAvailable: true,
+        trackingAuthAvailable: true,
+        trackingAuthReason: null,
+      }),
       { "Content-Type": "application/json" },
     );
 
@@ -566,7 +578,13 @@ describe("PUT /settings", () => {
       buildApp(),
       "PUT",
       "/api/settings",
-      JSON.stringify({ maxWorktrees: 10, githubTokenConfigured: true, prAuthAvailable: true }),
+      JSON.stringify({
+        maxWorktrees: 10,
+        githubTokenConfigured: true,
+        prAuthAvailable: true,
+        trackingAuthAvailable: false,
+        trackingAuthReason: "token_missing",
+      }),
       { "Content-Type": "application/json" },
     );
 
@@ -669,6 +687,22 @@ describe("PUT /settings", () => {
     expect(res.body.error).toContain("must include both provider and modelId or neither");
   });
 
+  it("accepts dual-scope githubTrackingDefaultRepo on project settings endpoint", async () => {
+    const updatedSettings = { ...DEFAULT_SETTINGS, githubTrackingDefaultRepo: "octo/project-default" };
+    (store.updateSettings as ReturnType<typeof vi.fn>).mockResolvedValue(updatedSettings);
+
+    const res = await REQUEST(
+      buildApp(),
+      "PUT",
+      "/api/settings",
+      JSON.stringify({ githubTrackingDefaultRepo: "octo/project-default" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateSettings).toHaveBeenCalledWith({ githubTrackingDefaultRepo: "octo/project-default" });
+  });
+
   it("rejects global-only fields with 400 error and helpful message", async () => {
     const res = await REQUEST(
       buildApp(),
@@ -711,6 +745,69 @@ describe("PUT /settings", () => {
 
     expect(res.status).toBe(200);
     expect(store.updateSettings).toHaveBeenCalledWith({ maxConcurrent: 8, autoMerge: false });
+  });
+
+  it("accepts valid nested evalSettings payload", async () => {
+    (store.updateSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      evalSettings: {
+        enabled: true,
+        intervalMs: 300000,
+        evaluatorProvider: "openai",
+        evaluatorModelId: "gpt-5",
+        followUpPolicy: "suggest-only",
+        retentionDays: 45,
+      },
+    });
+
+    const payload = {
+      evalSettings: {
+        enabled: true,
+        intervalMs: 300000,
+        evaluatorProvider: "openai",
+        evaluatorModelId: "gpt-5",
+        followUpPolicy: "suggest-only",
+        retentionDays: 45,
+      },
+    };
+
+    const res = await REQUEST(buildApp(), "PUT", "/api/settings", JSON.stringify(payload), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(store.updateSettings).toHaveBeenCalledWith(payload);
+  });
+
+  it("rejects invalid evalSettings payloads", async () => {
+    const invalidPayloads = [
+      {
+        payload: { evalSettings: { intervalMs: 59_999 } },
+        message: "evalSettings.intervalMs",
+      },
+      {
+        payload: { evalSettings: { retentionDays: 0 } },
+        message: "evalSettings.retentionDays",
+      },
+      {
+        payload: { evalSettings: { followUpPolicy: "create" } },
+        message: "evalSettings.followUpPolicy",
+      },
+      {
+        payload: { evalSettings: { evaluatorProvider: "openai" } },
+        message: "evalSettings.evaluatorProvider and evalSettings.evaluatorModelId",
+      },
+    ];
+
+    for (const { payload, message } of invalidPayloads) {
+      const res = await REQUEST(buildApp(), "PUT", "/api/settings", JSON.stringify(payload), {
+        "Content-Type": "application/json",
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(message);
+    }
+
+    expect(store.updateSettings).not.toHaveBeenCalled();
   });
 
   it("accepts partial remoteAccess patches and GET /settings returns merged sibling branches", async () => {
@@ -1039,6 +1136,23 @@ describe("PUT /settings/global", () => {
     expect(res.body.persistAgentToolOutput).toBe(false);
   });
 
+  it("accepts persistAgentThinkingLog in global updates", async () => {
+    const updatedMerged = { persistAgentThinkingLog: true };
+    (store.updateGlobalSettings as ReturnType<typeof vi.fn>).mockResolvedValue(updatedMerged);
+
+    const res = await REQUEST(
+      buildApp(),
+      "PUT",
+      "/api/settings/global",
+      JSON.stringify({ persistAgentThinkingLog: true }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ persistAgentThinkingLog: true });
+    expect(res.body.persistAgentThinkingLog).toBe(true);
+  });
+
   it("returns 500 on update error", async () => {
     (store.updateGlobalSettings as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("Write failed"));
 
@@ -1173,7 +1287,12 @@ describe("GET /settings/scopes", () => {
 
   it("returns settings separated by scope", async () => {
     (store.getSettingsByScope as ReturnType<typeof vi.fn>).mockResolvedValue({
-      global: { themeMode: "dark", defaultProvider: "anthropic", persistAgentToolOutput: true },
+      global: {
+        themeMode: "dark",
+        defaultProvider: "anthropic",
+        persistAgentToolOutput: true,
+        persistAgentThinkingLog: false,
+      },
       project: { maxConcurrent: 4, autoMerge: false },
     });
 
@@ -1183,9 +1302,11 @@ describe("GET /settings/scopes", () => {
     expect(res.body.global.themeMode).toBe("dark");
     expect(res.body.global.defaultProvider).toBe("anthropic");
     expect(res.body.global.persistAgentToolOutput).toBe(true);
+    expect(res.body.global.persistAgentThinkingLog).toBe(false);
     expect(res.body.project.maxConcurrent).toBe(4);
     expect(res.body.project.autoMerge).toBe(false);
     expect(res.body.project.persistAgentToolOutput).toBeUndefined();
+    expect(res.body.project.persistAgentThinkingLog).toBeUndefined();
   });
 
   it("returns exact response envelope shape with only global and project keys", async () => {
@@ -1249,6 +1370,31 @@ describe("GET /settings/scopes", () => {
     expect(res.body.project.planningModelId).toBe("claude-sonnet-4-5");
     expect(res.body.project.titleSummarizerProvider).toBe("google");
     expect(res.body.project.titleSummarizerModelId).toBe("gemini-2.5-pro");
+  });
+
+  it("returns evalSettings in project scope only", async () => {
+    (store.getSettingsByScope as ReturnType<typeof vi.fn>).mockResolvedValue({
+      global: { themeMode: "dark" },
+      project: {
+        evalSettings: {
+          enabled: true,
+          intervalMs: 300000,
+          followUpPolicy: "auto-create",
+          retentionDays: 14,
+        },
+      },
+    });
+
+    const res = await GET(buildApp(), "/api/settings/scopes");
+
+    expect(res.status).toBe(200);
+    expect(res.body.project.evalSettings).toEqual({
+      enabled: true,
+      intervalMs: 300000,
+      followUpPolicy: "auto-create",
+      retentionDays: 14,
+    });
+    expect(res.body.global.evalSettings).toBeUndefined();
   });
 
   it("returns remoteAccess only under project scope", async () => {
@@ -1610,6 +1756,7 @@ describe("POST /settings/test-notification", () => {
 
   beforeEach(() => {
     store = createMockStore();
+    mockGetActiveNotificationService.mockReset();
     fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
   });
 
@@ -1644,6 +1791,38 @@ describe("POST /settings/test-notification", () => {
         }),
       }),
     );
+  });
+
+  it("ntfy provider dispatches a message-event pipeline test when messageEventType is provided", async () => {
+    const dispatchSpy = vi.fn().mockResolvedValue(undefined);
+    mockGetActiveNotificationService.mockReturnValue({ dispatch: dispatchSpy });
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "test-topic",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-notification",
+      JSON.stringify({ providerId: "ntfy", messageEventType: "message:agent-to-user" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    expect(dispatchSpy).toHaveBeenCalledWith(
+      "message:agent-to-user",
+      expect.objectContaining({
+        event: "message:agent-to-user",
+        metadata: expect.objectContaining({
+          fromId: "system",
+          toId: "user",
+          preview: "Fusion test message notification",
+        }),
+      }),
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("ntfy provider uses config override for baseUrl", async () => {

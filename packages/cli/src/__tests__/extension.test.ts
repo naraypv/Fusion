@@ -123,6 +123,7 @@ async function enableResearch(cwd: string): Promise<TaskStore> {
     researchGlobalEnabled: true,
     researchGlobalDefaults: { searchProvider: "searxng" },
     researchGlobalSearxngUrl: "http://localhost:8888",
+    experimentalFeatures: { researchView: true } as Record<string, boolean>,
   });
   await store.updateSettings({
     researchEnabled: true,
@@ -135,15 +136,16 @@ async function enableResearch(cwd: string): Promise<TaskStore> {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-// Audited in FN-3189: this suite is expensive (~62s) and currently stale
-// against modern extension behavior/tooling (see FN-3204). Keep an explicit,
-// discoverable gate so it never silently disappears behind unconditional skip,
-// but do not include it in the default slow lane until the failures are fixed.
-const SHOULD_RUN_EXTENSION_INTEGRATION =
-  process.env.FUSION_TEST_EXTENSION_INTEGRATION === "1" ||
-  process.env.FUSION_TEST_EXTENSION_INTEGRATION === "true";
+// Audited in FN-3189: this exhaustive suite is expensive (~62s) and stale
+// against modern extension behavior/tooling (see FN-3204). The maintained
+// release lane lives in extension-integration.test.ts and uses
+// FUSION_TEST_EXTENSION_INTEGRATION. Keep this under a separate legacy gate for
+// historical debugging only.
+const SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION =
+  process.env.FUSION_TEST_LEGACY_EXTENSION_INTEGRATION === "1" ||
+  process.env.FUSION_TEST_LEGACY_EXTENSION_INTEGRATION === "true";
 
-describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
+describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (legacy exhaustive suite)", () => {
   let tmpDir: string;
   let api: ReturnType<typeof createMockAPI>;
 
@@ -202,6 +204,8 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
         "fn_feature_link_task",
         "fn_agent_stop",
         "fn_agent_start",
+        "fn_agent_create",
+        "fn_agent_delete",
         "fn_list_agents",
         "fn_delegate_task",
         "fn_agent_show",
@@ -354,6 +358,22 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
       expect(result.details.assignedAgentId).toBeUndefined();
       expect(result.content[0].text).not.toContain("Assigned to:");
     });
+
+    it("FN-3799: treats empty-string agentId as unassigned on create", async () => {
+      const tool = api.tools.get("fn_task_create")!;
+      const result = await tool.execute(
+        "call-1",
+        { description: "Task without assignee", agentId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(result.details.assignedAgentId).toBeUndefined();
+      expect(result.content[0].text).not.toContain("Agent  not found");
+      expect(result.content[0].text).not.toContain("Assigned to:");
+    });
   });
 
   describe("fn_task_update", () => {
@@ -454,6 +474,120 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
       expect(show.details.task.assignedAgentId).toBe(agentId);
     });
 
+    it("FN-3799: clears task assigned agent ID with empty string", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      await createTool.execute(
+        "c1",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const result = await updateTool.execute(
+        "u1",
+        { id: "FN-001", agentId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.content[0].text).toContain("Updated FN-001");
+      expect(result.details.updatedFields).toEqual(["agentId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute("s1", { id: "FN-001" }, undefined, undefined, makeCtx(tmpDir));
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("clears task assigned agent ID with whitespace", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      await createTool.execute(
+        "c1",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const result = await updateTool.execute(
+        "u1",
+        { id: "FN-001", agentId: "   " },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.content[0].text).toContain("Updated FN-001");
+      expect(result.details.updatedFields).toEqual(["agentId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute("s1", { id: "FN-001" }, undefined, undefined, makeCtx(tmpDir));
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("clears task assigned agent ID with literal null string", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      await createTool.execute(
+        "c1",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const result = await updateTool.execute(
+        "u1",
+        { id: "FN-001", agentId: "null" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.content[0].text).toContain("Updated FN-001");
+      expect(result.details.updatedFields).toEqual(["agentId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute("s1", { id: "FN-001" }, undefined, undefined, makeCtx(tmpDir));
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("clears node override with empty string", async () => {
+      const createTool = api.tools.get("fn_task_create")!;
+      await createTool.execute("c1", { description: "Original" }, undefined, undefined, makeCtx(tmpDir));
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const setNode = await updateTool.execute(
+        "u1",
+        { id: "FN-001", nodeId: "node-123" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(setNode.isError).not.toBe(true);
+
+      const clearNode = await updateTool.execute(
+        "u2",
+        { id: "FN-001", nodeId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(clearNode.content[0].text).toContain("Updated FN-001");
+      expect(clearNode.details.updatedFields).toEqual(["nodeId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute("s1", { id: "FN-001" }, undefined, undefined, makeCtx(tmpDir));
+      expect(show.details.task.nodeId).toBeNull();
+    });
+
     it("rejects unknown agent IDs on update", async () => {
       const createTool = api.tools.get("fn_task_create")!;
       await createTool.execute("c1", { description: "Original" }, undefined, undefined, makeCtx(tmpDir));
@@ -468,7 +602,7 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
       );
 
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("Agent agent-does-not-exist not found");
+      expect(result.content[0].text).toBe("Agent agent-does-not-exist not found");
     });
 
     it("clears task assigned agent ID with null", async () => {
@@ -562,6 +696,30 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
       expect(result.details.count).toBe(2);
     });
 
+    it("includes concise provenance in list rows", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      await store.createTask({
+        description: "Created by dashboard",
+        source: { sourceType: "dashboard_ui" },
+      });
+      await store.createTask({
+        description: "Created by agent",
+        source: {
+          sourceType: "agent_heartbeat",
+          sourceAgentId: "agent-123",
+          sourceMetadata: { agentName: "Reviewer Bot" },
+        },
+      });
+
+      const listTool = api.tools.get("fn_task_list")!;
+      const result = await listTool.execute("call-2", {}, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.content[0].text).toContain("FN-001  Created by dashboard [via: Dashboard]");
+      expect(result.content[0].text).toContain("FN-002  Created by agent [via: Agent (Reviewer Bot)]");
+    });
+
     it("filters by column", async () => {
       const createTool = api.tools.get("fn_task_create")!;
       await createTool.execute(
@@ -645,8 +803,36 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
       expect(result.content[0].text).toContain("FN-001");
       expect(result.content[0].text).toContain("Implement caching layer");
       expect(result.content[0].text).toContain("Planning");
+      expect(result.content[0].text).toContain("Created via: API");
       expect(result.details.task).toBeDefined();
       expect(result.details.task.id).toBe("FN-001");
+    });
+
+    it("shows agent and dashboard provenance", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      await store.createTask({
+        description: "Agent created",
+        source: {
+          sourceType: "agent_heartbeat",
+          sourceAgentId: "agent-999",
+          sourceMetadata: { agentName: "Scout" },
+        },
+      });
+      await store.createTask({
+        description: "UI created",
+        source: { sourceType: "dashboard_ui" },
+      });
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const agentResult = await showTool.execute("call-2", { id: "FN-001" }, undefined, undefined, makeCtx(tmpDir));
+      const dashboardResult = await showTool.execute("call-3", { id: "FN-002" }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(agentResult.content[0].text).toContain("Created via: Agent (Scout)");
+      expect(dashboardResult.content[0].text).toContain("Created via: Dashboard");
+      expect(agentResult.details.task.sourceMetadata?.agentName).toBe("Scout");
+      expect(agentResult.details.task.sourceAgentId).toBe("agent-999");
     });
   });
 
@@ -1185,6 +1371,10 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("fn pi extension", () => {
         issueNumber: 1,
         url: "https://github.com/acme/demo/issues/1",
       });
+      expect(issueOneTask?.source?.sourceMetadata).toEqual({
+        issueUrl: "https://github.com/acme/demo/issues/1",
+        issueNumber: 1,
+      });
     });
 
     it("fn_task_browse_github_issues lists issues via gh api", async () => {
@@ -1284,6 +1474,310 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     expect(result.content[0].text).toContain(ephemeralId);
   });
 
+  it("fn_task_create allows durable engineer assignment for implementation tasks", async () => {
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    await agentStore.init();
+    const engineer = await agentStore.createAgent({ name: "engineer-create", role: "engineer" });
+
+    const createTool = api.tools.get("fn_task_create")!;
+    const result = await createTool.execute(
+      "create-role-check-engineer",
+      { description: "create with engineer", agentId: engineer.id },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0].text).toContain(`Assigned to: ${engineer.id}`);
+  });
+
+  it("fn_task_create rejects reviewer assignment for implementation tasks", async () => {
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    await agentStore.init();
+    const reviewer = await agentStore.createAgent({ name: "reviewer-create", role: "reviewer" });
+
+    const createTool = api.tools.get("fn_task_create")!;
+    const result = await createTool.execute(
+      "create-role-check",
+      { description: "create with reviewer", agentId: reviewer.id },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+  });
+
+  it("fn_task_update rejects reviewer assignment for implementation tasks", async () => {
+    const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+    await agentStore.init();
+    const reviewer = await agentStore.createAgent({ name: "reviewer", role: "reviewer" });
+
+    const store = new TaskStore(tmpDir);
+    await store.init();
+    const task = await store.createTask({ description: "needs owner", column: "todo" });
+
+    const updateTool = api.tools.get("fn_task_update")!;
+    const result = await updateTool.execute(
+      "update-role-check",
+      { id: task.id, agentId: reviewer.id },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+  });
+
+  describe("FN-3799 assignment normalization", () => {
+    it("FN-3799: treats empty-string agentId as unassigned on create", async () => {
+      const createTool = api.tools.get("fn_task_create")!;
+      const result = await createTool.execute(
+        "create-empty-agent",
+        { description: "Task without assignee", agentId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(result.details.assignedAgentId).toBeUndefined();
+      expect(result.content[0].text).not.toContain("Assigned to:");
+      expect(result.content[0].text).not.toContain("Agent  not found");
+    });
+
+    it("clears task assigned agent ID with empty string", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      const created = await createTool.execute(
+        "create-assigned",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const result = await updateTool.execute(
+        "update-clear-empty",
+        { id: created.details.taskId, agentId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.content[0].text).toContain(`Updated ${created.details.taskId}`);
+      expect(result.details.updatedFields).toEqual(["agentId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute(
+        "show-cleared-empty",
+        { id: created.details.taskId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("clears task assigned agent ID with whitespace", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      const created = await createTool.execute(
+        "create-assigned-whitespace",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      await updateTool.execute(
+        "update-clear-whitespace",
+        { id: created.details.taskId, agentId: "   " },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute(
+        "show-cleared-whitespace",
+        { id: created.details.taskId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("clears task assigned agent ID with literal null string", async () => {
+      const agentId = await seedAgent(tmpDir);
+      const createTool = api.tools.get("fn_task_create")!;
+      const created = await createTool.execute(
+        "create-assigned-null-string",
+        { description: "Original", agentId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      await updateTool.execute(
+        "update-clear-null-string",
+        { id: created.details.taskId, agentId: "null" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute(
+        "show-cleared-null-string",
+        { id: created.details.taskId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(show.details.task.assignedAgentId).toBeUndefined();
+    });
+
+    it("returns readable unknown-agent errors with the invalid id", async () => {
+      const createTool = api.tools.get("fn_task_create")!;
+      const created = await createTool.execute(
+        "create-for-error",
+        { description: "Original" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const result = await updateTool.execute(
+        "update-unknown-agent",
+        { id: created.details.taskId, agentId: "agent-does-not-exist" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe("Agent agent-does-not-exist not found");
+    });
+
+    it("clears node override with empty string", async () => {
+      const createTool = api.tools.get("fn_task_create")!;
+      const created = await createTool.execute(
+        "create-node-task",
+        { description: "Original" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      const updateTool = api.tools.get("fn_task_update")!;
+      const setNode = await updateTool.execute(
+        "set-node",
+        { id: created.details.taskId, nodeId: "node-123" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(setNode.isError).not.toBe(true);
+
+      const clearNode = await updateTool.execute(
+        "clear-node",
+        { id: created.details.taskId, nodeId: "" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(clearNode.content[0].text).toContain(`Updated ${created.details.taskId}`);
+      expect(clearNode.details.updatedFields).toEqual(["nodeId"]);
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute(
+        "show-cleared-node",
+        { id: created.details.taskId },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+      expect(show.details.task.nodeId).toBeUndefined();
+    });
+  });
+
+  describe("fn_task_retry", () => {
+    it("moves execution-failed in-review task (incomplete steps) to todo preserving progress", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      const task = await store.createTask({
+        title: "execution-failed task",
+        description: "test",
+        column: "todo",
+      });
+      await store.updateTask(task.id, {
+        steps: [
+          { name: "Step 0", status: "done" },
+          { name: "Step 1", status: "in-progress" },
+          { name: "Step 2", status: "pending" },
+        ],
+      });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, { status: "failed", error: "429 rate limited" });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-exec", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("todo");
+
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("todo");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.steps[1].status).toBe("in-progress");
+    });
+
+    it("keeps merge-failed in-review task (all steps done) in in-review and resets merge state", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      const task = await store.createTask({
+        title: "merge-failed task",
+        description: "test",
+        column: "todo",
+      });
+      await store.updateTask(task.id, {
+        steps: [
+          { name: "Step 0", status: "done" },
+          { name: "Step 1", status: "done" },
+        ],
+      });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, { status: "failed", error: "merge conflict", mergeRetries: 3 });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-merge", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("in-review");
+
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("in-review");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.mergeRetries).toBe(0);
+    });
+  });
+
   describe("fn_list_agents", () => {
     it("returns agent list", async () => {
       await seedAgent(tmpDir, { name: "alpha-agent" });
@@ -1345,6 +1839,31 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   });
 
   describe("research tools", () => {
+    it("fn_research_run treats builtin as configured when no provider is explicitly set", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+      await store.updateGlobalSettings({
+        researchGlobalEnabled: true,
+        experimentalFeatures: { researchView: true } as Record<string, boolean>,
+      });
+      await store.updateSettings({
+        researchEnabled: true,
+        researchSettings: { enabled: true },
+      });
+
+      const tool = api.tools.get("fn_research_run")!;
+      const result = await tool.execute(
+        "research-run-builtin",
+        { query: "builtin default" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.details.setup).toBeNull();
+      expect(result.details.status).toBe("queued");
+    });
+
     it("fn_research_list status parameter matches RESEARCH_RUN_STATUSES", () => {
       const tool = api.tools.get("fn_research_list") as any;
       const statusSchema = tool.parameters.properties.status;
@@ -1373,17 +1892,32 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       const tool = api.tools.get("fn_research_run")!;
       const researchStore = store.getResearchStore();
 
-      setTimeout(() => {
+      const settleRunToCompleted = () => {
         const queuedRun = researchStore.listRuns({ limit: 1 })[0];
         if (!queuedRun) {
-          return;
+          return false;
         }
-        researchStore.updateRun(queuedRun.id, { status: "running" });
+        if (queuedRun.status === "completed") {
+          return true;
+        }
+        if (queuedRun.status === "queued") {
+          researchStore.updateRun(queuedRun.id, { status: "running" });
+        }
         researchStore.updateRun(queuedRun.id, {
           status: "completed",
           results: { summary: "done", findings: [{ heading: "h1", content: "f1", sources: [] }], citations: [] },
         });
-      }, 25);
+        return true;
+      };
+
+      if (!settleRunToCompleted()) {
+        const interval = setInterval(() => {
+          if (settleRunToCompleted()) {
+            clearInterval(interval);
+          }
+        }, 25);
+        setTimeout(() => clearInterval(interval), 500);
+      }
 
       const result = await tool.execute(
         "research-run-wait",
@@ -1455,6 +1989,68 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("ephemeral/runtime agent");
+    });
+
+    it("allows durable engineer delegate target without override", async () => {
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      await agentStore.init();
+      const engineer = await agentStore.createAgent({ name: "delegate-engineer", role: "engineer" });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-role-eng",
+        { agent_id: engineer.id, description: "Engineer routing" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(result.details.agentId).toBe(engineer.id);
+    });
+
+    it("rejects reviewer delegate target without override", async () => {
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      await agentStore.init();
+      const reviewer = await agentStore.createAgent({ name: "delegate-reviewer", role: "reviewer" });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-role-1",
+        { agent_id: reviewer.id, description: "Will fail role policy" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("requires an \"executor\"-role agent");
+    });
+
+    it("allows non-executor delegate target with override", async () => {
+      const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
+      await agentStore.init();
+      const reviewer = await agentStore.createAgent({ name: "delegate-reviewer-override", role: "reviewer" });
+
+      const tool = api.tools.get("fn_delegate_task")!;
+      const result = await tool.execute(
+        "dt-role-2",
+        { agent_id: reviewer.id, description: "Intentional override", override: true },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(result.details.agentId).toBe(reviewer.id);
+
+      const store = new TaskStore(tmpDir);
+      await store.init();
+      const task = await store.getTask(result.details.taskId);
+      expect(task.sourceMetadata).toMatchObject({ executorRoleOverride: true });
+
+      const selected = await store.selectNextTaskForAgent(reviewer.id, { id: reviewer.id, role: reviewer.role });
+      expect(selected?.task.id).toBe(task.id);
     });
 
     it("wires dependencies correctly", async () => {

@@ -5,6 +5,7 @@ import {
   fetchChatMessages,
   updateChatSession,
   deleteChatSession,
+  attachChatStream,
   streamChatResponse,
   cancelChatResponse,
   fetchAgents,
@@ -12,7 +13,7 @@ import {
 } from "../api";
 import { subscribeSse } from "../sse-bus";
 import { getScopedItem, setScopedItem, removeScopedItem } from "../utils/projectStorage";
-import type { Agent, ChatMessage } from "@fusion/core";
+import type { Agent, ChatInFlightGenerationState, ChatMessage } from "@fusion/core";
 
 const ACTIVE_SESSION_STORAGE_KEY = "kb-chat-active-session";
 
@@ -28,40 +29,15 @@ export interface ChatSessionInfo {
   lastMessagePreview?: string;
   lastMessageAt?: string;
   isGenerating?: boolean;
+  inFlightGeneration?: ChatInFlightGenerationState | null;
 }
 
-export interface ToolCallInfo {
-  toolName: string;
-  args?: Record<string, unknown>;
-  isError: boolean;
-  result?: unknown;
-  status: "running" | "completed";
-}
-
-export interface FallbackInfo {
-  primaryModel: string;
-  fallbackModel: string;
-  triggerPoint: "session-creation" | "prompt-time";
-}
-
-export interface ChatMessageInfo {
-  id: string;
-  sessionId: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  thinkingOutput?: string | null;
-  toolCalls?: ToolCallInfo[];
-  fallbackInfo?: FallbackInfo;
-  attachments?: Array<{
-    id: string;
-    filename: string;
-    originalName: string;
-    mimeType: string;
-    size: number;
-    createdAt: string;
-  }>;
-  createdAt: string;
-}
+// Re-export shared chat types so existing consumers (`import { ChatMessageInfo } from "../hooks/useChat"`)
+// keep working — single source of truth lives in chatTypes.ts.
+export type { ChatMessageInfo, FallbackInfo, ToolCallInfo } from "./chatTypes";
+import type { ChatMessageInfo, FallbackInfo, ToolCallInfo } from "./chatTypes";
+import { createChatStreamHandlers } from "./createChatStreamHandlers";
+import { isLikelyTabSuspensionError, useTabVisibilitySuspension } from "./visibilitySuspension";
 
 export interface UseChatReturn {
   // Session state
@@ -290,22 +266,35 @@ export function useChat(
     refreshSessions();
   }, [refreshSessions]);
 
-  // Restore active session from localStorage after initial load
-  // Uses a ref to avoid circular dependency with selectSession
+  // Restore active session from localStorage after initial load.
+  // Uses refs to avoid circular dependency with selectSession and to avoid
+  // re-selecting/resetting the thread on every sessions refresh.
   const selectSessionRef = useRef<(id: string, sessionOverride?: ChatSessionInfo) => void>(() => {
     /* noop - will be replaced after selectSession is defined */
   });
+  const hasRestoredActiveSessionRef = useRef(false);
+
   useEffect(() => {
-    if (sessionsLoading) return; // Wait for sessions to load
+    hasRestoredActiveSessionRef.current = false;
+  }, [projectId]);
+
+  useEffect(() => {
+    if (sessionsLoading || hasRestoredActiveSessionRef.current || activeSessionRef.current) return;
 
     const savedSessionId = getScopedItem(ACTIVE_SESSION_STORAGE_KEY, projectId);
-    if (savedSessionId) {
-      // Check if the saved session exists in the loaded sessions
-      const session = sessions.find((s) => s.id === savedSessionId);
-      if (session) {
-        selectSessionRef.current(savedSessionId);
-      }
+    if (!savedSessionId) {
+      hasRestoredActiveSessionRef.current = true;
+      return;
     }
+
+    const session = sessions.find((s) => s.id === savedSessionId);
+    if (session) {
+      hasRestoredActiveSessionRef.current = true;
+      selectSessionRef.current(savedSessionId, session);
+      return;
+    }
+
+    hasRestoredActiveSessionRef.current = true;
   }, [sessionsLoading, sessions, projectId]);
 
   // Load messages when active session changes
@@ -342,9 +331,73 @@ export function useChat(
     setIsStreaming(false);
   }, []);
 
+  const attachIfGenerating = useCallback((sessionId: string, inFlightGeneration?: ChatInFlightGenerationState | null) => {
+    if (streamRef.current || !sessionId) {
+      return true;
+    }
+
+    cancelledByUserRef.current = false;
+    if (inFlightGeneration) {
+      setStreamingText(inFlightGeneration.streamingText);
+      setStreamingThinking(inFlightGeneration.streamingThinking);
+      setStreamingToolCalls(inFlightGeneration.toolCalls);
+    }
+    setIsStreaming(true);
+
+    const { handlers } = createChatStreamHandlers({
+      sessionId,
+      tempUserMessageId: "",
+      setStreamingText,
+      setStreamingThinking,
+      setStreamingToolCalls,
+      cancelStreamingFlushesRef,
+      addToast,
+      onFallbackSession: (data, fallbackSessionId) => {
+        const nextModel = parseModelDescriptor(data.fallbackModel);
+        setSessions((prev) => prev.map((session) =>
+          session.id === fallbackSessionId ? { ...session, ...nextModel } : session,
+        ));
+        setActiveSession((prev) => prev && prev.id === fallbackSessionId ? { ...prev, ...nextModel } : prev);
+      },
+      onDone: () => {
+        setStreamingText("");
+        setStreamingThinking("");
+        setStreamingToolCalls([]);
+        setIsStreaming(false);
+        isStreamingRef.current = false;
+        streamRef.current = null;
+        void loadMessages(sessionId);
+      },
+      onError: (data) => {
+        setStreamingText("");
+        setStreamingThinking("");
+        setStreamingToolCalls([]);
+        setIsStreaming(false);
+        isStreamingRef.current = false;
+        streamRef.current = null;
+        const errorMessage = typeof data === "string" && data.trim() ? data : "Failed to get response";
+        addToast?.(errorMessage, "error");
+        void loadMessages(sessionId);
+      },
+    });
+
+    const stream = attachChatStream(sessionId, handlers, projectId, {
+      ...(typeof inFlightGeneration?.replayFromEventId === "number"
+        ? { lastEventId: inFlightGeneration.replayFromEventId }
+        : {}),
+    });
+    streamRef.current = stream;
+    return true;
+  }, [addToast, loadMessages, projectId]);
+
   // Select a session
   const selectSession = useCallback(
     (id: string, sessionOverride?: ChatSessionInfo) => {
+      const currentActiveSessionId = activeSessionRef.current?.id ?? null;
+      if (id && currentActiveSessionId === id && !sessionOverride) {
+        return;
+      }
+
       // Close any existing stream
       if (streamRef.current) {
         streamRef.current.close();
@@ -371,8 +424,7 @@ export function useChat(
       // all streaming state. Showing "Connecting…" immediately tells the
       // user the AI is still working.
       if (session?.isGenerating) {
-        setIsStreaming(true);
-        setStreamingText("");
+        attachIfGenerating(session.id, session.inFlightGeneration);
       }
 
       // Persist active session to localStorage
@@ -382,7 +434,7 @@ export function useChat(
         removeScopedItem(ACTIVE_SESSION_STORAGE_KEY, projectId);
       }
     },
-    [sessions, loadMessages, projectId, resetTransientComposerState],
+    [attachIfGenerating, sessions, loadMessages, projectId, resetTransientComposerState],
   );
 
   // Update the ref to point to the actual selectSession function
@@ -494,11 +546,16 @@ export function useChat(
    * @param content Message text content to send.
    * @param attachments Optional files to upload with the message in the same request.
    */
+  const sendMessageRef = useRef<(content: string, attachments?: File[]) => void>(() => {
+    // no-op until sendMessage is defined
+  });
+  const visibilitySuspension = useTabVisibilitySuspension();
+
   const sendMessage = useCallback(
     (content: string, attachments?: File[]) => {
       if (!activeSession) return;
 
-      if (isStreaming) {
+      if (isStreamingRef.current) {
         pendingMessageRef.current = content;
         setPendingMessage(content);
         return;
@@ -529,124 +586,37 @@ export function useChat(
       setStreamingToolCalls([]);
       setIsStreaming(true);
 
-      // Accumulate streaming text and tool calls in local variables
-      let capturedText = "";
-      let capturedThinking = "";
-      let capturedToolCalls: ToolCallInfo[] = [];
-      let capturedFallbackInfo: FallbackInfo | undefined;
-
-      // Coalesce per-token state updates to one render per animation frame.
-      // ReactMarkdown re-parses the entire growing string on every render and
-      // every prior message also re-renders, so unthrottled updates pin the
-      // main thread for long replies.
-      let textRaf: number | null = null;
-      let thinkingRaf: number | null = null;
-      const flushText = () => {
-        textRaf = null;
-        setStreamingText(capturedText);
-      };
-      const flushThinking = () => {
-        thinkingRaf = null;
-        setStreamingThinking(capturedThinking);
-      };
-      const cancelStreamingFlushes = () => {
-        if (textRaf !== null) {
-          cancelAnimationFrame(textRaf);
-          textRaf = null;
-        }
-        if (thinkingRaf !== null) {
-          cancelAnimationFrame(thinkingRaf);
-          thinkingRaf = null;
-        }
-      };
-      cancelStreamingFlushesRef.current = cancelStreamingFlushes;
-
-      const textHandlers = {
-        onThinking: (data: string) => {
-          capturedThinking += data;
-          if (thinkingRaf === null) {
-            thinkingRaf = requestAnimationFrame(flushThinking);
-          }
-        },
-        onText: (data: string) => {
-          capturedText += data;
-          if (textRaf === null) {
-            textRaf = requestAnimationFrame(flushText);
-          }
-        },
-        onToolStart: (data: { toolName: string; args?: Record<string, unknown> }) => {
-          capturedToolCalls = [
-            ...capturedToolCalls,
-            {
-              toolName: data.toolName,
-              args: data.args,
-              isError: false,
-              status: "running",
-            },
-          ];
-          setStreamingToolCalls(capturedToolCalls);
-        },
-        onToolEnd: (data: { toolName: string; isError: boolean; result?: unknown }) => {
-          const nextToolCalls = [...capturedToolCalls];
-          for (let i = nextToolCalls.length - 1; i >= 0; i--) {
-            const candidate = nextToolCalls[i];
-            if (candidate?.toolName === data.toolName && candidate.status === "running") {
-              nextToolCalls[i] = {
-                ...candidate,
-                status: "completed",
-                isError: data.isError,
-                result: data.result,
-              };
-              capturedToolCalls = nextToolCalls;
-              setStreamingToolCalls(nextToolCalls);
-              return;
-            }
-          }
-
-          capturedToolCalls = [
-            ...nextToolCalls,
-            {
-              toolName: data.toolName,
-              isError: data.isError,
-              result: data.result,
-              status: "completed",
-            },
-          ];
-          setStreamingToolCalls(capturedToolCalls);
-        },
-        onFallback: (data: FallbackInfo) => {
-          capturedFallbackInfo = data;
+      const { handlers } = createChatStreamHandlers({
+        sessionId: activeSession.id,
+        tempUserMessageId: tempId,
+        setStreamingText,
+        setStreamingThinking,
+        setStreamingToolCalls,
+        cancelStreamingFlushesRef,
+        addToast,
+        onFallbackSession: (data, sessionId) => {
           const nextModel = parseModelDescriptor(data.fallbackModel);
           setSessions((prev) => prev.map((session) =>
-            session.id === activeSession.id
-              ? {
-                  ...session,
-                  ...nextModel,
-                }
-              : session,
+            session.id === sessionId ? { ...session, ...nextModel } : session,
           ));
-          setActiveSession((prev) => prev && prev.id === activeSession.id
-            ? {
-                ...prev,
-                ...nextModel,
-              }
-            : prev);
-          addToast?.(`Primary model unavailable. Switched to fallback ${data.fallbackModel}.`, "warning");
+          setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, ...nextModel } : prev);
         },
-        onDone: (data: { messageId: string }) => {
-          cancelStreamingFlushes();
-          const assistantMessage: ChatMessageInfo = {
-            id: data.messageId || `msg-${Date.now()}`,
-            sessionId: activeSession.id,
-            role: "assistant",
-            content: capturedText,
-            thinkingOutput: capturedThinking,
-            toolCalls: capturedToolCalls.length > 0 ? capturedToolCalls : undefined,
-            fallbackInfo: capturedFallbackInfo,
-            createdAt: new Date().toISOString(),
-          };
+        onDone: ({ messageId, message: finalMessage, accumulated }) => {
+          const assistantMessage: ChatMessageInfo = finalMessage
+            ? mapChatMessageToInfo(finalMessage)
+            : {
+                id: messageId || `msg-${Date.now()}`,
+                sessionId: activeSession.id,
+                role: "assistant",
+                content: accumulated.text,
+                thinkingOutput: accumulated.thinking,
+                toolCalls: accumulated.toolCalls.length > 0 ? accumulated.toolCalls : undefined,
+                fallbackInfo: accumulated.fallbackInfo,
+                createdAt: new Date().toISOString(),
+              };
 
-          // Track this message ID so SSE handler skips it if event arrives first
+          // Track this message ID so the SSE chatMessageAdded handler skips it
+          // if the broadcast event arrives before our optimistic add settles.
           streamingMessageIdsRef.current.add(assistantMessage.id);
 
           // Preserve user message and add assistant message
@@ -656,6 +626,7 @@ export function useChat(
           setStreamingThinking("");
           setStreamingToolCalls([]);
           setIsStreaming(false);
+          isStreamingRef.current = false;
           streamRef.current = null;
 
           // Clean up tracked ID after a short delay (SSE event should arrive quickly)
@@ -669,35 +640,53 @@ export function useChat(
           if (queuedMessage) {
             pendingMessageRef.current = "";
             setPendingMessage("");
-            sendMessage(queuedMessage);
+            sendMessageRef.current(queuedMessage);
           }
         },
-        onError: (data: string) => {
-          cancelStreamingFlushes();
-          setMessages((prev) => prev.filter((m) => m.id !== tempId));
+        onError: (data, tempUserMessageId) => {
+          setMessages((prev) => prev.filter((m) => m.id !== tempUserMessageId));
           setStreamingText("");
           setStreamingThinking("");
           setStreamingToolCalls([]);
           setIsStreaming(false);
+          isStreamingRef.current = false;
           streamRef.current = null;
           console.error("[useChat] Stream error:", data);
-          addToast?.(typeof data === "string" && data.trim() ? data : "Failed to get response", "error");
+          const errorMessage = typeof data === "string" && data.trim() ? data : "Failed to get response";
+          const shouldSuppressSuspensionError = typeof data === "string"
+            && isLikelyTabSuspensionError(data)
+            && (visibilitySuspension.isHiddenNow() || visibilitySuspension.wasRecentlyHidden(5000));
+
+          if (shouldSuppressSuspensionError) {
+            console.info("[useChat] Suppressed tab-suspension stream error:", data);
+            if (activeSession?.id) {
+              if (activeSession.isGenerating) {
+                attachIfGenerating(activeSession.id, activeSession.inFlightGeneration);
+              } else {
+                void loadMessages(activeSession.id);
+              }
+            }
+          } else {
+            addToast?.(errorMessage, "error");
+          }
 
           if (!cancelledByUserRef.current) {
             const queuedMessage = pendingMessageRef.current.trim();
             if (queuedMessage) {
               pendingMessageRef.current = "";
               setPendingMessage("");
-              sendMessage(queuedMessage);
+              sendMessageRef.current(queuedMessage);
             }
           }
         },
-      };
+      });
 
-      streamRef.current = streamChatResponse(activeSession.id, content, textHandlers, attachments, projectId);
+      streamRef.current = streamChatResponse(activeSession.id, content, handlers, attachments, projectId);
     },
-    [activeSession, isStreaming, projectId, refreshSessions, addToast],
+    [activeSession, projectId, refreshSessions, addToast, loadMessages, attachIfGenerating, visibilitySuspension],
   );
+
+  sendMessageRef.current = sendMessage;
 
   // Filter sessions based on search query
   const filteredSessions = searchQuery
@@ -707,6 +696,42 @@ export function useChat(
           s.agentId.toLowerCase().includes(searchQuery.toLowerCase()),
       )
     : sessions;
+
+  // Recovery mode polling: if reloaded mid-generation, keep waiting state alive
+  // until generation finishes and messages can be reloaded.
+  useEffect(() => {
+    if (!activeSessionRef.current?.isGenerating) return;
+
+    if (!streamRef.current) {
+      attachIfGenerating(activeSessionRef.current.id, activeSessionRef.current.inFlightGeneration);
+    }
+
+    if (!isStreamingRef.current || streamRef.current || !activeSessionRef.current) return;
+
+    const interval = setInterval(async () => {
+      if (!isStreamingRef.current || streamRef.current || !activeSessionRef.current) {
+        clearInterval(interval);
+        return;
+      }
+
+      try {
+        const data: ChatSessionListResponse = await fetchChatSessions(projectId);
+        const session = data.sessions.find((candidate) => candidate.id === activeSessionRef.current?.id);
+        if (!session?.isGenerating) {
+          clearInterval(interval);
+          await loadMessages(activeSessionRef.current.id);
+          setStreamingText("");
+          setStreamingThinking("");
+          setStreamingToolCalls([]);
+          setIsStreaming(false);
+        }
+      } catch {
+        // Silently fail - will retry next interval
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [attachIfGenerating, loadMessages, projectId, activeSession]);
 
   // SSE real-time updates
   useEffect(() => {
@@ -736,6 +761,9 @@ export function useChat(
       // If this is the active session, update it too
       if (activeSessionRef.current?.id === updatedSession.id) {
         setActiveSession(updatedSession);
+        if (updatedSession.isGenerating && !streamRef.current) {
+          attachIfGenerating(updatedSession.id, updatedSession.inFlightGeneration);
+        }
       }
     };
 
@@ -786,8 +814,24 @@ export function useChat(
       // Use ref to get the current value (state may not be updated yet when handler runs)
       if (activeSessionRef.current?.id === message.sessionId && !isStreamingRef.current) {
         setMessages((prev) => {
-          // Avoid duplicates
+          // Avoid duplicates by persisted id first.
           if (prev.some((m) => m.id === message.id)) return prev;
+
+          // Reconcile optimistic local user messages against persisted SSE echoes.
+          // The optimistic message uses a temp id and should be replaced instead of appended.
+          if (message.role === "user") {
+            const optimisticIndex = prev.findIndex((candidate) =>
+              candidate.role === "user"
+              && candidate.id.startsWith("temp-")
+              && candidate.content.trim() === message.content.trim(),
+            );
+            if (optimisticIndex >= 0) {
+              const next = [...prev];
+              next[optimisticIndex] = message;
+              return next;
+            }
+          }
+
           return [...prev, message];
         });
       }
@@ -810,7 +854,7 @@ export function useChat(
     });
 
     return unsubscribe;
-  }, [projectId]);
+  }, [attachIfGenerating, projectId]);
 
   // Cleanup on unmount
   useEffect(() => {

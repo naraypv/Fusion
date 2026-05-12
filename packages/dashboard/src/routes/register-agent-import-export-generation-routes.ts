@@ -112,6 +112,48 @@ export function registerAgentImportExportRoutes(ctx: ApiRoutesContext): void {
     return /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/.test(slug) || /^[a-z0-9]$/.test(slug);
   }
 
+  function parseCompanyWebsiteSubPath(
+    website: string | undefined,
+    expectedRepo: string,
+  ): { branch?: string; subPath?: string } | null {
+    if (typeof website !== "string" || website.trim().length === 0) {
+      return null;
+    }
+
+    const repoMatch = expectedRepo.match(/^([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_.-]+)$/);
+    if (!repoMatch) {
+      return null;
+    }
+
+    let url: URL;
+    try {
+      url = new URL(website);
+    } catch {
+      return null;
+    }
+
+    if (url.hostname.toLowerCase() !== "github.com") {
+      return null;
+    }
+
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length < 5 || segments[2] !== "tree") {
+      return null;
+    }
+
+    const [, expectedOwner, expectedRepoName] = repoMatch;
+    const [owner, repoName, , branch, ...subPathParts] = segments;
+    if (owner !== expectedOwner || repoName !== expectedRepoName) {
+      return null;
+    }
+
+    const subPath = subPathParts.join("/").trim();
+    return {
+      branch: typeof branch === "string" && branch.length > 0 ? branch : undefined,
+      subPath: subPath.length > 0 ? subPath : undefined,
+    };
+  }
+
   /**
    * GET /api/agents/companies
    * Browse companies from companies.sh catalog.
@@ -496,7 +538,7 @@ async function persistImportedSkills(
         // Note: The per-company endpoint (/api/companies/:slug) returns HTML (SPA),
         // so we fetch the full list and filter by slug.
         const companyApiUrl = "https://companies.sh/api/companies";
-        let companyInfo: { name: string; repo?: string; tagline?: string } | null = null;
+        let companyInfo: { name: string; repo?: string; tagline?: string; website?: string } | null = null;
 
         try {
           const controller = new AbortController();
@@ -538,8 +580,9 @@ async function persistImportedSkills(
           const name = typeof match.name === "string" ? match.name : importCompanySlug;
           const repo = typeof match.repo === "string" ? match.repo : undefined;
           const tagline = typeof match.tagline === "string" ? match.tagline : undefined;
+          const website = typeof match.website === "string" ? match.website : undefined;
 
-          companyInfo = { name, repo, tagline };
+          companyInfo = { name, repo, tagline, website };
         } catch (fetchErr) {
           const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
           if (fetchErr instanceof ApiError) throw fetchErr;
@@ -563,8 +606,10 @@ async function persistImportedSkills(
         }
 
         const [, repoOwner, repoName] = repoMatch;
-        // Use GitHub's archive API to get the default branch archive
-        const archiveUrl = `https://github.com/${repoOwner}/${repoName}/archive/refs/heads/main.tar.gz`;
+        const websiteInfo = parseCompanyWebsiteSubPath(companyInfo.website, `${repoOwner}/${repoName}`);
+        const preferredBranch = websiteInfo?.branch?.trim() || "main";
+        const subPath = websiteInfo?.subPath;
+        const archiveUrl = `https://github.com/${repoOwner}/${repoName}/archive/refs/heads/${preferredBranch}.tar.gz`;
 
         // Download and extract to temp directory
         let tempDir: string | null = null;
@@ -616,7 +661,14 @@ async function persistImportedSkills(
           );
 
           // Parse the downloaded archive directly to avoid requiring shell tar tools.
-          pkg = await parseCompanyArchive(archivePath);
+          try {
+            pkg = await parseCompanyArchive(archivePath, subPath ? { subPath } : undefined);
+          } catch (parseErr) {
+            if (parseErr instanceof Error && parseErr.name === "AgentCompaniesParseError" && subPath) {
+              throw badRequest(`Failed to import companies.sh slug "${importCompanySlug}" from subpath "${subPath}": ${parseErr.message}`);
+            }
+            throw parseErr;
+          }
 
           // Override company info if available from API
           if (companyInfo) {
@@ -689,6 +741,9 @@ async function persistImportedSkills(
           reportsTo: item.reportsTo?.resolvedAgentId,
           instructionsText: typeof item.input.instructionsText === "string"
             ? item.input.instructionsText.slice(0, 200) + (item.input.instructionsText.length > 200 ? "..." : "")
+            : undefined,
+          memory: typeof item.input.memory === "string"
+            ? item.input.memory.slice(0, 200) + (item.input.memory.length > 200 ? "..." : "")
             : undefined,
           skills: Array.isArray(item.input.metadata?.skills)
             ? item.input.metadata.skills.filter((skill: unknown): skill is string => typeof skill === "string")
@@ -804,12 +859,16 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
 
   router.post("/agents/onboarding/start-streaming", async (req, res) => {
     try {
-      const { intent, context, planningModelProvider, planningModelId } = req.body as {
+      const { intent, context, mode, existingAgentConfig, planningModelProvider, planningModelId } = req.body as {
         intent?: string;
         context?: {
           existingAgents?: Array<{ id: string; name: string; role: string }>;
           templates?: Array<{ id: string; label: string; description?: string }>;
+          mode?: "create" | "edit";
+          existingAgentConfig?: Record<string, unknown>;
         };
+        mode?: "create" | "edit";
+        existingAgentConfig?: Record<string, unknown>;
         planningModelProvider?: string;
         planningModelId?: string;
       };
@@ -818,6 +877,13 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
         throw badRequest("intent is required and must be a string");
       }
 
+      const resolvedMode = mode ?? context?.mode ?? "create";
+      if (resolvedMode !== "create" && resolvedMode !== "edit") {
+        throw badRequest("mode must be 'create' or 'edit'");
+      }
+
+      const resolvedExistingAgentConfig = existingAgentConfig ?? context?.existingAgentConfig;
+
       const { store: scopedStore } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
       const ip = req.ip || req.socket.remoteAddress || "unknown";
@@ -825,9 +891,11 @@ export function registerAgentGenerationRoutes(ctx: ApiRoutesContext): void {
       const sessionId = await startAgentOnboardingSession(
         ip,
         {
+          mode: resolvedMode,
           intent,
           existingAgents: Array.isArray(context?.existingAgents) ? context.existingAgents : [],
           templates: Array.isArray(context?.templates) ? context.templates : [],
+          existingAgentConfig: resolvedExistingAgentConfig,
         },
         scopedStore.getRootDir(),
         planningModelProvider,

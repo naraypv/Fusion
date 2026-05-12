@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useViewState } from "../useViewState";
+import * as pluginViewRegistry from "../../plugins/pluginViewRegistry";
 import type { ProjectInfo } from "../../api";
 import type { ThemeMode } from "@fusion/core";
 
@@ -33,6 +34,7 @@ describe("useViewState", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockImplementation(() => false);
   });
 
   it("returns default viewMode and taskView when no localStorage exists", async () => {
@@ -61,6 +63,28 @@ describe("useViewState", () => {
 
     await waitFor(() => {
       expect(result.current.taskView).toBe("list");
+    });
+  });
+
+  it("migrates legacy roadmaps state to plugin view when registered", async () => {
+    vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockReturnValue(true);
+    localStorage.setItem("kb-dashboard-task-view", "roadmaps");
+
+    const { result } = renderHook(() => useViewState(createOptions()));
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("plugin:fusion-plugin-roadmap:roadmaps");
+    });
+  });
+
+  it("falls back to board for legacy roadmaps state when plugin is unavailable", async () => {
+    vi.spyOn(pluginViewRegistry, "isPluginViewRegistered").mockReturnValue(false);
+    localStorage.setItem("kb-dashboard-task-view", "roadmaps");
+
+    const { result } = renderHook(() => useViewState(createOptions()));
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("board");
     });
   });
 
@@ -307,6 +331,28 @@ describe("useViewState", () => {
     });
   });
 
+  it("restores and persists graph taskView using scoped storage", async () => {
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "graph");
+
+    const { result } = renderHook(() =>
+      useViewState(
+        createOptions({
+          currentProject: PROJECT,
+        }),
+      ),
+    );
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("graph");
+    });
+
+    await act(async () => {
+      result.current.setTaskView("graph");
+    });
+
+    expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("graph");
+  });
+
   it("restores and persists plugin task views using the canonical composite key", async () => {
     localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "plugin:fusion-plugin-dependency-graph:graph");
 
@@ -327,6 +373,50 @@ describe("useViewState", () => {
     });
 
     expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("plugin:fusion-plugin-dependency-graph:graph");
+  });
+
+  it("rejects invalid plugin view IDs and falls back to board", async () => {
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "plugin:only-one-segment");
+
+    const { result } = renderHook(() =>
+      useViewState(
+        createOptions({
+          currentProject: PROJECT,
+        }),
+      ),
+    );
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("board");
+    });
+  });
+
+  it("round-trips between built-in and plugin task views", async () => {
+    localStorage.setItem("kb:proj_123:kb-dashboard-task-view", "board");
+
+    const { result } = renderHook(() =>
+      useViewState(
+        createOptions({
+          currentProject: PROJECT,
+        }),
+      ),
+    );
+
+    await waitFor(() => {
+      expect(result.current.taskView).toBe("board");
+    });
+
+    await act(async () => {
+      result.current.handleChangeTaskView("plugin:fusion-plugin-dependency-graph:graph");
+    });
+    expect(result.current.taskView).toBe("plugin:fusion-plugin-dependency-graph:graph");
+    expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("plugin:fusion-plugin-dependency-graph:graph");
+
+    await act(async () => {
+      result.current.handleChangeTaskView("board");
+    });
+    expect(result.current.taskView).toBe("board");
+    expect(localStorage.getItem("kb:proj_123:kb-dashboard-task-view")).toBe("board");
   });
 
   it("restores legacy views (board/list/agents/missions/chat) from scoped storage", async () => {

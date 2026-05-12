@@ -133,6 +133,9 @@ export function useMobileKeyboard(
       return;
     }
 
+    // Full update — used on resize and focus transitions. These are the
+    // events that signal an actual keyboard open/close, so we want to
+    // re-snapshot offsetTop/height/overlap.
     const update = () => {
       const metrics = getKeyboardMetrics();
       setKeyboardOverlap(metrics.overlap);
@@ -141,17 +144,107 @@ export function useMobileKeyboard(
       setKeyboardOpen(metrics.open);
     };
 
-    update();
+    // Scroll-only update — fires on every visualViewport pan (60fps on
+    // iOS during a swipe with the keyboard up). Updating offsetTop on
+    // each event amplifies jitter into the .chat-thread transform that
+    // tracks --vv-offset-top, visibly judders the thread, and can shift
+    // it hundreds of px. We deliberately skip offsetTop here and only
+    // update height/keyboardOpen if those changed; offsetTop stays
+    // pinned to whatever resize/focus last set it.
+    const updateScrollOnly = () => {
+      const metrics = getKeyboardMetrics();
+      setKeyboardOverlap(metrics.overlap);
+      setViewportHeight(metrics.vvHeight);
+      setKeyboardOpen(metrics.open);
+    };
+
+    const timeoutIds: number[] = [];
+
+    const scheduleUpdate = (delayMs: number) => {
+      if (typeof window === "undefined") return;
+      const timeoutId = window.setTimeout(() => {
+        if (typeof window === "undefined") return;
+        update();
+      }, delayMs);
+      timeoutIds.push(timeoutId);
+    };
+
+    // Re-snapshot once iOS has settled. focusin/page-restore frequently
+    // fire while the visualViewport is still mid-transition; the
+    // synchronous read captures stale offsetTop and the chat-thread
+    // anchors wrong. We combine two strategies:
+    //   1. A short tail of timed updates (50/200/500/1000/1500 ms) for
+    //      cases where settlement is on a fixed schedule.
+    //   2. A rAF poll that stops once offsetTop is stable across two
+    //      frames, capped at 1.5s. Catches slow / variable settles
+    //      (e.g. switching tabs back with the keyboard up) where the
+    //      timed reads miss the right window.
+    let rafId: number | null = null;
+    let pollDeadline = 0;
+    let lastOffsetTop = -1;
+    let stableFrames = 0;
+    const cancelPoll = () => {
+      if (rafId !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    };
+    const pollFrame = () => {
+      if (typeof window === "undefined") return;
+      update();
+      const currentOffsetTop = window.visualViewport?.offsetTop ?? 0;
+      if (currentOffsetTop === lastOffsetTop) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+        lastOffsetTop = currentOffsetTop;
+      }
+      if (stableFrames >= 2 || performance.now() > pollDeadline) {
+        rafId = null;
+        return;
+      }
+      rafId = window.requestAnimationFrame(pollFrame);
+    };
+    const startStabilityPoll = () => {
+      if (typeof window === "undefined") return;
+      cancelPoll();
+      pollDeadline = performance.now() + 1500;
+      lastOffsetTop = -1;
+      stableFrames = 0;
+      rafId = window.requestAnimationFrame(pollFrame);
+    };
+    const updateWithTail = () => {
+      update();
+      scheduleUpdate(50);
+      scheduleUpdate(200);
+      scheduleUpdate(500);
+      scheduleUpdate(1000);
+      scheduleUpdate(1500);
+      startStabilityPoll();
+    };
+
+    updateWithTail();
     vv.addEventListener("resize", update);
-    vv.addEventListener("scroll", update);
-    document.addEventListener("focusin", update);
+    vv.addEventListener("scroll", updateScrollOnly);
+    document.addEventListener("focusin", updateWithTail);
     document.addEventListener("focusout", update);
+    // When the user navigates back to this view, force a fresh snapshot
+    // — without it the hook initializes with stale metrics (keyboard up
+    // from before, but our state thinks it's closed).
+    document.addEventListener("visibilitychange", updateWithTail);
+    window.addEventListener("pageshow", updateWithTail);
 
     return () => {
       vv.removeEventListener("resize", update);
-      vv.removeEventListener("scroll", update);
-      document.removeEventListener("focusin", update);
+      vv.removeEventListener("scroll", updateScrollOnly);
+      document.removeEventListener("focusin", updateWithTail);
       document.removeEventListener("focusout", update);
+      document.removeEventListener("visibilitychange", updateWithTail);
+      window.removeEventListener("pageshow", updateWithTail);
+      for (const timeoutId of timeoutIds) {
+        clearTimeout(timeoutId);
+      }
+      cancelPoll();
       setKeyboardOverlap(0);
       setViewportHeight(null);
       setViewportOffsetTop(0);

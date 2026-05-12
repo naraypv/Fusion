@@ -1,6 +1,7 @@
 import type { ResearchProviderConfig, ResearchSource } from "@fusion/core";
 import type { ResearchProvider } from "../../research-step-runner.js";
 import { createLogger } from "../../logger.js";
+import { fetchWebContent, WebFetchError } from "../../web-fetch.js";
 import { ResearchProviderError, type ResearchFetchResult } from "../types.js";
 
 const log = createLogger("research:page-fetch");
@@ -28,61 +29,33 @@ export class PageFetchProvider implements ResearchProvider {
 
   async fetchContent(url: string, config: ResearchProviderConfig = {}, signal?: AbortSignal): Promise<ResearchFetchResult> {
     const timeoutMs = Number(config.timeoutMs ?? this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
     try {
-      const response = await fetch(url, {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "User-Agent": (config.metadata?.userAgent as string) ?? this.options.userAgent ?? DEFAULT_USER_AGENT,
-        },
-        signal: requestSignal,
+      const result = await fetchWebContent(url, {
+        timeoutMs,
+        maxBytes: MAX_CONTENT_CHARS,
+        userAgent: (config.metadata?.userAgent as string) ?? this.options.userAgent ?? DEFAULT_USER_AGENT,
+        signal,
       });
 
-      if (!response.ok) {
-        throw new ResearchProviderError({
-          providerType: "page-fetch",
-          code: response.status >= 500 ? "provider-unavailable" : "network-error",
-          message: `fetch failed with status ${response.status}`,
-          retryable: response.status >= 500,
-        });
-      }
-
-      const contentType = response.headers.get("content-type") ?? "application/octet-stream";
-      const mimeType = contentType.split(";")[0].trim().toLowerCase();
-      const raw = await response.text();
       const metadata: Record<string, unknown> = {
         url,
-        contentType,
-        contentLength: raw.length,
+        contentType: result.contentType,
+        contentLength: result.bytesRead,
+        title: result.title,
+        description: result.description,
       };
 
-      if (mimeType.includes("text/html")) {
-        const extracted = extractHtml(raw);
-        metadata.title = extracted.title;
-        metadata.description = extracted.description;
-        metadata.contentLength = extracted.content.length;
-        return { content: truncate(extracted.content), metadata, mimeType };
-      }
-
-      if (mimeType.includes("application/json") || looksLikeJson(raw)) {
-        const pretty = JSON.stringify(JSON.parse(raw), null, 2);
-        return { content: truncate(pretty), metadata, mimeType };
-      }
-
-      if (mimeType.includes("text/") || mimeType.includes("markdown")) {
-        return { content: truncate(raw), metadata, mimeType };
-      }
-
-      throw new ResearchProviderError({
-        providerType: "page-fetch",
-        code: "provider-unavailable",
-        message: `unsupported mime type: ${mimeType}`,
-      });
+      return {
+        content: result.content,
+        metadata,
+        mimeType: result.mimeType,
+      };
     } catch (error) {
       if (error instanceof ResearchProviderError) throw error;
+      if (error instanceof WebFetchError) {
+        throw mapWebFetchError(error);
+      }
       if (error instanceof DOMException && error.name === "AbortError") {
         throw new ResearchProviderError({ providerType: "page-fetch", code: "abort", message: "Fetch aborted", cause: error });
       }
@@ -101,23 +74,33 @@ export class PageFetchProvider implements ResearchProvider {
   }
 }
 
-function extractHtml(html: string): { title?: string; description?: string; content: string } {
-  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim();
-  const description = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["'][^>]*>/i)?.[1]?.trim();
-  const stripped = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<(nav|footer|header)[\s\S]*?<\/\1>/gi, " ");
-  const main = stripped.match(/<(main|article)[^>]*>([\s\S]*?)<\/\1>/i)?.[2] ?? stripped.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] ?? stripped;
-  const text = main.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  return { title, description, content: text };
-}
-
-function truncate(value: string): string {
-  return value.length > MAX_CONTENT_CHARS ? value.slice(0, MAX_CONTENT_CHARS) : value;
-}
-
-function looksLikeJson(value: string): boolean {
-  const trimmed = value.trim();
-  return trimmed.startsWith("{") || trimmed.startsWith("[");
+function mapWebFetchError(error: WebFetchError): ResearchProviderError {
+  switch (error.code) {
+    case "timeout":
+      return new ResearchProviderError({ providerType: "page-fetch", code: "timeout", message: error.message, retryable: true, cause: error });
+    case "unsupported-mime":
+      return new ResearchProviderError({ providerType: "page-fetch", code: "provider-unavailable", message: error.message, cause: error });
+    case "http-error": {
+      const isServerError = /status\s+5\d\d/.test(error.message);
+      return new ResearchProviderError({
+        providerType: "page-fetch",
+        code: isServerError ? "provider-unavailable" : "network-error",
+        message: error.message,
+        retryable: isServerError,
+        cause: error,
+      });
+    }
+    case "network-error":
+      if (error.cause instanceof DOMException && error.cause.name === "AbortError") {
+        return new ResearchProviderError({ providerType: "page-fetch", code: "abort", message: "Fetch aborted", cause: error.cause });
+      }
+      return new ResearchProviderError({ providerType: "page-fetch", code: "network-error", message: error.message, retryable: true, cause: error });
+    case "blocked-host":
+    case "blocked-scheme":
+    case "invalid-url":
+    case "too-large":
+      return new ResearchProviderError({ providerType: "page-fetch", code: "network-error", message: error.message, cause: error });
+    default:
+      return new ResearchProviderError({ providerType: "page-fetch", code: "network-error", message: error.message, retryable: true, cause: error });
+  }
 }

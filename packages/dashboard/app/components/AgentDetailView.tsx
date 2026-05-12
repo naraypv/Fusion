@@ -1,19 +1,21 @@
 import "./AgentDetailView.css";
+import "./MailboxModal.css";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   Bot, Heart, Activity, Pause, Play, Square, Trash2, RefreshCw, 
   Settings, FileText, ActivitySquare, X, Copy, 
   ExternalLink, CheckCircle, XCircle, Loader2, GitBranch, ListChecks,
   AlertCircle,
-  ChevronDown, ChevronRight, ChevronLeft, BarChart3, BookOpen, Eye, FileEdit
+  ChevronDown, ChevronRight, ChevronLeft, BarChart3, BookOpen, Eye, FileEdit,
+  Mail, Send, Inbox as InboxIcon, User, MoreVertical
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo, SkillContent } from "../api";
-import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure, updateGlobalSettings, fetchSkillContent } from "../api";
+import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, ModelInfo, MemoryFileInfo, AgentCapability, PluginRuntimeInfo, SkillContent, AgentOnboardingSummary, AgentMailboxResponse } from "../api";
+import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure, updateGlobalSettings, fetchSkillContent, uploadAgentAvatar, deleteAgentAvatar, fetchAgentMailbox, markMessageRead } from "../api";
 import type { Agent } from "../api";
-import type { AgentLogEntry, Task } from "@fusion/core";
-import { getErrorMessage } from "@fusion/core";
+import type { AgentLogEntry, Task, Message, ParticipantType } from "@fusion/core";
+import { getErrorMessage, isEphemeralAgent } from "@fusion/core";
 import { AgentLogViewer } from "./AgentLogViewer";
 import { AgentReflectionsTab } from "./AgentReflectionsTab";
 import { getAgentHealthStatus } from "../utils/agentHealth";
@@ -25,6 +27,9 @@ import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { useConfirm } from "../hooks/useConfirm";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
+import { AgentAvatar } from "./AgentAvatar";
+import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
+import { ExperimentalAgentOnboardingModal } from "./ExperimentalAgentOnboardingModal";
 
 /**
  * Simple className utility - joins class names conditionally
@@ -68,13 +73,15 @@ interface AgentDetailViewProps {
   initialTab?: TabId;
   initialRunId?: string | null;
   preferActiveRun?: boolean;
+  onMutationSuccess?: (context: { agentId: string; deleted?: boolean }) => void | Promise<void>;
 }
 
-type TabId = "dashboard" | "logs" | "config" | "runs" | "tasks" | "employees" | "soul" | "instructions" | "memory" | "reflections";
+type TabId = "dashboard" | "logs" | "mail" | "config" | "runs" | "tasks" | "employees" | "soul" | "instructions" | "memory" | "reflections";
 
 const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: "dashboard", label: "Dashboard", icon: ActivitySquare },
   { id: "logs", label: "Logs", icon: FileText },
+  { id: "mail", label: "Mail", icon: Mail },
   { id: "runs", label: "Runs", icon: Activity },
   { id: "tasks", label: "Tasks", icon: ListChecks },
   { id: "employees", label: "Employees", icon: GitBranch },
@@ -91,7 +98,6 @@ const STATE_COLORS: Record<AgentState, { bg: string; text: string; border: strin
   running: { bg: "var(--state-active-bg)", text: "var(--state-active-text)", border: "var(--state-active-border)" },
   paused: { bg: "var(--state-paused-bg)", text: "var(--state-paused-text)", border: "var(--state-paused-border)" },
   error: { bg: "var(--state-error-bg)", text: "var(--state-error-text)", border: "var(--state-error-border)" },
-  terminated: { bg: "var(--state-error-bg)", text: "var(--state-error-text)", border: "var(--state-error-border)" },
 };
 
 const RUN_STATUS_ICONS: Record<string, { icon: typeof CheckCircle; color: string }> = {
@@ -126,7 +132,7 @@ function pickDefaultAgentMemoryPath(files: MemoryFileInfo[], currentPath: string
     ?? "";
 }
 
-export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, showInlineBackButton = false, initialTab, initialRunId, preferActiveRun = false }: AgentDetailViewProps) {
+export function AgentDetailView({ agentId, projectId, onClose, addToast, onChildClick, inline = false, showInlineBackButton = false, initialTab, initialRunId, preferActiveRun = false, onMutationSuccess }: AgentDetailViewProps) {
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const { confirm } = useConfirm();
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
@@ -134,8 +140,19 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
   const [activeTab, setActiveTab] = useState<TabId>(initialTab ?? "dashboard");
   const [isStreaming, setIsStreaming] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
+  const [isStartingRun, setIsStartingRun] = useState(false);
+  const [isBulkMenuOpen, setIsBulkMenuOpen] = useState(false);
+  const [isBulkActionRunning, setIsBulkActionRunning] = useState(false);
+  const [isBulkEligibilityLoading, setIsBulkEligibilityLoading] = useState(false);
+  const [bulkPauseEligibleCount, setBulkPauseEligibleCount] = useState(0);
+  const [bulkResumeEligibleCount, setBulkResumeEligibleCount] = useState(0);
+  const [runNowRefreshToken, setRunNowRefreshToken] = useState(0);
   const [latestRun, setLatestRun] = useState<AgentHeartbeatRun | null>(null);
+  const [agentMailbox, setAgentMailbox] = useState<AgentMailboxResponse | null>(null);
+  const [isLoadingMailbox, setIsLoadingMailbox] = useState(false);
+  const [mailboxError, setMailboxError] = useState<string | null>(null);
   const agentDetailModalRef = useRef<HTMLDivElement>(null);
+  const bulkMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayMouseDownRef = useRef(false);
   useModalResizePersist(agentDetailModalRef, !inline, "fusion:agent-detail-modal-size");
   const onCloseRef = useRef(onClose);
@@ -216,9 +233,32 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     }
   }, [agent?.taskId, agentId, projectId]);
 
+  const loadMailbox = useCallback(async () => {
+    setIsLoadingMailbox(true);
+    setMailboxError(null);
+    try {
+      const mailbox = await fetchAgentMailbox(agentId, projectId);
+      setAgentMailbox(mailbox);
+    } catch (err) {
+      setMailboxError(getErrorMessage(err));
+      setAgentMailbox(null);
+    } finally {
+      setIsLoadingMailbox(false);
+    }
+  }, [agentId, projectId]);
+
   const handleConfigChangesState = useCallback((hasChanges: boolean) => {
     hasConfigChangesRef.current = hasChanges;
   }, []);
+
+  const notifyMutationSuccess = useCallback(async (deleted = false) => {
+    await onMutationSuccess?.({ agentId, deleted });
+  }, [agentId, onMutationSuccess]);
+
+  const handleSavedMutation = useCallback(async () => {
+    await loadAgent();
+    await notifyMutationSuccess(false);
+  }, [loadAgent, notifyMutationSuccess]);
 
   useEffect(() => {
     void loadAgent();
@@ -247,6 +287,65 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
       loadedLatestRunLogsRef.current = null;
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    if (agent && activeTab === "mail") {
+      void loadMailbox();
+    }
+  }, [agent, activeTab, loadMailbox]);
+
+  useEffect(() => {
+    if (!isBulkMenuOpen) return;
+
+    const onDocumentMouseDown = (event: MouseEvent) => {
+      if (!bulkMenuRef.current?.contains(event.target as Node)) {
+        setIsBulkMenuOpen(false);
+      }
+    };
+
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsBulkMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", onDocumentMouseDown);
+    document.addEventListener("keydown", onDocumentKeyDown);
+
+    return () => {
+      document.removeEventListener("mousedown", onDocumentMouseDown);
+      document.removeEventListener("keydown", onDocumentKeyDown);
+    };
+  }, [isBulkMenuOpen]);
+
+  useEffect(() => {
+    if (!isBulkMenuOpen) return;
+
+    let cancelled = false;
+    setIsBulkEligibilityLoading(true);
+
+    fetchAgents(undefined, projectId)
+      .then((projectAgents) => {
+        if (cancelled) return;
+        const nonEphemeralAgents = projectAgents.filter((projectAgent) => !isEphemeralAgent(projectAgent));
+        setBulkPauseEligibleCount(nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "active" || projectAgent.state === "running").length);
+        setBulkResumeEligibleCount(nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "paused").length);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBulkPauseEligibleCount(0);
+        setBulkResumeEligibleCount(0);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsBulkEligibilityLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isBulkMenuOpen, projectId]);
 
   // When falling back to latest-run logs (no taskId) and that run is active,
   // subscribe to the run-scoped SSE stream so the Logs tab tails updates.
@@ -305,6 +404,8 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
       setLogs([]);
       setIsStreaming(false);
       setLatestRun(null);
+      setAgentMailbox(null);
+      setMailboxError(null);
       loadedLatestRunLogsRef.current = null;
       hasConfigChangesRef.current = false;
     }
@@ -315,24 +416,37 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
     const contextVersionAtStart = contextVersionRef.current;
 
+    const refreshAgentForApprovalEvent = (event: MessageEvent) => {
+      if (contextVersionRef.current !== contextVersionAtStart) return;
+      try {
+        const payload: unknown = JSON.parse(event.data);
+        if (!payload || typeof payload !== "object") return;
+        const approvalAgentId = (payload as { agentId?: unknown }).agentId;
+        if (approvalAgentId !== agentId) return;
+        void loadAgent();
+      } catch {
+        // Ignore malformed events
+      }
+    };
+
     return subscribeSse(`/api/events${query}`, {
       events: {
         "agent:updated": (event) => {
           if (contextVersionRef.current !== contextVersionAtStart) return;
-
           try {
             const payload: unknown = JSON.parse(event.data);
             if (!payload || typeof payload !== "object") return;
-
             const updatedId = (payload as { id?: unknown }).id;
             if (updatedId !== agentId) return;
             if (hasConfigChangesRef.current) return;
-
             void loadAgent();
           } catch {
             // Ignore malformed events
           }
         },
+        "approval:requested": refreshAgentForApprovalEvent,
+        "approval:updated": refreshAgentForApprovalEvent,
+        "approval:decided": refreshAgentForApprovalEvent,
       },
     });
   }, [agentId, projectId, loadAgent]);
@@ -396,12 +510,83 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     try {
       await updateAgentState(agentId, newState, projectId);
       addToast(`Agent state updated to ${newState}`, "success");
-      void loadAgent();
+      await handleSavedMutation();
     } catch (err) {
       setAgent((prev) => (prev ? { ...prev, state: previousState } : prev));
       addToast(`Failed to update state: ${getErrorMessage(err)}`, "error");
     } finally {
       setIsTransitioning(false);
+    }
+  };
+
+  const handleBulkStateChange = async (targetState: "paused" | "active") => {
+    if (isBulkActionRunning) return;
+    setIsBulkMenuOpen(false);
+    setIsBulkActionRunning(true);
+
+    try {
+      const projectAgents = await fetchAgents(undefined, projectId);
+      const nonEphemeralAgents = projectAgents.filter((projectAgent) => !isEphemeralAgent(projectAgent));
+      const eligibleAgents = nonEphemeralAgents.filter((projectAgent) => (
+        targetState === "paused"
+          ? projectAgent.state === "active" || projectAgent.state === "running"
+          : projectAgent.state === "paused"
+      ));
+
+      const skippedCount = nonEphemeralAgents.length - eligibleAgents.length;
+      if (eligibleAgents.length === 0) {
+        addToast(`No agents eligible to ${targetState === "paused" ? "pause" : "resume"}`, "error");
+        return;
+      }
+
+      const confirmed = await confirm({
+        title: targetState === "paused" ? "Pause All Agents" : "Resume All Agents",
+        message: `${targetState === "paused" ? "Pause" : "Resume"} ${eligibleAgents.length} agent${eligibleAgents.length === 1 ? "" : "s"} in this project?`,
+        danger: targetState === "paused",
+      });
+      if (!confirmed) return;
+
+      const results = await Promise.allSettled(
+        eligibleAgents.map((projectAgent) => updateAgentState(projectAgent.id, targetState, projectId)),
+      );
+
+      const failedResults = results
+        .map((result, index) => ({ result, agent: eligibleAgents[index] }))
+        .filter((entry): entry is { result: PromiseRejectedResult; agent: Agent } => entry.result.status === "rejected");
+
+      const successCount = results.length - failedResults.length;
+      const failureCount = failedResults.length;
+      const baseSummary = `${targetState === "paused" ? "Paused" : "Resumed"} ${successCount} agent${successCount === 1 ? "" : "s"}; skipped ${skippedCount}`;
+
+      if (failureCount > 0) {
+        const failureSummary = failedResults
+          .slice(0, 3)
+          .map(({ agent, result }) => `${agent.name || agent.id}: ${getErrorMessage(result.reason)}`)
+          .join("; ");
+        addToast(`${baseSummary}; failed ${failureCount}${failureSummary ? ` (${failureSummary})` : ""}`, "error");
+      } else {
+        addToast(baseSummary, "success");
+      }
+
+      await handleSavedMutation();
+    } catch (err) {
+      addToast(`Failed to ${targetState === "paused" ? "pause" : "resume"} agents: ${getErrorMessage(err)}`, "error");
+    } finally {
+      setIsBulkActionRunning(false);
+    }
+  };
+
+  const handleRunHeartbeat = async () => {
+    if (isStartingRun) return;
+    setIsStartingRun(true);
+    try {
+      await startAgentRun(agentId, projectId, { source: "on_demand", triggerDetail: "Triggered from dashboard" });
+      addToast(`Heartbeat run started for ${agent?.name ?? agentId}`, "success");
+      setRunNowRefreshToken((prev) => prev + 1);
+    } catch (err) {
+      addToast(`Failed to start heartbeat run: ${getErrorMessage(err)}`, "error");
+    } finally {
+      setIsStartingRun(false);
     }
   };
 
@@ -416,6 +601,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     try {
       await deleteAgent(agentId, projectId);
       addToast(`Agent "${agent.name}" deleted`, "success");
+      await notifyMutationSuccess(true);
       onClose();
     } catch (err) {
       addToast(`Failed to delete agent: ${getErrorMessage(err)}`, "error");
@@ -483,6 +669,8 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
   const stateStyle = STATE_COLORS[agent.state];
   const health = getHealthStatus();
   const detailShellClassName = inline ? "agent-detail-inline" : "agent-detail-modal";
+  const isPauseAllDisabled = isBulkEligibilityLoading || bulkPauseEligibleCount === 0;
+  const isResumeAllDisabled = isBulkEligibilityLoading || bulkResumeEligibleCount === 0;
 
   return (
     <div
@@ -509,7 +697,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               </button>
             ) : null}
             <div className="agent-detail-icon">
-              <Bot size={20} />
+              <AgentAvatar agent={agent} size={36} />
             </div>
             <div className="agent-detail-info">
               <h2>{agent.name}</h2>
@@ -538,6 +726,15 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                     <Play size={14} />
                     Start
                   </button>
+                  <button
+                    className="btn btn-task-create btn--compact"
+                    onClick={() => void handleRunHeartbeat()}
+                    aria-label={`Run now for ${agent.name}`}
+                    disabled={isStartingRun || isTransitioning}
+                  >
+                    <Activity size={14} />
+                    Run Now
+                  </button>
                   <button className="btn btn--danger btn--compact" onClick={handleDelete}>
                     <Trash2 size={14} />
                     Delete
@@ -545,16 +742,37 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                 </>
               )}
               {agent.state === "active" && (
-                <button className="btn btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("paused")} disabled={isTransitioning} aria-label="Pause">
-                  <Pause size={14} />
-                  <span className="agent-detail-control-label">Pause</span>
-                </button>
+                <>
+                  <button className="btn btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("paused")} disabled={isTransitioning} aria-label="Pause">
+                    <Pause size={14} />
+                    <span className="agent-detail-control-label">Pause</span>
+                  </button>
+                  <button className="btn btn--danger btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("paused")} disabled={isTransitioning} aria-label="Stop">
+                    <Square size={14} />
+                    <span className="agent-detail-control-label">Stop</span>
+                  </button>
+                  <button
+                    className="btn btn-task-create btn--compact agent-detail-mobile-icon-control"
+                    onClick={() => void handleRunHeartbeat()}
+                    aria-label={`Run now for ${agent.name}`}
+                    disabled={isStartingRun || isTransitioning}
+                  >
+                    <Activity size={14} />
+                    <span className="agent-detail-control-label">Run Now</span>
+                  </button>
+                </>
               )}
               {agent.state === "paused" && (
-                <button className="btn btn-task-create btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("active")} disabled={isTransitioning} aria-label="Resume">
-                  <Play size={14} />
-                  <span className="agent-detail-control-label">Resume</span>
-                </button>
+                <>
+                  <button className="btn btn-task-create btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("active")} disabled={isTransitioning} aria-label="Resume">
+                    <Play size={14} />
+                    <span className="agent-detail-control-label">Resume</span>
+                  </button>
+                  <button className="btn btn--danger btn--compact" onClick={handleDelete}>
+                    <Trash2 size={14} />
+                    Delete
+                  </button>
+                </>
               )}
               {agent.state === "running" && (
                 <>
@@ -562,9 +780,9 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                     <Pause size={14} />
                     <span className="agent-detail-control-label">Pause</span>
                   </button>
-                  <button className="btn btn--danger btn--compact" onClick={() => void handleStateChange("terminated")} disabled={isTransitioning}>
+                  <button className="btn btn--danger btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("paused")} disabled={isTransitioning} aria-label="Stop">
                     <Square size={14} />
-                    Stop
+                    <span className="agent-detail-control-label">Stop</span>
                   </button>
                 </>
               )}
@@ -574,21 +792,9 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
                     <Play size={14} />
                     Retry
                   </button>
-                  <button className="btn btn--danger btn--compact" onClick={() => void handleStateChange("terminated")} disabled={isTransitioning}>
+                  <button className="btn btn--danger btn--compact agent-detail-mobile-icon-control" onClick={() => void handleStateChange("paused")} disabled={isTransitioning} aria-label="Stop">
                     <Square size={14} />
-                    Stop
-                  </button>
-                </>
-              )}
-              {agent.state === "terminated" && (
-                <>
-                  <button className="btn btn-task-create btn--compact" onClick={() => void handleStateChange("active")} disabled={isTransitioning}>
-                    <Play size={14} />
-                    Start
-                  </button>
-                  <button className="btn btn--danger btn--compact" onClick={handleDelete}>
-                    <Trash2 size={14} />
-                    Delete
+                    <span className="agent-detail-control-label">Stop</span>
                   </button>
                 </>
               )}
@@ -596,6 +802,56 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
 
             {/* Utility actions: refresh + close */}
             <div className="agent-detail-utility-actions">
+              <div className="agent-detail-bulk-menu" ref={bulkMenuRef}>
+                <button
+                  type="button"
+                  className="btn-icon"
+                  onClick={() => setIsBulkMenuOpen((open) => !open)}
+                  aria-haspopup="menu"
+                  aria-expanded={isBulkMenuOpen}
+                  aria-label="Bulk agent actions"
+                  title="Bulk agent actions"
+                  disabled={isTransitioning || isBulkActionRunning}
+                >
+                  <MoreVertical size={16} />
+                </button>
+                {isBulkMenuOpen && (
+                  <div className="agent-detail-bulk-menu-popover" role="menu">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-detail-bulk-menu-item"
+                      onClick={() => void handleBulkStateChange("paused")}
+                      disabled={isPauseAllDisabled || isBulkActionRunning}
+                    >
+                      Pause All Agents
+                      <span className="agent-detail-bulk-menu-item-hint">
+                        {isBulkEligibilityLoading
+                          ? "Loading eligible agents..."
+                          : isPauseAllDisabled
+                            ? "No active agents eligible"
+                            : `Pause ${bulkPauseEligibleCount} active/running agent${bulkPauseEligibleCount === 1 ? "" : "s"}`}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-detail-bulk-menu-item"
+                      onClick={() => void handleBulkStateChange("active")}
+                      disabled={isResumeAllDisabled || isBulkActionRunning}
+                    >
+                      Resume All Agents
+                      <span className="agent-detail-bulk-menu-item-hint">
+                        {isBulkEligibilityLoading
+                          ? "Loading eligible agents..."
+                          : isResumeAllDisabled
+                            ? "No paused agents eligible"
+                            : `Resume ${bulkResumeEligibleCount} paused agent${bulkResumeEligibleCount === 1 ? "" : "s"}`}
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
               <button className="btn-icon" onClick={() => void loadAgent()} title="Refresh" aria-label="Refresh">
                 <RefreshCw size={16} />
               </button>
@@ -641,6 +897,18 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               fallbackLabel={!agent.taskId && latestRun ? `Latest run · ${latestRun.id.slice(0, 8)}` : null}
             />
           )}
+
+          {activeTab === "mail" && (
+            <MailTab
+              agent={agent}
+              mailbox={agentMailbox}
+              isLoading={isLoadingMailbox}
+              error={mailboxError}
+              projectId={projectId}
+              addToast={addToast}
+              onRefresh={() => void loadMailbox()}
+            />
+          )}
           
           {activeTab === "runs" && (
             <RunsTab 
@@ -651,6 +919,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               agentName={agent.name}
               initialRunId={initialRunId}
               preferActiveRun={preferActiveRun}
+              runNowRefreshToken={runNowRefreshToken}
             />
           )}
 
@@ -675,7 +944,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               agent={agent}
               projectId={projectId}
               addToast={addToast}
-              onSaved={loadAgent}
+              onSaved={handleSavedMutation}
             />
           )}
 
@@ -684,7 +953,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               agent={agent}
               projectId={projectId}
               addToast={addToast}
-              onSaved={loadAgent}
+              onSaved={handleSavedMutation}
             />
           )}
 
@@ -693,7 +962,7 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               agent={agent}
               projectId={projectId}
               addToast={addToast}
-              onSaved={loadAgent}
+              onSaved={handleSavedMutation}
             />
           )}
 
@@ -711,9 +980,12 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
               agent={agent}
               projectId={projectId}
               addToast={addToast}
-              onSaved={loadAgent}
+              onSaved={handleSavedMutation}
               onHasChangesChange={handleConfigChangesState}
               onDelete={handleDelete}
+              onAgentDraftApplied={(updates) => {
+                setAgent((current) => (current ? { ...current, ...updates } : current));
+              }}
             />
           )}
         </div>
@@ -906,6 +1178,12 @@ function DashboardTab({
         </div>
         <div className="dashboard-summary-hero__meta">
           <span className="dashboard-summary-hero__health" title={health.reason ?? health.label}>{health.icon} {health.label}</span>
+          {(agent.pendingApprovalCount ?? 0) > 0 ? (
+            <span className="badge agent-detail-approval-badge" title="Pending approvals">
+              <span className="status-dot status-dot--pending" />
+              {agent.pendingApprovalCount} pending approvals
+            </span>
+          ) : null}
           <span>Role: {agent.role}</span>
           <span>
             <span className="dashboard-summary-label">{runtimeHint ? "Runtime" : "Model"}</span>
@@ -1120,6 +1398,244 @@ function LogsTab({
   );
 }
 
+function formatMailboxTimestamp(ts: string): string {
+  const date = new Date(ts);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return "Just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function mailboxParticipantLabel(
+  id: string,
+  type: ParticipantType,
+  agentNamesById?: ReadonlyMap<string, string>,
+): string {
+  if (type === "user") return id === "dashboard" ? "You" : `User: ${id}`;
+  if (type === "agent") {
+    const name = agentNamesById?.get(id)?.trim();
+    if (!name || name === id) return `Agent: ${id}`;
+    return `Agent: ${name}`;
+  }
+  return "System";
+}
+
+function MailTab({
+  agent,
+  mailbox,
+  isLoading,
+  error,
+  projectId,
+  addToast,
+  onRefresh,
+}: {
+  agent: AgentDetail;
+  mailbox: AgentMailboxResponse | null;
+  isLoading: boolean;
+  error: string | null;
+  projectId?: string;
+  addToast?: (message: string, type?: "success" | "error") => void;
+  onRefresh: () => void;
+}) {
+  const [activeSubtab, setActiveSubtab] = useState<"inbox" | "outbox">("inbox");
+  const [knownAgents, setKnownAgents] = useState<Agent[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetchAgents(undefined, projectId)
+      .then((agents) => {
+        if (!cancelled) {
+          setKnownAgents(agents);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setKnownAgents([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  const agentNamesById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const knownAgent of knownAgents) {
+      if (!knownAgent.id) continue;
+      const name = typeof knownAgent.name === "string" ? knownAgent.name.trim() : "";
+      if (name.length > 0) {
+        map.set(knownAgent.id, name);
+      }
+    }
+    const currentAgentName = typeof agent.name === "string" ? agent.name.trim() : "";
+    if (currentAgentName.length > 0) {
+      map.set(agent.id, currentAgentName);
+    }
+    return map;
+  }, [knownAgents, agent.id, agent.name]);
+  const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
+  const messages = activeSubtab === "inbox" ? (mailbox?.inbox ?? []) : (mailbox?.outbox ?? []);
+  const selectedMessage = selectedMessageId ? messages.find((message) => message.id === selectedMessageId) ?? null : null;
+
+  useEffect(() => {
+    setSelectedMessageId(null);
+  }, [activeSubtab, agent.id]);
+
+  const handleMessageClick = async (message: Message) => {
+    setSelectedMessageId(message.id);
+
+    if (activeSubtab !== "inbox" || message.read) {
+      return;
+    }
+
+    try {
+      await markMessageRead(message.id, projectId);
+      onRefresh();
+    } catch (err) {
+      const errorMessage = `Failed to mark message as read: ${getErrorMessage(err)}`;
+      if (addToast) {
+        addToast(errorMessage, "error");
+      } else {
+        console.warn(errorMessage);
+      }
+    }
+  };
+
+  const handleRefresh = () => {
+    setSelectedMessageId(null);
+    onRefresh();
+  };
+
+  const renderMessage = (message: Message) => (
+    <button
+      key={message.id}
+      type="button"
+      className={cn("mailbox-item", "agent-mail-tab-message", activeSubtab === "inbox" && !message.read && "unread", selectedMessageId === message.id && "agent-mail-tab-message--selected")}
+      onClick={() => void handleMessageClick(message)}
+      aria-pressed={selectedMessageId === message.id}
+    >
+      <div className="mailbox-item-avatar">
+        {(activeSubtab === "inbox" ? message.fromType : message.toType) === "agent" ? <Bot size={16} /> : <User size={16} />}
+      </div>
+      <div className="mailbox-item-content">
+        <div className="mailbox-item-header">
+          {activeSubtab === "inbox" ? (
+            <span className="mailbox-item-from">{mailboxParticipantLabel(message.fromId, message.fromType, agentNamesById)}</span>
+          ) : (
+            <span className="mailbox-item-to">To: {mailboxParticipantLabel(message.toId, message.toType, agentNamesById)}</span>
+          )}
+          <span className="mailbox-item-time">{formatMailboxTimestamp(message.createdAt)}</span>
+        </div>
+        <div className="mailbox-item-preview">{message.content.slice(0, 80)}{message.content.length > 80 ? "…" : ""}</div>
+      </div>
+      {activeSubtab === "inbox" && !message.read ? <div className="mailbox-item-unread-dot" aria-label="Unread message" /> : null}
+    </button>
+  );
+
+  return (
+    <div className="agent-mail-tab">
+      <div className="agent-mail-tab-header">
+        <h3>{agent.name} Mail</h3>
+        <button className="btn btn-sm" onClick={handleRefresh} disabled={isLoading}>
+          <RefreshCw size={14} />
+          Refresh
+        </button>
+      </div>
+
+      <div className="mailbox-agent-subtabs" data-testid="agent-detail-mail-subtabs">
+        <button
+          className={cn("btn", "btn-sm", "btn-secondary", "mailbox-agent-subtab", activeSubtab === "inbox" && "active")}
+          onClick={() => setActiveSubtab("inbox")}
+        >
+          <InboxIcon size={12} />
+          <span>Inbox</span>
+          {(mailbox?.unreadCount ?? 0) > 0 ? <span className="mailbox-tab-badge">{mailbox?.unreadCount}</span> : null}
+        </button>
+        <button
+          className={cn("btn", "btn-sm", "btn-secondary", "mailbox-agent-subtab", activeSubtab === "outbox" && "active")}
+          onClick={() => setActiveSubtab("outbox")}
+        >
+          <Send size={12} />
+          <span>Outbox</span>
+        </button>
+      </div>
+
+      {isLoading && !mailbox ? (
+        <div className="agent-detail-loading agent-detail-loading--inline" role="status" aria-live="polite">
+          <Loader2 className="animate-spin" size={16} />
+          <span>Loading mailbox...</span>
+        </div>
+      ) : null}
+
+      {!isLoading && error ? (
+        <div className="agent-mail-tab-error" role="alert">
+          <AlertCircle size={16} />
+          <span>Failed to load mailbox: {error}</span>
+        </div>
+      ) : null}
+
+      {!isLoading && !error ? (
+        selectedMessage ? (
+          <div className="agent-mail-tab-detail" data-testid="agent-detail-mail-message">
+            <button
+              type="button"
+              className="btn btn-sm agent-mail-tab-back"
+              data-testid="agent-detail-mail-back"
+              onClick={() => setSelectedMessageId(null)}
+            >
+              <ChevronLeft size={14} />
+              Back to {activeSubtab === "inbox" ? "Inbox" : "Outbox"}
+            </button>
+            <div className="agent-mail-tab-detail-meta">
+              <div className="agent-mail-tab-detail-row">
+                <span className="agent-mail-tab-detail-label">From</span>
+                <span>{mailboxParticipantLabel(selectedMessage.fromId, selectedMessage.fromType, agentNamesById)}</span>
+              </div>
+              <div className="agent-mail-tab-detail-row">
+                <span className="agent-mail-tab-detail-label">To</span>
+                <span>{mailboxParticipantLabel(selectedMessage.toId, selectedMessage.toType, agentNamesById)}</span>
+              </div>
+              <div className="agent-mail-tab-detail-row">
+                <span className="agent-mail-tab-detail-label">Type</span>
+                <span>{selectedMessage.type}</span>
+              </div>
+              <div className="agent-mail-tab-detail-row">
+                <span className="agent-mail-tab-detail-label">Sent</span>
+                <span>{new Date(selectedMessage.createdAt).toLocaleString()}</span>
+              </div>
+              {selectedMessage.metadata?.replyTo?.messageId ? (
+                <div className="agent-mail-tab-reply-context">↪ Replying to message {selectedMessage.metadata.replyTo.messageId}</div>
+              ) : null}
+            </div>
+            <div className="agent-mail-tab-detail-body">{selectedMessage.content}</div>
+          </div>
+        ) : (
+          <div className="mailbox-list" data-testid="agent-detail-mail-list">
+            {messages.length === 0 ? (
+              <div className="mailbox-empty" data-testid="agent-detail-mail-empty">
+                {activeSubtab === "inbox" ? <InboxIcon size={32} /> : <Send size={32} />}
+                <p>{activeSubtab === "inbox" ? "No received messages for this agent" : "No sent messages for this agent"}</p>
+              </div>
+            ) : (
+              messages.map(renderMessage)
+            )}
+          </div>
+        )
+      ) : null}
+    </div>
+  );
+}
+
 // ── Runs Tab ───────────────────────────────────────────────────────────────
 
 function RunsTab({ 
@@ -1130,6 +1646,7 @@ function RunsTab({
   agentName,
   initialRunId,
   preferActiveRun,
+  runNowRefreshToken,
 }: { 
   addToast: (msg: string, type?: "success" | "error") => void;
   agentId: string;
@@ -1138,6 +1655,7 @@ function RunsTab({
   agentName?: string;
   initialRunId?: string | null;
   preferActiveRun?: boolean;
+  runNowRefreshToken: number;
 }) {
   const [runs, setRuns] = useState<AgentHeartbeatRun[]>([]);
   const { confirm } = useConfirm();
@@ -1148,6 +1666,7 @@ function RunsTab({
   const [detailRun, setDetailRun] = useState<AgentHeartbeatRun | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const hasAutoExpandedInitialRunRef = useRef(false);
+  const didMountRunNowRefreshRef = useRef(false);
 
   // Load runs on mount
   const loadRuns = useCallback(async () => {
@@ -1164,6 +1683,15 @@ function RunsTab({
   useEffect(() => {
     void loadRuns();
   }, [loadRuns]);
+
+  useEffect(() => {
+    if (!didMountRunNowRefreshRef.current) {
+      didMountRunNowRefreshRef.current = true;
+      return;
+    }
+    setIsLoadingRuns(true);
+    void loadRuns();
+  }, [loadRuns, runNowRefreshToken]);
 
   // Poll for active runs
   const hasActiveRun = runs.some(r => r.status === "active");
@@ -1252,17 +1780,6 @@ function RunsTab({
     }
   }, [initialRunId, preferActiveRun, runs, isLoadingRuns, handleRunClick]);
 
-  const handleRunHeartbeat = async () => {
-    try {
-      await startAgentRun(agentId, projectId, { source: "on_demand", triggerDetail: "Triggered from dashboard" });
-      addToast(`Heartbeat run started for ${agentName ?? agentId}`, "success");
-      setIsLoadingRuns(true);
-      void loadRuns();
-    } catch (err) {
-      addToast(`Failed to start heartbeat run: ${getErrorMessage(err)}`, "error");
-    }
-  };
-
   const handleStopRun = async () => {
     const shouldStop = await confirm({
       title: "Stop Active Run",
@@ -1283,8 +1800,6 @@ function RunsTab({
     }
   };
 
-  const canRunHeartbeat = agentState === "active" || agentState === "idle";
-
   if (isLoadingRuns && runs.length === 0) {
     return (
       <div className="runs-tab">
@@ -1299,17 +1814,6 @@ function RunsTab({
   if (runs.length === 0) {
     return (
       <div className="runs-tab">
-        {canRunHeartbeat && (
-          <div className="runs-toolbar">
-            <button
-              className="btn btn--sm btn-task-create"
-              onClick={() => void handleRunHeartbeat()}
-              aria-label={`Run now for ${agentName ?? agentId}`}
-            >
-              <Activity size={14} /> Run Now
-            </button>
-          </div>
-        )}
         <div className="runs-empty">
           <Activity size={48} opacity={0.3} />
           <p>No runs yet</p>
@@ -1393,7 +1897,7 @@ function RunsTab({
                 </button>
               )}
               <span className={cn("run-status", run.status)}>
-                <StatusIcon size={14} className={statusInfo.color} />
+                <StatusIcon size={14} style={{ color: statusInfo.color }} />
                 {run.status}
               </span>
               {run.heartbeatProcedureSource === "custom" && (
@@ -1473,7 +1977,19 @@ function RunsTab({
                 {detailRun.stderrExcerpt && (
                   <div className="run-output-section">
                     <div className="run-output-label run-output-label--error">Errors</div>
-                    <pre className="run-output-panel run-output-panel--error">{detailRun.stderrExcerpt}</pre>
+                    <AgentErrorIndicator
+                      errorText={detailRun.stderrExcerpt}
+                      summaryPrefix="Run error"
+                      issueContext={{
+                        surface: "AgentDetailView runs",
+                        agentId,
+                        agentName,
+                        agentState,
+                        runId: detailRun.id,
+                        taskId: undefined,
+                        timestamp: detailRun.startedAt,
+                      }}
+                    />
                   </div>
                 )}
 
@@ -1529,32 +2045,23 @@ function RunsTab({
 
   return (
     <div className="runs-tab">
-      {canRunHeartbeat && (
-        <div className="runs-toolbar runs-toolbar--between">
-          <span className="runs-toolbar-meta">
-            {runs.length} run{runs.length !== 1 ? "s" : ""}
-            {hasActiveRun && <span className="run-live-indicator run-live-indicator--with-margin"><span className="live-dot" />Live</span>}
-          </span>
-          <div className="run-header-group">
-            {hasActiveRun && (
-              <button
-                className="btn btn--sm btn--danger"
-                onClick={() => void handleStopRun()}
-                aria-label={`Stop active run for ${agentName ?? agentId}`}
-              >
-                <Square size={14} /> Stop Run
-              </button>
-            )}
+      <div className="runs-toolbar runs-toolbar--between">
+        <span className="runs-toolbar-meta">
+          {runs.length} run{runs.length !== 1 ? "s" : ""}
+          {hasActiveRun && <span className="run-live-indicator run-live-indicator--with-margin"><span className="live-dot" />Live</span>}
+        </span>
+        <div className="run-header-group">
+          {hasActiveRun && (
             <button
-              className="btn btn--sm btn-task-create"
-              onClick={() => void handleRunHeartbeat()}
-              aria-label={`Run now for ${agentName ?? agentId}`}
+              className="btn btn--sm btn--danger"
+              onClick={() => void handleStopRun()}
+              aria-label={`Stop active run for ${agentName ?? agentId}`}
             >
-              <Activity size={14} /> Run Now
+              <Square size={14} /> Stop Run
             </button>
-          </div>
+          )}
         </div>
-      )}
+      </div>
       {activeRuns.map((run, i) => renderRunCard(run, i, true))}
       {completedRuns.map((run, i) => renderRunCard(run, activeRuns.length + i, false))}
     </div>
@@ -1916,6 +2423,7 @@ function MemoryTab({
   const [isSaving, setIsSaving] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
+  const [showFilePreview, setShowFilePreview] = useState(false);
 
   const [memoryFiles, setMemoryFiles] = useState<MemoryFileInfo[]>([]);
   const [memoryFilesLoading, setMemoryFilesLoading] = useState(false);
@@ -1986,6 +2494,7 @@ function MemoryTab({
     setMemory(agent.memory ?? "");
     setJustSaved(false);
     setShowPreview(false);
+    setShowFilePreview(false);
     setFileSwitchHint("");
     setSelectedFileJustSaved(false);
     void loadMemoryFiles();
@@ -2055,6 +2564,7 @@ function MemoryTab({
       setFileSwitchHint("");
       await loadMemoryFiles(selectedFilePath);
       addToast("Agent memory file saved", "success");
+      await onSaved();
     } catch (err) {
       addToast(`Failed to save agent memory file: ${getErrorMessage(err)}`, "error");
     } finally {
@@ -2178,19 +2688,58 @@ function MemoryTab({
               </div>
             )}
 
-            <textarea
-              className="input config-textarea-mono config-textarea-top-spacing"
-              rows={14}
-              placeholder="Select a memory file to view and edit its content..."
-              value={selectedFileContent}
-              readOnly={isReadOnly || !selectedFilePath || selectedFileLoading}
-              onChange={(e) => {
-                setSelectedFileContent(e.target.value);
-                setSelectedFileDirty(true);
-                setSelectedFileJustSaved(false);
-                setFileSwitchHint("");
-              }}
-            />
+            <div className="agent-content-toolbar config-textarea-top-spacing">
+              <div className="agent-content-mode-toggle">
+                {!isReadOnly && (
+                  <button
+                    className={`btn btn-sm ${!showFilePreview ? "btn-primary" : ""}`}
+                    onClick={() => setShowFilePreview(false)}
+                    disabled={!showFilePreview}
+                    aria-label="Memory file edit mode"
+                  >
+                    <FileEdit size={14} />
+                    Edit
+                  </button>
+                )}
+                <button
+                  className={`btn btn-sm ${showFilePreview ? "btn-primary" : ""}`}
+                  onClick={() => setShowFilePreview(true)}
+                  disabled={showFilePreview}
+                  aria-label="Memory file preview mode"
+                >
+                  <Eye size={14} />
+                  Preview
+                </button>
+              </div>
+            </div>
+
+            {showFilePreview ? (
+              selectedFileContent.trim() ? (
+                <div className="agent-content-preview markdown-body">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {selectedFileContent}
+                  </ReactMarkdown>
+                </div>
+              ) : (
+                <div className="agent-content-preview agent-content-placeholder">
+                  No memory file content yet. Switch to Edit mode to add content.
+                </div>
+              )
+            ) : (
+              <textarea
+                className="input config-textarea-mono"
+                rows={14}
+                placeholder="Select a memory file to view and edit its content..."
+                value={selectedFileContent}
+                readOnly={isReadOnly || !selectedFilePath || selectedFileLoading}
+                onChange={(e) => {
+                  setSelectedFileContent(e.target.value);
+                  setSelectedFileDirty(true);
+                  setSelectedFileJustSaved(false);
+                  setFileSwitchHint("");
+                }}
+              />
+            )}
 
             {selectedFileLoading && (
               <span className="config-hint config-hint--inline-loader">
@@ -2227,23 +2776,25 @@ function MemoryTab({
               )}
             </button>
           )}
-          <button
-            className="btn"
-            disabled={!selectedFileDirty || savingSelectedFile || !selectedFilePath || isReadOnly}
-            onClick={() => void handleSaveSelectedMemoryFile()}
-          >
-            {savingSelectedFile ? (
-              <>
-                <Loader2 size={16} className="animate-spin" />
-                Saving file…
-              </>
-            ) : (
-              <>
-                <CheckCircle size={16} />
-                Save Memory File
-              </>
-            )}
-          </button>
+          {!showFilePreview && (
+            <button
+              className="btn"
+              disabled={!selectedFileDirty || savingSelectedFile || !selectedFilePath || isReadOnly}
+              onClick={() => void handleSaveSelectedMemoryFile()}
+            >
+              {savingSelectedFile ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" />
+                  Saving file…
+                </>
+              ) : (
+                <>
+                  <CheckCircle size={16} />
+                  Save Memory File
+                </>
+              )}
+            </button>
+          )}
           {!hasInlineChanges && justSaved && (
             <span className="config-saved-indicator">
               <CheckCircle size={14} />
@@ -2392,6 +2943,7 @@ function InstructionsTab({
         clearTimeout(justSavedFileTimeoutRef.current);
       }
       justSavedFileTimeoutRef.current = setTimeout(() => setJustSavedFile(false), 3000);
+      await onSaved();
     } catch (err) {
       addToast(`Failed to save instructions file: ${getErrorMessage(err)}`, "error");
     } finally {
@@ -2607,6 +3159,18 @@ function deriveHeartbeatEnabled(runtimeConfig: AgentDetail["runtimeConfig"] | un
   return runtimeConfig?.enabled !== false;
 }
 
+function deriveAutoClaimRelevantTasksEnabled(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): boolean {
+  return runtimeConfig?.autoClaimRelevantTasks !== false;
+}
+
+function deriveRunMissedHeartbeatOnStartup(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): boolean {
+  return runtimeConfig?.runMissedHeartbeatOnStartup === true;
+}
+
+function deriveAllowParallelExecution(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): boolean {
+  return runtimeConfig?.allowParallelExecution !== false;
+}
+
 function deriveBudgetValues(runtimeConfig: AgentDetail["runtimeConfig"] | undefined): Record<string, string> {
   const bc = (runtimeConfig ?? {}).budgetConfig as Record<string, unknown> | undefined;
   const nextValues: Record<string, string> = {};
@@ -2724,6 +3288,7 @@ function HeartbeatProcedureSection({
         clearTimeout(justSavedFileTimeoutRef.current);
       }
       justSavedFileTimeoutRef.current = setTimeout(() => setJustSavedFile(false), 3000);
+      await onSaved();
     } catch (err) {
       addToast(`Failed to save heartbeat procedure file: ${getErrorMessage(err)}`, "error");
     } finally {
@@ -2925,6 +3490,7 @@ function ConfigTab({
   onSaved,
   onHasChangesChange,
   onDelete,
+  onAgentDraftApplied,
 }: {
   agent: AgentDetail;
   projectId?: string;
@@ -2932,6 +3498,7 @@ function ConfigTab({
   onSaved: () => Promise<void>;
   onHasChangesChange?: (hasChanges: boolean) => void;
   onDelete?: () => Promise<void> | void;
+  onAgentDraftApplied?: (updates: Partial<AgentDetail>) => void;
 }) {
   // Identity field state
   const [nameValue, setNameValue] = useState(agent.name);
@@ -2941,6 +3508,9 @@ function ConfigTab({
   const [reportsToValue, setReportsToValue] = useState(agent.reportsTo ?? "");
   const [managerOptions, setManagerOptions] = useState<Agent[]>([]);
   const [isLoadingManagers, setIsLoadingManagers] = useState(false);
+  const [isAvatarPending, setIsAvatarPending] = useState(false);
+  const [isAiInterviewOpen, setIsAiInterviewOpen] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
 
   // Local form state initialised from agent.metadata
   const [formValues, setFormValues] = useState<Record<string, string>>(() => {
@@ -2960,6 +3530,15 @@ function ConfigTab({
   );
   const [heartbeatEnabled, setHeartbeatEnabled] = useState<boolean>(
     () => deriveHeartbeatEnabled(agent.runtimeConfig),
+  );
+  const [autoClaimRelevantTasksEnabled, setAutoClaimRelevantTasksEnabled] = useState<boolean>(
+    () => deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig),
+  );
+  const [runMissedHeartbeatOnStartup, setRunMissedHeartbeatOnStartup] = useState<boolean>(
+    () => deriveRunMissedHeartbeatOnStartup(agent.runtimeConfig),
+  );
+  const [allowParallelExecution, setAllowParallelExecution] = useState<boolean>(
+    () => deriveAllowParallelExecution(agent.runtimeConfig),
   );
 
   // Budget config state initialised from agent.runtimeConfig.budgetConfig
@@ -3010,6 +3589,89 @@ function ConfigTab({
   );
   const hasMissingManagerSelection = !!managerSelection
     && !availableManagers.some((candidate) => candidate.id === managerSelection);
+
+  const existingAgentConfig = useMemo(() => ({
+    name: nameValue,
+    role: roleValue,
+    title: titleValue || undefined,
+    instructionsText: agent.instructionsText,
+    soul: agent.soul,
+    memory: agent.memory,
+    reportsTo: reportsToValue || undefined,
+    skills: selectedSkills,
+    model: modelValue || undefined,
+    runtimeHint: runtimeMode === "runtime" ? selectedRuntimeId || undefined : undefined,
+    thinkingLevel: (formValues.thinkingLevel as "off" | "minimal" | "low" | "medium" | "high" | undefined) ?? undefined,
+    maxTurns: formValues.maxTurns ? Number(formValues.maxTurns) : undefined,
+    heartbeatIntervalMs: heartbeatValues.heartbeatIntervalMs ? Number(heartbeatValues.heartbeatIntervalMs) * 1000 : undefined,
+    heartbeatTimeoutMs: heartbeatValues.heartbeatTimeoutMs ? Number(heartbeatValues.heartbeatTimeoutMs) * 1000 : undefined,
+    maxConcurrentRuns: heartbeatValues.maxConcurrentRuns ? Number(heartbeatValues.maxConcurrentRuns) : undefined,
+    messageResponseMode: heartbeatValues.messageResponseMode as "immediate" | "on-heartbeat" | undefined,
+  }), [
+    agent.instructionsText,
+    agent.memory,
+    agent.soul,
+    formValues.maxTurns,
+    formValues.thinkingLevel,
+    heartbeatValues.heartbeatIntervalMs,
+    heartbeatValues.heartbeatTimeoutMs,
+    heartbeatValues.maxConcurrentRuns,
+    heartbeatValues.messageResponseMode,
+    modelValue,
+    nameValue,
+    reportsToValue,
+    roleValue,
+    runtimeMode,
+    selectedRuntimeId,
+    selectedSkills,
+    titleValue,
+  ]);
+
+  const applyInterviewDraft = useCallback((summary: AgentOnboardingSummary) => {
+    setNameValue(summary.name);
+    setRoleValue(summary.role);
+    setTitleValue(summary.title ?? "");
+    setIconValue(summary.icon ?? "");
+    setReportsToValue(summary.reportsTo ?? "");
+
+    if (summary.skills) {
+      setSelectedSkills(summary.skills);
+    }
+    if (summary.thinkingLevel) {
+      setFormValues((prev) => ({ ...prev, thinkingLevel: summary.thinkingLevel }));
+    }
+    if (summary.maxTurns !== undefined) {
+      setFormValues((prev) => ({ ...prev, maxTurns: String(summary.maxTurns) }));
+    }
+    if (summary.runtimeHint !== undefined) {
+      setRuntimeMode("runtime");
+      setSelectedRuntimeId(summary.runtimeHint ?? "");
+      if (summary.runtimeHint) {
+        setModelValue("");
+      }
+    } else if (summary.model !== undefined) {
+      setRuntimeMode("model");
+      setModelValue(summary.model ?? "");
+      setSelectedRuntimeId("");
+    }
+
+    const draftUpdates = Object.fromEntries(
+      Object.entries({
+        name: summary.name,
+        role: summary.role,
+        title: summary.title,
+        icon: summary.icon,
+        reportsTo: summary.reportsTo,
+        instructionsText: summary.instructionsText,
+        soul: summary.soul,
+        memory: summary.memory,
+      }).filter(([, value]) => value !== undefined),
+    ) as Partial<AgentDetail>;
+    onAgentDraftApplied?.(draftUpdates);
+
+    setIsAiInterviewOpen(false);
+    addToast("Interview draft applied. Review and save when ready.", "success");
+  }, [addToast, onAgentDraftApplied]);
 
   // Load candidate managers for reports-to dropdown
   useEffect(() => {
@@ -3122,7 +3784,7 @@ function ConfigTab({
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [justSaved, setJustSaved] = useState(false);
   const [autoSaveError, setAutoSaveError] = useState<string | null>(null);
-  const isDeletableState = agent.state === "idle" || agent.state === "terminated";
+  const isDeletableState = agent.state === "idle" || agent.state === "paused";
   const justSavedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousAgentRuntimeSyncRef = useRef<{ id: string; updatedAt: string } | null>(null);
   const lastSavedSignatureRef = useRef<string | null>(null);
@@ -3161,6 +3823,9 @@ function ConfigTab({
     // Check heartbeat values
     const rc = agent.runtimeConfig ?? {};
     if (heartbeatEnabled !== deriveHeartbeatEnabled(agent.runtimeConfig)) return true;
+    if (autoClaimRelevantTasksEnabled !== deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig)) return true;
+    if (runMissedHeartbeatOnStartup !== deriveRunMissedHeartbeatOnStartup(agent.runtimeConfig)) return true;
+    if (allowParallelExecution !== deriveAllowParallelExecution(agent.runtimeConfig)) return true;
     for (const key of ["heartbeatIntervalMs", "heartbeatTimeoutMs", "maxConcurrentRuns", "messageResponseMode"] as const) {
       const current = heartbeatValues[key]?.trim() ?? "";
       let persisted = rc[key] !== undefined && rc[key] !== null ? String(rc[key]) : "";
@@ -3234,6 +3899,9 @@ function ConfigTab({
     previousAgentRuntimeSyncRef.current = nextSnapshot;
     setHeartbeatValues(deriveHeartbeatValues(agent.runtimeConfig));
     setHeartbeatEnabled(deriveHeartbeatEnabled(agent.runtimeConfig));
+    setAutoClaimRelevantTasksEnabled(deriveAutoClaimRelevantTasksEnabled(agent.runtimeConfig));
+    setRunMissedHeartbeatOnStartup(deriveRunMissedHeartbeatOnStartup(agent.runtimeConfig));
+    setAllowParallelExecution(deriveAllowParallelExecution(agent.runtimeConfig));
     setBudgetValues(deriveBudgetValues(agent.runtimeConfig));
     setModelValue(initialModelValue);
     setSelectedRuntimeId(initialRuntimeHint);
@@ -3379,6 +4047,9 @@ function ConfigTab({
     // Build the runtimeConfig payload — only include non-empty values
     const newRuntimeConfig: Record<string, unknown> = { ...agent.runtimeConfig };
     newRuntimeConfig.enabled = heartbeatEnabled;
+    newRuntimeConfig.autoClaimRelevantTasks = autoClaimRelevantTasksEnabled;
+    newRuntimeConfig.runMissedHeartbeatOnStartup = runMissedHeartbeatOnStartup;
+    newRuntimeConfig.allowParallelExecution = allowParallelExecution;
     for (const key of ["heartbeatIntervalMs", "heartbeatTimeoutMs", "maxConcurrentRuns"] as const) {
       const raw = heartbeatValues[key]?.trim();
       if (!raw) {
@@ -3474,7 +4145,7 @@ function ConfigTab({
       runtimeConfig: newRuntimeConfig,
       bundleConfig: newBundleConfig,
     };
-  }, [agent.metadata, agent.runtimeConfig, budgetValues, bundleEntryFile, bundleExternalPath, bundleFiles, bundleMode, formValues, heartbeatEnabled, heartbeatValues, iconValue, modelValue, nameValue, reportsToValue, roleValue, runtimeMode, selectedRuntimeId, selectedSkills, titleValue, validationErrors]);
+  }, [agent.metadata, agent.runtimeConfig, allowParallelExecution, autoClaimRelevantTasksEnabled, budgetValues, bundleEntryFile, bundleExternalPath, bundleFiles, bundleMode, formValues, heartbeatEnabled, heartbeatValues, iconValue, modelValue, nameValue, reportsToValue, roleValue, runMissedHeartbeatOnStartup, runtimeMode, selectedRuntimeId, selectedSkills, titleValue, validationErrors]);
 
   const persistSettings = useCallback(async (showValidationToast: boolean, source: "auto" | "manual") => {
     const payload = buildSavePayload();
@@ -3533,6 +4204,19 @@ function ConfigTab({
     await persistSettings(true, "manual");
   };
 
+  const scheduleAutoSave = useCallback(() => {
+    if (!hasChanges || isSaving) {
+      return;
+    }
+
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors);
+      return;
+    }
+
+    void persistSettings(false, "auto");
+  }, [hasChanges, isSaving, persistSettings, validationErrors]);
+
   useEffect(() => {
     if (!hasChanges || isSaving) {
       return;
@@ -3550,6 +4234,35 @@ function ConfigTab({
     return () => clearTimeout(timeout);
   }, [hasChanges, isSaving, persistSettings, validationErrors]);
 
+  const handleAvatarUpload = useCallback(async (file: File) => {
+    setIsAvatarPending(true);
+    try {
+      await uploadAgentAvatar(agent.id, file, projectId);
+      await onSaved();
+      addToast("Avatar uploaded", "success");
+    } catch (error: unknown) {
+      addToast(getErrorMessage(error), "error");
+    } finally {
+      setIsAvatarPending(false);
+      if (avatarInputRef.current) {
+        avatarInputRef.current.value = "";
+      }
+    }
+  }, [addToast, agent.id, onSaved, projectId]);
+
+  const handleAvatarDelete = useCallback(async () => {
+    setIsAvatarPending(true);
+    try {
+      await deleteAgentAvatar(agent.id, projectId);
+      await onSaved();
+      addToast("Avatar removed", "success");
+    } catch (error: unknown) {
+      addToast(getErrorMessage(error), "error");
+    } finally {
+      setIsAvatarPending(false);
+    }
+  }, [addToast, agent.id, onSaved, projectId]);
+
   const saveStatusLabel = isSaving
     ? "Saving changes…"
     : autoSaveError
@@ -3565,7 +4278,12 @@ function ConfigTab({
         <p className="config-description">
           Configure agent settings and behavior.
         </p>
-        
+        <div className="config-actions-row">
+          <button type="button" className="btn btn-sm" onClick={() => setIsAiInterviewOpen(true)}>
+            AI Interview
+          </button>
+        </div>
+
         <div className="config-fields">
           <div className="config-field">
             <label htmlFor="agent-name">Name</label>
@@ -3575,6 +4293,7 @@ function ConfigTab({
               className="input" 
               value={nameValue}
               onChange={(e) => setNameValue(e.target.value)}
+              onBlur={() => { void scheduleAutoSave(); }}
             />
           </div>
           
@@ -3584,7 +4303,10 @@ function ConfigTab({
               id="agent-role"
               className="select"
               value={roleValue}
-              onChange={(e) => setRoleValue(e.target.value as AgentCapability)}
+              onChange={(e) => {
+                setRoleValue(e.target.value as AgentCapability);
+                void scheduleAutoSave();
+              }}
             >
               <option value="triage">Triage</option>
               <option value="executor">Executor</option>
@@ -3604,7 +4326,44 @@ function ConfigTab({
               placeholder="e.g. Senior Code Reviewer"
               value={titleValue}
               onChange={(e) => setTitleValue(e.target.value)}
+              onBlur={() => { void scheduleAutoSave(); }}
             />
+          </div>
+
+          <div className="config-field">
+            <label>Avatar</label>
+            <div className="agent-avatar-editor">
+              <AgentAvatar agent={agent} size={64} className="agent-avatar-editor-preview" />
+              <div className="agent-avatar-editor-actions">
+                <input
+                  ref={avatarInputRef}
+                  id="agent-avatar-upload"
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  className="visually-hidden"
+                  disabled={isAvatarPending}
+                  onChange={(event) => {
+                    const selectedFile = event.target.files?.[0];
+                    if (selectedFile) {
+                      void handleAvatarUpload(selectedFile);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={isAvatarPending}
+                  onClick={() => avatarInputRef.current?.click()}
+                >
+                  Upload Avatar
+                </button>
+                {agent.imageUrl ? (
+                  <button type="button" className="btn btn-sm" onClick={() => void handleAvatarDelete()} disabled={isAvatarPending}>
+                    Remove Avatar
+                  </button>
+                ) : null}
+              </div>
+            </div>
           </div>
 
           <div className="config-field">
@@ -3616,6 +4375,7 @@ function ConfigTab({
               placeholder="e.g. 🤖"
               value={iconValue}
               onChange={(e) => setIconValue(e.target.value)}
+              onBlur={() => { void scheduleAutoSave(); }}
             />
           </div>
 
@@ -3625,7 +4385,10 @@ function ConfigTab({
               id="agent-reports-to"
               className="select"
               value={reportsToValue}
-              onChange={(e) => setReportsToValue(e.target.value)}
+              onChange={(e) => {
+                setReportsToValue(e.target.value);
+                void scheduleAutoSave();
+              }}
               disabled={isLoadingManagers}
             >
               <option value="">No manager</option>
@@ -3654,7 +4417,10 @@ function ConfigTab({
               id="agent-skills"
               label="Skills"
               value={selectedSkills}
-              onChange={setSelectedSkills}
+              onChange={(nextSkills) => {
+                setSelectedSkills(nextSkills);
+                void scheduleAutoSave();
+              }}
               projectId={projectId}
             />
           </div>
@@ -3680,6 +4446,7 @@ function ConfigTab({
                 onClick={() => {
                   setRuntimeMode("model");
                   setSelectedRuntimeId("");
+                  void scheduleAutoSave();
                 }}
               >
                 Built-in Model
@@ -3690,7 +4457,10 @@ function ConfigTab({
                 role="tab"
                 aria-selected={runtimeMode === "runtime"}
                 tabIndex={runtimeMode === "runtime" ? 0 : -1}
-                onClick={() => setRuntimeMode("runtime")}
+                onClick={() => {
+                  setRuntimeMode("runtime");
+                  void scheduleAutoSave();
+                }}
               >
                 Plugin Runtime
               </button>
@@ -3702,7 +4472,10 @@ function ConfigTab({
               <CustomModelDropdown
                 models={availableModels}
                 value={modelValue}
-                onChange={setModelValue}
+                onChange={(value) => {
+                  setModelValue(value);
+                  void scheduleAutoSave();
+                }}
                 placeholder="Use global default"
                 label="Agent Model"
                 disabled={modelsLoading}
@@ -3722,7 +4495,10 @@ function ConfigTab({
                   id="agent-runtime-hint"
                   className="select"
                   value={selectedRuntimeId}
-                  onChange={(e) => setSelectedRuntimeId(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedRuntimeId(e.target.value);
+                    void scheduleAutoSave();
+                  }}
                 >
                   <option value="">
                     {availableRuntimes.length > 0 ? "Select a plugin runtime…" : "No plugin runtimes available"}
@@ -3752,11 +4528,62 @@ function ConfigTab({
                 id="hb-enabled"
                 type="checkbox"
                 checked={heartbeatEnabled}
-                onChange={(e) => handleHeartbeatEnabledChange(e.target.checked)}
+                onChange={(e) => {
+                  handleHeartbeatEnabledChange(e.target.checked);
+                  void scheduleAutoSave();
+                }}
               />
               Heartbeat Enabled
             </label>
             <span className="config-hint">When enabled, this agent receives scheduled heartbeat runs based on its interval.</span>
+          </div>
+
+          <div className="config-field">
+            <label className="checkbox-label" htmlFor="hb-autoClaimRelevantTasks">
+              <input
+                id="hb-autoClaimRelevantTasks"
+                type="checkbox"
+                checked={autoClaimRelevantTasksEnabled}
+                onChange={(e) => {
+                  setAutoClaimRelevantTasksEnabled(e.target.checked);
+                  void scheduleAutoSave();
+                }}
+              />
+              Auto-Claim Relevant Tasks
+            </label>
+            <span className="config-hint">When enabled (default), no-task heartbeats scan open unowned work and auto-claim tasks aligned with this agent&apos;s role and soul.</span>
+          </div>
+
+          <div className="config-field">
+            <label className="checkbox-label" htmlFor="hb-runMissedHeartbeatOnStartup">
+              <input
+                id="hb-runMissedHeartbeatOnStartup"
+                type="checkbox"
+                checked={runMissedHeartbeatOnStartup}
+                onChange={(e) => {
+                  setRunMissedHeartbeatOnStartup(e.target.checked);
+                  void scheduleAutoSave();
+                }}
+              />
+              Run Missed Heartbeat On Startup
+            </label>
+            <span className="config-hint">When enabled, if the server was down across this agent&apos;s scheduled heartbeat tick, fire a single catch-up heartbeat at startup. Default: off.</span>
+          </div>
+
+          <div className="config-field">
+            <label className="checkbox-label" htmlFor="hb-allowParallelExecution">
+              <input
+                id="hb-allowParallelExecution"
+                type="checkbox"
+                checked={allowParallelExecution}
+                onChange={(e) => {
+                  setAllowParallelExecution(e.target.checked);
+                  void scheduleAutoSave();
+                }}
+              />
+              Allow Parallel Execution
+            </label>
+            <span className="config-hint">When disabled, the heartbeat and task execution paths serialize for this agent (heartbeat will not start while the agent&apos;s task is executing, and vice versa). Permanent agents only.</span>
           </div>
 
           <div className="config-field">
@@ -4148,11 +4975,21 @@ function ConfigTab({
             <span className="config-danger-note">
               {isDeletableState
                 ? "Deletion is permanent and cannot be undone."
-                : `Agent deletion is only available when state is idle or terminated (current state: ${agent.state}).`}
+                : `Agent deletion is only available when state is idle or paused (current state: ${agent.state}).`}
             </span>
           </div>
         </div>
       </div>
+
+      <ExperimentalAgentOnboardingModal
+        isOpen={isAiInterviewOpen}
+        onClose={() => setIsAiInterviewOpen(false)}
+        onUseDraft={applyInterviewDraft}
+        projectId={projectId}
+        existingAgents={managerOptions}
+        mode="edit"
+        existingAgentConfig={existingAgentConfig}
+      />
     </div>
   );
 }

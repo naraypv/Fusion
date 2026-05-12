@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { loadAllAppCss } from "../../test/cssFixture";
 import { AgentsView } from "../AgentsView";
 import * as apiModule from "../../api";
 import type { Agent, AgentState, AgentCapability, OrgTreeNode } from "../../api";
@@ -30,12 +31,40 @@ vi.mock("../../api", async (importOriginal) => {
   });
 });
 
+vi.mock("../ExperimentalAgentOnboardingModal", () => ({
+  ExperimentalAgentOnboardingModal: ({ isOpen, onClose, onUseDraft }: { isOpen: boolean; onClose: () => void; onUseDraft: (draft: any) => void }) => {
+    if (!isOpen) return null;
+    return (
+      <div role="dialog" aria-label="AI Interview">
+        <p>Draft ready for review</p>
+        <button type="button" onClick={onClose}>Cancel</button>
+        <button
+          type="button"
+          onClick={() =>
+            onUseDraft({
+              name: "Interview Draft Agent",
+              role: "reviewer",
+              title: "Drafted Title",
+              instructionsText: "Drafted instructions",
+              thinkingLevel: "low",
+              maxTurns: 10,
+            })
+          }
+        >
+          Apply draft to agent form
+        </button>
+      </div>
+    );
+  },
+}));
+
 vi.mock("../AgentDetailView", () => ({
-  AgentDetailView: ({ agentId, inline, onClose, showInlineBackButton, initialTab, initialRunId, preferActiveRun }: { agentId: string; inline?: boolean; onClose?: () => void; showInlineBackButton?: boolean; initialTab?: string; initialRunId?: string | null; preferActiveRun?: boolean }) => (
+  AgentDetailView: ({ agentId, inline, onClose, showInlineBackButton, initialTab, initialRunId, preferActiveRun, onMutationSuccess }: { agentId: string; inline?: boolean; onClose?: () => void; showInlineBackButton?: boolean; initialTab?: string; initialRunId?: string | null; preferActiveRun?: boolean; onMutationSuccess?: (context: { agentId: string; deleted?: boolean }) => void | Promise<void> }) => (
     <div data-testid="agent-detail-view" data-inline={inline ? "true" : "false"} data-initial-tab={initialTab ?? "dashboard"} data-initial-run-id={initialRunId ?? ""} data-prefer-active-run={preferActiveRun ? "true" : "false"}>
       {showInlineBackButton ? (
         <button type="button" aria-label="Back to agents" onClick={onClose}>Agents</button>
       ) : null}
+      <button type="button" onClick={() => void onMutationSuccess?.({ agentId })}>Trigger detail mutation success</button>
       Agent detail: {agentId}
     </div>
   ),
@@ -65,6 +94,8 @@ const mockFetchAgentStats = vi.mocked((apiModule as any).fetchAgentStats);
 const mockFetchSettings = vi.mocked((apiModule as any).fetchSettings);
 const mockUpdateSettings = vi.mocked((apiModule as any).updateSettings);
 const mockClipboardWriteText = vi.fn();
+const mockResizeObserverObserve = vi.fn();
+const mockResizeObserverDisconnect = vi.fn();
 
 describe("AgentsView", () => {
   const mockAddToast = vi.fn();
@@ -109,7 +140,7 @@ describe("AgentsView", () => {
       id: "agent-004",
       name: "Test Agent 4",
       role: "reviewer" as AgentCapability,
-      state: "terminated" as AgentState,
+      state: "error" as AgentState,
       totalInputTokens: 1,
       totalOutputTokens: 1,
       createdAt: new Date(Date.now() - 259200000).toISOString(),
@@ -120,6 +151,10 @@ describe("AgentsView", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal("ResizeObserver", class {
+      observe = mockResizeObserverObserve;
+      disconnect = mockResizeObserverDisconnect;
+    });
     mockViewportMode.mockReturnValue("desktop");
     mockClipboardWriteText.mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
@@ -184,6 +219,20 @@ describe("AgentsView", () => {
       });
     });
 
+    it("shows pending approval badge when agent has pending approvals", async () => {
+      mockFetchAgents.mockResolvedValueOnce([
+        { ...mockAgents[0], id: "agent-pending", name: "Pending Agent", pendingApprovalCount: 2 },
+      ]);
+      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
+
+      render(<AgentsView addToast={mockAddToast} />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle("Pending approvals")).toBeInTheDocument();
+        expect(screen.getByText("2")).toBeInTheDocument();
+      });
+    });
+
     it("formats skill badge labels from SKILL.md paths", async () => {
       mockFetchAgents.mockResolvedValueOnce([
         {
@@ -238,82 +287,18 @@ describe("AgentsView", () => {
       expect(container.querySelector(".agent-card--selected")).toBeTruthy();
     });
 
-    it("renders desktop quick controls and run now starts heartbeat", async () => {
-      render(<AgentsView addToast={mockAddToast} />);
+    it("keeps desktop selection in detail pane without rendering sidebar quick-controls strip", async () => {
+      const { container } = render(<AgentsView addToast={mockAddToast} />);
 
       const detailButton = await screen.findByRole("button", { name: "View details for Test Agent 2" });
       fireEvent.click(detailButton);
 
-      const runNowButtons = await screen.findAllByRole("button", { name: /Run Now/i });
-      fireEvent.click(runNowButtons[0]);
-
       await waitFor(() => {
-        expect(mockStartAgentRun).toHaveBeenCalled();
+        expect(screen.getByTestId("agent-detail-view")).toHaveAttribute("data-inline", "true");
       });
-    });
 
-    it.each([
-      { state: "idle", expected: ["Start"], unexpected: ["Run Now", "Pause", "Resume", "Retry", "Delete"] },
-      { state: "active", expected: ["Run Now", "Pause"], unexpected: ["Resume", "Retry", "Delete"] },
-      { state: "paused", expected: ["Resume"], unexpected: ["Run Now", "Pause", "Retry", "Delete"] },
-      { state: "running", expected: ["Pause"], unexpected: ["Run Now", "Resume", "Retry", "Delete"] },
-      { state: "error", expected: ["Retry"], unexpected: ["Run Now", "Pause", "Resume", "Delete"] },
-      { state: "terminated", expected: ["Start", "Delete"], unexpected: ["Run Now", "Pause", "Resume", "Retry"] },
-    ] as const)("shows correct quick-control buttons for $state state", async ({ state, expected, unexpected }) => {
-      const stateAgent = {
-        ...mockAgents[0],
-        id: "state-agent",
-        name: `State ${state}`,
-        state,
-      } as Agent;
-      mockFetchAgents.mockResolvedValueOnce([stateAgent]);
-      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
-
-      render(<AgentsView addToast={mockAddToast} />);
-
-      const detailButton = await screen.findByRole("button", { name: `View details for State ${state}` });
-      fireEvent.click(detailButton);
-
-      const quickControls = await screen.findByText(`State ${state}`, { selector: ".agents-sidebar-quick-controls strong" });
-      const quickControlsPanel = quickControls.closest(".agents-sidebar-quick-controls");
-      expect(quickControlsPanel).toBeTruthy();
-
-      for (const label of expected) {
-        expect(within(quickControlsPanel as HTMLElement).getByRole("button", { name: new RegExp(label, "i") })).toBeTruthy();
-      }
-      for (const label of unexpected) {
-        expect(within(quickControlsPanel as HTMLElement).queryByRole("button", { name: new RegExp(label, "i") })).toBeNull();
-      }
-    });
-
-    it("quick control start button triggers state update", async () => {
-      const idleAgent = { ...mockAgents[0], id: "idle-agent", name: "Idle Agent", state: "idle" as AgentState };
-      mockFetchAgents.mockResolvedValueOnce([idleAgent]);
-      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
-
-      render(<AgentsView addToast={mockAddToast} />);
-      fireEvent.click(await screen.findByRole("button", { name: "View details for Idle Agent" }));
-      const quickControlsPanel = await screen.findByText("Idle Agent", { selector: ".agents-sidebar-quick-controls strong" });
-      fireEvent.click(within(quickControlsPanel.closest(".agents-sidebar-quick-controls") as HTMLElement).getByRole("button", { name: /Start/i }));
-
-      await waitFor(() => {
-        expect(mockUpdateAgentState).toHaveBeenCalledWith("idle-agent", "active", undefined);
-      });
-    });
-
-    it("quick control delete button deletes terminated agent", async () => {
-      const terminatedAgent = { ...mockAgents[0], id: "terminated-agent", name: "Terminated Agent", state: "terminated" as AgentState };
-      mockFetchAgents.mockResolvedValueOnce([terminatedAgent]);
-      mockFetchAgentStats.mockResolvedValueOnce({ total: 1, byState: {}, byRole: {} });
-
-      render(<AgentsView addToast={mockAddToast} />);
-      fireEvent.click(await screen.findByRole("button", { name: "View details for Terminated Agent" }));
-      const quickControlsPanel = await screen.findByText("Terminated Agent", { selector: ".agents-sidebar-quick-controls strong" });
-      fireEvent.click(within(quickControlsPanel.closest(".agents-sidebar-quick-controls") as HTMLElement).getByRole("button", { name: /Delete/i }));
-
-      await waitFor(() => {
-        expect(mockDeleteAgent).toHaveBeenCalledWith("terminated-agent", undefined);
-      });
+      expect(container.querySelector(".agent-card--selected")).toBeTruthy();
+      expect(container.querySelector(".agents-sidebar-quick-controls")).toBeNull();
     });
 
     it("supports mobile drill-in detail with back navigation", async () => {
@@ -599,7 +584,7 @@ describe("AgentsView", () => {
         expect(screen.getAllByText("idle").length).toBeGreaterThanOrEqual(1);
         expect(screen.getAllByText("active").length).toBeGreaterThanOrEqual(1);
         expect(screen.getAllByText("paused").length).toBeGreaterThanOrEqual(1);
-        expect(screen.getAllByText("terminated").length).toBeGreaterThanOrEqual(1);
+        expect(screen.getAllByText("error").length).toBeGreaterThanOrEqual(1);
       });
     });
 
@@ -648,19 +633,6 @@ describe("AgentsView", () => {
       });
     });
 
-    it("shows terminated agents when explicitly filtered", async () => {
-      render(<AgentsView addToast={mockAddToast} />);
-      await openControlsPanel();
-
-      // Switch to terminated filter
-      const filterSelect = screen.getByLabelText("Filter agents by state");
-      fireEvent.change(filterSelect, { target: { value: "terminated" } });
-
-      await waitFor(() => {
-        expect(screen.getAllByText("terminated").length).toBeGreaterThanOrEqual(1);
-      });
-    });
-
     it("displays agent task when working on one", async () => {
       render(<AgentsView addToast={mockAddToast} />);
       await waitFor(() => {
@@ -676,7 +648,22 @@ describe("AgentsView", () => {
         expect(screen.getByRole("button", { name: "View details for Test Agent 2" })).toBeTruthy();
       });
 
-      expect(screen.getAllByText("View Details").length).toBeGreaterThanOrEqual(4);
+      expect(screen.getAllByText("Details").length).toBeGreaterThanOrEqual(4);
+    });
+
+    it("keeps a visible icon affordance on View Details buttons when labels are compacted", async () => {
+      render(<AgentsView addToast={mockAddToast} />);
+
+      const detailsButton = await screen.findByRole("button", { name: "View details for Test Agent 1" });
+      expect(detailsButton.querySelector("svg")).toBeTruthy();
+    });
+
+    it("hides split-sidebar action labels only within an agent-card-actions container query", () => {
+      const css = loadAllAppCss();
+
+      expect(css).not.toContain(".agents-split-sidebar .agent-card-actions .agent-card-action-label {\n  display: none;\n}");
+      expect(css).toContain("@container agent-card-actions (max-width: calc(var(--space-2xl) * 9))");
+      expect(css).toContain(".agents-split-sidebar .agent-card-actions .agent-card-action-label {\n    display: none;\n  }");
     });
 
     it("opens matching detail view when clicking View Details button", async () => {
@@ -693,19 +680,42 @@ describe("AgentsView", () => {
       });
     });
 
-    it("keeps clickable identity area behavior for opening detail view", async () => {
+    it("refreshes left-pane list immediately when detail pane reports a successful mutation", async () => {
+      mockFetchAgents
+        .mockResolvedValueOnce(mockAgents)
+        .mockResolvedValueOnce([
+          { ...mockAgents[0], name: "Renamed Agent" },
+          ...mockAgents.slice(1),
+        ]);
+
       render(<AgentsView addToast={mockAddToast} />);
 
       await waitFor(() => {
         expect(screen.getAllByText("Test Agent 1").length).toBeGreaterThan(0);
       });
 
-      const clickableIdentity = Array.from(document.querySelectorAll(".agent-info--clickable")).find((element) =>
+      fireEvent.click(screen.getByRole("button", { name: "View details for Test Agent 1" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Trigger detail mutation success" }));
+
+      await waitFor(() => {
+        expect(mockFetchAgents).toHaveBeenCalledTimes(2);
+        expect(screen.getAllByText("Renamed Agent").length).toBeGreaterThan(0);
+      });
+    });
+
+    it("opens detail view when clicking anywhere on the agent card body", async () => {
+      render(<AgentsView addToast={mockAddToast} />);
+
+      await waitFor(() => {
+        expect(screen.getAllByText("Test Agent 1").length).toBeGreaterThan(0);
+      });
+
+      const clickableCard = Array.from(document.querySelectorAll(".agent-card--clickable")).find((element) =>
         element.textContent?.includes("Test Agent 1"),
       ) as HTMLElement | undefined;
-      expect(clickableIdentity).toBeTruthy();
+      expect(clickableCard).toBeTruthy();
 
-      fireEvent.click(clickableIdentity!);
+      fireEvent.click(clickableCard!);
 
       await waitFor(() => {
         const detail = screen.getByTestId("agent-detail-view");
@@ -1044,7 +1054,7 @@ describe("AgentsView", () => {
       );
     });
 
-    it("renders collapsible error display and supports expand/copy", async () => {
+    it("renders compact error indicator and opens modal with copy/github actions", async () => {
       const errorAgent: Agent = {
         ...mockAgents[0],
         id: "agent-error",
@@ -1058,20 +1068,30 @@ describe("AgentsView", () => {
       render(<AgentsView addToast={mockAddToast} />);
 
       await waitFor(() => {
-        expect(screen.getAllByText("something broke").length).toBeGreaterThan(0);
+        expect(screen.getByRole("button", { name: "Open error details" })).toBeTruthy();
       });
 
-      const expandButton = screen.getByRole("button", { name: "Expand error" });
-      fireEvent.click(expandButton);
-      expect(screen.getByRole("button", { name: "Collapse error" })).toBeTruthy();
-      fireEvent.click(screen.getByRole("button", { name: "Collapse error" }));
-      expect(screen.getByRole("button", { name: "Expand error" })).toBeTruthy();
+      expect(screen.queryByText("something broke")).toBeNull();
+      expect(screen.queryByLabelText("Agent error details")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Open error details" }));
+
+      expect(screen.getByLabelText("Agent error details")).toBeTruthy();
+      expect(screen.getAllByText("something broke").length).toBeGreaterThan(0);
 
       fireEvent.click(screen.getByRole("button", { name: "Copy error to clipboard" }));
       await waitFor(() => {
         expect(mockClipboardWriteText).toHaveBeenCalledWith("something broke");
       });
-      expect(screen.getByRole("button", { name: "Copied error to clipboard" })).toBeTruthy();
+
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      fireEvent.click(screen.getByRole("link", { name: "Report on GitHub" }));
+      expect(openSpy).toHaveBeenCalledWith(
+        expect.stringContaining("https://github.com/Runfusion/Fusion/issues/new?"),
+        "_blank",
+        "noopener,noreferrer",
+      );
+      expect(openSpy.mock.calls[0]?.[0]).toContain("Surface%3A+AgentsView+list");
+      openSpy.mockRestore();
     });
 
     it("does not render error display without error state and lastError", async () => {
@@ -1089,7 +1109,7 @@ describe("AgentsView", () => {
       });
 
       expect(screen.queryByText("should not show")).toBeNull();
-      expect(screen.queryByRole("button", { name: "Copy error to clipboard" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Open error details" })).toBeNull();
     });
 
     it("shows refresh button", async () => {
@@ -1274,7 +1294,7 @@ describe("AgentsView", () => {
 
     it("renders org chart nodes and opens detail view when clicking a node", async () => {
       mockFetchOrgTree.mockResolvedValue(orgTree);
-      render(<AgentsView addToast={mockAddToast} />);
+      const { container } = render(<AgentsView addToast={mockAddToast} />);
 
       fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
 
@@ -1286,11 +1306,25 @@ describe("AgentsView", () => {
         expect(screen.getAllByText(/Healthy|Idle|Paused|Unresponsive|Agent stalled/).length).toBeGreaterThan(0);
       });
 
+      expect(container.querySelector(".agents-split-layout")).toBeNull();
+      expect(container.querySelector(".agents-org-full-view")).toBeTruthy();
+
       fireEvent.click(screen.getByText("Director One"));
 
       await waitFor(() => {
         expect(screen.getByTestId("agent-detail-view")).toHaveTextContent("agent-child-1");
+        expect(screen.getByRole("button", { name: "Back to org chart" })).toBeTruthy();
+        expect(screen.queryByRole("button", { name: "Back to agents" })).toBeNull();
       });
+
+      fireEvent.click(screen.getByRole("button", { name: "Back to org chart" }));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId("agent-detail-view")).toBeNull();
+        expect(screen.getByTestId("agent-org-chart")).toBeTruthy();
+      });
+
+      expect(container.querySelector("[class*='org-chart-node-card--'].agent-card--selected")).toBeTruthy();
     });
 
     it("keeps org chart node metadata compact without skill badges", async () => {
@@ -1331,7 +1365,53 @@ describe("AgentsView", () => {
       expect(leafNode.style.getPropertyValue("--org-chart-subtree-leaves")).toBe("1");
       expect(rootChildren).toBeTruthy();
       expect(rootChildren.className).toContain("org-chart-children");
+      expect(rootChildren.style.getPropertyValue("--org-chart-first-child-leaves")).toBe("1");
+      expect(rootChildren.style.getPropertyValue("--org-chart-last-child-leaves")).toBe("1");
       expect(container.querySelectorAll(".org-chart-node--has-children").length).toBeGreaterThan(0);
+    });
+
+    it("uses tokenized connector edge offsets for org chart child bars", () => {
+      const css = loadAllAppCss();
+      expect(css).toContain("--org-chart-first-child-center-offset");
+      expect(css).toContain("--org-chart-last-child-center-offset");
+      expect(css).toContain("left: var(--org-chart-first-child-center-offset)");
+      expect(css).toContain("right: var(--org-chart-last-child-center-offset)");
+      expect(css).toContain(".org-chart-children > .org-chart-node::before");
+    });
+
+    it("switches org chart to vertical layout mode when estimated width exceeds viewport", async () => {
+      const clientWidthSpy = vi.spyOn(window.HTMLElement.prototype, "clientWidth", "get").mockReturnValue(320);
+      mockFetchOrgTree.mockResolvedValue(orgTree);
+      render(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      await waitFor(() => {
+        const chart = screen.getByTestId("agent-org-chart");
+        expect(chart.getAttribute("data-layout-mode")).toBe("vertical");
+        expect(chart.className).toContain("agent-org-chart--vertical");
+      });
+
+      fireEvent.click(screen.getByText("Director One"));
+      await waitFor(() => {
+        expect(screen.getByTestId("agent-detail-view")).toHaveTextContent("agent-child-1");
+      });
+      clientWidthSpy.mockRestore();
+    });
+
+    it("keeps org chart horizontal layout mode when viewport is wide enough", async () => {
+      const clientWidthSpy = vi.spyOn(window.HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1920);
+      mockFetchOrgTree.mockResolvedValue(orgTree);
+      render(<AgentsView addToast={mockAddToast} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Org Chart view" }));
+
+      await waitFor(() => {
+        const chart = screen.getByTestId("agent-org-chart");
+        expect(chart.getAttribute("data-layout-mode")).toBe("horizontal");
+        expect(chart.className).not.toContain("agent-org-chart--vertical");
+      });
+      clientWidthSpy.mockRestore();
     });
 
     it("shows mobile zoom controls for org chart and keeps node selection working", async () => {
@@ -1602,10 +1682,11 @@ describe("AgentsView", () => {
 
       await waitFor(() => {
         expect(screen.getByRole("dialog", { name: "Create new agent" })).toBeTruthy();
+        expect(screen.queryByRole("button", { name: "AI Interview" })).toBeNull();
       });
     });
 
-    it("opens onboarding modal and not legacy dialog when agent onboarding flag is enabled", async () => {
+    it("keeps New Agent launch on the standard dialog when agent onboarding flag is enabled", async () => {
       render(<AgentsView addToast={mockAddToast} agentOnboardingEnabled={true} />);
 
       await waitFor(() => {
@@ -1615,9 +1696,44 @@ describe("AgentsView", () => {
       fireEvent.click(screen.getByText("New Agent"));
 
       await waitFor(() => {
-        expect(screen.getByRole("dialog", { name: "Experimental agent onboarding" })).toBeTruthy();
-        expect(screen.queryByRole("dialog", { name: "Create new agent" })).toBeNull();
+        expect(screen.getByRole("dialog", { name: "Create new agent" })).toBeTruthy();
+        expect(screen.getByRole("button", { name: "AI Interview" })).toBeTruthy();
       });
+    });
+
+    it("launches interview from AgentsView and only applies draft after review confirmation", async () => {
+      render(<AgentsView addToast={mockAddToast} agentOnboardingEnabled={true} />);
+
+      await waitFor(() => {
+        expect(screen.getByText("New Agent")).toBeTruthy();
+      });
+
+      fireEvent.click(screen.getByText("New Agent"));
+      fireEvent.click(screen.getByRole("button", { name: "AI Interview" }));
+
+      const interviewDialog = await screen.findByRole("dialog", { name: "AI Interview" });
+      expect(screen.getByText("Draft ready for review")).toBeTruthy();
+      expect(mockCreateAgent).not.toHaveBeenCalled();
+
+      fireEvent.click(within(interviewDialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog", { name: "AI Interview" })).toBeNull();
+      });
+      expect(mockCreateAgent).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "AI Interview" }));
+      await screen.findByRole("dialog", { name: "AI Interview" });
+      fireEvent.click(screen.getByRole("button", { name: "Apply draft to agent form" }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(screen.getByRole("tab", { name: "Custom agent" }));
+      const nameInput = screen.getByLabelText(/Name/) as HTMLInputElement;
+      expect(nameInput.value).toBe("Interview Draft Agent");
+      expect(mockCreateAgent).not.toHaveBeenCalled();
     });
 
     it("does not allow proceeding with empty name", async () => {
@@ -1875,6 +1991,30 @@ describe("AgentsView", () => {
   });
 
   describe("Run Now button", () => {
+    it("renders compact sidebar action controls with visible icon affordances (FN-3902/FN-3923)", async () => {
+      const activeWithoutTaskId = { ...mockAgents[1] };
+      delete activeWithoutTaskId.taskId;
+      mockFetchAgents.mockResolvedValue([
+        mockAgents[0],
+        activeWithoutTaskId,
+        mockAgents[2],
+        mockAgents[3],
+      ]);
+
+      render(<AgentsView addToast={mockAddToast} />);
+
+      const runNowButton = await screen.findByTitle("Run Now");
+      const pauseButton = await screen.findByTitle("Pause");
+      const activeCard = runNowButton.closest(".agent-card");
+      const detailsButton = activeCard?.querySelector('[aria-label^="View details for "]') as HTMLButtonElement | null;
+
+      expect(detailsButton).toBeTruthy();
+      expect(runNowButton.querySelector(".agent-card-action-label")).toBeTruthy();
+      expect(pauseButton.querySelector(".agent-card-action-label")).toBeTruthy();
+      expect(detailsButton?.querySelector(".agent-card-action-label")).toBeTruthy();
+      expect(detailsButton?.querySelector("svg")).toBeTruthy();
+    });
+
     it("shows Run Now button for active agent without taskId", async () => {
       const activeWithoutTaskId = { ...mockAgents[1] };
       delete activeWithoutTaskId.taskId;
@@ -1924,104 +2064,35 @@ describe("AgentsView", () => {
   });
 
   describe("delete agent", () => {
-    it("shows Delete button for idle and terminated agents in default view", async () => {
+    it("shows Delete button for idle and paused agents in default view", async () => {
       render(<AgentsView addToast={mockAddToast} />);
 
       await waitFor(() => {
         const deleteButtons = screen.getAllByTitle("Delete");
         expect(deleteButtons.length).toBeGreaterThanOrEqual(2);
       });
-
-      expect(screen.getAllByText("Test Agent 4").length).toBeGreaterThan(0);
     });
 
-    it("shows Delete button for terminated agents when explicitly filtered", async () => {
-      render(<AgentsView addToast={mockAddToast} />);
-      await openControlsPanel();
-
-      // Switch to terminated filter
-      const filterSelect = screen.getByLabelText("Filter agents by state");
-      fireEvent.change(filterSelect, { target: { value: "terminated" } });
-
-      await waitFor(() => {
-        expect(screen.getAllByText("Test Agent 4").length).toBeGreaterThan(0);
-        // Now we should see the Delete button for terminated agent
-        expect(screen.getAllByTitle("Delete").length).toBeGreaterThanOrEqual(1);
-      });
-    });
-
-    it("does not show Delete button for active or paused agents", async () => {
+    it("does not show Delete button for active agents", async () => {
       render(<AgentsView addToast={mockAddToast} />);
 
       await waitFor(() => {
-        // Find the active agent card (agent-002)
         const allCards = Array.from(document.querySelectorAll(".agent-card"));
         const activeCard = allCards.find((card) => card.textContent?.includes("agent-002")) ?? null;
+
+        expect((activeCard as Element | null)?.querySelector('[title="Delete"]')).toBeFalsy();
+      });
+    });
+
+    it("shows Delete button for paused agents", async () => {
+      render(<AgentsView addToast={mockAddToast} />);
+
+      await waitFor(() => {
+        const allCards = Array.from(document.querySelectorAll(".agent-card"));
         const pausedCard = allCards.find((card) => card.textContent?.includes("agent-003")) ?? null;
 
-        // Active and paused agents should not have delete buttons
-        expect((activeCard as Element | null)?.querySelector('[title="Delete"]')).toBeFalsy();
-        expect((pausedCard as Element | null)?.querySelector('[title="Delete"]')).toBeFalsy();
+        expect((pausedCard as Element | null)?.querySelector('[title="Delete"]')).toBeTruthy();
       });
-    });
-
-    it("confirms before deleting terminated agent (from terminated filter)", async () => {
-      mockConfirm.mockResolvedValueOnce(false);
-
-      render(<AgentsView addToast={mockAddToast} />);
-      await openControlsPanel();
-
-      // Switch to terminated filter to see terminated agent
-      const filterSelect = screen.getByLabelText("Filter agents by state");
-      fireEvent.change(filterSelect, { target: { value: "terminated" } });
-
-      await waitFor(() => {
-        expect(screen.getAllByText("Test Agent 4").length).toBeGreaterThan(0);
-        // Click the delete button for the terminated agent (agent-004)
-        const terminatedCard = Array.from(document.querySelectorAll(".agent-card")).find(
-          (card) => card.textContent?.includes("agent-004")
-        ) ?? null;
-        const terminatedDeleteBtn = (terminatedCard as Element | null)?.querySelector('[title="Delete"]') as HTMLElement;
-        expect(terminatedDeleteBtn).toBeTruthy();
-        fireEvent.click(terminatedDeleteBtn);
-      });
-
-      expect(mockConfirm).toHaveBeenCalledWith({
-        title: "Delete Agent",
-        message: 'Delete agent "Test Agent 4"? This cannot be undone.',
-        danger: true,
-      });
-      expect(mockDeleteAgent).not.toHaveBeenCalled();
-    });
-
-    it("deletes terminated agent after confirmation (from terminated filter)", async () => {
-
-      render(<AgentsView addToast={mockAddToast} />);
-      await openControlsPanel();
-
-      // Switch to terminated filter to see terminated agent
-      const filterSelect = screen.getByLabelText("Filter agents by state");
-      fireEvent.change(filterSelect, { target: { value: "terminated" } });
-
-      await waitFor(() => {
-        expect(screen.getAllByText("Test Agent 4").length).toBeGreaterThan(0);
-      });
-
-      // Find the delete button for terminated agent (agent-004)
-      const terminatedCard = Array.from(document.querySelectorAll(".agent-card")).find(
-        (card) => card.textContent?.includes("agent-004")
-      ) ?? null;
-      const terminatedDeleteBtn = (terminatedCard as Element | null)?.querySelector('[title="Delete"]') as HTMLElement;
-      fireEvent.click(terminatedDeleteBtn);
-
-      await waitFor(() => {
-        expect(mockDeleteAgent).toHaveBeenCalledWith("agent-004", undefined);
-      });
-
-      expect(mockAddToast).toHaveBeenCalledWith(
-        expect.stringContaining("deleted"),
-        "success"
-      );
     });
 
     it("deletes idle agent after confirmation (from default view)", async () => {
@@ -2048,6 +2119,23 @@ describe("AgentsView", () => {
         expect.stringContaining("deleted"),
         "success"
       );
+    });
+
+    it("deletes paused agent after confirmation (from default view)", async () => {
+      render(<AgentsView addToast={mockAddToast} />);
+
+      await waitFor(() => {
+        const pausedCard = Array.from(document.querySelectorAll(".agent-card")).find(
+          (card) => card.textContent?.includes("agent-003"),
+        ) ?? null;
+        const pausedDeleteBtn = (pausedCard as Element | null)?.querySelector('[title="Delete"]') as HTMLElement;
+        expect(pausedDeleteBtn).toBeTruthy();
+        fireEvent.click(pausedDeleteBtn);
+      });
+
+      await waitFor(() => {
+        expect(mockDeleteAgent).toHaveBeenCalledWith("agent-003", undefined);
+      });
     });
   });
 

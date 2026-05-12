@@ -1,10 +1,12 @@
 import type { Task, TaskDetail, Column as ColumnType, TaskCreateInput } from "@fusion/core";
-import { COLUMNS } from "@fusion/core";
+import { COLUMNS, DEFAULT_COLUMN, isColumn } from "@fusion/core";
+import { sortTasksForDisplayColumn } from "./taskSorting";
 import { Column } from "./Column";
 import type { ToastType } from "../hooks/useToast";
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useBatchBadgeFetch } from "../hooks/useBatchBadgeFetch";
 import { fetchWorkflowSteps, type ModelInfo } from "../api";
+import { useBlockerFanout } from "../hooks/useBlockerFanout";
 
 interface BoardProps {
   tasks: Task[];
@@ -49,104 +51,12 @@ interface BoardProps {
   taskStuckTimeoutMs?: number;
   /** Called when user clicks a mission badge on a task card */
   onOpenMission?: (missionId: string) => void;
+  /** Age threshold in milliseconds before high fan-out blockers escalate in dashboard surfaces. */
+  staleHighFanoutBlockerAgeThresholdMs?: number;
   /** Timestamp (ms) when task data was last confirmed fresh from the server. Used for freshness-aware stuck detection. */
   lastFetchTimeMs?: number;
 }
 
-function normalizeTaskPriority(priority: Task["priority"]): "low" | "normal" | "high" | "urgent" {
-  if (priority === "low" || priority === "normal" || priority === "high" || priority === "urgent") {
-    return priority;
-  }
-  return "normal";
-}
-
-function getTaskPriorityRank(priority: Task["priority"]): number {
-  switch (normalizeTaskPriority(priority)) {
-    case "urgent":
-      return 3;
-    case "high":
-      return 2;
-    case "normal":
-      return 1;
-    case "low":
-      return 0;
-    default:
-      return 1;
-  }
-}
-
-function compareTaskPriority(a: Task["priority"], b: Task["priority"]): number {
-  return getTaskPriorityRank(b) - getTaskPriorityRank(a);
-}
-
-function compareTaskIdNumeric(a: string, b: string): number {
-  const aNum = Number.parseInt(a.slice(a.lastIndexOf("-") + 1), 10);
-  const bNum = Number.parseInt(b.slice(b.lastIndexOf("-") + 1), 10);
-
-  if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) {
-    return aNum - bNum;
-  }
-
-  return a.localeCompare(b);
-}
-
-function sortTasksByPriorityThenAgeAndId(tasks: Task[]): Task[] {
-  return [...tasks].sort((a, b) => {
-    const priorityCmp = compareTaskPriority(a.priority, b.priority);
-    if (priorityCmp !== 0) {
-      return priorityCmp;
-    }
-
-    if (a.createdAt !== b.createdAt) {
-      return a.createdAt.localeCompare(b.createdAt);
-    }
-
-    return compareTaskIdNumeric(a.id, b.id);
-  });
-}
-
-function getDoneSortTimestamp(task: Task): number {
-  const timestamp = task.columnMovedAt ?? task.updatedAt ?? task.createdAt;
-  const parsed = Date.parse(timestamp);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function sortTasksForColumn(tasks: Task[], column: ColumnType): Task[] {
-  if (column === "todo") {
-    // Match scheduler pickup order: priority DESC, createdAt ASC, id ASC.
-    return sortTasksByPriorityThenAgeAndId(tasks);
-  }
-
-  return [...tasks].sort((a, b) => {
-    if (column === "done") {
-      const timestampCmp = getDoneSortTimestamp(b) - getDoneSortTimestamp(a);
-      if (timestampCmp !== 0) {
-        return timestampCmp;
-      }
-
-      // Deterministic tie-breaker when completion timestamps match.
-      return compareTaskIdNumeric(a.id, b.id);
-    }
-
-    // In the in-review column, merging tasks stay pinned above non-merging tasks.
-    if (column === "in-review") {
-      const aIsMerging = a.status === "merging" || a.status === "merging-pr" || a.status === "merging-fix";
-      const bIsMerging = b.status === "merging" || b.status === "merging-pr" || b.status === "merging-fix";
-      if (aIsMerging !== bIsMerging) {
-        return aIsMerging ? -1 : 1;
-      }
-    }
-
-    // Primary sort for non-done/non-todo columns: priority descending.
-    const priorityCmp = compareTaskPriority(a.priority, b.priority);
-    if (priorityCmp !== 0) {
-      return priorityCmp;
-    }
-
-    // Secondary sort: numeric task ID ascending (lower number first).
-    return compareTaskIdNumeric(a.id, b.id);
-  });
-}
 
 function areTaskArraysEqual(previous: Task[], next: Task[]): boolean {
   if (previous.length !== next.length) return false;
@@ -163,12 +73,15 @@ function areWorkflowNameLookupsEqual(previous: ReadonlyMap<string, string>, next
   return true;
 }
 
-export function Board({ tasks, projectId, maxConcurrent, onMoveTask, onPauseTask, onOpenDetail, addToast, onQuickCreate, onNewTask, autoMerge, onToggleAutoMerge, globalPaused, onUpdateTask, onRetryTask, onArchiveTask, onUnarchiveTask, onDeleteTask, onArchiveAllDone, onLoadArchivedTasks, searchQuery = "", availableModels, onPlanningMode, onSubtaskBreakdown, onOpenDetailWithTab, favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, taskStuckTimeoutMs, onOpenMission, lastFetchTimeMs }: BoardProps) {
+export function Board({ tasks, projectId, maxConcurrent, onMoveTask, onPauseTask, onOpenDetail, addToast, onQuickCreate, onNewTask, autoMerge, onToggleAutoMerge, globalPaused, onUpdateTask, onRetryTask, onArchiveTask, onUnarchiveTask, onDeleteTask, onArchiveAllDone, onLoadArchivedTasks, searchQuery = "", availableModels, onPlanningMode, onSubtaskBreakdown, onOpenDetailWithTab, favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, taskStuckTimeoutMs, onOpenMission, staleHighFanoutBlockerAgeThresholdMs, lastFetchTimeMs }: BoardProps) {
   const [archivedCollapsed, setArchivedCollapsed] = useState(true);
   const archivedLoadedRef = useRef(false);
   const { fetchBatch } = useBatchBadgeFetch(projectId);
   const debounceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [workflowStepNameLookup, setWorkflowStepNameLookup] = useState<ReadonlyMap<string, string>>(EMPTY_WORKFLOW_STEP_NAME_LOOKUP);
+  const blockerFanoutMap = useBlockerFanout(tasks, {
+    staleHighFanoutAgeThresholdMs: staleHighFanoutBlockerAgeThresholdMs,
+  });
   // Normalized search-active signal: trimmed and non-empty
   const isSearchActive = searchQuery.trim() !== "";
   const tasksByColumnCacheRef = useRef<Record<ColumnType, Task[]>>({
@@ -196,19 +109,26 @@ export function Board({ tasks, projectId, maxConcurrent, onMoveTask, onPauseTask
   // Keep per-column array identities stable for unchanged columns so React.memo(Column)
   // can skip sibling rerenders during unrelated task updates.
   const tasksByColumn = useMemo(() => {
-    const nextGrouped = Object.fromEntries(
-      COLUMNS.map((column) => [column, [] as Task[]]),
-    ) as Record<ColumnType, Task[]>;
+    const nextGrouped: Record<ColumnType, Task[]> = {
+      triage: [],
+      todo: [],
+      "in-progress": [],
+      "in-review": [],
+      done: [],
+      archived: [],
+    };
 
     for (const task of tasks) {
-      nextGrouped[task.column].push(task);
+      const column = isColumn(task.column) ? task.column : DEFAULT_COLUMN;
+      const bucket = nextGrouped[column] ?? nextGrouped[DEFAULT_COLUMN];
+      bucket.push(task);
     }
 
     const previousGrouped = tasksByColumnCacheRef.current;
     const stableGrouped = {} as Record<ColumnType, Task[]>;
 
     for (const column of COLUMNS) {
-      const sortedTasks = sortTasksForColumn(nextGrouped[column], column);
+      const sortedTasks = sortTasksForDisplayColumn(nextGrouped[column], column);
       stableGrouped[column] = areTaskArraysEqual(previousGrouped[column], sortedTasks)
         ? previousGrouped[column]
         : sortedTasks;
@@ -308,6 +228,7 @@ export function Board({ tasks, projectId, maxConcurrent, onMoveTask, onPauseTask
             onOpenMission={onOpenMission}
             lastFetchTimeMs={lastFetchTimeMs}
             workflowStepNameLookup={workflowStepNameLookup}
+            blockerFanoutMap={blockerFanoutMap}
             {...(col === "triage" ? { onQuickCreate, onNewTask, onPlanningMode, onSubtaskBreakdown } : {})}
             {...(col === "in-review" ? { autoMerge, onToggleAutoMerge } : {})}
             {...(col === "done" ? { onArchiveAllDone } : {})}

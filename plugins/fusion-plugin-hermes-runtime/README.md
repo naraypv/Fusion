@@ -29,6 +29,21 @@ After install, run `hermes login` (or `hermes auth`) to configure a provider. Th
 
 Verify with `hermes --version`.
 
+## Fusion skill auto-install
+
+When the Hermes runtime plugin loads, it attempts to auto-install/mirror Fusion's bundled `fusion` skill into the active Hermes profile skill directory:
+
+- default profile: `${HERMES_HOME:-~/.hermes}/skills/fusion`
+- named profile: `${HERMES_HOME:-~/.hermes}/profiles/<profile>/skills/fusion`
+
+The installer is idempotent and self-healing:
+
+- leaves an already-correct install untouched
+- replaces prior Fusion installs it can positively identify
+- avoids replacing unrelated user-managed directories
+
+If the bundled Fusion skill source is missing or filesystem writes fail, the plugin logs a warning and still starts the Hermes runtime.
+
 ## Limitations
 
 Because we drive the CLI's `chat -q` mode:
@@ -36,7 +51,9 @@ Because we drive the CLI's `chat -q` mode:
 - **No per-token streaming.** Hermes buffers output through prompt_toolkit; the full response arrives once the process exits. `onText` is called exactly once per turn.
 - **No reasoning/thinking deltas.** `-Q` mode suppresses them. If you need streaming + reasoning, switch to Hermes's ACP mode (not yet implemented in this plugin).
 - **No tool-call hooks.** Hermes runs tools internally; Fusion only sees the final assistant text. Use `yolo: true` to skip Hermes's interactive approval prompts in non-interactive sessions.
-- **`AgentRuntimeOptions.cwd`, `tools`, `skills`, `sessionManager`, etc. are ignored** — Hermes's own session/tools/skills systems handle these.
+- **No JS tool callbacks.** `customTools` callback functions are still not executable through Hermes CLI mode; Hermes runs its own tool layer and Fusion receives final text.
+- **Fusion context is prompt-mediated.** The engine forwards requested Fusion skill names into `skills`, and the adapter prepends Fusion system/runtime context on the first turn of each session so capability expectations (for example messaging/delegation flows) are not silently dropped on non-pi runtimes.
+- `AgentRuntimeOptions.cwd` / `sessionManager` are still adapter-noops in CLI mode.
 
 ## Settings
 

@@ -11,7 +11,6 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
-import { homedir } from "node:os";
 
 const execAsync = promisify(exec);
 import {
@@ -35,18 +34,29 @@ import {
   type AgentSession,
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
-import { getEnabledPiExtensionPaths, getFusionAgentDir, getLegacyPiAgentDir, reconcileClaudeCliPaths, reconcileDroidCliPaths, resolveModelFallbackChain, resolvePiExtensionProjectRoot, resolveRouteAllLlmCallsViaDspy, type Settings } from "@fusion/core";
-import { setFusionClaudeCliAccountEnv } from "@fusion/pi-claude-cli/src/process-manager.js";
+import { getEnabledPiExtensionPaths, getFusionAgentDir, getLegacyPiAgentDir, reconcileClaudeCliPaths, reconcileDroidCliPaths, resolvePiExtensionProjectRoot } from "@fusion/core";
+import type {
+  AgentPermissionPolicyActionCategory,
+  PermanentAgentActionCategory,
+  PermanentAgentGatingContext,
+} from "@fusion/core";
 import {
   resolveSessionSkills,
   createSkillsOverrideFromSelection,
   type SkillSelectionContext,
 } from "./skill-resolver.js";
 import { isContextLimitError } from "./context-limit-detector.js";
-import { createFusionAuthStorage, getModelRegistryModelsPath, type FusionAuthStorageExtras } from "./auth-storage.js";
-import { buildDspyRoutedSystemPrompt, createDspyRoutingMetadata, syncFusionAccountsToDspyRegistry } from "./dspy-bridge.js";
+import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
 import { piLog, extensionsLog } from "./logger.js";
 import { readCustomProviders } from "./custom-providers.js";
+import {
+  buildGateRejection,
+  evaluateAgentActionGate,
+  resolveGateOutcome,
+  type AgentActionGateContext,
+} from "./agent-action-gate.js";
+import { resolvePermanentAgentToolDecision } from "./permanent-agent-gating.js";
+import type { SystemPromptLayers } from "./prompt-layers.js";
 
 export interface AgentResult {
   session: AgentSession;
@@ -82,38 +92,6 @@ interface SessionManagerLike {
   _rewriteFile?: () => void;
 }
 
-function getHomeDir(): string {
-  return process.env.HOME || process.env.USERPROFILE || homedir();
-}
-
-function readSettingsJsonObject(path: string): Record<string, unknown> | undefined {
-  try {
-    if (!existsSync(path)) {
-      return undefined;
-    }
-    const parsed = JSON.parse(readFileSync(path, "utf-8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function readSessionSettingsSnapshot(projectRoot: string): Partial<Settings> | undefined {
-  if (process.env.VITEST === "true") {
-    return undefined;
-  }
-
-  const globalSettings = readSettingsJsonObject(join(getHomeDir(), ".fusion", "settings.json")) ?? {};
-  const projectSettings =
-    readSettingsJsonObject(join(projectRoot, ".fusion", "config.json")) ??
-    readSettingsJsonObject(join(projectRoot, ".fusion", "settings.json")) ??
-    {};
-  const settings = { ...globalSettings, ...projectSettings } as Partial<Settings>;
-  return Object.keys(settings).length > 0 ? settings : undefined;
-}
-
 interface ToolHookPayload {
   toolCall: unknown;
   args: unknown;
@@ -138,6 +116,79 @@ type AgentToolHookSession = AgentSession & {
   __fusionMessageContentGuardInstalled?: boolean;
 };
 const FN_MEMORY_APPEND_TOOL_NAME = "fn_memory_append";
+const FUSION_SHUTDOWN_WRAP_FLAG = "__fusionSessionShutdownDisposeWrapped";
+
+type SessionShutdownEventShape = { type: "session_shutdown"; reason: "quit" | "reload" };
+type ExtensionRunnerShutdownEmitter = {
+  hasHandlers: (event: "session_shutdown") => boolean;
+  emit: (event: SessionShutdownEventShape) => Promise<unknown>;
+};
+
+async function emitSessionShutdownEvent(
+  extensionRunner: ExtensionRunnerShutdownEmitter,
+  event: SessionShutdownEventShape,
+): Promise<boolean> {
+  if (!extensionRunner.hasHandlers("session_shutdown")) {
+    return false;
+  }
+  await extensionRunner.emit(event);
+  return true;
+}
+
+/**
+ * Fusion creates raw pi `AgentSession` objects and many engine call sites
+ * invoke `session.dispose()` directly. Wrap dispose so we mirror
+ * `AgentSessionRuntime.dispose()` behavior and emit `session_shutdown` first.
+ */
+function wrapSessionDisposeWithShutdown(session: AgentSession): void {
+  const mutableSession = session as AgentSession & Record<string, unknown>;
+  if (mutableSession[FUSION_SHUTDOWN_WRAP_FLAG]) {
+    return;
+  }
+  mutableSession[FUSION_SHUTDOWN_WRAP_FLAG] = true;
+
+  const originalDispose =
+    typeof session.dispose === "function"
+      ? session.dispose.bind(session)
+      : () => undefined;
+  let disposeStarted = false;
+  const wrappedDispose = async (): Promise<void> => {
+    if (disposeStarted) {
+      return;
+    }
+    disposeStarted = true;
+
+    const extensionRunner = (session as { extensionRunner?: unknown }).extensionRunner;
+    if (
+      extensionRunner &&
+      typeof (extensionRunner as ExtensionRunnerShutdownEmitter).hasHandlers === "function" &&
+      typeof (extensionRunner as ExtensionRunnerShutdownEmitter).emit === "function"
+    ) {
+      try {
+        await emitSessionShutdownEvent(extensionRunner as ExtensionRunnerShutdownEmitter, {
+          type: "session_shutdown",
+          reason: "quit",
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        piLog.warn(`Failed to emit session_shutdown during dispose: ${message}`);
+      }
+    }
+
+    try {
+      await Promise.resolve(originalDispose());
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      piLog.warn(`Session dispose failed after session_shutdown emit: ${message}`);
+    }
+  };
+
+  (mutableSession as unknown as { dispose: () => void }).dispose = wrappedDispose as unknown as () => void;
+}
+
+export function _wrapSessionDisposeForTest(session: AgentSession): void {
+  wrapSessionDisposeWithShutdown(session);
+}
 
 function getSessionStateError(session: AgentSession): string {
   const state = (session as any).state;
@@ -163,6 +214,10 @@ function clearSessionStateError(session: AgentSession): void {
       }
     }
   }
+}
+
+function isThinkingReasoningConflictError(message: string): boolean {
+  return /cannot specify both\s+['"]?thinking['"]?\s+and\s+['"]?reasoning_effort['"]?/i.test(message);
 }
 
 async function promptSessionAndCheck(session: AgentSession, prompt: string, options?: unknown): Promise<void> {
@@ -212,6 +267,18 @@ async function promptSessionAndCheck(session: AgentSession, prompt: string, opti
       clearSessionStateError(session);
       return;
     }
+    // pi-ai's openai-codex-responses provider (Codex via ChatGPT-plan WebSocket)
+    // surfaces transport drops as bare "WebSocket error" / "WebSocket closed".
+    // The underlying ErrorEvent's `event.error` (cause/code) is dropped by
+    // pi-ai's `extractWebSocketError` (it only inspects `event.message`), so
+    // by the time we see the string the cause is gone. Tag the message with
+    // the model identity so retry/transient classification can at least tell
+    // which transport is unstable, and emit a structured warn for triage.
+    if (/^WebSocket (error|closed)\b/i.test(stateError) || /WebSocket stream closed before response\.completed/i.test(stateError)) {
+      const modelDesc = describeModel(session);
+      piLog.warn(`pi state error — Codex WebSocket transport drop (model=${modelDesc}): ${stateError}`);
+      throw new Error(`${stateError} (model=${modelDesc})`);
+    }
     throw new Error(stateError);
   }
 }
@@ -245,6 +312,17 @@ export async function promptWithFallback(session: AgentSession, prompt: string, 
       const retryMessage = promptMemoryRetry.error instanceof Error ? promptMemoryRetry.error.message : String(promptMemoryRetry.error);
       if (!isContextLimitError(retryMessage)) {
         throw promptMemoryRetry.error;
+      }
+    }
+
+    const promptSectionRetry = await retryWithCompactedPromptSections(session, prompt, options);
+    if (promptSectionRetry.recovered) {
+      return;
+    }
+    if (promptSectionRetry.error) {
+      const retryMessage = promptSectionRetry.error instanceof Error ? promptSectionRetry.error.message : String(promptSectionRetry.error);
+      if (!isContextLimitError(retryMessage)) {
+        throw promptSectionRetry.error;
       }
     }
 
@@ -292,6 +370,10 @@ export const COMPACTION_FALLBACK_INSTRUCTIONS = [
 ].join(" ");
 
 const MAX_COMPACTED_PROMPT_MEMORY_CHARS = 8_000;
+const MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS = 1_200;
+const MAX_COMPACTED_ATTACHMENTS_CHARS = 4_000;
+const MAX_COMPACTED_EXISTING_SPEC_CHARS = 4_000;
+const MAX_COMPACTED_USER_COMMENTS_CHARS = 2_000;
 
 function compactMarkdownMemorySection(sectionBody: string): string {
   const lines = sectionBody.split("\n");
@@ -354,6 +436,158 @@ function compactPromptMemory(prompt: string): string | null {
   return changed && compactedPrompt.length < prompt.length ? compactedPrompt : null;
 }
 
+function trimSubtaskSectionBody(body: string): string {
+  const paragraphs = body
+    .trim()
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const rawFirstParagraph = paragraphs[0] ?? "Subtask guidance omitted for context limits.";
+  const maxFirstParagraphChars = Math.max(200, MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS - 200);
+  const firstParagraph = rawFirstParagraph.length > maxFirstParagraphChars
+    ? `${rawFirstParagraph.slice(0, maxFirstParagraphChars)}…`
+    : rawFirstParagraph;
+  return [
+    firstParagraph,
+    "",
+    "Follow the project's standard subtask split rules.",
+  ].join("\n");
+}
+
+function compactAttachmentSectionBody(body: string): string {
+  if (body.length <= MAX_COMPACTED_ATTACHMENTS_CHARS) {
+    return body.trim();
+  }
+
+  const lines = body.split("\n");
+  const kept: string[] = [];
+  let inFence = false;
+  let fenceHasContent = false;
+
+  for (const line of lines) {
+    if (/^```/.test(line.trim())) {
+      if (!inFence) {
+        inFence = true;
+        fenceHasContent = false;
+        continue;
+      }
+      inFence = false;
+      if (fenceHasContent) {
+        kept.push("```", "_... attachment body trimmed ..._", "```");
+      }
+      continue;
+    }
+
+    if (inFence) {
+      fenceHasContent = true;
+      continue;
+    }
+
+    kept.push(line);
+  }
+
+  return kept.join("\n").trim();
+}
+
+function compactExistingSpecificationSectionBody(body: string): string {
+  const trimmed = body.trim();
+  if (trimmed.length <= MAX_COMPACTED_EXISTING_SPEC_CHARS) {
+    return trimmed;
+  }
+
+  const head = trimmed.slice(0, Math.floor(MAX_COMPACTED_EXISTING_SPEC_CHARS / 2));
+  const tail = trimmed.slice(-Math.floor(MAX_COMPACTED_EXISTING_SPEC_CHARS / 2));
+  return `${head}\n\n_... existing specification middle trimmed ..._\n\n${tail}`;
+}
+
+function compactUserCommentsSectionBody(body: string): string {
+  const trimmed = body.trim();
+  if (trimmed.length <= MAX_COMPACTED_USER_COMMENTS_CHARS) {
+    return trimmed;
+  }
+
+  const lines = trimmed.split("\n");
+  const commentLines = lines.filter((line) => /^- \*\*\[[^\]]+\]\*\*/.test(line));
+  const staticLines = lines.filter((line) => !/^- \*\*\[[^\]]+\]\*\*/.test(line));
+  const sortedComments = [...commentLines].sort((a, b) => {
+    const aDate = a.match(/^- \*\*\[([^\]]+)\]\*\*/)?.[1] ?? "";
+    const bDate = b.match(/^- \*\*\[([^\]]+)\]\*\*/)?.[1] ?? "";
+    return bDate.localeCompare(aDate);
+  });
+
+  const kept: string[] = [];
+  let used = staticLines.join("\n").length;
+  for (const line of sortedComments) {
+    const next = used + line.length + 1;
+    if (next > MAX_COMPACTED_USER_COMMENTS_CHARS) {
+      break;
+    }
+    kept.push(line);
+    used = next;
+  }
+
+  const trimmedCount = Math.max(0, commentLines.length - kept.length);
+  return [
+    ...staticLines,
+    "",
+    ...kept,
+    ...(trimmedCount > 0 ? ["", `_... ${trimmedCount} earlier comments trimmed ..._`] : []),
+  ].join("\n").trim();
+}
+
+function compactLargePromptSections(prompt: string): string | null {
+  const sectionPattern = /(^|\n)(## (?:Subtask Consideration|Subtask Breakdown Requested|Attachments|Existing Specification|User Comments)\n)([\s\S]*?)(?=\n## [^#]|\n# [^#]|$)/g;
+  let changed = false;
+
+  const compactedPrompt = prompt.replace(sectionPattern, (match, prefix: string, heading: string, body: string) => {
+    const headingName = heading.trim().replace(/^##\s+/, "");
+    const trimmedBody = body.trim();
+
+    const maxByHeading: Record<string, number> = {
+      "Subtask Consideration": MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS,
+      "Subtask Breakdown Requested": MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS,
+      Attachments: MAX_COMPACTED_ATTACHMENTS_CHARS,
+      "Existing Specification": MAX_COMPACTED_EXISTING_SPEC_CHARS,
+      "User Comments": MAX_COMPACTED_USER_COMMENTS_CHARS,
+    };
+
+    const maxChars = maxByHeading[headingName] ?? MAX_COMPACTED_PROMPT_MEMORY_CHARS;
+    if (trimmedBody.length <= maxChars) {
+      return match;
+    }
+
+    let compactedBody = trimmedBody;
+    if (headingName === "Subtask Consideration" || headingName === "Subtask Breakdown Requested") {
+      compactedBody = trimSubtaskSectionBody(trimmedBody);
+    } else if (headingName === "Attachments") {
+      compactedBody = compactAttachmentSectionBody(trimmedBody);
+    } else if (headingName === "Existing Specification") {
+      compactedBody = compactExistingSpecificationSectionBody(trimmedBody);
+    } else if (headingName === "User Comments") {
+      compactedBody = compactUserCommentsSectionBody(trimmedBody);
+    }
+
+    const finalBody = [
+      compactedBody,
+      "",
+      `<!-- Section trimmed from ${trimmedBody.length} characters to fit context window. -->`,
+    ].join("\n").trim();
+
+    if (finalBody.length >= trimmedBody.length) {
+      return match;
+    }
+
+    changed = true;
+    return `${prefix}${heading}${finalBody}`;
+  });
+
+  return changed && compactedPrompt.length < prompt.length ? compactedPrompt : null;
+}
+
+export const __testOnlyPromptCompaction = {
+  compactLargePromptSections,
+};
+
 async function retryWithCompactedPromptMemory(
   session: AgentSession,
   prompt: string,
@@ -379,6 +613,31 @@ async function retryWithCompactedPromptMemory(
   }
 }
 
+async function retryWithCompactedPromptSections(
+  session: AgentSession,
+  prompt: string,
+  options?: unknown,
+): Promise<{ recovered: boolean; error?: unknown }> {
+  const compactedPrompt = compactLargePromptSections(prompt);
+  if (!compactedPrompt) {
+    return { recovered: false };
+  }
+
+  piLog.log(
+    `promptWithFallback: retrying with compacted prompt sections (${prompt.length} → ${compactedPrompt.length} chars)`,
+  );
+
+  try {
+    await promptSessionAndCheck(session, compactedPrompt, options);
+    piLog.log("promptWithFallback: prompt completed after section compaction");
+    return { recovered: true };
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    piLog.error(`promptWithFallback: retry after section compaction failed: ${errorMessage}`);
+    return { recovered: false, error: err };
+  }
+}
+
 async function flushMemoryBeforeSessionCompaction(session: AgentSession): Promise<void> {
   if ((session as any).__fusionMemoryAppendAvailable !== true) {
     return;
@@ -386,7 +645,8 @@ async function flushMemoryBeforeSessionCompaction(session: AgentSession): Promis
 
   const flushPrompt = [
     "Before context compaction, preserve only unresolved durable memory if needed.",
-    "If fn_memory_append is available and you learned reusable project decisions, conventions, pitfalls, or open loops that are not already saved, append them now.",
+    "If fn_memory_append is available and you learned reusable project decisions/conventions/pitfalls/open loops or private operating context that is not already saved, append it now.",
+    "Use scope=\"project\" for shared workspace knowledge and scope=\"agent\" for private operating context.",
     "Use layer=\"long-term\" for durable facts and layer=\"daily\" for running notes/open loops.",
     "If there is nothing durable to save, reply exactly: NONE.",
   ].join("\n");
@@ -447,11 +707,20 @@ export interface FallbackModelUsedPayload {
   timestamp?: string;
 }
 
+export type BuiltinWebToolName = "WebSearch" | "WebFetch";
+
 export interface AgentOptions {
   cwd: string;
   systemPrompt: string;
+  /** Structured prompt layers for cross-session caching. When provided,
+   *  the stable layer is used as systemPromptOverride and the dynamic
+   *  layer as appendSystemPromptOverride. Falls back to systemPrompt
+   *  when not provided. */
+  systemPromptLayers?: SystemPromptLayers;
   tools?: "coding" | "readonly";
   customTools?: ToolDefinition[];
+  /** Optional allowlist of builtin runtime web tools to keep enabled. */
+  builtinToolsAllowlist?: BuiltinWebToolName[];
   onText?: (delta: string) => void;
   onThinking?: (delta: string) => void;
   onToolStart?: (name: string, args?: Record<string, unknown>) => void;
@@ -465,10 +734,6 @@ export interface AgentOptions {
   fallbackProvider?: string;
   /** Optional fallback model ID used with `fallbackProvider`. */
   fallbackModelId?: string;
-  /** Ordered fallback models. When present, this supersedes the legacy single fallback pair. */
-  modelFallbackChain?: Array<{ provider?: string; modelId?: string; accountId?: string; accountProvider?: string }>;
-  /** Route this session through Fusion's DSPy declarative bridge. */
-  routeViaDspy?: boolean;
   /** Default thinking effort level (e.g. "medium", "high"). When provided, sets the session's thinking level after creation. */
   defaultThinkingLevel?: string;
   /** Optional pre-configured SessionManager. When provided, the agent session
@@ -484,6 +749,8 @@ export interface AgentOptions {
    *  (and `skillSelection` is not), auto-constructs a SkillSelectionContext
    *  from the cwd and these names. Ignored when `skillSelection` is set. */
   skills?: string[];
+  /** Optional task-scoped env injected into this session's subprocess tools only. */
+  taskEnv?: NodeJS.ProcessEnv;
   /** Last-chance abort hook fired immediately before `createAgentSession`.
    *  See `AgentRuntimeOptions.beforeSpawnSession`. */
   beforeSpawnSession?: () => Promise<void> | void;
@@ -492,6 +759,9 @@ export interface AgentOptions {
   /** Optional task context for fallback notifications. */
   taskId?: string;
   taskTitle?: string;
+  actionGateContext?: AgentActionGateContext;
+  /** Permanent-agent action gating context forwarded by runtime/session helpers. */
+  permanentAgentGating?: PermanentAgentGatingContext;
 }
 
 function resolveConfiguredModel(
@@ -544,56 +814,6 @@ function isRetryableModelSelectionError(message: string): boolean {
     || normalized.includes("capacity")
     || normalized.includes("temporarily unavailable")
     || normalized.includes("invalid temperature");
-}
-
-function classifyAccountFailure(message: string) {
-  const normalized = message.toLowerCase();
-  if (normalized.includes("rate limit") || normalized.includes("too many requests") || normalized.includes("429")) {
-    return "rate_limit" as const;
-  }
-  if (normalized.includes("quota") || normalized.includes("credit") || normalized.includes("billing")) {
-    return "quota" as const;
-  }
-  if (
-    normalized.includes("401") ||
-    normalized.includes("403") ||
-    normalized.includes("unauthorized") ||
-    normalized.includes("forbidden") ||
-    normalized.includes("authentication") ||
-    normalized.includes("invalid api key") ||
-    normalized.includes("invalid key")
-  ) {
-    return "auth" as const;
-  }
-  if (normalized.includes("overloaded") || normalized.includes("capacity") || normalized.includes("temporarily unavailable")) {
-    return "transient" as const;
-  }
-  return "unknown" as const;
-}
-
-function accountProviderForModelProvider(provider: string | undefined): string | undefined {
-  if (!provider) return undefined;
-  if (provider === "pi-claude-cli") return "claude-cli";
-  return provider;
-}
-
-function cliAccountEnvFor(provider: string, home: string): NodeJS.ProcessEnv {
-  if (provider === "claude-cli") {
-    return {
-      HOME: home,
-      CLAUDE_CONFIG_DIR: join(home, ".claude"),
-    };
-  }
-  return { HOME: home };
-}
-
-function accountFailureCooldownMs(message: string): number {
-  const kind = classifyAccountFailure(message);
-  if (kind === "auth") return 60 * 60 * 1000;
-  if (kind === "quota") return 24 * 60 * 60 * 1000;
-  if (kind === "rate_limit") return 5 * 60 * 1000;
-  if (kind === "transient") return 60 * 1000;
-  return 2 * 60 * 1000;
 }
 
 interface PackageManagerSettingsView {
@@ -1069,14 +1289,43 @@ function isWorktreeAllowedPath(
  * message with `content: undefined`, which pi's downstream handling later
  * crashes on with "Cannot read properties of undefined (reading 'filter')".
  */
-function boundaryRejection(message: string) {
+function boundaryRejection(message: string, details?: Record<string, unknown>) {
   return {
     content: [{ type: "text", text: message }],
     isError: true,
     ok: false,
     error: message,
+    ...(details ? { details } : {}),
   };
 }
+
+function normalizeApprovalRequestCategory(
+  category: PermanentAgentActionCategory,
+): AgentPermissionPolicyActionCategory {
+  if (category === "none") {
+    return "command_execution";
+  }
+  return category;
+}
+
+function buildPermanentAgentApprovalDedupeKey(input: {
+  requesterActorId?: string;
+  taskId?: string;
+  toolName: string;
+  category: PermanentAgentActionCategory;
+}): string {
+  return [
+    input.requesterActorId ?? "",
+    input.taskId ?? "",
+    input.toolName,
+    input.category,
+  ].join("|");
+}
+
+const GATE_BYPASS_TOOL_NAMES = new Set([
+  "fn_heartbeat_done",
+  "fn_send_message",
+]);
 
 export function wrapToolsWithBoundary(
   tools: ToolDefinition[],
@@ -1134,29 +1383,186 @@ export function wrapToolsWithBoundary(
   });
 }
 
+export function wrapToolsWithPermanentAgentGating(
+  tools: ToolDefinition[],
+  gating: PermanentAgentGatingContext | undefined,
+): ToolDefinition[] {
+  if (!gating) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    // FN-3852/FN-3855: terminal completion and send-message coordination
+    // primitives must never be approval-gated, or open sessions can deadlock.
+    if (GATE_BYPASS_TOOL_NAMES.has(tool.name)) {
+      return tool;
+    }
+
+    const originalExecute = tool.execute as any;
+    return {
+      ...tool,
+      execute: async (...args: any[]) => {
+        const params = (args[1] ?? {}) as Record<string, unknown>;
+        const decision = resolvePermanentAgentToolDecision({
+          toolName: tool.name,
+          args: params,
+          gating,
+        });
+
+        if (decision.disposition === "allow") {
+          return originalExecute(...args);
+        }
+
+        const details: Record<string, unknown> = {
+          disposition: decision.disposition,
+          category: decision.category,
+          toolName: decision.toolName,
+          ...(decision.disposition === "require-approval" ? { requiresApproval: true } : {}),
+        };
+
+        if (decision.disposition === "require-approval") {
+          const dedupeKey = buildPermanentAgentApprovalDedupeKey({
+            requesterActorId: gating.requester?.actorId,
+            taskId: gating.taskId,
+            toolName: decision.toolName,
+            category: decision.category,
+          });
+          details.approvalDedupeKey = dedupeKey;
+
+          let approvalRequest = await gating.findPendingApprovalRequest?.(dedupeKey);
+          if (!approvalRequest && gating.createApprovalRequest) {
+            approvalRequest = await gating.createApprovalRequest({
+              category: normalizeApprovalRequestCategory(decision.category),
+              toolName: decision.toolName,
+              args: params,
+            });
+          }
+
+          if (approvalRequest?.id) {
+            details.approvalRequestId = approvalRequest.id;
+          }
+        }
+
+        const reason = decision.disposition === "block"
+          ? `Action blocked by permanent-agent policy (${decision.category}) for tool ${decision.toolName}`
+          : `Action requires approval (${decision.category}) before tool ${decision.toolName} can run`;
+
+        return boundaryRejection(reason, details);
+      },
+    };
+  });
+}
+
+export function wrapToolsWithActionGate(
+  tools: ToolDefinition[],
+  gateContext: AgentActionGateContext | undefined,
+): ToolDefinition[] {
+  if (!gateContext || gateContext.isEphemeral) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    // FN-3852/FN-3855: terminal completion and send-message coordination
+    // primitives must never be approval-gated, or open sessions can deadlock.
+    if (GATE_BYPASS_TOOL_NAMES.has(tool.name)) {
+      return tool;
+    }
+
+    const originalExecute = tool.execute as any;
+    return {
+      ...tool,
+      execute: async (...args: any[]) => {
+        const params = (args[1] ?? {}) as Record<string, unknown>;
+        const decision = evaluateAgentActionGate({
+          agentId: gateContext.agentId,
+          taskId: gateContext.taskId,
+          toolName: tool.name,
+          args: params,
+          permissionPolicy: gateContext.permissionPolicy,
+        });
+
+        const latestApproval = gateContext.findApprovalByDedupeKey
+          ? await gateContext.findApprovalByDedupeKey(decision.approvalDedupeKey)
+          : await gateContext.findPendingApprovalByDedupeKey?.(decision.approvalDedupeKey).then((request) =>
+            request ? { id: request.id, status: "pending" as const } : null
+          );
+
+        const gateOutcome = resolveGateOutcome(decision, latestApproval ?? null);
+
+        if (gateOutcome.outcome === "allow") {
+          return originalExecute(...args);
+        }
+
+        if (gateOutcome.outcome === "execute-once-then-complete") {
+          const result = await originalExecute(...args);
+          if (gateOutcome.approvalRequestId) {
+            await gateContext.markApprovalCompleted?.(gateOutcome.approvalRequestId);
+          }
+          return result;
+        }
+
+        if (gateOutcome.outcome === "block") {
+          if (latestApproval?.status === "denied") {
+            return buildGateRejection(
+              {
+                ...decision,
+                metadata: {
+                  ...decision.metadata,
+                  approvalRequestId: latestApproval.id,
+                  dedupeKey: decision.approvalDedupeKey,
+                },
+              },
+              "Action was denied by approver. The agent must not retry this action.",
+            );
+          }
+
+          return buildGateRejection(
+            decision,
+            `Action blocked by permission policy (${decision.category}) for ${gateContext.agentName}`,
+          );
+        }
+
+        let approvalRequestId = gateOutcome.approvalRequestId;
+        if (!approvalRequestId) {
+          const created = await gateContext.createApprovalRequest(decision, params) as { id?: string } | null;
+          approvalRequestId = created?.id;
+          if (approvalRequestId) {
+            await gateContext.pauseForApproval?.({ approvalRequestId, decision });
+          }
+        }
+
+        return buildGateRejection(
+          {
+            ...decision,
+            metadata: {
+              ...decision.metadata,
+              ...(approvalRequestId ? { approvalRequestId } : {}),
+              dedupeKey: decision.approvalDedupeKey,
+            },
+          },
+          `Action requires approval (request ${approvalRequestId ?? "pending"}). Agent and task have been paused; will resume once a decision is made.`,
+        );
+      },
+    };
+  });
+}
+
 /**
  * Create a pi agent session configured for fn.
  * Reuses the user's existing pi auth and model configuration.
+ *
+ * Returned sessions are wrapped so `session.dispose()` emits pi's
+ * `session_shutdown` extension event before teardown.
  */
 export async function createFnAgent(options: AgentOptions): Promise<AgentResult> {
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
-  const selectedAccountIds: Record<string, string | undefined> = {};
-  const authStorage = createFusionAuthStorage({ selectedAccountIds }) as ReturnType<typeof createFusionAuthStorage> & FusionAuthStorageExtras;
+  const authStorage = createFusionAuthStorage();
   const modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
 
   // Resolve the project root early so extension providers, skill discovery,
   // and resource loading all use the correct root when cwd is a worktree,
   // subdirectory, or any path other than the project root itself.
   const resolvedProjectRoot = getProjectRootFromWorktree(options.cwd) ?? resolvePiExtensionProjectRoot(options.cwd);
-  const sessionSettings = readSessionSettingsSnapshot(resolvedProjectRoot);
-  const effectiveModelFallbackChain = options.modelFallbackChain && options.modelFallbackChain.length > 0
-    ? options.modelFallbackChain
-    : options.fallbackProvider && options.fallbackModelId
-      ? [{ provider: options.fallbackProvider, modelId: options.fallbackModelId }]
-      : resolveModelFallbackChain(sessionSettings);
-  const routeViaDspy = typeof options.routeViaDspy === "boolean"
-    ? options.routeViaDspy
-    : resolveRouteAllLlmCallsViaDspy(sessionSettings);
   await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
 
   for (const provider of readCustomProviders()) {
@@ -1194,6 +1600,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   // Grep→grep). When a coding session ran via Claude CLI tried `Glob`, pi
   // returned "Tool find not found" and the agent looped. Compose explicitly
   // so every tool referenced by tool-mapping.ts is registered.
+  const bashToolOptions = options.taskEnv
+    ? {
+        spawnHook: ({ command, cwd, env }: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => ({
+          command,
+          cwd,
+          env: {
+            ...env,
+            ...options.taskEnv,
+          },
+        }),
+      }
+    : undefined;
+
   const tools =
     options.tools === "readonly"
       ? [
@@ -1204,7 +1623,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         ]
       : [
           createReadTool(options.cwd),
-          createBashTool(options.cwd),
+          createBashTool(options.cwd, bashToolOptions),
           createEditTool(options.cwd),
           createWriteTool(options.cwd),
           createGrepTool(options.cwd),
@@ -1221,7 +1640,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   if (worktreeProjectRoot) {
     await assertValidWorktreeSession(worktreePath, worktreeProjectRoot);
   }
-  const wrappedTools = wrapToolsWithBoundary(tools, worktreePath, worktreeProjectRoot);
+  const boundaryContext = { worktreePath, worktreeProjectRoot };
 
   // resolvedProjectRoot was computed above (before registerExtensionProviders)
   // and is reused here for resource loader and skill discovery.
@@ -1236,34 +1655,39 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     retry: { enabled: true, maxRetries: 3 },
   });
 
-  // Resolve explicit model selection if provider and model ID are specified
-  const selectedModel = resolveConfiguredModel(
-    modelRegistry,
-    "primary",
-    options.defaultProvider,
-    options.defaultModelId,
-  );
-  const fallbackCandidates = effectiveModelFallbackChain
-    .map((entry) => {
-      const model = resolveConfiguredModel(
-        modelRegistry,
-        "fallback",
-        entry.provider,
-        entry.modelId,
-      );
-      return model ? {
-        model,
-        ...(entry.accountId ? { accountId: entry.accountId } : {}),
-        ...(entry.accountProvider ? { accountProvider: entry.accountProvider } : {}),
-      } : undefined;
-    })
-    .filter((candidate): candidate is {
-      model: NonNullable<typeof selectedModel>;
-      accountId?: string;
-      accountProvider?: string;
-    } => Boolean(candidate));
-  const fallbackModels = fallbackCandidates.map((candidate) => candidate.model);
-  const fallbackModel = fallbackCandidates[0]?.model;
+  // Resolve explicit model selection if provider and model ID are specified.
+  // If the primary configured model cannot be resolved but a fallback model is
+  // configured, prefer the fallback as the initial model selection.
+  let selectedModel;
+  let fallbackModel;
+  try {
+    selectedModel = resolveConfiguredModel(
+      modelRegistry,
+      "primary",
+      options.defaultProvider,
+      options.defaultModelId,
+    );
+  } catch (primaryResolutionError) {
+    if (!options.fallbackProvider || !options.fallbackModelId) {
+      throw primaryResolutionError;
+    }
+    fallbackModel = resolveConfiguredModel(
+      modelRegistry,
+      "fallback",
+      options.fallbackProvider,
+      options.fallbackModelId,
+    );
+    selectedModel = fallbackModel;
+  }
+
+  if (!fallbackModel) {
+    fallbackModel = resolveConfiguredModel(
+      modelRegistry,
+      "fallback",
+      options.fallbackProvider,
+      options.fallbackModelId,
+    );
+  }
 
   // Resolve skill selection: explicit skillSelection wins over convenience `skills`
   let effectiveSkillSelection: SkillSelectionContext | undefined = options.skillSelection;
@@ -1283,7 +1707,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     if (selectionResult.diagnostics.length > 0) {
       const purpose = effectiveSkillSelection.sessionPurpose ?? "skills";
       for (const diag of selectionResult.diagnostics) {
-        piLog.warn(`[skills] [${purpose}] ${diag.type}: ${diag.message}`);
+        const msg = `[skills] [${purpose}] ${diag.type}: ${diag.message}`;
+        if (diag.type === "error") piLog.error(msg);
+        else if (diag.type === "warning") piLog.warn(msg);
+        else piLog.log(msg);
       }
     }
     skillsOverrideFn = createSkillsOverrideFromSelection(selectionResult, {
@@ -1305,26 +1732,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     piLog.log(`readonly session — host extensions (${hostExtensionPaths.length}) skipped`);
   }
 
-  const dspyRegistry = routeViaDspy
-    ? syncFusionAccountsToDspyRegistry({ defaultModelId: options.defaultModelId })
-    : undefined;
-  const dspyRouting = createDspyRoutingMetadata({
-    enabled: routeViaDspy,
-    provider: options.defaultProvider,
-    modelId: options.defaultModelId,
-    accountRegistryPath: dspyRegistry?.path,
-  });
-  if (dspyRouting.enabled) {
-    piLog.log(`DSPy routing enabled for session via ${dspyRouting.moduleName} (${dspyRouting.adapterRoot}); projected ${dspyRegistry?.accountsWritten ?? 0} account(s)`);
-  }
-  const routedSystemPrompt = buildDspyRoutedSystemPrompt(options.systemPrompt, dspyRouting);
-
   const resourceLoader = new DefaultResourceLoader({
     cwd: resolvedProjectRoot,
     agentDir: getFusionAgentDir(),
     settingsManager,
-    systemPromptOverride: () => routedSystemPrompt,
-    appendSystemPromptOverride: () => [],
+    systemPromptOverride: () => options.systemPromptLayers?.stable ?? options.systemPrompt,
+    appendSystemPromptOverride: () =>
+      options.systemPromptLayers?.dynamic
+        ? [options.systemPromptLayers.dynamic]
+        : [],
     ...(effectiveExtensionPaths.length > 0 ? { additionalExtensionPaths: [...effectiveExtensionPaths] } : {}),
     ...(skillsOverrideFn ? { skillsOverride: skillsOverrideFn } : {}),
   });
@@ -1333,33 +1749,40 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const sessionManager = options.sessionManager ?? SessionManager.inMemory();
   normalizeSessionHistoryEntries(sessionManager as unknown as SessionManagerLike);
 
-  const markCurrentAccountFailure = (provider: string | undefined, message: string): boolean => {
-    if (!provider) return false;
-    const accountId = selectedAccountIds[provider];
-    if (!accountId) return false;
-    const failure = {
-      kind: classifyAccountFailure(message),
-      message: message.slice(0, 500),
-      at: new Date().toISOString(),
-    };
-    authStorage.markAccountFailure(accountId, failure, accountFailureCooldownMs(message));
-    delete selectedAccountIds[provider];
-    return true;
-  };
-
-  const createSessionWithModel = async (
-    modelOverride?: typeof selectedModel,
-    accountSelection?: { accountId?: string; accountProvider?: string },
-  ) => {
+  const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
     // suppress the defaults with `noTools: "builtin"` and register our wrapped
     // tools through `customTools` instead. The wrapped tools preserve the same
     // names (`read`, `bash`, ...) as the built-ins they replace.
-    const customToolList: ToolDefinition[] = [
-      ...(wrappedTools as ToolDefinition[]),
+    const toolChainStart: ToolDefinition[] = [
+      ...(tools as ToolDefinition[]),
       ...(options.customTools ?? []),
     ];
+    const toolsWithPermanentGating = wrapToolsWithPermanentAgentGating(
+      toolChainStart,
+      options.permanentAgentGating,
+    );
+    const toolsWithActionGate = wrapToolsWithActionGate(
+      toolsWithPermanentGating,
+      options.actionGateContext,
+    );
+    const customToolList: ToolDefinition[] = wrapToolsWithBoundary(
+      toolsWithActionGate,
+      boundaryContext.worktreePath,
+      boundaryContext.worktreeProjectRoot,
+    );
+    // Sort tools alphabetically by name for deterministic ordering.
+    // Prompt caching requires the tool list to be byte-identical across
+    // sessions — reordering breaks cache prefix matching.
+    // Exception: fn_heartbeat_done must remain last (stable terminal signal
+    // required by the heartbeat executor — see agent-heartbeat.ts).
+    customToolList.sort((a, b) => a.name.localeCompare(b.name));
+    const heartbeatDoneIdx = customToolList.findIndex((t) => t.name === "fn_heartbeat_done");
+    if (heartbeatDoneIdx >= 0 && heartbeatDoneIdx < customToolList.length - 1) {
+      const [doneTool] = customToolList.splice(heartbeatDoneIdx, 1);
+      customToolList.push(doneTool);
+    }
     // Last-chance abort hook. Fires *here* — after every awaited setup step
     // in createFnAgent (provider registration, worktree validation, resource
     // loader reload) and immediately before the actual LLM session spawn.
@@ -1368,21 +1791,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     if (options.beforeSpawnSession) {
       await options.beforeSpawnSession();
     }
-    const provider = modelOverride?.provider;
-    const accountProvider = accountSelection?.accountProvider ?? accountProviderForModelProvider(provider);
-    if (accountProvider && accountSelection?.accountId) {
-      selectedAccountIds[accountProvider] = accountSelection.accountId;
-      const account = authStorage.listAccounts(accountProvider).find((candidate) => candidate.id === accountSelection.accountId);
-      if (account) {
-        piLog.log(`Selected ${accountProvider} auth account ${account.label}`);
-      }
-    } else if (accountProvider && authStorage.listAccounts(accountProvider).length > 0 && !selectedAccountIds[accountProvider]) {
-      const account = authStorage.selectAccount(accountProvider);
-      if (account) {
-        piLog.log(`Selected ${accountProvider} auth account ${account.label}`);
-      }
-    }
-    const result = await createAgentSession({
+    const createSessionOptions: Parameters<typeof createAgentSession>[0] = {
       cwd: options.cwd,
       authStorage,
       modelRegistry,
@@ -1392,57 +1801,27 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       sessionManager,
       settingsManager,
       ...(modelOverride ? { model: modelOverride } : {}),
-    });
-    if (provider === "pi-claude-cli") {
-      const account = authStorage.getSelectedAccount("claude-cli");
-      if (account?.home) {
-        setFusionClaudeCliAccountEnv(result.session.sessionId, cliAccountEnvFor("claude-cli", account.home));
-      }
-    }
-    return result;
-  };
+    };
 
-  const createSessionWithAccountFallback = async (
-    modelOverride?: typeof selectedModel,
-    accountSelection?: { accountId?: string; accountProvider?: string },
-  ) => {
-    const provider = modelOverride?.provider;
-    const accountProvider = accountSelection?.accountProvider ?? accountProviderForModelProvider(provider);
-    const maxAttempts = accountSelection?.accountId
-      ? 1
-      : accountProvider ? Math.max(1, authStorage.listAccounts(accountProvider).length) : 1;
-    let lastError: unknown;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      try {
-        return await createSessionWithModel(modelOverride, accountSelection);
-      } catch (err: any) {
-        lastError = err;
-        const message = err?.message || String(err);
-        if (!accountProvider || !isRetryableModelSelectionError(message) || !markCurrentAccountFailure(accountProvider, message)) {
-          throw err;
-        }
-        const next = authStorage.selectAccount(accountProvider);
-        if (!next || selectedAccountIds[accountProvider] === undefined) {
-          throw err;
-        }
-        piLog.warn(`Auth account for ${accountProvider} failed during session creation (${message}); retrying with ${next.label}`);
-      }
+    if (options.builtinToolsAllowlist && options.builtinToolsAllowlist.length > 0) {
+      createSessionOptions.tools = [
+        ...new Set([
+          ...customToolList.map((tool) => tool.name),
+          ...options.builtinToolsAllowlist,
+        ]),
+      ].sort();
     }
 
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    return createAgentSession(createSessionOptions);
   };
 
-  const emitFallbackUsed = async (
-    triggerPoint: "session-creation" | "prompt-time",
-    usedFallbackModel = fallbackModel,
-  ): Promise<void> => {
-    if (!options.onFallbackModelUsed || !selectedModel || !usedFallbackModel) {
+  const emitFallbackUsed = async (triggerPoint: "session-creation" | "prompt-time"): Promise<void> => {
+    if (!options.onFallbackModelUsed || !selectedModel || !fallbackModel) {
       return;
     }
     await options.onFallbackModelUsed({
       primaryModel: `${selectedModel.provider}/${selectedModel.id}`,
-      fallbackModel: `${usedFallbackModel.provider}/${usedFallbackModel.id}`,
+      fallbackModel: `${fallbackModel.provider}/${fallbackModel.id}`,
       triggerPoint,
       taskId: options.taskId,
       taskTitle: options.taskTitle,
@@ -1452,45 +1831,52 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
   let sessionResult;
   let usingFallback = false;
-  let activeFallbackCandidate: (typeof fallbackCandidates)[number] | undefined;
   try {
-    sessionResult = await createSessionWithAccountFallback(selectedModel);
+    sessionResult = await createSessionWithModel(selectedModel);
     piLog.log(`Session created successfully (model=${selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : "default"})`);
   } catch (err: any) {
-    if (fallbackModels.length === 0 || !selectedModel || !isRetryableModelSelectionError(err?.message || "")) {
+    if (!fallbackModel || !selectedModel || !isRetryableModelSelectionError(err?.message || "")) {
       piLog.error(`Session creation failed: ${err.message}`);
       throw err;
     }
-    piLog.warn(`Primary model failed (${err.message}), trying fallback chain`);
-    let lastFallbackError: unknown = err;
-    for (const candidate of fallbackCandidates) {
-      try {
-        usingFallback = true;
-        activeFallbackCandidate = candidate;
-        sessionResult = await createSessionWithAccountFallback(candidate.model, candidate);
-        await emitFallbackUsed("session-creation", candidate.model);
-        piLog.log(`Fallback session created successfully (${candidate.model.provider}/${candidate.model.id})`);
-        break;
-      } catch (fallbackErr: any) {
-        lastFallbackError = fallbackErr;
-        if (!isRetryableModelSelectionError(fallbackErr?.message || "")) {
-          throw fallbackErr;
-        }
-        piLog.warn(`Fallback model ${candidate.model.provider}/${candidate.model.id} failed (${fallbackErr.message}); trying next fallback`);
-      }
-    }
-    if (!sessionResult) {
-      throw lastFallbackError instanceof Error ? lastFallbackError : err;
-    }
+    piLog.warn(`Primary model failed (${err.message}), trying fallback`);
+    usingFallback = true;
+    sessionResult = await createSessionWithModel(fallbackModel);
+    await emitFallbackUsed("session-creation");
+    piLog.log("Fallback session created successfully");
   }
 
-  const { session } = sessionResult;
-  installToolResultContentGuard(session as AgentToolHookSession);
-  installMessageContentGuard(session as AgentToolHookSession, sessionManager as unknown as SessionManagerLike);
-  (session as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
-  const promptableSession = session as PromptableSession;
+  let activeSession = sessionResult.session;
+  wrapSessionDisposeWithShutdown(activeSession);
+  installToolResultContentGuard(activeSession as AgentToolHookSession);
+  installMessageContentGuard(activeSession as AgentToolHookSession, sessionManager as unknown as SessionManagerLike);
+  (activeSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
+  const promptableSession = activeSession as PromptableSession;
 
-  const attachSessionForwarders = (targetSession: PromptableSession) => {
+  let thinkingCompatibilityDisabled = false;
+  const applyThinkingLevelIfSupported = (targetSession: AgentSession, sourceModel: string): void => {
+    if (!options.defaultThinkingLevel || thinkingCompatibilityDisabled) {
+      return;
+    }
+    try {
+      (targetSession as PromptableSession).setThinkingLevel(options.defaultThinkingLevel as any);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!isThinkingReasoningConflictError(message)) {
+        throw err;
+      }
+      thinkingCompatibilityDisabled = true;
+      piLog.warn(`Disabling explicit thinking level for model ${sourceModel}: ${message}`);
+    }
+  };
+
+  const wireFallbackHooks = (targetSession: PromptableSession): void => {
+    installToolResultContentGuard(targetSession as unknown as AgentToolHookSession);
+    installMessageContentGuard(
+      targetSession as unknown as AgentToolHookSession,
+      sessionManager as unknown as SessionManagerLike,
+    );
+    (targetSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
     targetSession.subscribe((event) => {
       if (event.type === "message_update") {
         const msgEvent = event.assistantMessageEvent;
@@ -1509,15 +1895,37 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     });
   };
 
+  const swapPromptSession = async (modelToUse: typeof selectedModel): Promise<PromptableSession> => {
+    if (!modelToUse) {
+      throw new Error("Cannot swap session without a resolved model");
+    }
+    wrapSessionDisposeWithShutdown(activeSession);
+    try {
+      activeSession.dispose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      piLog.warn(`Failed to dispose session during swap: ${msg}`);
+    }
+    const next = (await createSessionWithModel(modelToUse)).session as PromptableSession;
+    wireFallbackHooks(next);
+    wrapSessionDisposeWithShutdown(next);
+    applyThinkingLevelIfSupported(next, `${modelToUse.provider}/${modelToUse.id}`);
+    Object.setPrototypeOf(promptableSession, Object.getPrototypeOf(next));
+    Object.assign(promptableSession, next);
+    promptableSession.promptWithFallback = next.promptWithFallback ?? promptableSession.promptWithFallback;
+    activeSession = next;
+    return next;
+  };
+
   promptableSession.promptWithFallback = async (prompt: string, promptOptions?: unknown) => {
     try {
-      await promptSessionAndCheck(session, prompt, promptOptions);
+      await promptSessionAndCheck(activeSession, prompt, promptOptions);
       return;
     } catch (err: any) {
       const errorMessage = err?.message || "";
       if (isContextLimitError(errorMessage)) {
         // Context limit error — attempt auto-compaction and retry once
-        const promptMemoryRetry = await retryWithCompactedPromptMemory(session, prompt, promptOptions);
+        const promptMemoryRetry = await retryWithCompactedPromptMemory(activeSession, prompt, promptOptions);
         if (promptMemoryRetry.recovered) {
           return;
         }
@@ -1528,13 +1936,24 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           }
         }
 
+        const promptSectionRetry = await retryWithCompactedPromptSections(activeSession, prompt, promptOptions);
+        if (promptSectionRetry.recovered) {
+          return;
+        }
+        if (promptSectionRetry.error) {
+          const retryMessage = promptSectionRetry.error instanceof Error ? promptSectionRetry.error.message : String(promptSectionRetry.error);
+          if (!isContextLimitError(retryMessage)) {
+            throw promptSectionRetry.error;
+          }
+        }
+
         piLog.warn("promptWithFallback: context limit error — attempting auto-compaction");
-        await flushMemoryBeforeSessionCompaction(session);
-        const compactResult = await compactSessionContext(session);
+        await flushMemoryBeforeSessionCompaction(activeSession);
+        const compactResult = await compactSessionContext(activeSession);
         if (compactResult) {
           piLog.log(`promptWithFallback: compaction succeeded (${compactResult.tokensBefore} tokens) — retrying prompt`);
           try {
-            await promptSessionAndCheck(session, prompt, promptOptions);
+            await promptSessionAndCheck(activeSession, prompt, promptOptions);
             return;
           } catch (retryErr: any) {
             const retryErrorMessage = retryErr?.message || "";
@@ -1548,140 +1967,97 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         }
       }
 
-      const activeModel = usingFallback ? activeFallbackCandidate?.model ?? fallbackModel : selectedModel;
-      const activeProvider = activeModel?.provider;
-      const activeAccountProvider = usingFallback
-        ? activeFallbackCandidate?.accountProvider ?? accountProviderForModelProvider(activeProvider)
-        : accountProviderForModelProvider(activeProvider);
-      const explicitActiveAccount = usingFallback && Boolean(activeFallbackCandidate?.accountId);
-      if (activeModel && activeAccountProvider && !explicitActiveAccount && isRetryableModelSelectionError(errorMessage) && markCurrentAccountFailure(activeAccountProvider, errorMessage)) {
-        const nextAccount = authStorage.selectAccount(activeAccountProvider);
-        if (nextAccount) {
-          piLog.warn(`Auth account for ${activeAccountProvider} failed during prompt (${errorMessage}); retrying with ${nextAccount.label}`);
-          try {
-            session.dispose();
-          } catch (disposeErr: unknown) {
-            const msg = disposeErr instanceof Error ? disposeErr.message : String(disposeErr);
-            piLog.warn(`Failed to dispose session during auth account fallback swap: ${msg}`);
-          }
-
-          const nextSessionResult = await createSessionWithAccountFallback(activeModel, usingFallback ? activeFallbackCandidate : undefined);
-          const nextSession = nextSessionResult.session as PromptableSession;
-          installToolResultContentGuard(nextSession as unknown as AgentToolHookSession);
-          installMessageContentGuard(
-            nextSession as unknown as AgentToolHookSession,
-            sessionManager as unknown as SessionManagerLike,
-          );
-          (nextSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
-
-          if (options.defaultThinkingLevel) {
-            nextSession.setThinkingLevel(options.defaultThinkingLevel as any);
-          }
-
-          attachSessionForwarders(nextSession);
-          Object.setPrototypeOf(promptableSession, Object.getPrototypeOf(nextSession));
-          Object.assign(promptableSession, nextSession);
-          await promptSessionAndCheck(nextSession, prompt, promptOptions);
-          return;
-        }
+      if (!usingFallback && options.defaultThinkingLevel && !thinkingCompatibilityDisabled && isThinkingReasoningConflictError(errorMessage)) {
+        thinkingCompatibilityDisabled = true;
+        piLog.warn(`Prompt failed with thinking/reasoning conflict; retrying without explicit thinking level: ${errorMessage}`);
+        const recoveredSession = await swapPromptSession(selectedModel);
+        await promptSessionAndCheck(recoveredSession, prompt, promptOptions);
+        return;
       }
 
-      const fallbackStartIndex = usingFallback && activeFallbackCandidate
-        ? fallbackCandidates.indexOf(activeFallbackCandidate) + 1
-        : 0;
-      const remainingFallbackCandidates = fallbackCandidates.slice(Math.max(0, fallbackStartIndex));
-      if (remainingFallbackCandidates.length === 0 || !isRetryableModelSelectionError(errorMessage)) {
+      if (!fallbackModel || usingFallback || !isRetryableModelSelectionError(errorMessage)) {
         throw err;
       }
 
       usingFallback = true;
+      const fallbackSession = await swapPromptSession(fallbackModel);
+      await emitFallbackUsed("prompt-time");
+
+      // Retry with fallback model, also with auto-compaction support
       try {
-        session.dispose();
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        piLog.warn(`Failed to dispose session during model fallback swap: ${msg}`);
-      }
-
-      let lastFallbackError: unknown = err;
-      for (const candidate of remainingFallbackCandidates) {
-        let fallbackSession: PromptableSession | undefined;
-        try {
-          const fallbackSessionResult = await createSessionWithAccountFallback(candidate.model, candidate);
-          activeFallbackCandidate = candidate;
-          await emitFallbackUsed("prompt-time", candidate.model);
-          fallbackSession = fallbackSessionResult.session as PromptableSession;
-          installToolResultContentGuard(fallbackSession as unknown as AgentToolHookSession);
-          installMessageContentGuard(
-            fallbackSession as unknown as AgentToolHookSession,
-            sessionManager as unknown as SessionManagerLike,
-          );
-          (fallbackSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
-
-          if (options.defaultThinkingLevel) {
-            fallbackSession.setThinkingLevel(options.defaultThinkingLevel as any);
+        await promptSessionAndCheck(fallbackSession, prompt, promptOptions);
+        return;
+      } catch (fallbackErr: any) {
+        const fallbackErrorMessage = fallbackErr?.message || "";
+        if (isContextLimitError(fallbackErrorMessage)) {
+          const promptMemoryRetry = await retryWithCompactedPromptMemory(fallbackSession, prompt, promptOptions);
+          if (promptMemoryRetry.recovered) {
+            return;
+          }
+          if (promptMemoryRetry.error) {
+            const retryMessage = promptMemoryRetry.error instanceof Error ? promptMemoryRetry.error.message : String(promptMemoryRetry.error);
+            if (!isContextLimitError(retryMessage)) {
+              throw promptMemoryRetry.error;
+            }
           }
 
-          attachSessionForwarders(fallbackSession);
-
-          Object.setPrototypeOf(promptableSession, Object.getPrototypeOf(fallbackSession));
-          Object.assign(promptableSession, fallbackSession);
-          promptableSession.promptWithFallback = fallbackSession.promptWithFallback ?? promptableSession.promptWithFallback;
-
-          await promptSessionAndCheck(fallbackSession, prompt, promptOptions);
-          return;
-        } catch (fallbackErr: any) {
-          lastFallbackError = fallbackErr;
-          const fallbackErrorMessage = fallbackErr?.message || "";
-          if (isContextLimitError(fallbackErrorMessage)) {
-            if (!fallbackSession) {
-              throw fallbackErr;
+          const promptSectionRetry = await retryWithCompactedPromptSections(fallbackSession, prompt, promptOptions);
+          if (promptSectionRetry.recovered) {
+            return;
+          }
+          if (promptSectionRetry.error) {
+            const retryMessage = promptSectionRetry.error instanceof Error ? promptSectionRetry.error.message : String(promptSectionRetry.error);
+            if (!isContextLimitError(retryMessage)) {
+              throw promptSectionRetry.error;
             }
-            const promptMemoryRetry = await retryWithCompactedPromptMemory(fallbackSession, prompt, promptOptions);
-            if (promptMemoryRetry.recovered) {
+          }
+
+          piLog.warn("promptWithFallback: fallback session context limit error — attempting auto-compaction");
+          await flushMemoryBeforeSessionCompaction(fallbackSession);
+          const compactResult = await compactSessionContext(fallbackSession);
+          if (compactResult) {
+            piLog.log(`promptWithFallback: fallback compaction succeeded (${compactResult.tokensBefore} tokens) — retrying`);
+            try {
+              await promptSessionAndCheck(fallbackSession, prompt, promptOptions);
               return;
+            } catch (retryErr: any) {
+              const retryErrorMessage = retryErr?.message || "";
+              piLog.error(`promptWithFallback: fallback retry after auto-compaction failed: ${retryErrorMessage}`);
+              throw fallbackErr; // Throw original fallback error
             }
-            if (promptMemoryRetry.error) {
-              const retryMessage = promptMemoryRetry.error instanceof Error ? promptMemoryRetry.error.message : String(promptMemoryRetry.error);
-              if (!isContextLimitError(retryMessage)) {
-                throw promptMemoryRetry.error;
-              }
-            }
-
-            piLog.warn("promptWithFallback: fallback session context limit error — attempting auto-compaction");
-            await flushMemoryBeforeSessionCompaction(fallbackSession);
-            const compactResult = await compactSessionContext(fallbackSession);
-            if (compactResult) {
-              piLog.log(`promptWithFallback: fallback compaction succeeded (${compactResult.tokensBefore} tokens) — retrying`);
-              try {
-                await promptSessionAndCheck(fallbackSession, prompt, promptOptions);
-                return;
-              } catch (retryErr: any) {
-                const retryErrorMessage = retryErr?.message || "";
-                piLog.error(`promptWithFallback: fallback retry after auto-compaction failed: ${retryErrorMessage}`);
-                throw fallbackErr;
-              }
-            } else {
-              piLog.error("promptWithFallback: fallback compaction unavailable — propagating original error");
-              throw fallbackErr;
-            }
-          }
-          if (!isRetryableModelSelectionError(fallbackErrorMessage)) {
+          } else {
+            piLog.error("promptWithFallback: fallback compaction unavailable — propagating original error");
             throw fallbackErr;
           }
-          piLog.warn(`Fallback model ${candidate.model.provider}/${candidate.model.id} failed during prompt (${fallbackErrorMessage}); trying next fallback`);
         }
+        throw fallbackErr;
       }
-      throw lastFallbackError instanceof Error ? lastFallbackError : err;
     }
   };
 
-  // Apply thinking level if specified
-  if (options.defaultThinkingLevel) {
-    promptableSession.setThinkingLevel(options.defaultThinkingLevel as any);
-  }
+  // Apply thinking level if specified (with compatibility fallback).
+  applyThinkingLevelIfSupported(
+    promptableSession,
+    selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : describeModel(promptableSession),
+  );
 
   // Wire up event listeners
-  attachSessionForwarders(promptableSession);
+  promptableSession.subscribe((event) => {
+    if (event.type === "message_update") {
+      const msgEvent = event.assistantMessageEvent;
+      if (msgEvent.type === "text_delta") {
+        options.onText?.(msgEvent.delta);
+      } else if (msgEvent.type === "thinking_delta") {
+        options.onThinking?.(msgEvent.delta);
+      }
+    }
+    if (event.type === "tool_execution_start") {
+      options.onToolStart?.(event.toolName, event.args as Record<string, unknown> | undefined);
+    }
+    if (event.type === "tool_execution_end") {
+      options.onToolEnd?.(event.toolName, event.isError, event.result);
+    }
+  });
 
   return { session: promptableSession, sessionFile: promptableSession.sessionFile };
 }

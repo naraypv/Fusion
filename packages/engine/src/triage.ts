@@ -20,12 +20,21 @@ import type {
   AgentSession,
 } from "@mariozechner/pi-coding-agent";
 import { describeModel, promptWithFallback } from "./pi.js";
-import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
+import {
+  createResolvedAgentSession,
+  extractRuntimeHint,
+  resolvePlanningSessionModel,
+} from "./agent-session-helpers.js";
 import { reviewStep, type ReviewVerdict } from "./reviewer.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { PRIORITY_SPECIFY, type AgentSemaphore } from "./concurrency.js";
 import { AgentLogger } from "./agent-logger.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import {
+  resolveAgentInstructions,
+  resolveAgentInstructionsWithRatings,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
+import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { planLog, reviewerLog, formatError } from "./logger.js";
 import {
@@ -45,9 +54,14 @@ import {
   createListAgentsTool,
   createMemoryTools,
   createResearchTools,
+  createWebFetchTool,
   createTaskDocumentReadTool,
   createTaskDocumentWriteTool,
 } from "./agent-tools.js";
+import {
+  getResearchGuidanceForSurface,
+  isResearchToolSurfaceEnabled,
+} from "./tool-availability.js";
 
 export const TRIAGE_SYSTEM_PROMPT = `You are a task specification agent for "fn", an AI-orchestrated task board.
 
@@ -235,10 +249,6 @@ When the planning conversation produces a structured plan, save it as a document
 - Order steps by dependency (foundation before integration, implementation before final validation)
 - Testing & Verification must run before Documentation & Delivery
 - Avoid giant catch-all steps; split outcomes so execution can be verified incrementally
-
-## Research tools
-When spec work needs missing domain context, you may use research tools (\`fn_research_run\`, \`fn_research_list\`, \`fn_research_get\`, \`fn_research_cancel\`). Keep research bounded to the task at hand, prefer concise queries, and write durable findings into task documents when useful.
-If research is unavailable or unconfigured, continue planning with repository context and clearly note assumptions.
 
 ## Guidelines
 - Read the project structure and relevant source files to understand context BEFORE writing
@@ -523,27 +533,7 @@ export class TriageProcessor {
     // When globalPause transitions from false → true, terminate all active triage sessions.
     store.on("settings:updated", ({ settings, previous }) => {
       if (settings.globalPause && !previous.globalPause) {
-        // Dispose every reviewer subagent first so they don't keep streaming
-        // verdicts while the main triage session is being torn down.
-        for (const taskId of [...this.activeSubagentSessions.keys()]) {
-          this.disposeSubagentsForTask(taskId, "global pause");
-        }
-        for (const [taskId, session] of this.activeSessions) {
-          planLog.log(
-            `Global pause — terminating triage session for ${taskId}`,
-          );
-          this.pauseAborted.add(taskId);
-          this.options.stuckTaskDetector?.untrackTask(taskId);
-          // abort() interrupts any in-flight LLM stream / tool call;
-          // dispose() then releases session resources.
-          const sessionWithAbort = session as { abort?: () => Promise<void>; dispose: () => void };
-          if (typeof sessionWithAbort.abort === "function") {
-            void sessionWithAbort.abort().catch((err) => {
-              planLog.warn(`Failed to abort triage session for ${taskId}: ${err}`);
-            });
-          }
-          session.dispose();
-        }
+        this.abortAndDisposeActiveSessions("global pause");
       }
     });
 
@@ -616,7 +606,40 @@ export class TriageProcessor {
       this.pollInterval = null;
       this.activePollMs = null;
     }
+    // Tear down any in-flight specify sessions and reviewer subagents so they
+    // don't keep streaming LLM tokens / tool calls past engine shutdown.
+    this.abortAndDisposeActiveSessions("engine stop");
     planLog.log("Processor stopped");
+  }
+
+  /**
+   * Abort and dispose every active specify session and reviewer subagent.
+   * Used by the global-pause handler and by `stop()`.
+   *
+   * Reviewer subagents are torn down first so they don't keep streaming
+   * verdicts while the main triage session is being disposed. abort()
+   * interrupts any in-flight LLM stream / tool call; dispose() then
+   * releases session resources.
+   */
+  private abortAndDisposeActiveSessions(reason: string): void {
+    for (const taskId of [...this.activeSubagentSessions.keys()]) {
+      this.disposeSubagentsForTask(taskId, reason);
+    }
+    for (const [taskId, session] of this.activeSessions) {
+      planLog.log(`${reason} — terminating triage session for ${taskId}`);
+      this.pauseAborted.add(taskId);
+      this.options.stuckTaskDetector?.untrackTask(taskId);
+      const sessionWithAbort = session as {
+        abort?: () => Promise<void>;
+        dispose: () => void;
+      };
+      if (typeof sessionWithAbort.abort === "function") {
+        void sessionWithAbort.abort().catch((err) => {
+          planLog.warn(`Failed to abort triage session for ${taskId}: ${err}`);
+        });
+      }
+      session.dispose();
+    }
   }
 
   /**
@@ -892,6 +915,7 @@ export class TriageProcessor {
           taskId: task.id,
           agent: "triage",
           persistAgentToolOutput: settings.persistAgentToolOutput,
+          persistAgentThinkingLog: settings.persistAgentThinkingLog,
           onAgentText: (id, delta) => {
             stuckDetector?.recordActivity(task.id);
             this.options.onAgentText?.(id, delta);
@@ -918,6 +942,10 @@ export class TriageProcessor {
         // Track subtasks created during triage when breakIntoSubtasks was requested.
         const createdSubtasksRef: { current: string[] } = { current: [] };
 
+        const assignedAgent = task.assignedAgentId && this.options.agentStore
+          ? await this.options.agentStore.getAgent(task.assignedAgentId).catch(() => null)
+          : null;
+
         const customTools = [
           ...this.createTriageTools({
             parentTaskId: task.id,
@@ -926,12 +954,23 @@ export class TriageProcessor {
           }),
           createTaskDocumentWriteTool(this.store, task.id),
           createTaskDocumentReadTool(this.store, task.id),
-          ...createResearchTools({
-            store: this.store,
-            rootDir: this.rootDir,
-            getSettings: async () => this.store.getSettings(),
-          }),
-          ...createMemoryTools(this.rootDir, settings),
+          ...(isResearchToolSurfaceEnabled(settings)
+            ? createResearchTools({
+              store: this.store,
+              rootDir: this.rootDir,
+              getSettings: async () => this.store.getSettings(),
+            })
+            : []),
+          ...createMemoryTools(this.rootDir, settings, assignedAgent
+            ? {
+              agentMemory: {
+                agentId: assignedAgent.id,
+                agentName: assignedAgent.name,
+                memory: assignedAgent.memory,
+              },
+            }
+            : undefined),
+          createWebFetchTool(),
           // Agent delegation tools — discover and delegate work to other agents.
           ...(this.options.agentStore ? [
             createListAgentsTool(this.options.agentStore),
@@ -949,19 +988,22 @@ export class TriageProcessor {
           ),
         ];
 
-        const assignedAgent = task.assignedAgentId && this.options.agentStore
-          ? await this.options.agentStore.getAgent(task.assignedAgentId).catch(() => null)
-          : null;
         let triageRuntimeHint = extractRuntimeHint(assignedAgent?.runtimeConfig);
 
-        // Resolve per-agent custom instructions for the triage role
+        // Resolve per-agent custom instructions for the triage role or assigned agent.
         let triageInstructions = "";
-        if (this.options.agentStore) {
+        if (assignedAgent) {
+          triageInstructions = await resolveAgentInstructionsWithRatings(
+            assignedAgent,
+            this.rootDir,
+            this.options.agentStore,
+          );
+        } else if (this.options.agentStore) {
           try {
             const agents = await this.options.agentStore.listAgents({ role: "triage" });
             for (const agent of agents) {
               triageRuntimeHint ??= extractRuntimeHint(agent.runtimeConfig);
-              if (agent.instructionsText || agent.instructionsPath) {
+              if (agent.instructionsText || agent.instructionsPath || agent.soul || agent.memory) {
                 triageInstructions = await resolveAgentInstructions(agent, this.rootDir);
                 break;
               }
@@ -972,11 +1014,32 @@ export class TriageProcessor {
           }
         }
         planLog.log(`${task.id}: planning in ${isFast ? "fast" : "standard"} mode`);
-        const triageSystemPrompt = buildSystemPromptWithInstructions(
-          resolveAgentPrompt("triage", settings.agentPrompts)
-            || (isFast ? FAST_TRIAGE_SYSTEM_PROMPT : TRIAGE_SYSTEM_PROMPT),
-          triageInstructions,
+        const triageIdentitySection = assignedAgent
+          ? `## Identity\n\nYou are ${assignedAgent.name}${assignedAgent.title?.trim() ? `, ${assignedAgent.title.trim()}` : ""} (agent ID: ${assignedAgent.id}, role: ${assignedAgent.role}).`
+          : "";
+        // Build structured layers for cross-session prompt caching.
+        const triagePluginContributions = buildPluginPromptSection(
+          "triage",
+          this.options.pluginRunner,
         );
+        if (triagePluginContributions) {
+          planLog.log(`${task.id}: applied plugin prompt contributions for triage surface`);
+        }
+
+        const triageLayers = buildPromptLayers({
+          basePrompt: resolveAgentPrompt("triage", settings.agentPrompts)
+            || (isFast ? FAST_TRIAGE_SYSTEM_PROMPT : TRIAGE_SYSTEM_PROMPT),
+          agentInstructions: [
+            triageIdentitySection,
+            triageInstructions,
+            isResearchToolSurfaceEnabled(settings)
+              ? getResearchGuidanceForSurface("triage")
+              : "",
+          ].filter((section) => section.trim()).join("\n\n"),
+          pluginContributions: triagePluginContributions,
+        });
+
+        const triageSystemPromptFinal = collapsePromptLayers(triageLayers);
 
         // Build skill selection context (assigned agent skills take precedence over role fallback)
         const skillContext = await buildSessionSkillContext({
@@ -987,42 +1050,36 @@ export class TriageProcessor {
           pluginRunner: this.options.pluginRunner,
         });
 
+        // Resolve planning model using executor-style precedence:
+        // 1. Assigned durable agent runtime model pair when complete
+        // 2. Task planning override pair
+        // 3. Planning/project/global fallbacks
+        const planningModel = resolvePlanningSessionModel(
+          task.planningModelProvider,
+          task.planningModelId,
+          settings,
+          assignedAgent?.runtimeConfig,
+        );
+
+        const planningSessionModelOptions = {
+          defaultProvider: planningModel.provider,
+          defaultModelId: planningModel.modelId,
+        };
+
         let { session } = await createResolvedAgentSession({
           sessionPurpose: "triage",
           runtimeHint: triageRuntimeHint,
           pluginRunner: this.options.pluginRunner,
           cwd: this.rootDir,
-          systemPrompt: triageSystemPrompt,
+          systemPrompt: triageSystemPromptFinal,
+          systemPromptLayers: triageLayers,
           tools: "coding",
           customTools,
           onText: agentLogger.onText,
           onThinking: agentLogger.onThinking,
           onToolStart: agentLogger.onToolStart,
           onToolEnd: agentLogger.onToolEnd,
-          // Resolve planning model using canonical lane hierarchy:
-          // 1. Task planning override pair (planningModelProvider + planningModelId)
-          // 2. Project planning lane pair (planningProvider + planningModelId)
-          // 3. Global planning lane pair (planningGlobalProvider + planningGlobalModelId)
-          // 4. Project default override pair (defaultProviderOverride + defaultModelIdOverride)
-          // 5. Global default pair (defaultProvider + defaultModelId)
-          defaultProvider: task.planningModelProvider && task.planningModelId
-            ? task.planningModelProvider
-            : (settings.planningProvider && settings.planningModelId
-                ? settings.planningProvider
-                : (settings.planningGlobalProvider && settings.planningGlobalModelId
-                    ? settings.planningGlobalProvider
-                    : (settings.defaultProviderOverride && settings.defaultModelIdOverride
-                        ? settings.defaultProviderOverride
-                        : settings.defaultProvider))),
-          defaultModelId: task.planningModelProvider && task.planningModelId
-            ? task.planningModelId
-            : (settings.planningProvider && settings.planningModelId
-                ? settings.planningModelId
-                : (settings.planningGlobalProvider && settings.planningGlobalModelId
-                    ? settings.planningGlobalModelId
-                    : (settings.defaultProviderOverride && settings.defaultModelIdOverride
-                        ? settings.defaultModelIdOverride
-                        : settings.defaultModelId))),
+          ...planningSessionModelOptions,
           fallbackProvider: settings.planningFallbackProvider && settings.planningFallbackModelId
             ? settings.planningFallbackProvider
             : settings.fallbackProvider,
@@ -1081,11 +1138,24 @@ export class TriageProcessor {
           let feedback: string | undefined;
 
           if (isReplan) {
-            // Extract feedback from the most recent "AI spec revision requested" log entry
-            const revisionLogEntry = [...task.log]
+            // Prefer explicit re-specification feedback logged by comment-triggered
+            // and approval-invalidation flows; fall back to legacy revision logs.
+            const feedbackLogEntry = [...task.log]
               .reverse()
-              .find((entry) => entry.action === "AI spec revision requested");
-            feedback = revisionLogEntry?.outcome;
+              .find((entry) =>
+                entry.action === "User comment requested re-specification of planned task"
+                || entry.action === "User comment invalidated spec approval — task needs re-specification"
+                || entry.action === "AI spec revision requested"
+              );
+            feedback = feedbackLogEntry?.outcome;
+
+            // Ensure the latest user feedback is always actionable for re-plans.
+            if (!feedback) {
+              const latestUserComment = [...(detail.comments || [])]
+                .reverse()
+                .find((comment) => comment.author === "user");
+              feedback = latestUserComment?.text;
+            }
 
             planLog.log(
               `${task.id} re-planning with feedback: ${feedback?.slice(0, 100)}...`,
@@ -1229,7 +1299,8 @@ export class TriageProcessor {
               runtimeHint: triageRuntimeHint,
               pluginRunner: this.options.pluginRunner,
               cwd: this.rootDir,
-              systemPrompt: triageSystemPrompt,
+              systemPrompt: triageSystemPromptFinal,
+              systemPromptLayers: triageLayers,
               tools: "coding",
               customTools,
               onText: agentLogger.onText,
@@ -1998,12 +2069,13 @@ export class TriageProcessor {
     // ordering as defense in depth so a future change to the guard can't
     // resurrect the regression.
     const promptDeclaredTitle = extractPromptDeclaredTitle(written, task.id);
+    const shouldApplyPromptDeclaredTitle = shouldReplaceTaskTitleFromPrompt(task, promptDeclaredTitle);
 
     await this.store.updateTask(task.id, taskUpdates);
 
     if (settings.requirePlanApproval) {
       const approvalUpdates: Record<string, unknown> = { status: "awaiting-approval" };
-      if (promptDeclaredTitle) {
+      if (shouldApplyPromptDeclaredTitle && promptDeclaredTitle) {
         approvalUpdates.title = promptDeclaredTitle;
       }
       await this.store.updateTask(task.id, approvalUpdates);
@@ -2017,7 +2089,7 @@ export class TriageProcessor {
 
     await this.store.moveTask(task.id, "todo");
 
-    if (promptDeclaredTitle) {
+    if (shouldApplyPromptDeclaredTitle && promptDeclaredTitle) {
       await this.store.updateTask(task.id, { title: promptDeclaredTitle });
     }
 
@@ -2046,11 +2118,30 @@ function extractPromptDeclaredTitle(prompt: string, taskId: string): string | nu
   if (!title) return null;
 
   // Conservative guard: do not overwrite metadata with confirmation prose.
-  if (/^created\s+(?:task\s+)?(?:fn-\d+\b|\*\*\s*fn-\d+\s*\*\*)/i.test(title)) {
+  if (isMalformedTaskTitle(title)) {
     return null;
   }
 
   return title;
+}
+
+function isMalformedTaskTitle(title: string): boolean {
+  return /^created\s+(?:task\s+)?(?:fn-\d+\b|\*\*\s*fn-\d+\s*\*\*)/i.test(title.trim());
+}
+
+function shouldReplaceTaskTitleFromPrompt(task: Task, promptDeclaredTitle: string | null): boolean {
+  if (!promptDeclaredTitle) return false;
+
+  if (
+    task.sourceType === "github_import" &&
+    task.sourceIssue?.provider === "github" &&
+    task.title?.trim() &&
+    !isMalformedTaskTitle(task.title)
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function hasLatestSpecReviewApproval(task: Task): boolean {
@@ -2274,7 +2365,7 @@ Please revise the specification above to address this feedback. Write the comple
 ## Re-specification Instructions
 You are creating a fresh replacement specification based on user feedback.
 
-**Important:** Do not reuse stale PROMPT.md content. Start from the current task description, inspect the codebase, and write a complete new specification that addresses the feedback below.
+**Important:** Do not reuse stale PROMPT.md content. Treat the current task title and description as required primary inputs, inspect the codebase, and write a complete new specification that addresses the feedback below.
 
 ## User Feedback
 ${feedback}
@@ -2344,7 +2435,7 @@ ${task.breakIntoSubtasks ? "- **Break into subtasks:** Yes (user requested)" : "
 ${task.dependencies.length > 0 ? `- **Dependencies:** ${task.dependencies.join(", ")}` : ""}${revisionSection}${subtaskSection}
 
 ## Instructions
-${isRevision ? "1. Review the existing specification and user feedback carefully\n2. Revise the PROMPT.md to address the feedback while maintaining the structure\n3. Ensure the specification is detailed enough for an AI agent to execute" : isFreshRespecification ? "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Write a fresh complete PROMPT.md specification to the given path following the format in your system prompt\n3. Address the user feedback without carrying forward stale assumptions from the old spec\n4. Name actual files, functions, and patterns from the codebase — be specific" : "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Write a complete PROMPT.md specification to the given path following the format in your system prompt\n3. The specification must be detailed enough for an autonomous AI agent to implement without asking questions\n4. Name actual files, functions, and patterns from the codebase — be specific"}
+${isRevision ? "1. Review the existing specification and user feedback carefully\n2. Revise the PROMPT.md to address the feedback while maintaining the structure\n3. Ensure the specification is detailed enough for an AI agent to execute" : isFreshRespecification ? "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Treat the current task title and description as mandatory primary inputs for a new spec\n3. Write a fresh complete PROMPT.md specification to the given path following the format in your system prompt\n4. Address the user feedback without carrying forward stale assumptions from the old spec\n5. Name actual files, functions, and patterns from the codebase — be specific" : "1. Read the project structure to understand context (package.json, source files, etc.)\n2. Write a complete PROMPT.md specification to the given path following the format in your system prompt\n3. The specification must be detailed enough for an autonomous AI agent to implement without asking questions\n4. Name actual files, functions, and patterns from the codebase — be specific"}
 
 Use the write tool to write the specification file.${commandsSection}${completionDocumentationSection}${memorySection}${attachmentsSection}${userCommentsSection}`;
 }

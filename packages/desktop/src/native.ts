@@ -18,6 +18,39 @@ export interface WindowState {
   isMaximized: boolean;
 }
 
+export type DesktopLaunchMode = "choose" | "local" | "remote";
+
+export interface DesktopRemoteProfileLike {
+  id: string;
+  name: string;
+  serverUrl: string;
+  authToken?: string | null;
+}
+
+export interface DesktopShellSettingsLike {
+  desktopMode: "local" | "remote" | null;
+  activeProfileId: string | null;
+  profiles: DesktopRemoteProfileLike[];
+}
+
+export interface NormalizedDesktopRemoteLaunch {
+  mode: "remote";
+  profileId: string;
+  serverBaseUrl: string;
+  serverLabel?: string;
+  authToken?: string;
+}
+
+export const SHELL_HANDOFF_QUERY = {
+  shellKind: "shellKind",
+  shellMode: "shellMode",
+  profileId: "profileId",
+  serverBaseUrl: "serverBaseUrl",
+  serverLabel: "serverLabel",
+  token: "token",
+  canOpenConnectionManager: "shellCanOpenConnectionManager",
+} as const;
+
 export const DEFAULT_WINDOW_STATE: WindowState = {
   width: 1280,
   height: 900,
@@ -42,6 +75,10 @@ function generateSettingsExportFilename(date: Date = new Date()): string {
 
 function getWindowStatePath(): string {
   return join(app.getPath("userData"), "window-state.json");
+}
+
+function getDesktopLaunchModePath(): string {
+  return join(app.getPath("userData"), "desktop-launch-mode.json");
 }
 
 function isValidWindowState(value: unknown): value is WindowState {
@@ -158,6 +195,90 @@ export function setupAutoUpdater(mainWindow?: BrowserWindow): void {
   } catch (error) {
     console.error("[desktop/native] Auto-updater unavailable", error);
   }
+}
+
+function normalizeServerBaseUrl(serverUrl: string): string | null {
+  try {
+    const parsed = new URL(serverUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeDesktopRemoteLaunch(settings: DesktopShellSettingsLike): NormalizedDesktopRemoteLaunch | null {
+  if (settings.desktopMode !== "remote" || !settings.activeProfileId) {
+    return null;
+  }
+
+  const activeProfile = settings.profiles.find((profile) => profile.id === settings.activeProfileId);
+  if (!activeProfile) {
+    return null;
+  }
+
+  const serverBaseUrl = normalizeServerBaseUrl(activeProfile.serverUrl);
+  if (!serverBaseUrl) {
+    return null;
+  }
+
+  return {
+    mode: "remote",
+    profileId: activeProfile.id,
+    serverBaseUrl,
+    ...(activeProfile.name ? { serverLabel: activeProfile.name } : {}),
+    ...(activeProfile.authToken ? { authToken: activeProfile.authToken } : {}),
+  };
+}
+
+export function buildRemoteShellHandoffUrl(launch: NormalizedDesktopRemoteLaunch): string {
+  const url = new URL(launch.serverBaseUrl);
+  url.searchParams.set(SHELL_HANDOFF_QUERY.shellKind, "desktop");
+  url.searchParams.set(SHELL_HANDOFF_QUERY.shellMode, "remote");
+  url.searchParams.set(SHELL_HANDOFF_QUERY.profileId, launch.profileId);
+  url.searchParams.set(SHELL_HANDOFF_QUERY.serverBaseUrl, launch.serverBaseUrl);
+  if (launch.serverLabel) {
+    url.searchParams.set(SHELL_HANDOFF_QUERY.serverLabel, launch.serverLabel);
+  }
+  if (launch.authToken) {
+    url.searchParams.set(SHELL_HANDOFF_QUERY.token, launch.authToken);
+  }
+  url.searchParams.set(SHELL_HANDOFF_QUERY.canOpenConnectionManager, "1");
+  return url.toString();
+}
+
+function isValidDesktopLaunchMode(value: unknown): value is DesktopLaunchMode {
+  return value === "choose" || value === "local" || value === "remote";
+}
+
+export async function loadDesktopLaunchMode(): Promise<DesktopLaunchMode> {
+  const launchModePath = getDesktopLaunchModePath();
+
+  try {
+    const raw = await readFile(launchModePath, "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+
+    if (parsed && typeof parsed === "object" && "mode" in parsed) {
+      const mode = (parsed as { mode?: unknown }).mode;
+      if (isValidDesktopLaunchMode(mode)) {
+        return mode;
+      }
+    }
+
+    return "choose";
+  } catch {
+    return "choose";
+  }
+}
+
+export async function saveDesktopLaunchMode(mode: DesktopLaunchMode): Promise<void> {
+  const launchModePath = getDesktopLaunchModePath();
+  const tempPath = `${launchModePath}.tmp`;
+
+  await writeFile(tempPath, JSON.stringify({ mode }, null, 2), "utf-8");
+  await rename(tempPath, launchModePath);
 }
 
 export async function loadWindowState(): Promise<WindowState | null> {

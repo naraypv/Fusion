@@ -67,6 +67,7 @@ describe("fn insight extension tools", () => {
       provenance: { trigger: "manual" },
       content: "Ensure this appears in extension output",
     });
+    store.close();
 
     const listTool = api.tools.get("fn_insight_list")!;
     const listResult = await listTool.execute("call-1", { category: "quality" }, undefined, undefined, makeCtx(tmpDir));
@@ -86,6 +87,7 @@ describe("fn insight extension tools", () => {
 
     const run = insightStore.createRun("", { trigger: "manual" });
     insightStore.updateRun(run.id, { status: "completed", insightsCreated: 2, insightsUpdated: 1 });
+    store.close();
 
     const listTool = api.tools.get("fn_insight_run_list")!;
     const listResult = await listTool.execute("call-3", { status: "completed" }, undefined, undefined, makeCtx(tmpDir));

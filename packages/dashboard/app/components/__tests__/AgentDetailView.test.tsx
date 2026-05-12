@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { loadAllAppCss } from "../../test/cssFixture";
-import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 import { AgentDetailView } from "../AgentDetailView";
@@ -17,6 +17,8 @@ vi.mock("../../api", () => ({
   deleteAgent: vi.fn(),
   fetchAgentLogs: vi.fn(),
   fetchAgentLogsWithMeta: vi.fn(),
+  fetchAgentMailbox: vi.fn(),
+  markMessageRead: vi.fn(),
   fetchAgentRunLogs: vi.fn(),
   fetchAgentChildren: vi.fn(),
   fetchAgentRuns: vi.fn(),
@@ -26,6 +28,9 @@ vi.mock("../../api", () => ({
   updateAgentInstructions: vi.fn(),
   updateAgentSoul: vi.fn(),
   updateAgentMemory: vi.fn(),
+  fetchAgentMemoryFiles: vi.fn(),
+  fetchAgentMemoryFile: vi.fn(),
+  saveAgentMemoryFile: vi.fn(),
   fetchAgentTasks: vi.fn(),
   fetchChainOfCommand: vi.fn(),
   fetchAgentBudgetStatus: vi.fn(),
@@ -38,6 +43,7 @@ vi.mock("../../api", () => ({
   fetchPluginRuntimes: vi.fn(),
   upgradeAgentHeartbeatProcedure: vi.fn(),
   updateGlobalSettings: vi.fn(),
+  fetchCompanies: vi.fn(),
 }));
 
 vi.mock("../AgentLogViewer", () => ({
@@ -99,12 +105,49 @@ vi.mock("../CustomModelDropdown", () => ({
 
 // Mock SkillMultiselect
 vi.mock("../SkillMultiselect", () => ({
-  SkillMultiselect: ({ value, onChange, id }: { value: string[]; onChange: (v: string[]) => void; id?: string }) => (
+  SkillMultiselect: ({ value, onChange, id: _id }: { value: string[]; onChange: (v: string[]) => void; id?: string }) => (
     <div data-testid="skill-multiselect">
       <span data-testid="skill-multiselect-value">{JSON.stringify(value)}</span>
       <button data-testid="add-skill-test" onClick={() => onChange([...value, "test-skill"])}>Add Test Skill</button>
       <button data-testid="remove-skill-test" onClick={() => onChange(value.filter(s => s !== "test-skill"))}>Remove Test Skill</button>
     </div>
+  ),
+}));
+
+vi.mock("../ExperimentalAgentOnboardingModal", () => ({
+  ExperimentalAgentOnboardingModal: ({ isOpen, mode, existingAgentConfig, onUseDraft, onClose }: {
+    isOpen: boolean;
+    mode?: "create" | "edit";
+    existingAgentConfig?: Record<string, unknown>;
+    onUseDraft: (summary: any) => void;
+    onClose: () => void;
+  }) => (
+    isOpen ? (
+      <div data-testid="mock-ai-interview-modal">
+        <span data-testid="mock-ai-interview-mode">{mode}</span>
+        <button
+          type="button"
+          onClick={() => onUseDraft({
+            name: "Interviewed Agent",
+            role: "reviewer",
+            title: "Draft Title",
+            icon: "🧠",
+            reportsTo: "agent-002",
+            instructionsText: "Updated instructions",
+            soul: "Updated soul",
+            memory: "Updated memory",
+            skills: ["skill-1"],
+            thinkingLevel: "high",
+            maxTurns: 12,
+            model: "openai/gpt-4o",
+          })}
+        >
+          Apply Draft
+        </button>
+        <button type="button" onClick={onClose}>Close Modal</button>
+        <pre data-testid="mock-ai-existing-config">{JSON.stringify(existingAgentConfig ?? {})}</pre>
+      </div>
+    ) : null
   ),
 }));
 
@@ -118,7 +161,7 @@ vi.mock("../../hooks/useConfirm", () => ({
   useConfirm: () => ({ confirm: mockConfirm }),
 }));
 
-import { fetchAgent, fetchAgents, updateAgent, updateAgentState, deleteAgent, fetchAgentChildren, fetchAgentRunLogs, fetchAgentRuns, fetchAgentRunDetail, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchDiscoveredSkills, fetchSkillContent, fetchModels, fetchPluginRuntimes, fetchAgentLogsWithMeta, upgradeAgentHeartbeatProcedure, updateGlobalSettings } from "../../api";
+import { fetchAgent, fetchAgents, updateAgent, updateAgentState, deleteAgent, fetchAgentChildren, fetchAgentRunLogs, fetchAgentRuns, fetchAgentRunDetail, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchDiscoveredSkills, fetchSkillContent, fetchModels, fetchPluginRuntimes, fetchAgentLogsWithMeta, fetchAgentMailbox, markMessageRead, startAgentRun, upgradeAgentHeartbeatProcedure, updateGlobalSettings, fetchCompanies } from "../../api";
 import { subscribeSse } from "../../sse-bus";
 
 const mockFetchAgent = vi.mocked(fetchAgent);
@@ -137,6 +180,9 @@ const mockResetAgentBudget = vi.mocked(resetAgentBudget);
 const mockUpdateAgentInstructions = vi.mocked(updateAgentInstructions);
 const mockUpdateAgentSoul = vi.mocked(updateAgentSoul);
 const mockUpdateAgentMemory = vi.mocked(updateAgentMemory);
+const mockFetchAgentMemoryFiles = vi.mocked(fetchAgentMemoryFiles);
+const mockFetchAgentMemoryFile = vi.mocked(fetchAgentMemoryFile);
+const mockSaveAgentMemoryFile = vi.mocked(saveAgentMemoryFile);
 const mockFetchWorkspaceFileContent = vi.mocked(fetchWorkspaceFileContent);
 const mockSaveWorkspaceFileContent = vi.mocked(saveWorkspaceFileContent);
 const mockFetchDiscoveredSkills = vi.mocked(fetchDiscoveredSkills);
@@ -144,8 +190,12 @@ const mockFetchSkillContent = vi.mocked(fetchSkillContent);
 const mockFetchModels = vi.mocked(fetchModels);
 const mockFetchPluginRuntimes = vi.mocked(fetchPluginRuntimes);
 const mockFetchAgentLogsWithMeta = vi.mocked(fetchAgentLogsWithMeta);
+const mockFetchAgentMailbox = vi.mocked(fetchAgentMailbox);
+const mockMarkMessageRead = vi.mocked(markMessageRead);
+const mockStartAgentRun = vi.mocked(startAgentRun);
 const mockUpgradeAgentHeartbeatProcedure = vi.mocked(upgradeAgentHeartbeatProcedure);
 const mockUpdateGlobalSettings = vi.mocked(updateGlobalSettings);
+const mockFetchCompanies = vi.mocked(fetchCompanies);
 const mockSubscribeSse = vi.mocked(subscribeSse);
 
 const MOCK_SKILLS = [
@@ -193,6 +243,7 @@ describe("AgentDetailView", () => {
     mockSubscribeSse.mockReturnValue(vi.fn());
     const mockAgent = createMockAgent();
     mockFetchAgent.mockResolvedValue(mockAgent);
+    mockStartAgentRun.mockResolvedValue({ id: "run-003" } as any);
     mockFetchAgents.mockResolvedValue([
       { id: "agent-001", name: "Test Agent", role: "executor", state: "active", metadata: {} },
       { id: "agent-002", name: "Manager Agent", role: "reviewer", state: "active", metadata: {} },
@@ -212,6 +263,27 @@ describe("AgentDetailView", () => {
     mockFetchAgentTasks.mockResolvedValue([]);
     mockFetchChainOfCommand.mockResolvedValue([mockAgent]);
     mockFetchAgentLogsWithMeta.mockResolvedValue({ entries: [], total: 0, hasMore: false });
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 0,
+      messages: [],
+      inbox: [],
+      outbox: [],
+    });
+    mockMarkMessageRead.mockResolvedValue({
+      id: "msg-default",
+      fromId: "dashboard",
+      fromType: "user",
+      toId: "agent-001",
+      toType: "agent",
+      content: "",
+      type: "user-to-agent",
+      read: true,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    } as any);
+    mockStartAgentRun.mockResolvedValue({ id: "run-003" } as any);
     // Default: no budget limit configured
     mockFetchAgentBudgetStatus.mockResolvedValue({
       agentId: "agent-001",
@@ -229,9 +301,25 @@ describe("AgentDetailView", () => {
     mockFetchWorkspaceFileContent.mockResolvedValue({ content: "", mtime: "2024-01-01T00:00:00.000Z", size: 0 });
     mockSaveWorkspaceFileContent.mockResolvedValue({ success: true, mtime: "2024-01-01T00:00:00.000Z", size: 0 });
     mockUpdateAgentInstructions.mockResolvedValue({} as any);
+    mockFetchAgentMemoryFiles.mockResolvedValue({
+      files: [
+        {
+          path: ".fusion/agent-memory/agent-001/MEMORY.md",
+          label: "MEMORY.md",
+          layer: "long-term",
+          size: 12,
+          updatedAt: "2024-01-01T00:00:00.000Z",
+        },
+      ],
+    } as any);
+    mockFetchAgentMemoryFile.mockResolvedValue({
+      path: ".fusion/agent-memory/agent-001/MEMORY.md",
+      content: "",
+    } as any);
+    mockSaveAgentMemoryFile.mockResolvedValue({ success: true } as any);
     // Default: return skills
     mockFetchDiscoveredSkills.mockResolvedValue(MOCK_SKILLS);
-    mockFetchSkillContent.mockResolvedValue({ skillMd: "# Skill", files: [] });
+    mockFetchSkillContent.mockResolvedValue({ name: "Skill", skillMd: "# Skill", files: [] });
     mockFetchModels.mockResolvedValue({
       models: [
         { provider: "openai", id: "gpt-4o", name: "gpt-4o", reasoning: false, contextWindow: 128000 },
@@ -249,6 +337,7 @@ describe("AgentDetailView", () => {
       procedureFileSeeded: true,
     });
     mockUpdateGlobalSettings.mockResolvedValue({} as any);
+    mockFetchCompanies.mockResolvedValue({ companies: [] });
   });
 
   it("shows loading state initially", () => {
@@ -261,6 +350,22 @@ describe("AgentDetailView", () => {
     );
 
     expect(screen.getByText(/Loading agent/i)).toBeInTheDocument();
+  });
+
+  it("renders pending approval badge when agent has pending approvals", async () => {
+    mockFetchAgent.mockResolvedValueOnce(createMockAgent({ pendingApprovalCount: 3 }));
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("3 pending approvals")).toBeInTheDocument();
+    });
   });
 
   it("renders inline mode as a region without overlay or close button", async () => {
@@ -343,8 +448,6 @@ describe("AgentDetailView", () => {
 
     // Verify state CSS variables are defined in the global stylesheet (styles.css)
     // (previously these were in inline style blocks, now they're in the global :root)
-    const fs = await import("fs");
-    const path = await import("path");
     const stylesContent = loadAllAppCss();
     expect(stylesContent).toContain("--state-idle-bg:");
     expect(stylesContent).toContain("--state-active-bg:");
@@ -426,8 +529,6 @@ describe("AgentDetailView", () => {
 
     // Verify that the global stylesheet defines --color-success and --color-error
     // (previously checked in inline style blocks, now verified by reading styles.css)
-    const fs = await import("fs");
-    const path = await import("path");
     const stylesContent = loadAllAppCss();
     expect(stylesContent).toMatch(/--color-success:/);
     expect(stylesContent).toMatch(/--color-error:/);
@@ -449,8 +550,6 @@ describe("AgentDetailView", () => {
     // Previously the component defined local aliases like --bg-primary, --accent, etc.
     // Now these are replaced with direct global token references in the CSS classes.
     // Verify the global stylesheet defines the real tokens that the component uses.
-    const fs = await import("fs");
-    const path = await import("path");
     const stylesContent = loadAllAppCss();
     // The component classes now use --surface, --todo, --text, --card-hover directly
     expect(stylesContent).toMatch(/--surface:/);
@@ -625,6 +724,7 @@ describe("AgentDetailView", () => {
     await waitFor(() => {
       expect(screen.getByText("Dashboard")).toBeInTheDocument();
       expect(screen.getByText("Logs")).toBeInTheDocument();
+      expect(screen.getByText("Mail")).toBeInTheDocument();
       expect(screen.getByText("Runs")).toBeInTheDocument();
       expect(screen.getByText("Tasks")).toBeInTheDocument();
       expect(screen.getByText("Employees")).toBeInTheDocument();
@@ -633,6 +733,267 @@ describe("AgentDetailView", () => {
       expect(screen.getByText("Agent Memory")).toBeInTheDocument();
       expect(screen.getByText("Settings")).toBeInTheDocument();
     });
+  });
+
+  it("loads mailbox only when Mail tab is opened", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 1,
+      messages: [],
+      inbox: [
+        {
+          id: "msg-1",
+          fromId: "dashboard",
+          fromType: "user",
+          toId: "agent-001",
+          toType: "agent",
+          content: "Inbox message",
+          type: "user-to-agent",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: false,
+        },
+      ],
+      outbox: [],
+    } as any);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Dashboard")).toBeInTheDocument();
+    });
+
+    expect(mockFetchAgentMailbox).not.toHaveBeenCalled();
+
+    await user.click(screen.getByText("Mail"));
+
+    await waitFor(() => {
+      expect(mockFetchAgentMailbox).toHaveBeenCalledWith("agent-001", undefined);
+      expect(screen.getByText("Inbox message")).toBeInTheDocument();
+    });
+  });
+
+  it("switches Mail tab between inbox and outbox", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 0,
+      messages: [],
+      inbox: [],
+      outbox: [
+        {
+          id: "msg-2",
+          fromId: "agent-001",
+          fromType: "agent",
+          toId: "dashboard",
+          toType: "user",
+          content: "Sent message",
+          type: "agent-to-user",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: true,
+        },
+      ],
+    } as any);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await user.click(await screen.findByText("Mail"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("agent-detail-mail-empty")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Outbox" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Sent message")).toBeInTheDocument();
+    });
+  });
+
+  it("opens message detail and supports going back to list", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 1,
+      messages: [],
+      inbox: [
+        {
+          id: "msg-1",
+          fromId: "dashboard",
+          fromType: "user",
+          toId: "agent-001",
+          toType: "agent",
+          content: "First line\nSecond line with full body",
+          type: "user-to-agent",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          metadata: { replyTo: { messageId: "msg-0" } },
+          read: true,
+        },
+      ],
+      outbox: [],
+    } as any);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await user.click(await screen.findByText("Mail"));
+    await user.click(await screen.findByRole("button", { name: /You/i }));
+
+    expect(await screen.findByTestId("agent-detail-mail-message")).toBeInTheDocument();
+    expect(screen.getByText(/First line\s*Second line with full body/)).toBeInTheDocument();
+    expect(screen.getByText(/Replying to message msg-0/)).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("agent-detail-mail-back"));
+    expect(await screen.findByTestId("agent-detail-mail-list")).toBeInTheDocument();
+  });
+
+  it("renders agent mailbox participant labels with known agent names", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 1,
+      messages: [],
+      inbox: [
+        {
+          id: "msg-1",
+          fromId: "agent-001",
+          fromType: "agent",
+          toId: "dashboard",
+          toType: "user",
+          content: "Self message",
+          type: "agent-to-user",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: true,
+        },
+      ],
+      outbox: [
+        {
+          id: "msg-2",
+          fromId: "agent-001",
+          fromType: "agent",
+          toId: "agent-002",
+          toType: "agent",
+          content: "Known recipient",
+          type: "agent-to-agent",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: true,
+        },
+      ],
+    } as any);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await user.click(await screen.findByText("Mail"));
+    expect(await screen.findByText("Agent: Test Agent")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Outbox" }));
+    expect(await screen.findByText("To: Agent: Manager Agent")).toBeInTheDocument();
+  });
+
+  it("marks unread inbox messages as read and refreshes mailbox", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 1,
+      messages: [],
+      inbox: [
+        {
+          id: "msg-1",
+          fromId: "dashboard",
+          fromType: "user",
+          toId: "agent-001",
+          toType: "agent",
+          content: "Unread message",
+          type: "user-to-agent",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: false,
+        },
+      ],
+      outbox: [],
+    } as any);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        projectId="proj-1"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await user.click(await screen.findByText("Mail"));
+    await user.click(await screen.findByRole("button", { name: /You/i }));
+
+    await waitFor(() => {
+      expect(mockMarkMessageRead).toHaveBeenCalledWith("msg-1", "proj-1");
+      expect(mockFetchAgentMailbox).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("does not mark already read inbox messages", async () => {
+    const user = userEvent.setup();
+    mockFetchAgentMailbox.mockResolvedValue({
+      ownerId: "agent-001",
+      ownerType: "agent",
+      unreadCount: 0,
+      messages: [],
+      inbox: [
+        {
+          id: "msg-1",
+          fromId: "dashboard",
+          fromType: "user",
+          toId: "agent-001",
+          toType: "agent",
+          content: "Read message",
+          type: "user-to-agent",
+          createdAt: "2024-01-01T00:00:00.000Z",
+          updatedAt: "2024-01-01T00:00:00.000Z",
+          read: true,
+        },
+      ],
+      outbox: [],
+    } as any);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await user.click(await screen.findByText("Mail"));
+    await user.click(await screen.findByRole("button", { name: /You/i }));
+
+    expect(mockMarkMessageRead).not.toHaveBeenCalled();
   });
 
   it("renders redesigned dashboard summary sections", async () => {
@@ -776,6 +1137,25 @@ describe("AgentDetailView", () => {
     });
   });
 
+  it("notifies parent mutation callback after successful state change", async () => {
+    const onMutationSuccess = vi.fn();
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        onMutationSuccess={onMutationSuccess}
+      />
+    );
+
+    await userEvent.click(await screen.findByText("Pause"));
+
+    await waitFor(() => {
+      expect(onMutationSuccess).toHaveBeenCalledWith({ agentId: "agent-001", deleted: false });
+    });
+  });
+
   it("shows Resume button for paused agent", async () => {
     mockFetchAgent.mockResolvedValue(createMockAgent({ state: "paused" }));
 
@@ -792,8 +1172,8 @@ describe("AgentDetailView", () => {
     });
   });
 
-  it("shows Delete button for terminated agent", async () => {
-    mockFetchAgent.mockResolvedValue(createMockAgent({ state: "terminated" }));
+  it("shows Delete button for paused agent", async () => {
+    mockFetchAgent.mockResolvedValue(createMockAgent({ state: "paused" }));
 
     render(
       <AgentDetailView
@@ -804,31 +1184,7 @@ describe("AgentDetailView", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText("Start")).toBeInTheDocument();
       expect(screen.getByText("Delete")).toBeInTheDocument();
-    });
-  });
-
-  it("shows Start button for terminated agent", async () => {
-    mockFetchAgent.mockResolvedValue(createMockAgent({ state: "terminated" }));
-    mockUpdateAgentState.mockResolvedValue(createMockAgent({ state: "active" }));
-
-    render(
-      <AgentDetailView
-        agentId="agent-001"
-        onClose={vi.fn()}
-        addToast={vi.fn()}
-      />
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText("Start")).toBeInTheDocument();
-    });
-
-    await userEvent.click(screen.getByText("Start"));
-
-    await waitFor(() => {
-      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-001", "active", undefined);
     });
   });
 
@@ -865,6 +1221,40 @@ describe("AgentDetailView", () => {
     });
   });
 
+  it("keeps active header Stop and Run Now buttons accessible by name while using mobile icon-control class", async () => {
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    const stopButton = await screen.findByRole("button", { name: "Stop" });
+    const runNowButton = await screen.findByRole("button", { name: "Run now for Test Agent" });
+
+    expect(stopButton.className).toContain("agent-detail-mobile-icon-control");
+    expect(runNowButton.className).toContain("agent-detail-mobile-icon-control");
+  });
+
+  it("transitions running agent to paused when Stop is clicked", async () => {
+    mockFetchAgent.mockResolvedValue(createMockAgent({ state: "running" }));
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />
+    );
+
+    await userEvent.click(await screen.findByText("Stop"));
+
+    await waitFor(() => {
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-001", "paused", undefined);
+    });
+  });
+
   it("shows Retry and Stop buttons for error agent", async () => {
     mockFetchAgent.mockResolvedValue(createMockAgent({ state: "error" }));
 
@@ -879,6 +1269,24 @@ describe("AgentDetailView", () => {
     await waitFor(() => {
       expect(screen.getByText("Retry")).toBeInTheDocument();
       expect(screen.getByText("Stop")).toBeInTheDocument();
+    });
+  });
+
+  it("transitions error agent to paused when Stop is clicked", async () => {
+    mockFetchAgent.mockResolvedValue(createMockAgent({ state: "error" }));
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />
+    );
+
+    await userEvent.click(await screen.findByText("Stop"));
+
+    await waitFor(() => {
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-001", "paused", undefined);
     });
   });
 
@@ -901,8 +1309,80 @@ describe("AgentDetailView", () => {
 
       const utilityContainer = headerActions?.querySelector(".agent-detail-utility-actions");
       expect(utilityContainer).toBeTruthy();
+      expect(utilityContainer?.querySelector('[title="Bulk agent actions"]')).toBeTruthy();
       expect(utilityContainer?.querySelector('[title="Refresh"]')).toBeTruthy();
       expect(utilityContainer?.querySelector('[title="Close"]')).toBeTruthy();
+    });
+  });
+
+  it("renders bulk lifecycle menu with state-aware eligibility hints", async () => {
+    const user = userEvent.setup();
+    mockFetchAgents.mockResolvedValueOnce([
+      { id: "agent-001", name: "Alpha", state: "active", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "running", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "paused", role: "executor", metadata: {} },
+    ] as any);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Pause All Agents")).toBeInTheDocument();
+      expect(screen.getByText("Resume All Agents")).toBeInTheDocument();
+      expect(screen.getByText("Pause 2 active/running agents")).toBeInTheDocument();
+      expect(screen.getByText("Resume 1 paused agent")).toBeInTheDocument();
+    });
+  });
+
+  it("bulk pause confirms, skips ineligible/system agents, and refreshes detail", async () => {
+    const user = userEvent.setup();
+    const addToast = vi.fn();
+    mockFetchAgents.mockResolvedValue([
+      { id: "agent-001", name: "Alpha", state: "active", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "running", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-004", name: "System", state: "active", role: "executor", metadata: { type: "spawned" } },
+    ] as any);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={addToast} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Pause All Agents/i }));
+
+    await waitFor(() => {
+      expect(mockConfirm).toHaveBeenCalled();
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-001", "paused", undefined);
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-002", "paused", undefined);
+      expect(mockUpdateAgentState).not.toHaveBeenCalledWith("agent-003", "paused", undefined);
+      expect(mockUpdateAgentState).not.toHaveBeenCalledWith("agent-004", "paused", undefined);
+      expect(addToast).toHaveBeenCalledWith("Paused 2 agents; skipped 1", "success");
+    });
+
+    await waitFor(() => {
+      expect(mockFetchAgent).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("reports partial failures during bulk resume", async () => {
+    const user = userEvent.setup();
+    const addToast = vi.fn();
+    mockFetchAgents.mockResolvedValue([
+      { id: "agent-001", name: "Alpha", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "idle", role: "executor", metadata: {} },
+    ] as any);
+    mockUpdateAgentState
+      .mockResolvedValueOnce(createMockAgent({ state: "active" }))
+      .mockRejectedValueOnce(new Error("network"));
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={addToast} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Resume All Agents/i }));
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith(expect.stringContaining("Resumed 1 agent; skipped 1; failed 1"), "error");
     });
   });
 
@@ -920,6 +1400,7 @@ describe("AgentDetailView", () => {
     expect(stylesContent).toContain("grid-column: 1;");
     expect(stylesContent).toContain(".agent-detail-header-actions {");
     expect(stylesContent).toContain("grid-column: 2;");
+    expect(stylesContent).toContain(".agent-detail-controls .agent-detail-mobile-icon-control {");
     expect(stylesContent).toContain(".agent-detail-mobile-icon-control .agent-detail-control-label {");
   });
 
@@ -1238,6 +1719,154 @@ describe("AgentDetailView", () => {
     });
   });
 
+  it("shows run error in modal and launches prefilled GitHub issue", async () => {
+    const runId = "run-error";
+    mockFetchAgentRuns.mockResolvedValueOnce([
+      {
+        id: runId,
+        agentId: "agent-001",
+        startedAt: "2024-01-01T00:00:00.000Z",
+        endedAt: "2024-01-01T00:01:00.000Z",
+        status: "failed",
+      } as AgentHeartbeatRun,
+    ]);
+    mockFetchAgentRunLogs.mockResolvedValueOnce([]);
+    mockFetchAgentRunDetail.mockResolvedValueOnce({
+      id: runId,
+      agentId: "agent-001",
+      startedAt: "2024-01-01T00:00:00.000Z",
+      endedAt: "2024-01-01T00:01:00.000Z",
+      status: "failed",
+      stderrExcerpt: "fatal: exploded",
+    } as AgentHeartbeatRun);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+        initialTab="runs"
+        initialRunId={runId}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Open error details" })).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText("fatal: exploded")).toBeNull();
+    expect(screen.queryByLabelText("Agent error details")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open error details" }));
+    expect(screen.getByLabelText("Agent error details")).toBeInTheDocument();
+    expect(screen.getByText("fatal: exploded")).toBeInTheDocument();
+
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    fireEvent.click(screen.getByRole("link", { name: "Report on GitHub" }));
+    expect(openSpy).toHaveBeenCalledWith(
+      expect.stringContaining("https://github.com/Runfusion/Fusion/issues/new?"),
+      "_blank",
+      "noopener,noreferrer",
+    );
+    expect(openSpy.mock.calls[0]?.[0]).toContain("run-error");
+    openSpy.mockRestore();
+  });
+
+  it("renders Run Now in header for active and idle states only", async () => {
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Run now for Test Agent" })).toBeInTheDocument();
+    });
+
+    cleanup();
+    mockFetchAgent.mockResolvedValueOnce(createMockAgent({ state: "idle", taskId: undefined }));
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Run now for Test Agent" })).toBeInTheDocument();
+    });
+
+    cleanup();
+    mockFetchAgent.mockResolvedValueOnce(createMockAgent({ state: "running", taskId: undefined }));
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Run now for Test Agent" })).not.toBeInTheDocument();
+    });
+  });
+
+  it("starts run from header and refreshes runs without runs-tab Run Now", async () => {
+    const addToast = vi.fn();
+    const user = userEvent.setup();
+    mockFetchAgentRuns.mockResolvedValue([
+      {
+        id: "run-001",
+        agentId: "agent-001",
+        startedAt: "2024-01-01T00:00:00.000Z",
+        endedAt: null,
+        status: "active",
+      } as AgentHeartbeatRun,
+    ]);
+
+    render(
+      <AgentDetailView
+        agentId="agent-001"
+        onClose={vi.fn()}
+        addToast={addToast}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Run now for Test Agent" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Run now for Test Agent" }));
+
+    await waitFor(() => {
+      expect(mockStartAgentRun).toHaveBeenCalledWith("agent-001", undefined, {
+        source: "on_demand",
+        triggerDetail: "Triggered from dashboard",
+      });
+    });
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith("Heartbeat run started for Test Agent", "success");
+    });
+
+    await user.click(screen.getByText("Runs"));
+
+    const initialRunFetchCalls = mockFetchAgentRuns.mock.calls.length;
+    await waitFor(() => {
+      expect(initialRunFetchCalls).toBeGreaterThan(0);
+    });
+
+    await user.click(screen.getByRole("button", { name: "Run now for Test Agent" }));
+
+    await waitFor(() => {
+      expect(mockFetchAgentRuns.mock.calls.length).toBeGreaterThan(initialRunFetchCalls);
+    });
+
+    expect(screen.getAllByRole("button", { name: "Run now for Test Agent" })).toHaveLength(1);
+  });
+
   it("auto-expands the active run when opened from running control context", async () => {
     const activeRunId = "run-001";
     mockFetchAgentRunLogs.mockResolvedValueOnce([
@@ -1274,8 +1903,9 @@ describe("AgentDetailView", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Active run log line")).toBeInTheDocument();
       expect(screen.getByText("System Prompt")).toBeInTheDocument();
+      const viewer = screen.getByTestId("agent-log-viewer");
+      expect(viewer.textContent).toContain("Active run log line");
     });
   });
 
@@ -1323,8 +1953,9 @@ describe("AgentDetailView", () => {
 
       expect(screen.getByText("Latest run · run-1001")).toBeInTheDocument();
       await waitFor(() => {
-        expect(screen.getByText("First entry")).toBeInTheDocument();
-        expect(screen.getByText("Second entry")).toBeInTheDocument();
+        const viewer = screen.getByTestId("agent-log-viewer");
+        expect(viewer.textContent).toContain("First entry");
+        expect(viewer.textContent).toContain("Second entry");
       });
     });
 
@@ -1476,7 +2107,52 @@ describe("AgentDetailView", () => {
       await user.click(screen.getByText("Settings"));
     };
 
-    it("shows settings delete control for idle and terminated agents", async () => {
+    it("opens AI Interview in edit mode and applies draft values to local settings fields", async () => {
+      const user = userEvent.setup();
+
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />,
+      );
+
+      await navigateToSettings(user);
+      await user.click(await screen.findByRole("button", { name: "AI Interview" }));
+
+      expect(await screen.findByTestId("mock-ai-interview-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("mock-ai-interview-mode")).toHaveTextContent("edit");
+      expect(screen.getByTestId("mock-ai-existing-config").textContent).toContain("Test Agent");
+
+      await user.click(screen.getByRole("button", { name: "Apply Draft" }));
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Interviewed Agent");
+        expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Draft Title");
+        expect((screen.getByLabelText("Icon") as HTMLInputElement).value).toBe("🧠");
+        expect((screen.getByLabelText("Role") as HTMLSelectElement).value).toBe("reviewer");
+      });
+      expect(mockUpdateAgent).not.toHaveBeenCalled();
+
+      await user.click(screen.getByRole("button", { name: "Save Settings" }));
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledWith(
+          "agent-001",
+          expect.objectContaining({
+            name: "Interviewed Agent",
+            role: "reviewer",
+            title: "Draft Title",
+            reportsTo: "agent-002",
+            runtimeConfig: expect.objectContaining({ model: "openai/gpt-4o" }),
+            metadata: { skills: ["skill-1"] },
+          }),
+          undefined,
+        );
+      });
+    });
+
+    it("shows settings delete control for idle and paused agents", async () => {
       const user = userEvent.setup();
 
       mockFetchAgent.mockResolvedValue(createMockAgent({ state: "idle" }));
@@ -1492,7 +2168,7 @@ describe("AgentDetailView", () => {
       expect(await screen.findByRole("button", { name: "Delete Agent" })).toBeEnabled();
       idleRender.unmount();
 
-      mockFetchAgent.mockResolvedValue(createMockAgent({ state: "terminated" }));
+      mockFetchAgent.mockResolvedValue(createMockAgent({ state: "paused" }));
       render(
         <AgentDetailView
           agentId="agent-001"
@@ -1509,6 +2185,7 @@ describe("AgentDetailView", () => {
       mockFetchAgent.mockResolvedValue(createMockAgent({ state: "idle" }));
       const addToast = vi.fn();
       const onClose = vi.fn();
+      const onMutationSuccess = vi.fn();
       const user = userEvent.setup();
 
       render(
@@ -1517,6 +2194,7 @@ describe("AgentDetailView", () => {
           projectId="proj_123"
           onClose={onClose}
           addToast={addToast}
+          onMutationSuccess={onMutationSuccess}
         />,
       );
 
@@ -1531,6 +2209,7 @@ describe("AgentDetailView", () => {
         });
         expect(mockDeleteAgent).toHaveBeenCalledWith("agent-001", "proj_123");
         expect(addToast).toHaveBeenCalledWith('Agent "Test Agent" deleted', "success");
+        expect(onMutationSuccess).toHaveBeenCalledWith({ agentId: "agent-001", deleted: true });
         expect(onClose).toHaveBeenCalledTimes(1);
       });
     });
@@ -1578,7 +2257,7 @@ describe("AgentDetailView", () => {
 
       expect(await screen.findByRole("button", { name: "Delete Agent" })).toBeDisabled();
       expect(
-        screen.getByText("Agent deletion is only available when state is idle or terminated (current state: active)."),
+        screen.getByText("Agent deletion is only available when state is idle or paused (current state: active)."),
       ).toBeInTheDocument();
     });
 
@@ -2013,6 +2692,29 @@ describe("AgentDetailView", () => {
       });
     });
 
+    it("defaults auto-claim toggle to enabled when runtimeConfig.autoClaimRelevantTasks is missing", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Auto-Claim Relevant Tasks") as HTMLInputElement).checked).toBe(true);
+      });
+    });
+
     it("shows Save Settings button disabled when no changes", async () => {
       mockFetchAgent.mockResolvedValue(createMockAgent({ metadata: {} }));
 
@@ -2222,6 +2924,207 @@ describe("AgentDetailView", () => {
           "agent-001",
           expect.objectContaining({
             runtimeConfig: expect.objectContaining({ enabled: false, heartbeatIntervalMs: 30000 }),
+          }),
+          undefined,
+        );
+      });
+    });
+
+    it("defaults run-missed-heartbeat-on-startup toggle to disabled when runtimeConfig flag is missing", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Run Missed Heartbeat On Startup") as HTMLInputElement).checked).toBe(false);
+      });
+    });
+
+    it("persists run-missed-heartbeat-on-startup toggle changes on save", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          enabled: true,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      mockUpdateAgent.mockResolvedValue(createMockAgent() as any);
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      const toggle = await screen.findByLabelText("Run Missed Heartbeat On Startup");
+      await user.click(toggle);
+      await user.click(screen.getByText("Save Settings"));
+
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledWith(
+          "agent-001",
+          expect.objectContaining({
+            runtimeConfig: expect.objectContaining({ runMissedHeartbeatOnStartup: true }),
+          }),
+          undefined,
+        );
+      });
+    });
+
+    it("persists auto-claim toggle changes on save", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          enabled: true,
+          autoClaimRelevantTasks: true,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      mockUpdateAgent.mockResolvedValue(createMockAgent() as any);
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      const autoClaimInput = await screen.findByLabelText("Auto-Claim Relevant Tasks");
+      await user.click(autoClaimInput);
+      await user.click(screen.getByText("Save Settings"));
+
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledWith(
+          "agent-001",
+          expect.objectContaining({
+            runtimeConfig: expect.objectContaining({ autoClaimRelevantTasks: false }),
+          }),
+          undefined,
+        );
+      });
+    });
+
+    it("defaults allow-parallel-execution toggle to checked when runtimeConfig.allowParallelExecution is undefined", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Allow Parallel Execution") as HTMLInputElement).checked).toBe(true);
+      });
+    });
+
+    it("defaults allow-parallel-execution toggle to unchecked when runtimeConfig.allowParallelExecution === false", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          heartbeatIntervalMs: 30000,
+          allowParallelExecution: false,
+        },
+      }));
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Allow Parallel Execution") as HTMLInputElement).checked).toBe(false);
+      });
+    });
+
+    it("defaults allow-parallel-execution toggle to checked when runtimeConfig.allowParallelExecution === true", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          heartbeatIntervalMs: 30000,
+          allowParallelExecution: true,
+        },
+      }));
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      await waitFor(() => {
+        expect((screen.getByLabelText("Allow Parallel Execution") as HTMLInputElement).checked).toBe(true);
+      });
+    });
+
+    it("persists allow-parallel-execution toggle changes on save", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({
+        runtimeConfig: {
+          enabled: true,
+          allowParallelExecution: true,
+          heartbeatIntervalMs: 30000,
+        },
+      }));
+      mockUpdateAgent.mockResolvedValue(createMockAgent() as any);
+
+      const user = userEvent.setup();
+      render(
+        <AgentDetailView
+          agentId="agent-001"
+          onClose={vi.fn()}
+          addToast={vi.fn()}
+        />
+      );
+
+      await navigateToSettings(user);
+
+      const toggle = await screen.findByLabelText("Allow Parallel Execution");
+      await user.click(toggle);
+      await user.click(screen.getByText("Save Settings"));
+
+      await waitFor(() => {
+        expect(mockUpdateAgent).toHaveBeenCalledWith(
+          "agent-001",
+          expect.objectContaining({
+            runtimeConfig: expect.objectContaining({ allowParallelExecution: false }),
           }),
           undefined,
         );
@@ -3475,6 +4378,7 @@ describe("AgentDetailView", () => {
 
     it("calls saveWorkspaceFileContent when saving file content", async () => {
       const addToast = vi.fn();
+      const onMutationSuccess = vi.fn();
       mockFetchAgent.mockResolvedValue(createMockAgent({
         instructionsPath: ".fusion/agents/test.md",
       }));
@@ -3490,6 +4394,7 @@ describe("AgentDetailView", () => {
           agentId="agent-001"
           onClose={vi.fn()}
           addToast={addToast}
+          onMutationSuccess={onMutationSuccess}
         />
       );
 
@@ -3514,6 +4419,7 @@ describe("AgentDetailView", () => {
           ".fusion/agents/test.md",
           "Updated content",
         );
+        expect(onMutationSuccess).toHaveBeenCalledWith({ agentId: "agent-001", deleted: false });
       });
       expect(addToast).toHaveBeenCalledWith("Instructions file saved", "success");
     });
@@ -3936,55 +4842,26 @@ describe("AgentDetailView", () => {
 
     it("renders Memory tab with textarea by default", async () => {
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
-
       await waitFor(() => {
         expect(screen.getByLabelText("Agent Memory")).toBeInTheDocument();
-        expect(screen.getByText("Edit")).toBeInTheDocument();
-        expect(screen.getByText("Preview")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Edit mode" })).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Preview mode" })).toBeInTheDocument();
       });
     });
 
     it("toggles between edit and preview mode", async () => {
-      mockFetchAgent.mockResolvedValue(createMockAgent({
-        memory: "# Agent Memory\n\n- Item 1\n- Item 2",
-      }));
-
+      mockFetchAgent.mockResolvedValue(createMockAgent({ memory: "# Agent Memory\n\n- Item 1\n- Item 2" }));
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
-
-      // Default: edit mode
-      await waitFor(() => {
-        expect(screen.getByLabelText("Agent Memory")).toBeInTheDocument();
-      });
-
-      // Click Preview
-      await user.click(screen.getByText("Preview"));
-
+      await user.click(screen.getByRole("button", { name: "Preview mode" }));
       await waitFor(() => {
         expect(screen.queryByLabelText("Agent Memory")).not.toBeInTheDocument();
         expect(document.querySelector(".markdown-body")).toBeInTheDocument();
       });
-
-      // Click Edit
-      await user.click(screen.getByText("Edit"));
-
+      await user.click(screen.getByRole("button", { name: "Edit mode" }));
       await waitFor(() => {
         expect(screen.getByLabelText("Agent Memory")).toBeInTheDocument();
       });
@@ -3992,18 +4869,9 @@ describe("AgentDetailView", () => {
 
     it("shows placeholder when memory is empty in preview mode", async () => {
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
-
-      await user.click(screen.getByText("Preview"));
-
+      await user.click(screen.getByRole("button", { name: "Preview mode" }));
       await waitFor(() => {
         expect(screen.getByText("No agent memory defined yet. Switch to Edit mode to add memory content.")).toBeInTheDocument();
       });
@@ -4011,126 +4879,83 @@ describe("AgentDetailView", () => {
 
     it("hides save button when in preview mode", async () => {
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
+      expect(screen.getByText("Save Memory")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Preview mode" }));
+      await waitFor(() => expect(screen.queryByText("Save Memory")).not.toBeInTheDocument());
+    });
 
+    it("hides inline Edit button when agent is running", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({ state: "running", memory: "This agent has memory." }));
+      const user = userEvent.setup();
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+      await navigateToMemory(user);
       await waitFor(() => {
-        expect(screen.getByText("Save Memory")).toBeInTheDocument();
-      });
-
-      await user.click(screen.getByText("Preview"));
-
-      await waitFor(() => {
-        expect(screen.queryByText("Save Memory")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Preview mode" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Edit mode" })).not.toBeInTheDocument();
       });
     });
 
-    it("hides Edit button when agent is running", async () => {
-      mockFetchAgent.mockResolvedValue(createMockAgent({
-        state: "running",
-        memory: "This agent has memory.",
-      }));
-
+    it("can switch inline memory to preview mode when agent is running", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({ state: "running", memory: "Agent memory content" }));
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
+      await user.click(screen.getByRole("button", { name: "Preview mode" }));
+      await waitFor(() => expect(document.querySelector(".markdown-body")).toBeInTheDocument());
+    });
 
-      // Preview button should be visible, Edit button should be hidden
+    it("renders memory file preview markdown and toggles back to edit", async () => {
+      mockFetchAgentMemoryFile.mockResolvedValue({ path: ".fusion/agent-memory/agent-001/MEMORY.md", content: "# Heading\n\n- entry" } as any);
+      const user = userEvent.setup();
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+      await navigateToMemory(user);
+      await user.click(await screen.findByRole("button", { name: "Memory file preview mode" }));
       await waitFor(() => {
-        expect(screen.getByText("Preview")).toBeInTheDocument();
-        // Edit button should not be in the DOM (not just disabled, hidden)
-        expect(screen.queryByRole("button", { name: /Edit/i })).not.toBeInTheDocument();
+        expect(screen.queryByPlaceholderText("Select a memory file to view and edit its content...")).not.toBeInTheDocument();
+        expect(screen.getByText("Heading")).toBeInTheDocument();
+        expect(screen.queryByText("Save Memory File")).not.toBeInTheDocument();
+      });
+      await user.click(screen.getByRole("button", { name: "Memory file edit mode" }));
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText("Select a memory file to view and edit its content...")).toBeInTheDocument();
       });
     });
 
-    it("shows Preview button but not Edit when agent is running", async () => {
-      mockFetchAgent.mockResolvedValue(createMockAgent({
-        state: "running",
-        memory: "Agent memory content",
-      }));
-
+    it("shows memory file preview placeholder when selected file is empty", async () => {
+      mockFetchAgentMemoryFile.mockResolvedValue({ path: ".fusion/agent-memory/agent-001/MEMORY.md", content: "" } as any);
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
-
+      await user.click(await screen.findByRole("button", { name: "Memory file preview mode" }));
       await waitFor(() => {
-        // Preview button is visible
-        const previewBtn = screen.getByRole("button", { name: /Preview/i });
-        expect(previewBtn).toBeInTheDocument();
-        // Edit button should be hidden
-        expect(screen.queryByRole("button", { name: /Edit/i })).not.toBeInTheDocument();
-        // Since Edit is hidden and default is edit mode, the textarea should still be visible
-        // but user needs to click Preview to see the markdown render
+        expect(screen.getByText("No memory file content yet. Switch to Edit mode to add content.")).toBeInTheDocument();
       });
     });
 
-    it("can switch to preview mode when agent is running", async () => {
-      mockFetchAgent.mockResolvedValue(createMockAgent({
-        state: "running",
-        memory: "Agent memory content",
-      }));
-
+    it("hides memory file edit button and disables save button for running agents", async () => {
+      mockFetchAgent.mockResolvedValue(createMockAgent({ state: "running" }));
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={vi.fn()}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
       await navigateToMemory(user);
-
-      // Click Preview button
-      await user.click(screen.getByText("Preview"));
-
       await waitFor(() => {
-        expect(document.querySelector(".markdown-body")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Memory file preview mode" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Memory file edit mode" })).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Save Memory File" })).toBeDisabled();
       });
     });
 
     it("calls updateAgentMemory when saving memory", async () => {
       const addToast = vi.fn();
       mockUpdateAgentMemory.mockResolvedValue({} as any);
-
       const user = userEvent.setup();
-      render(
-        <AgentDetailView
-          agentId="agent-001"
-          onClose={vi.fn()}
-          addToast={addToast}
-        />
-      );
-
+      render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={addToast} />);
       await navigateToMemory(user);
-
       const textarea = await screen.findByLabelText("Agent Memory");
       await user.clear(textarea);
       await user.type(textarea, "This is the agent's new memory");
-
       await user.click(screen.getByText("Save Memory"));
-
       await waitFor(() => {
         expect(mockUpdateAgentMemory).toHaveBeenCalledWith("agent-001", "This is the agent's new memory", undefined);
         expect(addToast).toHaveBeenCalledWith("Memory saved", "success");
@@ -4171,6 +4996,7 @@ describe("AgentDetailView", () => {
       });
       mockFetchAgent.mockResolvedValue(agentWithSkills);
       mockFetchSkillContent.mockResolvedValue({
+        name: "Fusion Skill",
         skillMd: "# Fusion Skill",
         files: [],
       });
@@ -4200,7 +5026,7 @@ describe("AgentDetailView", () => {
       mockFetchAgent.mockResolvedValue(agentWithSkills);
       mockFetchSkillContent
         .mockRejectedValueOnce(new Error("Failed to load skill content"))
-        .mockResolvedValueOnce({ skillMd: "# Recovered", files: [] });
+        .mockResolvedValueOnce({ name: "Recovered", skillMd: "# Recovered", files: [] });
 
       render(
         <AgentDetailView
@@ -4227,7 +5053,7 @@ describe("AgentDetailView", () => {
       const user = userEvent.setup();
       const agentWithSkills = createMockAgent({ metadata: { skills: ["skill-1"] } });
       mockFetchAgent.mockResolvedValue(agentWithSkills);
-      mockFetchSkillContent.mockResolvedValue({ skillMd: "", files: [] });
+      mockFetchSkillContent.mockResolvedValue({ name: "Test Skill", skillMd: "", files: [] });
 
       render(
         <AgentDetailView

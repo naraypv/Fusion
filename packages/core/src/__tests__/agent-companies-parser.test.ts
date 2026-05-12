@@ -183,6 +183,7 @@ reportsTo: null
 skills:
   - plan-ceo-review
   - review
+memory: Preserve architecture rationale between incidents.
 ---
 Agent instructions.`);
 
@@ -190,6 +191,7 @@ Agent instructions.`);
       expect(manifest.title).toBe("Chief Executive Officer");
       expect(manifest.reportsTo).toBeNull();
       expect(manifest.skills).toEqual(["plan-ceo-review", "review"]);
+      expect(manifest.memory).toBe("Preserve architecture rationale between incidents.");
       expect(manifest.instructionBody).toBe("Agent instructions.");
     });
 
@@ -500,6 +502,64 @@ name: Nested Archive CEO
       expect(pkg.company?.name).toBe("Flat Zip Co");
     });
 
+    it("uses subPath to select the correct company from a monorepo archive", async () => {
+      const root = createTempDir();
+      const archivePath = join(root, "mono.zip");
+
+      createZipFromEntries(archivePath, [
+        { path: "companies-main/aeon/COMPANY.md", content: `---\nname: Aeon\n---` },
+        { path: "companies-main/gstack/COMPANY.md", content: `---\nname: GStack\n---` },
+        { path: "companies-main/gstack/agents/ceo/AGENTS.md", content: `---\nname: GStack CEO\n---` },
+      ]);
+
+      const pkg = await parseCompanyArchive(archivePath, { subPath: "gstack" });
+      expect(pkg.company?.name).toBe("GStack");
+      expect(pkg.company?.name).not.toBe("Aeon");
+      expect(pkg.agents[0]?.name).toBe("GStack CEO");
+    });
+
+    it("throws when subPath does not contain COMPANY.md", async () => {
+      const root = createTempDir();
+      const archivePath = join(root, "missing-subpath.zip");
+
+      createZipFromEntries(archivePath, [
+        { path: "companies-main/aeon/COMPANY.md", content: `---\nname: Aeon\n---` },
+      ]);
+
+      await expect(parseCompanyArchive(archivePath, { subPath: "gstack" })).rejects.toThrow(
+        AgentCompaniesParseError,
+      );
+    });
+
+    it("rejects invalid subPath values", async () => {
+      const root = createTempDir();
+      const archivePath = join(root, "invalid-subpath.zip");
+
+      createZipFromEntries(archivePath, [
+        { path: "companies-main/gstack/COMPANY.md", content: `---\nname: GStack\n---` },
+      ]);
+
+      await expect(parseCompanyArchive(archivePath, { subPath: "../etc" })).rejects.toThrow(
+        AgentCompaniesParseError,
+      );
+      await expect(parseCompanyArchive(archivePath, { subPath: "/abs" })).rejects.toThrow(
+        AgentCompaniesParseError,
+      );
+    });
+
+    it("preserves legacy extraction behavior when subPath is omitted", async () => {
+      const root = createTempDir();
+      const archivePath = join(root, "legacy-behavior.zip");
+
+      createZipFromEntries(archivePath, [
+        { path: "companies-main/aeon/COMPANY.md", content: `---\nname: Aeon\n---` },
+        { path: "companies-main/gstack/COMPANY.md", content: `---\nname: GStack\n---` },
+      ]);
+
+      const pkg = await parseCompanyArchive(archivePath);
+      expect(pkg.company?.name).toBe("Aeon");
+    });
+
     it("throws for unsupported archive extension", async () => {
       const root = createTempDir();
       const archivePath = join(root, "company.rar");
@@ -517,6 +577,7 @@ name: Nested Archive CEO
         name: "CEO",
         title: "Chief Executive Officer",
         instructionBody: "Lead strategy",
+        memory: "Track strategic assumptions each quarter.",
         skills: ["review"],
         reportsTo: null,
         metadata: {
@@ -529,6 +590,7 @@ name: Nested Archive CEO
         role: "custom",
         title: "Chief Executive Officer",
         instructionsText: "Lead strategy",
+        memory: "Track strategic assumptions each quarter.",
         metadata: {
           skills: ["review"],
           sources: [{ kind: "git", repo: "acme/repo" }],
@@ -676,6 +738,19 @@ name: Nested Archive CEO
         name: "Worker",
         role: "custom",
         reportsTo: "manager-001",
+      });
+    });
+
+    it("maps manifest memory to first-class field", () => {
+      const input = agentManifestToAgentCreateInput({
+        name: "Researcher",
+        memory: "Keep a running list of unresolved assumptions.",
+      });
+
+      expect(input).toEqual({
+        name: "Researcher",
+        role: "custom",
+        memory: "Keep a running list of unresolved assumptions.",
       });
     });
 

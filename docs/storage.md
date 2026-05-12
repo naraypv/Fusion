@@ -1,12 +1,19 @@
 # Fusion Dashboard Storage Audit (FN-1202)
 
+## Task-ID allocator authority and compatibility
+
+- `distributed_task_id_state` is the authoritative local task-ID allocator state. `nextSequence` is the active high-water mark used for local ID reservations.
+- `distributed_task_id_reservations` tracks reserve/commit/abort lifecycle entries. Aborted/expired reservations are burned and never reissued.
+- `config.nextId` is retained only as a legacy compatibility field and optional seed source; runtime task creation no longer mutates it as allocator truth.
+- Startup allocator reconciliation bumps each active prefix sequence to `max(current nextSequence, max(existing task suffix)+1)` across live + archived tasks to self-heal stale allocator drift.
+
 ## 1) Summary
 
 - **localStorage keys in runtime dashboard code:** **20**
 - **Backend settings keys defined in `@fusion/core`:** **78** total
   - **Global settings:** 17 (`GlobalSettings`)
   - **Project settings:** 61 (`ProjectSettings`)
-- **SQLite tables in project DB schema (`packages/core/src/db.ts`):** **36** (including migration-created tables)
+- **SQLite tables in project DB schema (`packages/core/src/db.ts`):** **43** (including migration-created tables)
 - **Issues identified:** **9**
   - High: 2
   - Medium: 5
@@ -170,6 +177,8 @@ Additional backend notes:
 | Table | Purpose |
 |---|---|
 | `tasks` | Core task metadata and JSON-backed nested fields (priority, dependencies, steps, log, attachments, comments, model overrides, workflow results, merge details, assignment, mission linkage). |
+
+The `tasks.githubTracking` JSON column stores per-task GitHub tracking state (`enabled`, optional `repoOverride`, linked issue metadata, and `unlinkedAt`). It is additive and default-off; imported-source issue metadata remains in `issueInfo` / `sourceIssue`. Behavior wiring (issue creation/lifecycle sync and UI surfacing) lands in FN-3870/FN-3873/FN-3874.
 | `config` | Single-row project configuration (`nextId`, settings payload, workflow step counters). |
 | `workflow_steps` | Workflow step definitions (`prompt`/`script`) with phase, template metadata, and model overrides. |
 | `activityLog` | Per-project activity/event log with timestamp/type/task indexes. |
@@ -177,6 +186,8 @@ Additional backend notes:
 | `automations` | Scheduled automation definitions, run state, and run history. |
 | `agents` | Agent registry/state/task assignment metadata. |
 | `agentHeartbeats` | Heartbeat run events linked to agents (`agentId` FK cascade). |
+| `approval_requests` | Durable approval request records: requester actor snapshot, target action payload (category/action/resource/context), lifecycle status (`pending`/`approved`/`denied`/`completed`), optional task/run context, and requested/decided/completed timestamps. |
+| `approval_request_audit_events` | Append-only audit trail for approval requests. Each row stores event type (`created`/`approved`/`denied`/`completed`), immutable actor snapshot, optional note, and deterministic per-request ordering by `(createdAt, rowid)`. |
 | `task_documents` | Task-scoped document metadata/content keyed by `(taskId, key)` with current revision pointer. |
 | `task_document_revisions` | Immutable revision history for task documents (content snapshots by revision). |
 | `__meta` | Schema version + monotonic `lastModified` change detector. |
@@ -187,9 +198,9 @@ Additional backend notes:
 | `mission_events` | Mission event log with ordered sequence numbers and metadata payloads. |
 | `plugins` | Plugin registry, lifecycle state, dependency metadata, and settings blobs. |
 | `routines` | Routine definitions (trigger config, steps/command, catch-up policy, run history, and persisted `agentId` ownership metadata). Legacy databases missing routine fields (including `agentId`) are backfilled during init-time compatibility migration. |
-| `roadmaps` | Standalone roadmap metadata. |
-| `roadmap_milestones` | Milestones within roadmaps (`roadmapId` FK). |
-| `roadmap_features` | Features within roadmap milestones (`milestoneId` FK). |
+| `roadmaps` | Roadmap plugin metadata (owned/registered by `plugins/fusion-plugin-roadmap`). |
+| `roadmap_milestones` | Milestones within roadmaps (`roadmapId` FK), owned/registered by roadmap plugin schema hooks. |
+| `roadmap_features` | Features within roadmap milestones (`milestoneId` FK), owned/registered by roadmap plugin schema hooks. |
 | `project_insights` | Extracted project insights with fingerprint-based deduplication and provenance metadata. |
 | `project_insight_runs` | Insight extraction run history with durable lifecycle metadata (`lifecycle` JSON includes terminalReason/cause, failureClass, retryable flag, cancellationRequestedAt, timeoutAt, retry lineage fields). Terminal rows are immutable for state transitions. |
 | `project_insight_run_events` | Append-only per-run lifecycle trail (`seq`, `type`, `message`, optional `status`/`classification`/`metadata`) used by cancel/retry/timeout auditing and API inspection. |
@@ -200,6 +211,9 @@ Additional backend notes:
 | `agentRatings` *(migration-created)* | Agent performance ratings (1-5), optional reviewer metadata, and run/task attribution. |
 | `chat_sessions` *(migration-created)* | Chat session metadata (agent/project/model/status/title timestamps). |
 | `chat_messages` *(migration-created)* | Chat message history per session (`role`, `content`, thinking output, metadata). |
+| `chat_rooms` *(migration-created)* | Room metadata (`name`, `slug`, `description`, `projectId`, `createdBy`, status and timestamps). |
+| `chat_room_members` *(migration-created)* | Room membership map with composite PK `(roomId, agentId)` and role (`owner`/`member`). |
+| `chat_room_messages` *(migration-created)* | Room message history with `senderAgentId`, JSON `mentions`, attachments/metadata blobs, ordered by `createdAt`. |
 | `runAuditEvents` *(migration-created)* | Run audit trail events across database/git/filesystem mutation domains. |
 | `mission_contract_assertions` *(migration-created)* | Milestone contract assertions used by mission validator workflows. |
 | `mission_feature_assertions` *(migration-created)* | Many-to-many links between mission features and contract assertions. |
@@ -209,8 +223,26 @@ Additional backend notes:
 | `research_runs` | Research run state (query, topic, status, lifecycle, sources, results, citations, events, exports, token usage). Supports project-scoped active-run uniqueness via `(projectId, trigger, status)` index. Terminal runs are immutable. |
 | `research_exports` | Persisted export records for research runs (`runId` FK cascade). Stores format, content, and optional file path. |
 | `research_run_events` | Append-only event log for research run lifecycle tracking (`runId` FK cascade, ordered by `seq`). Records status transitions, phase changes, step lifecycle, and failure classifications. |
+| `eval_runs` | Eval run lifecycle state (status, trigger, scope, evaluation window boundaries, evaluated task IDs/counts, aggregate scores, provenance). |
+| `eval_task_results` | Per-task eval outcomes linked to runs (`runId` FK cascade), including durable task snapshots and structured score payloads. `categoryScores[]` stores canonical per-category fields (`category`, `deterministicScore`, `aiScore`, `finalScore`, `weight`, `band`, `rationale`, `evidence[]`), plus `overallScore` derived from category finals. Also stores deterministic/AI signal payloads, summary rationale, structured follow-up suggestions (`suggestionId`, `dedupeKey`, recommendation, lifecycle state, suppression fields, optional `createdTaskId` linkage), and a bounded `TaskEvaluationEvidenceBundle` (fixed source-order groups, capped entry counts, max 500-char excerpts with truncation marker) embedded in result metadata for backward-compatible persistence. |
+| `eval_run_events` | Append-only eval run event trail (`runId` FK cascade, ordered by `seq`) for orchestration/debug auditing and downstream API/UI drill-down. |
+
+### Schema self-heal on init
+
+`Database.init()` now runs an unconditional schema-compatibility reconciliation pass after versioned migrations. The pass unions table definitions from `SCHEMA_SQL` plus `MIGRATION_ONLY_TABLE_SCHEMAS`, then backfills missing columns with `addColumnIfMissing()` for tables that already exist.
+
+Invariant: after init, every declared column for covered tables exists regardless of `__meta.schemaVersion`, preventing legacy drift from causing `no such column` regressions on newly added fields.
 
 ---
+
+### Chat rooms (migration 70)
+
+`ChatStore` now persists room chat data across three tables: `chat_rooms`, `chat_room_members`, and `chat_room_messages`.
+
+- `chat_rooms` stores canonical room identity (`id`, normalized `name`, unique `slug` scoped by `projectId`), metadata (`description`, `createdBy`), lifecycle status, and timestamps.
+- `chat_room_members` links agents to rooms via composite primary key `(roomId, agentId)` and tracks `role` plus `addedAt`.
+- `chat_room_messages` stores room history with message role/content, optional `thinkingOutput`, JSON `metadata`, JSON `attachments`, optional `senderAgentId`, and JSON `mentions`.
+- Foreign keys from members/messages to `chat_rooms(id)` use `ON DELETE CASCADE`, so deleting a room automatically removes memberships and room message history.
 
 ## 5) Issues Found
 
@@ -323,3 +355,36 @@ Additional backend notes:
 - [x] Backend settings + API route inventory included
 - [x] SQLite table inventory included
 - [x] Known in-progress FN-1201 called out
+
+## Per-Worktree DB Hydration
+
+Each git worktree has its own gitignored `.fusion/` directory, so `.fusion/fusion.db` is local scratch state per worktree. That isolation created a cross-task lookup gap: executor prompts that query sibling/dependency rows directly from the worktree DB could see empty results. FN-3840 documented the manual `ATTACH`/`INSERT OR REPLACE` recovery, and FN-3832 was the breaking case that surfaced this in production.
+
+Fusion now auto-hydrates the worktree DB during executor startup at three points:
+- after fresh worktree creation (including init/setup commands),
+- after pooled worktree acquire/reassignment,
+- when reusing an existing on-disk worktree for resume.
+
+Hydration copies only:
+- current task row,
+- transitive dependency task rows (BFS, depth cap 5, max 50 unique task IDs),
+- `task_documents` rows for that same task-id set.
+
+Implementation uses in-process SQLite streaming (`DatabaseSync`), source-side `SELECT`, destination-side `INSERT OR REPLACE` inside a destination transaction. Column lists are built from source/destination schema intersection (`PRAGMA table_info`), so schema drift degrades gracefully (dropped columns are logged once, and defaults apply on destination-only columns).
+
+Example shape of the destination write:
+
+```sql
+INSERT OR REPLACE INTO tasks (<shared-columns...>) VALUES (<placeholders...>);
+INSERT OR REPLACE INTO task_documents (<shared-columns...>) VALUES (<placeholders...>);
+```
+
+Expected executor log entry on success:
+
+```text
+Hydrated worktree DB: 4 tasks, 12 task_documents
+```
+
+A concrete recovered failure mode now covered by tests: when a worktree directory exists but its local `.fusion/` scratch state is missing, opening `DatabaseSync(<worktree>/.fusion/fusion.db)` can fail with `unable to open database file`. Hydration now performs destination bootstrap (`mkdir -p .fusion` + schema init) and retries the destination open once before degrading.
+
+Failure policy remains strict non-blocking for genuinely unrecoverable cases: hydration warnings are logged, but worktree creation/execution continues. Examples that still intentionally degrade include source DB missing, destination write-permission failures, and irreconcilable schema/open errors after bootstrap retry. Canonical task data remains the root project TaskStore DB; if an agent needs non-hydrated rows immediately, `fn_task_show` remains the canonical fallback path.

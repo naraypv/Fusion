@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useNodes } from "../useNodes";
 import * as api from "../../api";
-import type { NodeInfo, NodeCreateInput } from "../../api";
+import * as nodeApi from "../../api-node";
+import type { NodeInfo, NodeOnboardingInput } from "../../api";
 
 vi.mock("../../api", () => ({
   fetchNodes: vi.fn(),
@@ -12,11 +13,16 @@ vi.mock("../../api", () => ({
   checkNodeHealth: vi.fn(),
 }));
 
+vi.mock("../../api-node", () => ({
+  persistNodeProjectPathMappings: vi.fn(),
+}));
+
 const mockFetchNodes = vi.mocked(api.fetchNodes);
 const mockRegisterNode = vi.mocked(api.registerNode);
 const mockUpdateNode = vi.mocked(api.updateNode);
 const mockUnregisterNode = vi.mocked(api.unregisterNode);
 const mockCheckNodeHealth = vi.mocked(api.checkNodeHealth);
+const mockPersistNodeProjectPathMappings = vi.mocked(nodeApi.persistNodeProjectPathMappings);
 
 function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
   return {
@@ -45,6 +51,7 @@ describe("useNodes", () => {
     mockUpdateNode.mockReset();
     mockUnregisterNode.mockReset();
     mockCheckNodeHealth.mockReset();
+    mockPersistNodeProjectPathMappings.mockReset();
   });
 
   afterEach(() => {
@@ -78,9 +85,14 @@ describe("useNodes", () => {
     expect(result.current.error).toBe("boom");
   });
 
-  it("register adds node optimistically", async () => {
-    mockFetchNodes.mockResolvedValueOnce([]);
-    const nodeInput: NodeCreateInput = { name: "Remote Node", type: "remote", url: "https://node.test" };
+  it("register creates node and persists selected path mappings", async () => {
+    mockFetchNodes.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const nodeInput: NodeOnboardingInput = {
+      name: "Remote Node",
+      type: "remote",
+      url: "https://node.test",
+      projectMappings: [{ projectId: "proj-1", path: "/mnt/proj-1" }],
+    };
     const createdNode = makeNode({
       id: "node_remote",
       name: "Remote Node",
@@ -89,6 +101,7 @@ describe("useNodes", () => {
       status: "connecting",
     });
     mockRegisterNode.mockResolvedValueOnce(createdNode);
+    mockPersistNodeProjectPathMappings.mockResolvedValueOnce([]);
 
     const { result } = renderHook(() => useNodes());
 
@@ -100,9 +113,84 @@ describe("useNodes", () => {
       await result.current.register(nodeInput);
     });
 
-    expect(mockRegisterNode).toHaveBeenCalledWith(nodeInput);
-    expect(result.current.nodes).toHaveLength(1);
-    expect(result.current.nodes[0].id).toBe("node_remote");
+    expect(mockRegisterNode).toHaveBeenCalledWith({
+      name: "Remote Node",
+      type: "remote",
+      url: "https://node.test",
+    });
+    expect(mockPersistNodeProjectPathMappings).toHaveBeenCalledWith("node_remote", nodeInput.projectMappings);
+    expect(mockFetchNodes).toHaveBeenCalledTimes(2);
+  });
+
+  it("register rolls back node when mapping write fails", async () => {
+    mockFetchNodes.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const createdNode = makeNode({ id: "node_remote", type: "remote", status: "connecting" });
+    mockRegisterNode.mockResolvedValueOnce(createdNode);
+    mockPersistNodeProjectPathMappings.mockRejectedValueOnce(new Error("mapping failed"));
+    mockUnregisterNode.mockResolvedValueOnce(undefined);
+
+    const { result } = renderHook(() => useNodes());
+
+    await act(async () => {
+      await flushPromises();
+    });
+
+    await expect(result.current.register({
+      name: "Remote Node",
+      type: "remote",
+      url: "https://node.test",
+      projectMappings: [{ projectId: "proj-1", path: "/mnt/proj-1" }],
+    })).rejects.toThrow("mapping failed");
+
+    expect(mockUnregisterNode).toHaveBeenCalledWith("node_remote");
+    expect(mockFetchNodes).toHaveBeenCalledTimes(2);
+  });
+
+  it("register appends cleanup failure message when rollback also fails", async () => {
+    mockFetchNodes.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const createdNode = makeNode({ id: "node_remote", type: "remote", status: "connecting" });
+    mockRegisterNode.mockResolvedValueOnce(createdNode);
+    mockPersistNodeProjectPathMappings.mockRejectedValueOnce(new Error("mapping failed"));
+    mockUnregisterNode.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    const { result } = renderHook(() => useNodes());
+
+    await act(async () => {
+      await flushPromises();
+    });
+
+    await expect(result.current.register({
+      name: "Remote Node",
+      type: "remote",
+      url: "https://node.test",
+      projectMappings: [{ projectId: "proj-1", path: "/mnt/proj-1" }],
+    })).rejects.toThrow("mapping failed. Cleanup also failed: cleanup failed");
+
+    expect(mockUnregisterNode).toHaveBeenCalledWith("node_remote");
+  });
+
+  it("does not rollback when no mappings are selected even if post-success refresh fails", async () => {
+    mockFetchNodes.mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("refresh failed"));
+    const createdNode = makeNode({ id: "node_remote", type: "remote", status: "connecting" });
+    mockRegisterNode.mockResolvedValueOnce(createdNode);
+
+    const { result } = renderHook(() => useNodes());
+
+    await act(async () => {
+      await flushPromises();
+    });
+
+    await act(async () => {
+      await expect(result.current.register({
+        name: "Remote Node",
+        type: "remote",
+        url: "https://node.test",
+        projectMappings: [],
+      })).resolves.toEqual(createdNode);
+    });
+
+    expect(mockPersistNodeProjectPathMappings).not.toHaveBeenCalled();
+    expect(mockUnregisterNode).not.toHaveBeenCalled();
   });
 
   it("update modifies node optimistically", async () => {

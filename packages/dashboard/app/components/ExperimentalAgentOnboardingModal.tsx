@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Agent, AgentOnboardingSummary, ConversationHistoryEntry } from "../api";
+import type { Agent, AgentOnboardingSummary, ConversationHistoryEntry, ExistingAgentOnboardingConfig, OnboardingMode } from "../api";
 import {
   cancelAgentOnboarding,
   connectAgentOnboardingStream,
@@ -18,6 +18,8 @@ interface ExperimentalAgentOnboardingModalProps {
   onUseDraft: (summary: AgentOnboardingSummary) => void;
   projectId?: string;
   existingAgents: Agent[];
+  mode?: OnboardingMode;
+  existingAgentConfig?: ExistingAgentOnboardingConfig;
 }
 
 export function ExperimentalAgentOnboardingModal({
@@ -26,6 +28,8 @@ export function ExperimentalAgentOnboardingModal({
   onUseDraft,
   projectId,
   existingAgents,
+  mode = "create",
+  existingAgentConfig,
 }: ExperimentalAgentOnboardingModalProps) {
   const [viewState, setViewState] = useState<ViewState>("initial");
   const [intent, setIntent] = useState("");
@@ -36,6 +40,7 @@ export function ExperimentalAgentOnboardingModal({
   const [summary, setSummary] = useState<AgentOnboardingSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<ConversationHistoryEntry[]>([]);
+  const isEditMode = mode === "edit";
 
   const resetState = useCallback(() => {
     setViewState("initial");
@@ -106,6 +111,13 @@ export function ExperimentalAgentOnboardingModal({
 
   if (!isOpen) return null;
 
+  const renderSummaryValue = (value: string | number | null | undefined) => {
+    if (value === undefined || value === null || value === "") {
+      return <em className="experimental-agent-onboarding-modal__summary-empty">Not set</em>;
+    }
+    return <span>{value}</span>;
+  };
+
   const start = async () => {
     setViewState("loading");
     setError(null);
@@ -113,6 +125,8 @@ export function ExperimentalAgentOnboardingModal({
       const result = await startAgentOnboardingStreaming(
         intent,
         {
+          mode,
+          existingAgentConfig,
           existingAgents: existingAgents.map((agent) => ({ id: agent.id, name: agent.name, role: agent.role })),
           templates: templateOptions,
         },
@@ -146,11 +160,17 @@ export function ExperimentalAgentOnboardingModal({
     }
   };
 
+  const handleConfirmDraft = async () => {
+    if (!summary) return;
+    onUseDraft(summary);
+    await handleClose();
+  };
+
   return (
     <div className="modal-overlay open" role="presentation">
-      <div className="modal modal-lg experimental-agent-onboarding-modal" role="dialog" aria-modal="true" aria-label="Experimental agent onboarding">
+      <div className="modal modal-lg experimental-agent-onboarding-modal" role="dialog" aria-modal="true" aria-label="AI Interview">
         <div className="modal-header">
-          <h3>Experimental Agent Onboarding</h3>
+          <h3>AI Interview</h3>
           <button className="modal-close" onClick={() => void handleClose()} aria-label="Close">×</button>
         </div>
 
@@ -158,11 +178,11 @@ export function ExperimentalAgentOnboardingModal({
 
         {viewState === "initial" && (
           <div className="form-group">
-            <label htmlFor="agent-onboarding-intent">What should this new agent own?</label>
+            <label htmlFor="agent-onboarding-intent">{isEditMode ? "What should this agent change or improve?" : "What should this new agent own?"}</label>
             <textarea id="agent-onboarding-intent" className="input experimental-agent-onboarding-modal__textarea" value={intent} onChange={(e) => setIntent(e.target.value)} />
             <div className="modal-actions">
               <button className="btn" onClick={() => void handleClose()}>Cancel</button>
-              <button className="btn btn-primary" disabled={!intent.trim()} onClick={() => void start()}>Start onboarding</button>
+              <button className="btn btn-primary" disabled={!intent.trim()} onClick={() => void start()}>{isEditMode ? "Start interview" : "Start onboarding"}</button>
             </div>
           </div>
         )}
@@ -180,17 +200,59 @@ export function ExperimentalAgentOnboardingModal({
 
         {viewState === "summary" && summary && (
           <div className="form-group">
-            <label>Draft ready for review</label>
+            <label>{isEditMode ? "Updated draft ready for review" : "Draft ready for review"}</label>
+            <p className="experimental-agent-onboarding-modal__summary-intro">
+              Review this generated draft. Nothing is applied until you confirm.
+            </p>
             <div className="experimental-agent-onboarding-modal__summary card">
-              <p><strong>Name:</strong> {summary.name}</p>
-              <p><strong>Role:</strong> {summary.role}</p>
-              {summary.templateId && <p><strong>Template:</strong> {summary.templateId}</p>}
-              {summary.patternAgentId && <p><strong>Pattern agent:</strong> {summary.patternAgentId}</p>}
-              {summary.rationale && <p><strong>Why:</strong> {summary.rationale}</p>}
+              <div className="experimental-agent-onboarding-modal__summary-section">
+                <h4>Identity</h4>
+                <dl className="experimental-agent-onboarding-modal__summary-list">
+                  <div><dt>Name</dt><dd>{renderSummaryValue(summary.name)}</dd></div>
+                  <div><dt>Role</dt><dd>{renderSummaryValue(summary.role)}</dd></div>
+                  <div><dt>Title</dt><dd>{renderSummaryValue(summary.title)}</dd></div>
+                  <div><dt>Icon</dt><dd>{renderSummaryValue(summary.icon)}</dd></div>
+                  <div><dt>Reports To</dt><dd>{renderSummaryValue(summary.reportsTo)}</dd></div>
+                </dl>
+              </div>
+
+              <div className="experimental-agent-onboarding-modal__summary-section">
+                <h4>Configuration</h4>
+                <dl className="experimental-agent-onboarding-modal__summary-list">
+                  <div><dt>Inline Instructions</dt><dd className="experimental-agent-onboarding-modal__summary-block">{renderSummaryValue(summary.instructionsText)}</dd></div>
+                  <div><dt>Soul</dt><dd className="experimental-agent-onboarding-modal__summary-block">{renderSummaryValue(summary.soul)}</dd></div>
+                  <div><dt>Agent Memory</dt><dd className="experimental-agent-onboarding-modal__summary-block">{renderSummaryValue(summary.memory)}</dd></div>
+                  <div><dt>Skills</dt><dd>{renderSummaryValue(summary.skills?.join(", "))}</dd></div>
+                  <div><dt>Thinking Level</dt><dd>{renderSummaryValue(summary.thinkingLevel)}</dd></div>
+                  <div><dt>Max Turns</dt><dd>{renderSummaryValue(summary.maxTurns)}</dd></div>
+                  <div><dt>Template</dt><dd>{renderSummaryValue(summary.templateId)}</dd></div>
+                  <div><dt>Pattern Agent</dt><dd>{renderSummaryValue(summary.patternAgentId)}</dd></div>
+                </dl>
+              </div>
+
+              {(summary.heartbeatProcedurePath || summary.heartbeatIntervalMs || summary.heartbeatEnabled !== undefined || summary.modelHint || summary.runtimeHint) && (
+                <div className="experimental-agent-onboarding-modal__summary-section">
+                  <h4>Runtime Hints</h4>
+                  <dl className="experimental-agent-onboarding-modal__summary-list">
+                    <div><dt>Heartbeat Procedure Path</dt><dd>{renderSummaryValue(summary.heartbeatProcedurePath)}</dd></div>
+                    <div><dt>Heartbeat Interval</dt><dd>{renderSummaryValue(summary.heartbeatIntervalMs ? `${summary.heartbeatIntervalMs}ms` : undefined)}</dd></div>
+                    <div><dt>Heartbeat Enabled</dt><dd>{renderSummaryValue(summary.heartbeatEnabled === undefined ? undefined : summary.heartbeatEnabled ? "yes" : "no")}</dd></div>
+                    <div><dt>Model Hint</dt><dd>{renderSummaryValue(summary.modelHint)}</dd></div>
+                    <div><dt>Runtime Hint</dt><dd>{renderSummaryValue(summary.runtimeHint)}</dd></div>
+                  </dl>
+                </div>
+              )}
+
+              {summary.rationale && (
+                <div className="experimental-agent-onboarding-modal__summary-section">
+                  <h4>Rationale</h4>
+                  <p className="experimental-agent-onboarding-modal__summary-block">{summary.rationale}</p>
+                </div>
+              )}
             </div>
             <div className="modal-actions">
               <button className="btn" onClick={() => void handleClose()}>Cancel</button>
-              <button className="btn btn-primary" onClick={() => onUseDraft(summary)}>Continue to agent form</button>
+              <button className="btn btn-primary" onClick={() => void handleConfirmDraft()}>{isEditMode ? "Apply draft to settings form" : "Apply draft to agent form"}</button>
             </div>
           </div>
         )}

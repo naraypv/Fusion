@@ -1,41 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, ChatSession } from "@fusion/core";
+import type { ChatInFlightGenerationState, ChatMessage, EnrichedChatSession } from "@fusion/core";
 import {
   fetchResumeChatSession,
   fetchChatSessions,
   fetchChatSession,
   createChatSession,
   fetchChatMessages,
+  attachChatStream,
   streamChatResponse,
   cancelChatResponse,
 } from "../api";
 
 export const FN_AGENT_ID = "__fn_agent__";
 
-export interface ToolCallInfo {
-  toolName: string;
-  args?: Record<string, unknown>;
-  isError: boolean;
-  result?: unknown;
-  status: "running" | "completed";
-}
-
-export interface FallbackInfo {
-  primaryModel: string;
-  fallbackModel: string;
-  triggerPoint: "session-creation" | "prompt-time";
-}
-
-export interface ChatMessageInfo {
-  id: string;
-  sessionId: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  thinkingOutput?: string | null;
-  toolCalls?: ToolCallInfo[];
-  fallbackInfo?: FallbackInfo;
-  createdAt: string;
-}
+// Re-export shared chat types so existing consumers keep working — single
+// source of truth lives in chatTypes.ts and is shared with useChat.
+// Note: useQuickChat's previous local `ChatMessageInfo` lacked the
+// `attachments` field; the shared type adds it (a strict superset), which is
+// safe for callers that ignore it.
+export type { ChatMessageInfo, FallbackInfo, ToolCallInfo } from "./chatTypes";
+import type { ChatMessageInfo, FallbackInfo, ToolCallInfo } from "./chatTypes";
+import { createChatStreamHandlers } from "./createChatStreamHandlers";
+import { isLikelyTabSuspensionError, useTabVisibilitySuspension } from "./visibilitySuspension";
 
 interface ModelSelection {
   modelProvider?: string;
@@ -50,8 +36,8 @@ interface SessionTarget {
 
 export interface UseQuickChatReturn {
   // Session state
-  activeSession: ChatSession | null;
-  sessions: ChatSession[];
+  activeSession: EnrichedChatSession | null;
+  sessions: EnrichedChatSession[];
   sessionsLoading: boolean;
 
   // Message state
@@ -68,12 +54,20 @@ export interface UseQuickChatReturn {
   stopStreaming: () => void;
   clearPendingMessage: () => void;
   switchSession: (agentId: string, modelProvider?: string, modelId?: string) => Promise<void>;
-  selectSession: (session: ChatSession) => Promise<void>;
+  selectSession: (session: EnrichedChatSession) => Promise<void>;
   startModelChat: (modelProvider: string, modelId: string) => Promise<void>;
   startFreshSession: (agentId?: string, modelProvider?: string, modelId?: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
   loadMessages: () => Promise<void>;
   reloadMessages: () => Promise<void>;
+
+  /**
+   * When true, the consuming component's session-init useEffect should
+   * skip its automatic switchSession call.  Set during startFreshSession
+   * to prevent the useEffect from racing with an explicit fresh-session
+   * creation.
+   */
+  skipNextSessionInitRef: React.MutableRefObject<boolean>;
 }
 
 function normalizeModelSelection(modelProvider?: string, modelId?: string): ModelSelection {
@@ -198,8 +192,8 @@ export function useQuickChat(
   addToast?: (msg: string, type?: "success" | "error" | "warning") => void,
 ): UseQuickChatReturn {
   // Session state
-  const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSession, setActiveSession] = useState<EnrichedChatSession | null>(null);
+  const [sessions, setSessions] = useState<EnrichedChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(false);
 
   // Message state
@@ -224,6 +218,24 @@ export function useQuickChat(
   const currentSessionKeyRef = useRef<string>("");
   const currentSessionTargetRef = useRef<SessionTarget | null>(null);
 
+  // Ref mirror of activeSession to avoid cascading re-renders through
+  // switchSession's dependency array.  Reading activeSession from the
+  // closure causes switchSession to get a new identity every time
+  // activeSession changes — which then re-triggers the consuming
+  // component's useEffect that depends on switchSession.
+  const activeSessionRef = useRef<EnrichedChatSession | null>(activeSession);
+  activeSessionRef.current = activeSession;
+
+  // Max retries for session init to prevent infinite toast loops
+  const initRetryCountRef = useRef(0);
+  const INIT_MAX_RETRIES = 3;
+
+  // When true, the consuming component's session-init useEffect should
+  // skip its switchSession call.  Set by startFreshSession (and the
+  // component's handleCreateFreshSession) to prevent the automatic
+  // useEffect from racing with an explicit fresh-session creation.
+  const skipNextSessionInitRef = useRef(false);
+
   useEffect(() => {
     pendingMessageRef.current = pendingMessage;
   }, [pendingMessage]);
@@ -241,7 +253,7 @@ export function useQuickChat(
   }, [projectId]);
 
   const createSessionForTarget = useCallback(
-    async (target: SessionTarget): Promise<ChatSession> => {
+    async (target: SessionTarget): Promise<EnrichedChatSession> => {
       const newSessionInput: { agentId: string; modelProvider?: string; modelId?: string } = {
         agentId: target.agentId,
       };
@@ -256,6 +268,68 @@ export function useQuickChat(
     },
     [projectId],
   );
+
+  const attachIfGenerating = useCallback((sessionId: string, inFlightGeneration?: ChatInFlightGenerationState | null) => {
+    if (streamRef.current || !sessionId) {
+      return true;
+    }
+
+    cancelledByUserRef.current = false;
+    if (inFlightGeneration) {
+      setStreamingText(inFlightGeneration.streamingText);
+      setStreamingThinking(inFlightGeneration.streamingThinking);
+      setStreamingToolCalls(inFlightGeneration.toolCalls);
+    }
+    setIsStreaming(true);
+
+    const { handlers } = createChatStreamHandlers({
+      sessionId,
+      tempUserMessageId: "",
+      setStreamingText,
+      setStreamingThinking,
+      setStreamingToolCalls,
+      cancelStreamingFlushesRef,
+      addToast,
+      onFallbackSession: (data, fallbackSessionId) => {
+        const nextModel = parseModelDescriptor(data.fallbackModel);
+        setSessions((prev) => prev.map((session) =>
+          session.id === fallbackSessionId ? { ...session, ...nextModel } : session,
+        ));
+        setActiveSession((prev) => prev && prev.id === fallbackSessionId ? { ...prev, ...nextModel } : prev);
+      },
+      onDone: () => {
+        setStreamingText("");
+        setStreamingThinking("");
+        setStreamingToolCalls([]);
+        setIsStreaming(false);
+        isStreamingRef.current = false;
+        streamRef.current = null;
+        void fetchChatMessages(sessionId, { limit: 50 }, projectId).then((data) => {
+          setMessages(data.messages.map(mapChatMessageToInfo));
+        }).catch(() => {});
+      },
+      onError: (data) => {
+        setStreamingText("");
+        setStreamingThinking("");
+        setStreamingToolCalls([]);
+        setIsStreaming(false);
+        isStreamingRef.current = false;
+        streamRef.current = null;
+        const errorMessage = typeof data === "string" && data.trim() ? data : "Failed to get response";
+        addToast?.(errorMessage, "error");
+        void fetchChatMessages(sessionId, { limit: 50 }, projectId).then((resp) => {
+          setMessages(resp.messages.map(mapChatMessageToInfo));
+        }).catch(() => {});
+      },
+    });
+
+    streamRef.current = attachChatStream(sessionId, handlers, projectId, {
+      ...(typeof inFlightGeneration?.replayFromEventId === "number"
+        ? { lastEventId: inFlightGeneration.replayFromEventId }
+        : {}),
+    });
+    return true;
+  }, [addToast, projectId]);
 
   // Fetch existing sessions and find/create one for the given target
   const initializeSession = useCallback(
@@ -284,22 +358,30 @@ export function useQuickChat(
           // After a reload/HMR, the server keeps generating but the UI loses
           // all streaming state. Show the "Connecting…" indicator immediately.
           if (existingSession.isGenerating) {
-            setIsStreaming(true);
-            setStreamingText("");
+            attachIfGenerating(existingSession.id, existingSession.inFlightGeneration);
           }
         } else {
           const newSession = await createSessionForTarget(target);
           setActiveSession(newSession);
           currentSessionKeyRef.current = sessionKey;
         }
+
+        // Reset retry counter on success so a later failure can retry again
+        initRetryCountRef.current = 0;
       } catch (err) {
         console.error("[useQuickChat] Failed to initialize session:", err);
-        addToast?.("Failed to initialize chat", "error");
+        // Only show the toast while under the retry limit — once the limit
+        // is reached the user has already seen the warning and further
+        // toasts just create noise.
+        initRetryCountRef.current += 1;
+        if (initRetryCountRef.current <= INIT_MAX_RETRIES) {
+          addToast?.("Failed to initialize chat", "error");
+        }
       } finally {
         setSessionsLoading(false);
       }
     },
-    [projectId, addToast, createSessionForTarget],
+    [attachIfGenerating, projectId, addToast, createSessionForTarget],
   );
 
   // Load messages for the active session
@@ -332,7 +414,13 @@ export function useQuickChat(
   // Poll every 3s until the server reports isGenerating=false, then reload messages
   // and clear streaming state.
   useEffect(() => {
-    if (!isStreaming || streamRef.current || !activeSession) return;
+    if (!activeSession?.isGenerating) return;
+
+    if (!streamRef.current) {
+      attachIfGenerating(activeSession.id, activeSession.inFlightGeneration);
+    }
+
+    if (!isStreamingRef.current || streamRef.current || !activeSession) return;
 
     const interval = setInterval(async () => {
       // Re-check conditions inside the callback (state may have changed)
@@ -359,7 +447,7 @@ export function useQuickChat(
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [isStreaming, activeSession, projectId]);
+  }, [activeSession, attachIfGenerating, projectId]);
 
   // Reload messages from server (for same-session revisit)
   const reloadMessages = useCallback(async () => {
@@ -395,7 +483,10 @@ export function useQuickChat(
       const targetSessionKey = buildSessionKey(target.agentId, target.modelProvider, target.modelId);
       currentSessionTargetRef.current = target;
 
-      const isSameSession = targetSessionKey === currentSessionKeyRef.current && activeSession;
+      // Use ref to avoid cascading re-renders: reading activeSession from
+      // the closure would make switchSession change identity every time
+      // activeSession changes, triggering the consumer's useEffect again.
+      const isSameSession = targetSessionKey === currentSessionKeyRef.current && activeSessionRef.current;
 
       if (!isSameSession) {
         // Close any existing stream
@@ -423,10 +514,10 @@ export function useQuickChat(
       currentSessionKeyRef.current = targetSessionKey;
       await initializeSession(target.agentId, target.modelProvider, target.modelId);
     },
-    [activeSession, initializeSession, reloadMessages, resetTransientComposerState],
+    [initializeSession, reloadMessages, resetTransientComposerState],
   );
 
-  const selectSession = useCallback(async (session: ChatSession) => {
+  const selectSession = useCallback(async (session: EnrichedChatSession) => {
     const target = resolveSessionTarget(session.agentId, session.modelProvider ?? undefined, session.modelId ?? undefined);
     if (!target) return;
 
@@ -440,7 +531,10 @@ export function useQuickChat(
 
     resetTransientComposerState();
     setActiveSession(session);
-  }, [resetTransientComposerState]);
+    if (session.isGenerating) {
+      attachIfGenerating(session.id, session.inFlightGeneration);
+    }
+  }, [attachIfGenerating, resetTransientComposerState]);
 
   const startModelChat = useCallback(
     async (modelProvider: string, modelId: string) => {
@@ -459,6 +553,12 @@ export function useQuickChat(
     // Explicit "new chat" action: keep the same target key but create a new persisted session.
     // This preserves normal switchSession resume behavior while allowing multiple threads per target.
     const targetSessionKey = buildSessionKey(target.agentId, target.modelProvider, target.modelId);
+
+    // Prevent the consuming component's automatic session-init useEffect
+    // from racing with this explicit fresh-session creation.  The effect
+    // will see the flag, record the target key as "seen", and skip.
+    skipNextSessionInitRef.current = true;
+    initRetryCountRef.current = 0;
 
     if (streamRef.current) {
       streamRef.current.close();
@@ -481,6 +581,7 @@ export function useQuickChat(
       console.error("[useQuickChat] Failed to start a fresh session:", err);
       addToast?.("Failed to start a new chat", "error");
     } finally {
+      skipNextSessionInitRef.current = false;
       setSessionsLoading(false);
     }
   }, [addToast, createSessionForTarget, projectId, resetTransientComposerState]);
@@ -509,6 +610,9 @@ export function useQuickChat(
     setPendingMessage("");
   }, []);
 
+  const sendMessageRef = useRef<(content: string, attachments?: File[]) => Promise<void>>(() => Promise.resolve());
+  const visibilitySuspension = useTabVisibilitySuspension();
+
   /**
    * Send a message using SSE streaming.
    * @param content message text content
@@ -521,7 +625,7 @@ export function useQuickChat(
         return Promise.resolve();
       }
 
-      if (isStreaming) {
+      if (isStreamingRef.current) {
         if (attachments && attachments.length > 0) {
           return Promise.reject(new Error("Cannot send attachments while a response is streaming"));
         }
@@ -559,120 +663,34 @@ export function useQuickChat(
         setStreamingToolCalls([]);
         setIsStreaming(true);
 
-        // Accumulate streaming text and tool calls in local variables
-        let capturedText = "";
-        let capturedThinking = "";
-        let capturedToolCalls: ToolCallInfo[] = [];
-        let capturedFallbackInfo: FallbackInfo | undefined;
-
-        // Coalesce per-token state updates to one render per animation frame —
-        // unthrottled setStreamingText pegs the main thread on long replies.
-        let textRaf: number | null = null;
-        let thinkingRaf: number | null = null;
-        const flushText = () => {
-          textRaf = null;
-          setStreamingText(capturedText);
-        };
-        const flushThinking = () => {
-          thinkingRaf = null;
-          setStreamingThinking(capturedThinking);
-        };
-        const cancelStreamingFlushes = () => {
-          if (textRaf !== null) {
-            cancelAnimationFrame(textRaf);
-            textRaf = null;
-          }
-          if (thinkingRaf !== null) {
-            cancelAnimationFrame(thinkingRaf);
-            thinkingRaf = null;
-          }
-        };
-        cancelStreamingFlushesRef.current = cancelStreamingFlushes;
-
-        const textHandlers = {
-          onThinking: (data: string) => {
-            capturedThinking += data;
-            if (thinkingRaf === null) {
-              thinkingRaf = requestAnimationFrame(flushThinking);
-            }
-          },
-          onText: (data: string) => {
-            capturedText += data;
-            if (textRaf === null) {
-              textRaf = requestAnimationFrame(flushText);
-            }
-          },
-          onToolStart: (data: { toolName: string; args?: Record<string, unknown> }) => {
-            capturedToolCalls = [
-              ...capturedToolCalls,
-              {
-                toolName: data.toolName,
-                args: data.args,
-                isError: false,
-                status: "running",
-              },
-            ];
-            setStreamingToolCalls(capturedToolCalls);
-          },
-          onToolEnd: (data: { toolName: string; isError: boolean; result?: unknown }) => {
-            const nextToolCalls = [...capturedToolCalls];
-            for (let i = nextToolCalls.length - 1; i >= 0; i--) {
-              const candidate = nextToolCalls[i];
-              if (candidate?.toolName === data.toolName && candidate.status === "running") {
-                nextToolCalls[i] = {
-                  ...candidate,
-                  status: "completed",
-                  isError: data.isError,
-                  result: data.result,
-                };
-                capturedToolCalls = nextToolCalls;
-                setStreamingToolCalls(nextToolCalls);
-                return;
-              }
-            }
-
-            capturedToolCalls = [
-              ...nextToolCalls,
-              {
-                toolName: data.toolName,
-                isError: data.isError,
-                result: data.result,
-                status: "completed",
-              },
-            ];
-            setStreamingToolCalls(capturedToolCalls);
-          },
-          onFallback: (data: FallbackInfo) => {
-            capturedFallbackInfo = data;
+        const { handlers } = createChatStreamHandlers({
+          sessionId: activeSession.id,
+          tempUserMessageId: tempId,
+          setStreamingText,
+          setStreamingThinking,
+          setStreamingToolCalls,
+          cancelStreamingFlushesRef,
+          addToast,
+          onFallbackSession: (data, sessionId) => {
             const nextModel = parseModelDescriptor(data.fallbackModel);
             setSessions((prev) => prev.map((session) =>
-              session.id === activeSession.id
-                ? {
-                    ...session,
-                    ...nextModel,
-                  }
-                : session,
+              session.id === sessionId ? { ...session, ...nextModel } : session,
             ));
-            setActiveSession((prev) => prev && prev.id === activeSession.id
-              ? {
-                  ...prev,
-                  ...nextModel,
-                }
-              : prev);
-            addToast?.(`Primary model unavailable. Switched to fallback ${data.fallbackModel}.`, "warning");
+            setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, ...nextModel } : prev);
           },
-          onDone: (data: { messageId: string }) => {
-            cancelStreamingFlushes();
-            const assistantMessage: ChatMessageInfo = {
-              id: data.messageId || `msg-${Date.now()}`,
-              sessionId: activeSession.id,
-              role: "assistant",
-              content: capturedText,
-              thinkingOutput: capturedThinking || undefined,
-              toolCalls: capturedToolCalls.length > 0 ? capturedToolCalls : undefined,
-              fallbackInfo: capturedFallbackInfo,
-              createdAt: new Date().toISOString(),
-            };
+          onDone: ({ messageId, message: finalMessage, accumulated }) => {
+            const assistantMessage: ChatMessageInfo = finalMessage
+              ? mapChatMessageToInfo(finalMessage)
+              : {
+                  id: messageId || `msg-${Date.now()}`,
+                  sessionId: activeSession.id,
+                  role: "assistant",
+                  content: accumulated.text,
+                  thinkingOutput: accumulated.thinking || undefined,
+                  toolCalls: accumulated.toolCalls.length > 0 ? accumulated.toolCalls : undefined,
+                  fallbackInfo: accumulated.fallbackInfo,
+                  createdAt: new Date().toISOString(),
+                };
 
             // Preserve user message and add assistant message
             setMessages((prev) => [...prev, assistantMessage]);
@@ -681,6 +699,7 @@ export function useQuickChat(
             setStreamingThinking("");
             setStreamingToolCalls([]);
             setIsStreaming(false);
+            isStreamingRef.current = false;
             streamRef.current = null;
             sendCompletionRef.current?.resolve();
             sendCompletionRef.current = null;
@@ -689,19 +708,30 @@ export function useQuickChat(
             if (queuedMessage) {
               pendingMessageRef.current = "";
               setPendingMessage("");
-              void sendMessage(queuedMessage);
+              void sendMessageRef.current(queuedMessage);
             }
           },
-          onError: (data: string) => {
-            cancelStreamingFlushes();
+          onError: (data) => {
             setStreamingText("");
             setStreamingThinking("");
             setStreamingToolCalls([]);
             setIsStreaming(false);
+            isStreamingRef.current = false;
             streamRef.current = null;
             console.error("[useQuickChat] Stream error:", data);
-            addToast?.(typeof data === "string" && data.trim() ? data : "Failed to get response", "error");
-            sendCompletionRef.current?.reject(new Error(typeof data === "string" ? data : "Failed to get response"));
+
+            const errorMessage = typeof data === "string" && data.trim() ? data : "Failed to get response";
+            const shouldSuppressSuspensionError = typeof data === "string"
+              && isLikelyTabSuspensionError(data)
+              && (visibilitySuspension.isHiddenNow() || visibilitySuspension.wasRecentlyHidden(5000));
+
+            if (shouldSuppressSuspensionError) {
+              console.info("[useQuickChat] Suppressed tab-suspension stream error:", data);
+              sendCompletionRef.current?.resolve();
+            } else {
+              addToast?.(errorMessage, "error");
+              sendCompletionRef.current?.reject(new Error(errorMessage));
+            }
             sendCompletionRef.current = null;
 
             if (!cancelledByUserRef.current) {
@@ -709,15 +739,15 @@ export function useQuickChat(
               if (queuedMessage) {
                 pendingMessageRef.current = "";
                 setPendingMessage("");
-                void sendMessage(queuedMessage);
+                void sendMessageRef.current(queuedMessage);
               }
             }
 
             void reloadMessages();
           },
-        };
+        });
 
-        streamRef.current = streamChatResponse(activeSession.id, content, textHandlers, attachments, projectId);
+        streamRef.current = streamChatResponse(activeSession.id, content, handlers, attachments, projectId);
       });
 
       // Preserve rejection semantics for awaiters while preventing unhandled rejection noise
@@ -725,8 +755,10 @@ export function useQuickChat(
       void completionPromise.catch(() => {});
       return completionPromise;
     },
-    [activeSession, isStreaming, projectId, addToast, reloadMessages],
+    [activeSession, projectId, addToast, reloadMessages, visibilitySuspension],
   );
+
+  sendMessageRef.current = sendMessage;
 
   // Cleanup on unmount
   useEffect(() => {
@@ -759,6 +791,7 @@ export function useQuickChat(
     refreshSessions,
     loadMessages,
     reloadMessages,
+    skipNextSessionInitRef,
   }), [
     activeSession,
     sessions,

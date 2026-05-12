@@ -6,6 +6,7 @@ import type { Task } from "@fusion/core";
 // Mock lucide-react to avoid SVG rendering issues in test env
 vi.mock("lucide-react", () => ({
   Link: () => null,
+  GitBranch: () => null,
   Clock: () => null,
   Pencil: () => null,
   Layers: () => null,
@@ -57,6 +58,65 @@ describe("TaskCard", () => {
   it("renders the card ID text", () => {
     render(<TaskCard task={makeTask()} onOpenDetail={noop} addToast={noop} />);
     expect(screen.getByText("FN-001")).toBeDefined();
+  });
+
+  it("keeps native card dragging enabled by default", () => {
+    const { container } = render(<TaskCard task={makeTask()} onOpenDetail={noop} addToast={noop} />);
+    const card = container.querySelector(".card") as HTMLElement;
+    expect(card.getAttribute("draggable")).toBe("true");
+  });
+
+  it("disables native card dragging when disableDrag is true", () => {
+    const { container } = render(<TaskCard task={makeTask()} onOpenDetail={noop} addToast={noop} disableDrag={true} />);
+    const card = container.querySelector(".card") as HTMLElement;
+    expect(card.getAttribute("draggable")).toBe("false");
+  });
+
+  it("clicking PR badge link does not open the task detail modal", () => {
+    const onOpenDetail = vi.fn();
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          prInfo: {
+            url: "https://github.com/owner/repo/pull/42",
+            number: 42,
+            status: "open",
+            title: "PR",
+            headBranch: "fusion/fn-001",
+            baseBranch: "main",
+            commentCount: 0,
+          } as any,
+        })}
+        onOpenDetail={onOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "#42" }));
+    expect(onOpenDetail).not.toHaveBeenCalled();
+  });
+
+  it("clicking issue badge text does not open the task detail modal", () => {
+    const onOpenDetail = vi.fn();
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          issueInfo: {
+            url: "https://github.com/owner/repo/issues/123",
+            number: 123,
+            state: "open",
+            title: "Issue",
+          } as any,
+        })}
+        onOpenDetail={onOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("#123"));
+    expect(onOpenDetail).not.toHaveBeenCalled();
   });
 
   it("renders the status badge when task.status is set", () => {
@@ -122,6 +182,211 @@ describe("TaskCard", () => {
 
     expect(screen.getByText("paused")).toBeDefined();
     expect(screen.queryByText("paused by agent")).toBeNull();
+  });
+
+  it("does not render fan-out badge when fanout is missing or zero", () => {
+    const { container, rerender } = render(
+      <TaskCard task={makeTask({ column: "todo" })} onOpenDetail={noop} addToast={noop} />,
+    );
+
+    expect(container.querySelector(".card-fanout-badge")).toBeNull();
+
+    rerender(
+      <TaskCard
+        task={makeTask({ column: "todo" })}
+        fanout={{ totalCount: 0, activeTodoCount: 0, dependentIds: [], staleBlockedByDependentIds: [], isHighFanout: false }}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(container.querySelector(".card-fanout-badge")).toBeNull();
+  });
+
+  it("renders fan-out badge with downstream count and tooltip", () => {
+    render(
+      <TaskCard
+        task={makeTask({ column: "in-progress" })}
+        fanout={{ totalCount: 7, activeTodoCount: 4, dependentIds: ["FN-002"], staleBlockedByDependentIds: [], isHighFanout: false }}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const badge = screen.getByText("Blocks").closest(".card-fanout-badge") as HTMLElement;
+    expect(badge).not.toBeNull();
+    expect(badge.textContent).toContain("Blocks 7");
+    expect(badge.getAttribute("data-tooltip")).toBe("Blocking 7 active task(s); 4 waiting in todo");
+  });
+
+  it("applies stale fan-out modifier when stale blockedBy dependents exist", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ column: "in-progress" })}
+        fanout={{ totalCount: 3, activeTodoCount: 1, dependentIds: ["FN-003"], staleBlockedByDependentIds: ["FN-003"], isHighFanout: false }}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const badge = container.querySelector(".card-fanout-badge") as HTMLElement;
+    expect(badge.className).toContain("card-fanout-badge--stale");
+    expect(badge.textContent).toContain("(1 stale)");
+  });
+
+  it("escalates only threshold-crossing fan-out badges", () => {
+    const { rerender } = render(
+      <TaskCard
+        task={makeTask({ column: "in-progress" })}
+        fanout={{
+          totalCount: 8,
+          activeTodoCount: 5,
+          dependentIds: ["FN-003"],
+          staleBlockedByDependentIds: [],
+          isHighFanout: true,
+          escalation: { blockerId: "FN-001", activeTodoCount: 5, totalActiveCount: 8, blockingAgeMs: 3_600_000 },
+        }}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    let badge = document.querySelector(".card-fanout-badge--high-impact") as HTMLElement;
+    expect(badge).not.toBeNull();
+    expect(badge).toHaveClass("card-fanout-badge--escalated");
+    expect(badge.textContent).toContain("Escalated");
+    expect(badge.textContent).toContain("(5 todo)");
+
+    rerender(
+      <TaskCard
+        task={makeTask({ column: "in-progress" })}
+        fanout={{ totalCount: 8, activeTodoCount: 4, dependentIds: ["FN-003"], staleBlockedByDependentIds: [], isHighFanout: false }}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    badge = screen.getByText("Blocks").closest(".card-fanout-badge") as HTMLElement;
+    expect(badge).not.toHaveClass("card-fanout-badge--high-impact");
+  });
+
+  it("shows plain paused label when pausedByAgentId is not set", () => {
+    render(
+      <TaskCard task={makeTask({ paused: true })} onOpenDetail={noop} addToast={noop} />,
+    );
+
+    expect(screen.getByText("paused")).toBeDefined();
+    expect(screen.queryByText("paused by agent")).toBeNull();
+  });
+
+  it("hides default working branch and default base branch metadata", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ branch: "fusion/fn-001", baseBranch: "main" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(container.querySelector(".card-branch-row")).toBeNull();
+  });
+
+  it("hides auto-generated suffixed default working branches", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ branch: "fusion/fn-001-2", baseBranch: "main" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(container.querySelector(".card-branch-row")).toBeNull();
+  });
+
+  it("shows only custom working branch metadata when base branch is default", () => {
+    render(
+      <TaskCard
+        task={makeTask({ branch: "feature/working-only", baseBranch: "main" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.getByText("Branch")).toBeDefined();
+    expect(screen.getByText("feature/working-only")).toBeDefined();
+    expect(screen.queryByText("Base")).toBeNull();
+  });
+
+  it("shows only non-default base branch metadata when working branch is default", () => {
+    render(
+      <TaskCard
+        task={makeTask({ branch: "fusion/fn-001", baseBranch: "release/2026-05" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.getByText("Base")).toBeDefined();
+    expect(screen.getByText("release/2026-05")).toBeDefined();
+    expect(screen.queryByText("Branch")).toBeNull();
+  });
+
+  it("renders merge target from task.baseBranch, not prInfo.baseBranch metadata", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          branch: "fusion/fn-001",
+          baseBranch: "release/task-target",
+          prInfo: {
+            url: "https://github.com/runfusion/fusion/pull/10",
+            number: 10,
+            status: "open",
+            title: "PR title",
+            headBranch: "feature/pr-head",
+            baseBranch: "main",
+            commentCount: 0,
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.getByText("Base")).toBeDefined();
+    expect(screen.getByText("release/task-target")).toBeDefined();
+    expect(screen.queryByText("main")).toBeNull();
+  });
+
+  it("shows both chips when branch and base branch are both non-default", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ branch: "feature/fn-3423-card-branches", baseBranch: "develop" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const branchRow = container.querySelector(".card-branch-row");
+    expect(branchRow).not.toBeNull();
+    expect(screen.getByText("Branch")).toBeDefined();
+    expect(screen.getByText("feature/fn-3423-card-branches")).toBeDefined();
+    expect(screen.getByText("Base")).toBeDefined();
+    expect(screen.getByText("develop")).toBeDefined();
+  });
+
+  it("keeps long non-default branch names readable via text and title semantics", () => {
+    const longBranch = "feature/fn-3423-display-very-long-working-branch-name-for-card-metadata";
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ branch: longBranch, baseBranch: "main" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const branchChip = container.querySelector(".card-branch-chip");
+    expect(branchChip?.getAttribute("title")).toBe(longBranch);
+    expect(screen.getByText(longBranch)).toBeDefined();
   });
 
   it("renders fast-mode indicator only when executionMode is fast", () => {
@@ -1202,6 +1467,35 @@ describe("TaskCard provider icons on agent row", () => {
     expect(screen.getByTestId("provider-icon-anthropic")).toBeDefined();
   });
 
+  it("keeps assigned agent badge accessible when label is visually collapsible", async () => {
+    vi.mocked(fetchAgent).mockResolvedValue({
+      id: "agent-robot",
+      name: "Task Robot",
+      role: "executor",
+      state: "active",
+      metadata: {},
+      heartbeatHistory: [],
+      completedRuns: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    } as any);
+
+    const { container } = render(
+      <TaskCard
+        task={makeTask({ modelProvider: "anthropic", assignedAgentId: "agent-robot" })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    await waitFor(() => {
+      const badge = container.querySelector(".card-agent-badge");
+      expect(badge).not.toBeNull();
+      expect(badge?.getAttribute("title")).toBe("Assigned to Task Robot");
+      expect(badge?.querySelector(".visually-hidden")?.textContent).toContain("Assigned to Task Robot");
+    });
+  });
+
   it("deduplicates when executor and validator use same provider", () => {
     render(
       <TaskCard
@@ -1248,6 +1542,17 @@ describe("TaskCard provider icons on agent row", () => {
 });
 
 describe("TaskCard memo comparator provenance behavior", () => {
+  it("returns false when disableDrag changes", () => {
+    const task = makeTask();
+
+    expect(
+      __test_areTaskCardPropsEqual(
+        { task, onOpenDetail: noop, addToast: noop, disableDrag: false } as any,
+        { task, onOpenDetail: noop, addToast: noop, disableDrag: true } as any,
+      ),
+    ).toBe(false);
+  });
+
   it("returns false when sourceMetadata.agentName changes", () => {
     const previousTask = makeTask({ sourceType: "automation", sourceMetadata: { agentName: "Agent One" } });
     const nextTask = makeTask({ sourceType: "automation", sourceMetadata: { agentName: "Agent Two" } });
@@ -1281,6 +1586,30 @@ describe("TaskCard memo comparator provenance behavior", () => {
   it("returns false when sourceAgentId changes", () => {
     const previousTask = makeTask({ sourceType: "automation", sourceAgentId: "agent-a" });
     const nextTask = makeTask({ sourceType: "automation", sourceAgentId: "agent-b" });
+
+    expect(
+      __test_areTaskCardPropsEqual(
+        { task: previousTask, onOpenDetail: noop, addToast: noop } as any,
+        { task: nextTask, onOpenDetail: noop, addToast: noop } as any,
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false when branch changes", () => {
+    const previousTask = makeTask({ branch: "feature/old", baseBranch: "main" });
+    const nextTask = makeTask({ branch: "feature/new", baseBranch: "main" });
+
+    expect(
+      __test_areTaskCardPropsEqual(
+        { task: previousTask, onOpenDetail: noop, addToast: noop } as any,
+        { task: nextTask, onOpenDetail: noop, addToast: noop } as any,
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false when baseBranch changes", () => {
+    const previousTask = makeTask({ branch: "fusion/fn-001", baseBranch: "main" });
+    const nextTask = makeTask({ branch: "fusion/fn-001", baseBranch: "release/2026-05" });
 
     expect(
       __test_areTaskCardPropsEqual(
@@ -1472,8 +1801,9 @@ describe("TaskCard agent badge", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByTitle("Assigned to Task Robot")).toBeDefined();
-      expect(screen.getByText("Task Robot")).toBeDefined();
+      const badge = screen.getByTitle("Assigned to Task Robot");
+      expect(badge).toBeDefined();
+      expect(badge.querySelector(".visually-hidden")?.textContent).toContain("Assigned to Task Robot");
     });
   });
 

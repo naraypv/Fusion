@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { PluginLoader } from "../plugin-loader.js";
 import { PluginStore } from "../plugin-store.js";
 import type {
+  PluginSecurityScanResult,
   CreateAiSessionFactory,
   CreateAiSessionOptions,
   FusionPlugin,
@@ -14,8 +15,44 @@ import type {
   PluginSetupManifest,
   PluginSkillContribution,
   PluginWorkflowStepContribution,
+  PluginUiContributionDefinition,
+  PluginUiContributionInputDefinition,
+  PluginRouteResponse,
 } from "../plugin-types.js";
-import { validatePluginManifest } from "../plugin-types.js";
+import {
+  normalizePluginUiContributionDefinition,
+  normalizePluginUiContributionSurface,
+  validatePluginManifest,
+} from "../plugin-types.js";
+
+describe("PluginRouteResponse", () => {
+  it("keeps headers/contentType optional for back-compat", () => {
+    const legacy: PluginRouteResponse = { status: 200, body: { ok: true } };
+    const withOverrides: PluginRouteResponse = {
+      status: 200,
+      body: "<html></html>",
+      headers: { "Content-Disposition": "attachment; filename=\"x.html\"" },
+      contentType: "text/html; charset=utf-8",
+    };
+
+    expect(legacy.headers).toBeUndefined();
+    expect(legacy.contentType).toBeUndefined();
+    expect(withOverrides.contentType).toContain("text/html");
+  });
+});
+
+describe("PluginSecurityScanResult", () => {
+  it("supports stable verdict/findings shape", () => {
+    const result: PluginSecurityScanResult = {
+      verdict: "clean",
+      summary: "ok",
+      findings: [],
+      scannedAt: new Date().toISOString(),
+      scannedFiles: ["manifest.json"],
+    };
+    expect(result.verdict).toBe("clean");
+  });
+});
 
 describe("validatePluginManifest", () => {
   // ── Valid Manifests ─────────────────────────────────────────────────
@@ -136,6 +173,21 @@ describe("validatePluginManifest", () => {
         version: "1.0.0",
         settingsSchema: {
           description: { type: "string", label: "Description", multiline: true },
+        },
+      };
+      const result = validatePluginManifest(manifest);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+    });
+
+    it("accepts settings schema entries with optional group metadata", () => {
+      const manifest = {
+        id: "test",
+        name: "Test",
+        version: "1.0.0",
+        settingsSchema: {
+          enabled: { type: "boolean", group: "General" },
+          timeoutMs: { type: "number", group: "Browser" },
         },
       };
       const result = validatePluginManifest(manifest);
@@ -789,7 +841,7 @@ describe("PluginUiSlotDefinition", () => {
 describe("PluginDashboardViewDefinition", () => {
   it("accepts a valid PluginDashboardViewDefinition with optional fields", () => {
     const view = {
-      viewId: "roadmap-planner",
+      viewId: "fusion-plugin-roadmap",
       label: "Roadmap Planner",
       componentPath: "./views/RoadmapPlanner.js",
       icon: "Map",
@@ -798,7 +850,7 @@ describe("PluginDashboardViewDefinition", () => {
       description: "Plan milestones and slices",
     };
 
-    expect(view.viewId).toBe("roadmap-planner");
+    expect(view.viewId).toBe("fusion-plugin-roadmap");
     expect(view.placement).toBe("overflow");
     expect(view.description).toContain("milestones");
   });
@@ -1065,6 +1117,128 @@ describe("PluginRuntimeRegistration", () => {
   });
 });
 
+describe("plugin ui contribution normalization", () => {
+  it("normalizes settings-integration-card to settings-config-section", () => {
+    const normalized = normalizePluginUiContributionDefinition({
+      surface: "settings-integration-card",
+      contributionId: "settings-a",
+      sectionId: "provider-a",
+      title: "Provider settings",
+      pluginSettingKeys: ["provider.apiKey"],
+    });
+    expect(normalized.surface).toBe("settings-config-section");
+  });
+
+  it("normalizes onboarding-recommendation-card to onboarding-provider-recommendation", () => {
+    const normalized = normalizePluginUiContributionDefinition({
+      surface: "onboarding-recommendation-card",
+      contributionId: "rec-a",
+      providerId: "openai",
+      title: "OpenAI",
+      reason: "Best default",
+    });
+    expect(normalized.surface).toBe("onboarding-provider-recommendation");
+  });
+
+  it("passes through final structured surface names unchanged", () => {
+    expect(normalizePluginUiContributionSurface("settings-config-section")).toBe("settings-config-section");
+    expect(normalizePluginUiContributionSurface("onboarding-provider-recommendation")).toBe(
+      "onboarding-provider-recommendation",
+    );
+  });
+
+  it("accepts legacy surface names in input definitions for compatibility", () => {
+    const legacyInput: PluginUiContributionInputDefinition = {
+      surface: "settings-integration-card",
+      contributionId: "legacy-settings",
+      sectionId: "provider-a",
+      title: "Provider settings",
+      pluginSettingKeys: ["provider.apiKey"],
+    };
+    expect(legacyInput.surface).toBe("settings-integration-card");
+  });
+
+  it("supports all final structured contribution surfaces", () => {
+    const contributions: PluginUiContributionDefinition[] = [
+      {
+        surface: "settings-provider-card",
+        contributionId: "settings-provider",
+        providerId: "anthropic",
+        title: "Anthropic",
+        providerType: "api_key",
+      },
+      {
+        surface: "settings-config-section",
+        contributionId: "settings-config",
+        sectionId: "anthropic",
+        title: "Anthropic config",
+        pluginSettingKeys: ["anthropic.apiKey"],
+      },
+      {
+        surface: "onboarding-provider-card",
+        contributionId: "onboarding-provider",
+        providerId: "openai",
+        title: "OpenAI",
+        providerType: "oauth",
+      },
+      {
+        surface: "onboarding-setup-help",
+        contributionId: "setup-help",
+        title: "Need help?",
+        body: "Run auth login",
+        bodyFormat: "text",
+      },
+      {
+        surface: "onboarding-provider-recommendation",
+        contributionId: "provider-recommendation",
+        providerId: "openai",
+        title: "Recommended",
+        reason: "Fast setup",
+      },
+      {
+        surface: "post-onboarding-recommendation",
+        contributionId: "post-recommendation",
+        title: "Next step",
+        description: "Enable budgets",
+      },
+    ];
+    expect(contributions).toHaveLength(6);
+  });
+});
+
+describe("CLI provider contribution types", () => {
+  it("accepts a reusable CLI provider contribution contract", async () => {
+    const plugin: FusionPlugin = {
+      manifest: { id: "cli-provider-plugin", name: "CLI Provider Plugin", version: "1.0.0" },
+      state: "installed",
+      hooks: {},
+      cliProviders: [
+        {
+          providerId: "cursor-cli",
+          displayName: "Cursor CLI",
+          binaryName: "cursor-agent",
+          providerType: "cli",
+          statusRoute: "/providers/cursor-cli/status",
+          authRoute: "/auth/cursor-cli",
+          actions: [
+            { actionId: "enable", label: "Enable", actionType: "enable", route: "/auth/cursor-cli", method: "POST" },
+          ],
+          probe: async () => ({ available: true, authenticated: true, binaryName: "cursor-agent", binaryPath: "/usr/local/bin/cursor-agent" }),
+          discoverModels: async () => ({ models: [{ id: "cursor/default" }], source: "cli", fallbackUsed: false }),
+        },
+      ],
+    };
+
+    const contribution = plugin.cliProviders?.[0];
+    const probe = await contribution?.probe?.({} as any);
+    const discovery = await contribution?.discoverModels?.({} as any);
+
+    expect(contribution?.providerId).toBe("cursor-cli");
+    expect(probe?.available).toBe(true);
+    expect(discovery?.models[0]?.id).toBe("cursor/default");
+  });
+});
+
 describe("plugin contribution types", () => {
   it("accepts a minimal PluginSkillContribution shape", () => {
     const skill: PluginSkillContribution = {
@@ -1246,6 +1420,47 @@ describe("validatePluginManifest contribution metadata", () => {
     expect(result.valid).toBe(false);
     expect(result.errors).toContain("setup.binaryName is required and must be a non-empty string");
     expect(result.errors).toContain("setup.description is required and must be a non-empty string");
+  });
+
+  it("accepts valid dashboardViews metadata", () => {
+    const result = validatePluginManifest({
+      id: "plugin-a",
+      name: "Plugin A",
+      version: "1.0.0",
+      dashboardViews: [
+        {
+          viewId: "roadmaps",
+          label: "Roadmaps",
+          componentPath: "./dashboard-view",
+          placement: "primary",
+        },
+      ],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("rejects dashboardViews entries with malformed fields", () => {
+    const result = validatePluginManifest({
+      id: "plugin-a",
+      name: "Plugin A",
+      version: "1.0.0",
+      dashboardViews: [
+        {
+          viewId: "Roadmaps",
+          label: "",
+          componentPath: "",
+          placement: "sidebar",
+        },
+      ],
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("dashboardViews[0].viewId must be a valid slug (lowercase, alphanumeric, hyphens only, cannot start or end with hyphen)");
+    expect(result.errors).toContain("dashboardViews[0].label is required and must be a non-empty string");
+    expect(result.errors).toContain("dashboardViews[0].componentPath is required and must be a non-empty string");
+    expect(result.errors).toContain("dashboardViews[0].placement must be one of: primary, overflow, more");
   });
 });
 

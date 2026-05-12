@@ -1,6 +1,6 @@
 // ChatView.css is imported eagerly from App.tsx to avoid a flash of
 // unstyled content when the lazy chunk loads. Do not re-import here.
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -19,23 +19,32 @@ import {
   Paperclip,
   File,
   Wrench,
+  ChevronDown,
+  Copy,
+  Check,
 } from "lucide-react";
 import { useChat, type ChatMessageInfo, type ToolCallInfo } from "../hooks/useChat";
+import { useChatRooms } from "../hooks/useChatRooms";
 import { useViewportMode } from "./Header";
 import { fetchAgents, fetchDiscoveredSkills, fetchModels, updateGlobalSettings } from "../api";
 import type { Agent } from "@fusion/core";
 import type { DiscoveredSkill } from "@fusion/dashboard";
 import type { ModelInfo } from "../api";
 import { CustomModelDropdown } from "./CustomModelDropdown";
+import { ProviderIcon } from "./ProviderIcon";
 import { AgentMentionPopup } from "./AgentMentionPopup";
+import { AgentAvatar } from "./AgentAvatar";
 import { FileMentionPopup } from "./FileMentionPopup";
+import { CreateRoomModal } from "./CreateRoomModal";
 import { useFileMention } from "../hooks/useFileMention";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
+import { matchesAgentMentionFilter } from "./mentionMatching";
 
 export interface ChatViewProps {
   projectId?: string;
   addToast: (msg: string, type?: "success" | "error" | "warning") => void;
+  experimentalFeatures?: Record<string, boolean>;
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -182,7 +191,7 @@ function renderToolCalls(toolCalls?: ToolCallInfo[]): ReactNode {
       >
         <summary>
           <span className="chat-tool-call-status-dot" aria-hidden="true" />
-          <span className="chat-tool-call-name">{toolCall.toolName}</span>
+          <span className="chat-tool-call-name" title={toolCall.toolName}>{toolCall.toolName}</span>
           {summaryPreview && (
             <span className="chat-tool-call-preview" title={summaryPreview}>
               {summaryPreview}
@@ -241,7 +250,7 @@ function renderToolCalls(toolCalls?: ToolCallInfo[]): ReactNode {
       <details className="chat-tool-calls-group" data-testid="chat-tool-calls-group" open={hasRunning}>
         <summary className="chat-tool-calls-group-summary">
           <Wrench size={12} aria-hidden="true" />
-          <span>{toolCalls.length} tool calls</span>
+          <span className="chat-tool-calls-count">{toolCalls.length} tool calls</span>
           <span className="chat-tool-calls-names" title={namesSummary}>{namesSummary}</span>
           {statusSummary && <span className="chat-tool-calls-group-status">{statusSummary}</span>}
         </summary>
@@ -274,6 +283,7 @@ const CHAT_SIDEBAR_DEFAULT_WIDTH = 280;
 const CHAT_SIDEBAR_MIN_WIDTH = 180;
 const CHAT_SIDEBAR_MAX_WIDTH = 500;
 const CHAT_SIDEBAR_STORAGE_KEY = "fusion:chat-sidebar-width";
+const CHAT_SCOPE_STORAGE_KEY = "fusion:chat-scope";
 
 interface PendingAttachment {
   file: File;
@@ -539,15 +549,37 @@ function NewChatDialog({ projectId, onClose, onCreate }: NewChatDialogProps) {
 
 
 
+type CopyFeedbackState = "success" | "error" | null;
+
+interface RoomContext {
+  roomId: string;
+  roomName: string;
+  memberIds: ReadonlySet<string>;
+}
+
 interface ChatMessageItemProps {
   message: ChatMessageInfo;
+  /**
+   * When true, render assistant message content as plain text instead of
+   * Markdown. The per-message eye toggle has been removed in favor of a
+   * single thread-level toggle in the chat header, so this is a global
+   * mirror of that header state.
+   */
   forcePlain: boolean;
   agentName: string;
+  /**
+   * Hide the per-message agent identity (icon + name + model tag) on
+   * assistant bubbles. In model-only chats the agent identity *is* the
+   * active model and it's already shown in the thread header.
+   */
+  hideAssistantIdentity: boolean;
   showAssistantModelTag: boolean;
   activeModelTag: string | null;
+  activeModelProvider: string | null;
   activeSessionId: string | null;
   mentionAgentsByName: Map<string, Agent>;
-  onToggleRender: (id: string) => void;
+  roomContext: RoomContext | null;
+  copyAction?: ReactNode;
 }
 
 // Renders a single chat message bubble. Memoized so the streaming bubble's
@@ -557,11 +589,14 @@ const ChatMessageItem = memo(function ChatMessageItem({
   message,
   forcePlain,
   agentName,
+  hideAssistantIdentity,
   showAssistantModelTag,
   activeModelTag,
+  activeModelProvider,
   activeSessionId,
   mentionAgentsByName,
-  onToggleRender,
+  roomContext,
+  copyAction,
 }: ChatMessageItemProps) {
   const isAssistantMessage = message.role === "assistant";
 
@@ -579,8 +614,15 @@ const ChatMessageItem = memo(function ChatMessageItem({
       const normalizedName = rawName.replace(/_/g, " ").toLowerCase();
       const mentionedAgent = mentionAgentsByName.get(normalizedName);
       if (mentionedAgent) {
+        const isNonMember = Boolean(roomContext && !roomContext.memberIds.has(mentionedAgent.id));
+        const nonMemberLabel = isNonMember ? `Not a member of ${roomContext?.roomName}` : undefined;
         parts.push(
-          <span key={`${mentionedAgent.id}-${start}`} className="chat-mention-chip">
+          <span
+            key={`${mentionedAgent.id}-${start}`}
+            className={`chat-mention-chip${isNonMember ? " chat-mention-chip--non-member" : ""}`}
+            title={nonMemberLabel}
+            aria-label={nonMemberLabel}
+          >
             @{mentionedAgent.name.replace(/\s+/g, "_")}
           </span>,
         );
@@ -592,7 +634,7 @@ const ChatMessageItem = memo(function ChatMessageItem({
     }
     if (lastIndex < content.length) parts.push(content.slice(lastIndex));
     return parts.length === 0 ? content : parts;
-  }, [isAssistantMessage, message.content, mentionAgentsByName]);
+  }, [isAssistantMessage, message.content, mentionAgentsByName, roomContext]);
 
   const renderedAttachments = useMemo<ReactNode>(() => {
     const attachments = message.attachments;
@@ -659,25 +701,17 @@ const ChatMessageItem = memo(function ChatMessageItem({
       className={`chat-message chat-message--${message.role}`}
       data-testid={`chat-message-${message.id}`}
     >
-      {isAssistantMessage && (
+      {isAssistantMessage && !hideAssistantIdentity && (
         <div className="chat-message-avatar">
-          <Bot size={14} />
+          {activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="sm" /> : <Bot size={14} />}
           <span>{agentName}</span>
           {showAssistantModelTag && activeModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
-          <button
-            type="button"
-            className={`chat-message-render-toggle${forcePlain ? " chat-message-render-toggle--plain" : ""}`}
-            data-testid="chat-message-render-toggle"
-            aria-label={forcePlain ? "Show rendered markdown" : "Show plain text"}
-            onClick={() => onToggleRender(message.id)}
-          >
-            {forcePlain ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
         </div>
       )}
       {isAssistantMessage
         ? assistantBody
         : <div className="chat-message-content">{renderedUserContent}</div>}
+      {copyAction}
       {renderToolCalls(message.toolCalls)}
       {message.thinkingOutput && (
         <details className="chat-message-thinking">
@@ -691,7 +725,7 @@ const ChatMessageItem = memo(function ChatMessageItem({
   );
 });
 
-export function ChatView({ projectId, addToast }: ChatViewProps) {
+export function ChatView({ projectId, addToast, experimentalFeatures }: ChatViewProps) {
   const {
     activeSession,
     sessionsLoading,
@@ -718,8 +752,15 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   const [messageInput, setMessageInput] = useState("");
   const [contextMenu, setContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDeleteRoomId, setConfirmDeleteRoomId] = useState<string | null>(null);
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(CHAT_SIDEBAR_DEFAULT_WIDTH);
+  const [chatScope, setChatScope] = useState<"direct" | "rooms">("direct");
+  const [createRoomOpen, setCreateRoomOpen] = useState(false);
+  const chatRoomsEnabled = experimentalFeatures?.chatRooms === true;
+  // Keep this hook unconditional to preserve hook ordering and test stability.
+  // Rooms UI and interactions are fully gated by `chatRoomsEnabled`.
+  const rooms = useChatRooms(projectId, addToast);
   const [agentsMap, setAgentsMap] = useState<Map<string, Agent>>(new Map());
   const [discoveredSkills, setDiscoveredSkills] = useState<DiscoveredSkill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(true);
@@ -730,10 +771,17 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   const [mentionPopupVisible, setMentionPopupVisible] = useState(false);
   const [mentionHighlightIndex, setMentionHighlightIndex] = useState(0);
   const [mentionStartPos, setMentionStartPos] = useState(-1);
-  const [plainTextMessageIds, setPlainTextMessageIds] = useState<Set<string>>(() => new Set());
+  // Single thread-wide toggle: when true, all assistant content (including the
+  // streaming bubble) renders as plain text instead of Markdown. Replaces the
+  // earlier per-message toggle so the chat header owns this control instead
+  // of every reply having its own button.
+  const [showAllAsPlain, setShowAllAsPlain] = useState(false);
   // Attachment state mirrors QuickEntryBox: pending files selected before send.
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isUserScrolling, setIsUserScrolling] = useState(false);
+  const [copyFeedbackByMessageId, setCopyFeedbackByMessageId] = useState<Record<string, CopyFeedbackState>>({});
+  const [mobileSessionMenuOpen, setMobileSessionMenuOpen] = useState(false);
 
   // File mention state and hook
   const [, setFileMentionPopupVisible] = useState(false);
@@ -757,14 +805,16 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   }, [fileMention.mentionActive]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const mobileSessionMenuRef = useRef<HTMLDivElement>(null);
+  const isUserScrollingRef = useRef(false);
+  const lastAnchoredSessionStateRef = useRef<{ sessionId: string; loaded: boolean; hasMessages: boolean } | null>(null);
   const hideSkillMenuTimeoutRef = useRef<number | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const preserveComposerFocusRef = useRef(false);
-  const handledMobileSendRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const mentionCursorPosRef = useRef(0);
+  const copyFeedbackTimeoutsRef = useRef<Map<string, number>>(new Map());
   const mode = useViewportMode();
   const isMobile = mode === "mobile";
 
@@ -781,18 +831,52 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     }
   }, []);
 
+  useEffect(() => {
+    try {
+      const persistedScope = localStorage.getItem(CHAT_SCOPE_STORAGE_KEY);
+      if (persistedScope === "direct") {
+        setChatScope("direct");
+        return;
+      }
+      if (persistedScope === "rooms" && chatRoomsEnabled) {
+        setChatScope("rooms");
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [chatRoomsEnabled]);
+
+  useEffect(() => {
+    if (!chatRoomsEnabled && chatScope === "rooms") {
+      setChatScope("direct");
+      return;
+    }
+    try {
+      localStorage.setItem(CHAT_SCOPE_STORAGE_KEY, chatScope);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [chatRoomsEnabled, chatScope]);
+
+  const roomThreadActive = chatRoomsEnabled && chatScope === "rooms" && !!rooms.activeRoom;
   const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } = useMobileKeyboard({
-    enabled: isMobile && !!activeSession,
+    enabled: isMobile && (!!activeSession || roomThreadActive),
   });
 
+  // Only opt into visual-viewport sizing when we have concrete keyboard
+  // displacement (overlap or offset). The shared hook can report `keyboardOpen`
+  // during iOS settle/shrink phases with zero overlap; forcing vv-height in that
+  // transient state shrinks the thread and pushes the composer upward.
+  const hasKeyboardViewportDisplacement = keyboardOverlap > 0 || viewportOffsetTop > 0;
   const threadKeyboardStyle: CSSProperties =
-    keyboardOpen
+    keyboardOpen && hasKeyboardViewportDisplacement
       ? ({
           "--keyboard-overlap": `${keyboardOverlap}px`,
           "--vv-offset-top": `${viewportOffsetTop}px`,
           ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
         } as CSSProperties)
       : {};
+  const threadClassName = `chat-thread${keyboardOpen && hasKeyboardViewportDisplacement ? " chat-thread--keyboard-active" : ""}`;
 
   const filteredSkills = useMemo(() => {
     const normalizedFilter = skillFilter.trim().toLowerCase();
@@ -804,13 +888,31 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
 
   const mentionAgents = useMemo(() => Array.from(agentsMap.values()), [agentsMap]);
 
-  const filteredMentionAgents = useMemo(() => {
-    const normalizedFilter = mentionFilter.trim().toLowerCase();
-    if (!normalizedFilter) {
-      return mentionAgents;
+  const roomContext = useMemo<RoomContext | null>(() => {
+    if (!chatRoomsEnabled || chatScope !== "rooms" || !rooms.activeRoom) {
+      return null;
     }
-    return mentionAgents.filter((agent) => agent.name.toLowerCase().includes(normalizedFilter));
-  }, [mentionAgents, mentionFilter]);
+    return {
+      roomId: rooms.activeRoom.id,
+      roomName: rooms.activeRoom.name,
+      memberIds: new Set(rooms.activeRoomMembers.map((member) => member.agentId)),
+    };
+  }, [chatRoomsEnabled, chatScope, rooms.activeRoom, rooms.activeRoomMembers]);
+
+  const filteredMentionAgents = useMemo(() => {
+    const matchingAgents = mentionAgents.filter((agent) => matchesAgentMentionFilter(agent.name, mentionFilter));
+    if (!roomContext) {
+      return matchingAgents;
+    }
+
+    const memberAgents = matchingAgents.filter((agent) => roomContext.memberIds.has(agent.id));
+    if (mentionFilter.trim().length === 0) {
+      return memberAgents;
+    }
+
+    const otherAgents = matchingAgents.filter((agent) => !roomContext.memberIds.has(agent.id));
+    return [...memberAgents, ...otherAgents];
+  }, [mentionAgents, mentionFilter, roomContext]);
 
   const mentionAgentsByName = useMemo(() => {
     const byName = new Map<string, Agent>();
@@ -836,14 +938,95 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     };
   }, []);
 
-  // Scroll thread container to bottom on new messages or streaming.
+  const updateScrollState = useCallback(() => {
+    const messagesContainer = messagesContainerRef.current;
+    if (!messagesContainer) return;
+
+    const threshold = 50;
+    const atBottom = messagesContainer.scrollTop + messagesContainer.clientHeight >= messagesContainer.scrollHeight - threshold;
+    setIsUserScrolling(!atBottom);
+    isUserScrollingRef.current = !atBottom;
+  }, []);
+
+  const anchorToBottom = useCallback((container: HTMLElement) => {
+    if (!container.isConnected) return;
+
+    let frame = 0;
+    let stableFrames = 0;
+    let lastScrollHeight = -1;
+    const maxFrames = 6;
+
+    const writeBottom = () => {
+      if (!container.isConnected) return;
+
+      container.scrollTop = container.scrollHeight;
+      if (container.scrollHeight === lastScrollHeight) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+        lastScrollHeight = container.scrollHeight;
+      }
+
+      frame += 1;
+      if (frame >= maxFrames || stableFrames >= 2) {
+        setIsUserScrolling(false);
+        isUserScrollingRef.current = false;
+        return;
+      }
+
+      window.requestAnimationFrame(writeBottom);
+    };
+
+    writeBottom();
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    const messagesContainer = messagesContainerRef.current;
+    if (!messagesContainer) return;
+    anchorToBottom(messagesContainer);
+  }, [anchorToBottom]);
+
+  useLayoutEffect(() => {
+    const sessionId = activeSession?.id ?? null;
+    if (!sessionId) {
+      lastAnchoredSessionStateRef.current = null;
+      return;
+    }
+
+    const nextState = {
+      sessionId,
+      loaded: !messagesLoading,
+      hasMessages: messages.length > 0,
+    };
+    const previousState = lastAnchoredSessionStateRef.current;
+    const isSessionChanged = previousState?.sessionId !== sessionId;
+    const finishedLoading =
+      previousState?.sessionId === sessionId && !previousState.loaded && nextState.loaded;
+    const firstMessagesArrived =
+      previousState?.sessionId === sessionId && !previousState.hasMessages && nextState.hasMessages;
+
+    const shouldAnchor = previousState === null || isSessionChanged || finishedLoading || firstMessagesArrived;
+    if (!shouldAnchor) {
+      return;
+    }
+
+    const messagesContainer = messagesContainerRef.current;
+    if (!messagesContainer) {
+      return;
+    }
+
+    anchorToBottom(messagesContainer);
+    lastAnchoredSessionStateRef.current = nextState;
+  }, [activeSession?.id, messages.length, messagesLoading, anchorToBottom]);
+
+  // Scroll thread container to bottom on new messages or streaming when user is near live tail.
   // Avoid Element.scrollIntoView() here because on mobile Safari it can
   // scroll the page viewport instead of only the chat thread.
   useEffect(() => {
-    const messagesContainer = messagesContainerRef.current;
-    if (!messagesContainer) return;
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-  }, [messages, streamingText, streamingThinking, isStreaming]);
+    if (!isUserScrollingRef.current) {
+      scrollToBottom();
+    }
+  }, [messages, streamingText, streamingThinking, isStreaming, scrollToBottom]);
 
   useEffect(() => {
     if (keyboardOverlap <= 0) {
@@ -855,8 +1038,8 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       return;
     }
 
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-  }, [keyboardOverlap]);
+    scrollToBottom();
+  }, [keyboardOverlap, scrollToBottom]);
 
   // Lock body scroll on mobile while the keyboard is up so iOS can't shift
   // the visual viewport (offsetTop > 0). Shared hook also restores
@@ -871,6 +1054,83 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       return () => document.removeEventListener("click", handleClick);
     }
   }, [contextMenu]);
+
+  // While the keyboard is up on mobile, block touchmove gestures that
+  // would otherwise pan the iOS visualViewport (or scroll the document)
+  // and let the composer / header drift. We attach a non-passive listener
+  // to document so that gestures starting anywhere — header, composer
+  // padding, body — are cancelled. The exception is when the touch path
+  // crosses the messages list, which is the one place we DO want pan-y.
+  // useMobileScrollLock only pins document scroll; this complements it
+  // by stopping vv pan on top of the locked layout.
+  // React's synthetic onTouchMove is passive by default, so this has to
+  // be a native addEventListener with { passive: false }.
+  useEffect(() => {
+    if (!isMobile || !keyboardOpen) return;
+    const onTouchMove = (event: TouchEvent) => {
+      const target = event.target as Element | null;
+      if (target?.closest(".chat-messages")) return; // allow messages scroll
+      event.preventDefault();
+    };
+    document.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => {
+      document.removeEventListener("touchmove", onTouchMove);
+    };
+  }, [isMobile, keyboardOpen]);
+
+  // On mount and on visibility/page restore, if iOS thinks the keyboard is
+  // up but the textarea isn't actually focused (or vice versa), the
+  // visualViewport metrics get stuck in a half-state — composer pushed up
+  // or covered by a blank pane. Force a blur+refocus on the textarea to
+  // make iOS resync. Only runs on mobile and only when ChatView holds the
+  // active session (avoids stealing focus from other views).
+  useEffect(() => {
+    if (!isMobile || !activeSession) return;
+    const resync = () => {
+      const ta = inputRef.current;
+      if (!ta) return;
+      if (document.activeElement !== ta) return; // only if it was focused
+      ta.blur();
+      window.setTimeout(() => {
+        ta.focus({ preventScroll: true });
+      }, 0);
+    };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("pageshow", resync);
+    return () => {
+      document.removeEventListener("visibilitychange", resync);
+      window.removeEventListener("pageshow", resync);
+    };
+  }, [isMobile, activeSession]);
+
+  useEffect(() => {
+    if (!isMobile || !activeSession) {
+      return;
+    }
+
+    const reAnchorToLatest = () => {
+      const messagesContainer = messagesContainerRef.current;
+      if (!messagesContainer) {
+        return;
+      }
+      anchorToBottom(messagesContainer);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      reAnchorToLatest();
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pageshow", reAnchorToLatest);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pageshow", reAnchorToLatest);
+    };
+  }, [isMobile, activeSession, anchorToBottom]);
 
   // Fetch agents on mount for name resolution (project-scoped with stale-request protection)
   useEffect(() => {
@@ -932,6 +1192,10 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
           URL.revokeObjectURL(attachment.previewUrl);
         }
       }
+      for (const timeoutId of copyFeedbackTimeoutsRef.current.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      copyFeedbackTimeoutsRef.current.clear();
     };
   }, []);
 
@@ -1011,7 +1275,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     const files = pendingAttachments.map((attachment) => attachment.file);
     if ((!trimmed && files.length === 0) || !activeSession) return;
 
-    if (trimmed === "/clear") {
+    if (trimmed === "/clear" || trimmed === "/new") {
       clearComposerState();
       stopStreaming();
       clearPendingMessage();
@@ -1039,30 +1303,32 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     sendMessage,
   ]);
 
-  const focusComposerInput = useCallback(() => {
-    if (typeof window === "undefined") return;
-    if (window.innerWidth > 768) return;
-    const input = inputRef.current;
-    if (!input || input.disabled) return;
 
-    const previousScrollX = window.scrollX;
-    const previousScrollY = window.scrollY;
-    input.focus({ preventScroll: true });
+  const handleSendDispatch = useCallback(async () => {
+    const trimmed = messageInput.trim();
+    if (!trimmed) {
+      return;
+    }
 
-    // iOS can still jump layout viewport on focus changes even with preventScroll.
-    // Restore scroll position on the next frame to keep the thread anchored.
-    window.requestAnimationFrame(() => {
-      if (window.scrollX !== previousScrollX || window.scrollY !== previousScrollY) {
-        window.scrollTo(previousScrollX, previousScrollY);
+    if (chatRoomsEnabled && chatScope === "rooms") {
+      if (!rooms.activeRoom) {
+        return;
       }
-    });
-  }, []);
 
-  const markPreserveComposerFocus = useCallback(() => {
-    if (typeof window === "undefined") return;
-    if (window.innerWidth > 768) return;
-    preserveComposerFocusRef.current = true;
-  }, []);
+      try {
+        await rooms.sendRoomMessage(trimmed);
+        clearComposerState();
+      } catch (error) {
+        const message = error instanceof Error && error.message.trim()
+          ? error.message
+          : "Failed to send room message";
+        addToast(message, "error");
+      }
+      return;
+    }
+
+    handleSend();
+  }, [messageInput, chatRoomsEnabled, chatScope, rooms, clearComposerState, addToast, handleSend]);
 
   const handleSkillSelect = useCallback(
     (skill: DiscoveredSkill) => {
@@ -1218,7 +1484,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
 
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        void handleSend();
+        void handleSendDispatch();
       }
     },
     [
@@ -1230,7 +1496,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       filteredSkills,
       highlightedSkillIndex,
       handleSkillSelect,
-      handleSend,
+      handleSendDispatch,
       fileMention,
       messageInput,
     ],
@@ -1309,13 +1575,6 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   );
 
   const handleInputBlur = useCallback(() => {
-    if (preserveComposerFocusRef.current) {
-      window.requestAnimationFrame(() => {
-        focusComposerInput();
-      });
-      return;
-    }
-
     if (hideSkillMenuTimeoutRef.current !== null) {
       window.clearTimeout(hideSkillMenuTimeoutRef.current);
     }
@@ -1329,12 +1588,28 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       fileMention.dismissMention();
       hideSkillMenuTimeoutRef.current = null;
     }, 120);
-  }, [fileMention, focusComposerInput]);
+  }, [fileMention]);
 
   const handleInputFocus = useCallback(() => {
     if (hideSkillMenuTimeoutRef.current !== null) {
       window.clearTimeout(hideSkillMenuTimeoutRef.current);
       hideSkillMenuTimeoutRef.current = null;
+    }
+    // iOS quirk: after the keyboard has been dismissed once, re-focusing
+    // an input leaves window.scrollY > 0 *and* visualViewport.offsetTop
+    // > 0 — the layout viewport drifts up, and the position:fixed
+    // useMobileScrollLock applies to a body that is no longer at the
+    // top of the document. Result: the message thread anchors above
+    // the visible viewport with a large blank area below it. Forcing
+    // scroll back to (0,0) on the focus event neutralizes the drift
+    // before lock applies. Done in a microtask so iOS finishes its
+    // own scroll-into-view first.
+    if (typeof window !== "undefined" && window.innerWidth <= 768) {
+      window.setTimeout(() => {
+        if (window.scrollY !== 0 || window.scrollX !== 0) {
+          window.scrollTo(0, 0);
+        }
+      }, 0);
     }
   }, []);
 
@@ -1439,6 +1714,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   const handleSessionClick = useCallback(
     (id: string) => {
       selectSession(id);
+      setMobileSessionMenuOpen(false);
       if (isMobile) setSidebarVisible(false);
     },
     [selectSession, isMobile],
@@ -1448,6 +1724,7 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   const handleBack = useCallback(() => {
     selectSession("");
     setSidebarVisible(true);
+    setMobileSessionMenuOpen(false);
   }, [selectSession]);
 
   // Render empty state (no active session)
@@ -1465,12 +1742,15 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
   };
 
   const activeModelTag = formatModelTag(activeSession?.modelProvider, activeSession?.modelId);
+  const activeModelProvider = activeSession?.modelProvider ?? null;
+  const hasThreadInView = Boolean(activeSession || isStreaming || messages.length > 0);
 
   const threadHeaderTitle = activeSession?.agentId === FN_AGENT_ID
     ? (activeModelTag ?? "Fusion")
     : activeSession?.title || agentsMap.get(activeSession?.agentId ?? "")?.name || activeSession?.agentId || "Chat";
 
   const showThreadHeaderModelTag = Boolean(activeModelTag && activeModelTag !== threadHeaderTitle);
+  const showMobileSessionSwitcher = isMobile && chatScope === "direct" && !!activeSession;
 
   const agentName =
     agentsMap.get(activeSession?.agentId ?? "")?.name ||
@@ -1478,23 +1758,81 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
       ? (activeModelTag ?? "Fusion")
       : (activeSession?.agentId?.slice(0, 30) ?? "Fusion"));
 
-  const showAssistantModelTag = Boolean(activeModelTag && activeModelTag !== agentName);
+  // The model tag is already visible in the thread header — repeating it on
+  // every assistant message is noise. Keep it suppressed for regular chat
+  // (real agent name is the identity); QuickChat already collapses the tag
+  // because its `agentName` IS the model tag, so the per-message slot was
+  // always empty there too.
+  const showAssistantModelTag = false;
+
+  // In model-only chats (no real agent picked) the agent identity *is* the
+  // model name, which is already in the thread header. Repeating it on every
+  // assistant bubble is noise. Hide the per-message identity row entirely;
+  // the render-mode toggle still appears in a slim toolbar.
+  const hideAssistantIdentity = activeSession?.agentId === FN_AGENT_ID;
 
   const pendingPreview = pendingMessage.length > 50
     ? `${pendingMessage.slice(0, 50)}…`
     : pendingMessage;
 
-  const toggleMessageRenderMode = useCallback((messageId: string) => {
-    setPlainTextMessageIds((current) => {
-      const next = new Set(current);
-      if (next.has(messageId)) {
-        next.delete(messageId);
-      } else {
-        next.add(messageId);
-      }
-      return next;
-    });
+  const toggleAllAsPlain = useCallback(() => {
+    setShowAllAsPlain((value) => !value);
   }, []);
+
+  useEffect(() => {
+    if (!mobileSessionMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (mobileSessionMenuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setMobileSessionMenuOpen(false);
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+    };
+  }, [mobileSessionMenuOpen]);
+
+  useEffect(() => {
+    if (!isMobile || chatScope !== "direct" || sidebarVisible) {
+      setMobileSessionMenuOpen(false);
+    }
+  }, [isMobile, chatScope, sidebarVisible]);
+
+  const setCopyFeedback = useCallback((messageId: string, feedback: CopyFeedbackState) => {
+    const existingTimeout = copyFeedbackTimeoutsRef.current.get(messageId);
+    if (existingTimeout) {
+      window.clearTimeout(existingTimeout);
+    }
+
+    setCopyFeedbackByMessageId((current) => ({ ...current, [messageId]: feedback }));
+
+    const timeoutId = window.setTimeout(() => {
+      setCopyFeedbackByMessageId((current) => {
+        const { [messageId]: _removed, ...rest } = current;
+        return rest;
+      });
+      copyFeedbackTimeoutsRef.current.delete(messageId);
+    }, 2000);
+
+    copyFeedbackTimeoutsRef.current.set(messageId, timeoutId);
+  }, []);
+
+  const handleCopyResponse = useCallback(async (messageId: string, content: string) => {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(content);
+      setCopyFeedback(messageId, "success");
+    } catch {
+      setCopyFeedback(messageId, "error");
+    }
+  }, [setCopyFeedback]);
 
   const renderAssistantContent = useCallback(
     (content: string, forcePlain = false) => {
@@ -1514,6 +1852,22 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
     [],
   );
 
+  const showProviderResponseCopy = activeSession?.agentId === FN_AGENT_ID;
+
+  const renderCopyAction = useCallback((messageId: string, content: string, testId?: string) => (
+    <button
+      type="button"
+      className={`btn-icon chat-message-copy-action${copyFeedbackByMessageId[messageId] === "success" ? " chat-message-copy-action--success" : ""}${copyFeedbackByMessageId[messageId] === "error" ? " chat-message-copy-action--error" : ""}`}
+      data-testid={testId ?? `chat-copy-response-${messageId}`}
+      aria-label={copyFeedbackByMessageId[messageId] === "success" ? "Response copied" : copyFeedbackByMessageId[messageId] === "error" ? "Copy failed" : "Copy response"}
+      onClick={() => {
+        void handleCopyResponse(messageId, content);
+      }}
+    >
+      {copyFeedbackByMessageId[messageId] === "success" ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  ), [copyFeedbackByMessageId, handleCopyResponse]);
+
   return (
     <div className="chat-view">
       {/* Sidebar */}
@@ -1521,70 +1875,170 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
         className={`chat-sidebar${!sidebarVisible ? " chat-sidebar--hidden" : ""}`}
         style={isMobile ? undefined : { width: `${sidebarWidth}px` }}
       >
-        {/* Search section */}
-        <div className="chat-sidebar-search">
-          <div className="chat-sidebar-search-wrapper">
-            <Search size={14} className="chat-sidebar-search-icon" />
-            <input
-              type="text"
-              className="chat-sidebar-search"
-              placeholder="Search conversations..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              data-testid="chat-search-input"
-            />
+        {chatRoomsEnabled && (
+          <div className="chat-sidebar-scope-toggle" role="tablist" data-testid="chat-sidebar-scope-toggle">
+            <button
+              type="button"
+              role="tab"
+              className={`chat-sidebar-scope-btn${chatScope === "direct" ? " chat-sidebar-scope-btn--active" : ""}`}
+              aria-selected={chatScope === "direct"}
+              data-testid="chat-sidebar-scope-direct"
+              onClick={() => setChatScope("direct")}
+            >
+              Direct
+            </button>
+            <button
+              type="button"
+              role="tab"
+              className={`chat-sidebar-scope-btn${chatScope === "rooms" ? " chat-sidebar-scope-btn--active" : ""}`}
+              aria-selected={chatScope === "rooms"}
+              data-testid="chat-sidebar-scope-rooms"
+              onClick={() => setChatScope("rooms")}
+            >
+              Rooms
+            </button>
           </div>
-        </div>
-        {/* Session list section */}
-        <div className="chat-session-list chat-sidebar-list">
-          {sessionsLoading ? (
-            <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
-              Loading...
-            </div>
-          ) : filteredSessions.length === 0 ? (
-            <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
-              No conversations yet
-            </div>
-          ) : (
-            filteredSessions.map((session) => (
-              <div
-                key={session.id}
-                className={`chat-session-item${activeSession?.id === session.id ? " chat-session-item--active" : ""}`}
-                onClick={() => handleSessionClick(session.id)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setContextMenu({ sessionId: session.id, x: e.clientX, y: e.clientY });
-                }}
-                data-testid={`chat-session-${session.id}`}
-              >
-                <button
-                  className="chat-session-delete-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setConfirmDelete(session.id);
-                  }}
-                  data-testid="chat-session-delete-btn"
-                  aria-label="Delete conversation"
-                >
-                  <Trash2 size={14} />
-                </button>
-                <div className="chat-session-title">{session.title || "Untitled"}</div>
-                <div className="chat-session-preview">
-                  {session.lastMessagePreview || "No messages"}
-                </div>
-                <div className="chat-session-meta">
-                  <span>
-                    {agentsMap.get(session.agentId)?.name ||
-                      (session.agentId === FN_AGENT_ID
-                        ? (formatModelTag(session.modelProvider, session.modelId) ?? "Fusion")
-                        : session.agentId.slice(0, 30))}
-                  </span>
-                  <span>{session.updatedAt ? formatRelativeTime(session.updatedAt) : ""}</span>
-                </div>
+        )}
+        {!chatRoomsEnabled || chatScope === "direct" ? (
+          <>
+            {/* Search section */}
+            <div className="chat-sidebar-search-container">
+              <div className="chat-sidebar-search-wrapper">
+                <Search size={14} className="chat-sidebar-search-icon" />
+                <input
+                  type="text"
+                  className="chat-sidebar-search"
+                  placeholder="Search conversations..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  data-testid="chat-search-input"
+                />
               </div>
-            ))
-          )}
-        </div>
+            </div>
+            {/* Session list section */}
+            <div className="chat-session-list chat-sidebar-list">
+              {sessionsLoading ? (
+                <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
+                  Loading...
+                </div>
+              ) : filteredSessions.length === 0 ? (
+                <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
+                  No conversations yet
+                </div>
+              ) : (
+                filteredSessions.map((session) => (
+                  <div
+                    key={session.id}
+                    className={`chat-session-item${activeSession?.id === session.id ? " chat-session-item--active" : ""}`}
+                    onClick={() => handleSessionClick(session.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setContextMenu({ sessionId: session.id, x: e.clientX, y: e.clientY });
+                    }}
+                    data-testid={`chat-session-${session.id}`}
+                  >
+                    <button
+                      className="chat-session-delete-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDelete(session.id);
+                      }}
+                      data-testid="chat-session-delete-btn"
+                      aria-label="Delete conversation"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                    <div className="chat-session-title">{session.title || "Untitled"}</div>
+                    <div className="chat-session-preview">
+                      {session.lastMessagePreview || "No messages"}
+                    </div>
+                    <div className="chat-session-meta">
+                      <span className="chat-session-meta-model">
+                        {session.modelProvider && (
+                          <ProviderIcon provider={session.modelProvider} size="sm" />
+                        )}
+                        <span>
+                          {agentsMap.get(session.agentId)?.name ||
+                            (session.agentId === FN_AGENT_ID
+                              ? (formatModelTag(session.modelProvider, session.modelId) ?? "Fusion")
+                              : session.agentId.slice(0, 30))}
+                        </span>
+                      </span>
+                      <span>{session.updatedAt ? formatRelativeTime(session.updatedAt) : ""}</span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="chat-sidebar-rooms" data-testid="chat-sidebar-rooms">
+            <div className="chat-sidebar-rooms-header">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                data-testid="chat-create-room-btn"
+                onClick={() => setCreateRoomOpen(true)}
+              >
+                <Plus size={14} />
+                Create room
+              </button>
+            </div>
+            {rooms.rooms.length === 0 ? (
+              <div className="chat-sidebar-rooms-empty" data-testid="chat-sidebar-rooms-empty">
+                No rooms yet.
+              </div>
+            ) : (
+              <div className="chat-session-list chat-sidebar-list">
+                {rooms.rooms.map((room) => {
+                  const isActive = rooms.activeRoom?.id === room.id;
+                  const memberCount = isActive ? rooms.activeRoomMembers.length : "—";
+                  return (
+                    <div
+                      key={room.id}
+                      role="button"
+                      tabIndex={0}
+                      className={`chat-room-item${isActive ? " chat-room-item--active" : ""}`}
+                      data-testid={`chat-room-item-${room.slug}`}
+                      onClick={() => {
+                        rooms.selectRoom(room.id);
+                        if (isMobile) {
+                          setSidebarVisible(false);
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          rooms.selectRoom(room.id);
+                          if (isMobile) {
+                            setSidebarVisible(false);
+                          }
+                        }
+                      }}
+                    >
+                      <span className="chat-room-item-details">
+                        <span className="chat-room-item-name">#{room.name}</span>
+                        <span className="chat-room-item-meta">{memberCount} {memberCount === 1 ? "member" : "members"}</span>
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-icon chat-room-item-delete"
+                        data-testid={`chat-room-delete-${room.slug}`}
+                        aria-label={`Delete room ${room.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setConfirmDeleteRoomId(room.id);
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
         {/* Mobile footer with New Chat action */}
         <div className="chat-sidebar-footer">
           <button
@@ -1663,19 +2117,222 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
         </div>
       )}
 
+      {chatRoomsEnabled && confirmDeleteRoomId && (
+        <div className="chat-new-dialog-backdrop chat-view-dialog-backdrop" onClick={() => setConfirmDeleteRoomId(null)}>
+          <div className="chat-new-dialog chat-view-dialog" onClick={(e) => e.stopPropagation()}>
+            <h3>Delete Room?</h3>
+            <p className="chat-view-delete-dialog-copy">
+              This action cannot be undone. This room and all its messages will be permanently deleted.
+            </p>
+            <div className="chat-new-dialog-actions">
+              <button className="btn btn-sm" onClick={() => setConfirmDeleteRoomId(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-sm btn-danger"
+                onClick={() => {
+                  void (async () => {
+                    try {
+                      await rooms.deleteRoom(confirmDeleteRoomId);
+                      setConfirmDeleteRoomId(null);
+                    } catch {
+                      addToast("Failed to delete room", "error");
+                    }
+                  })();
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Thread */}
-      <div className="chat-thread" style={threadKeyboardStyle}>
+      {chatRoomsEnabled && chatScope === "rooms" ? (
+        <div className={threadClassName} style={threadKeyboardStyle}>
+          {rooms.activeRoom ? (
+            <>
+              <div className="chat-room-thread-header">
+                {isMobile && (
+                  <button className="btn-icon" onClick={() => {
+                    rooms.selectRoom(null);
+                    setSidebarVisible(true);
+                  }} data-testid="chat-back-btn">
+                    <ChevronLeft size={16} />
+                  </button>
+                )}
+                <div className="chat-thread-header-title">#{rooms.activeRoom.name}</div>
+                <div className="chat-room-thread-members">
+                  {rooms.activeRoomMembers.map((member) => (
+                    <AgentAvatar
+                      key={member.agentId}
+                      agent={
+                        agentsMap.get(member.agentId) ?? {
+                          id: member.agentId,
+                          name: member.agentId.slice(0, 30),
+                        }
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+              <div className="chat-messages" ref={messagesContainerRef} onScroll={updateScrollState}>
+                {rooms.messagesLoading ? (
+                  <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>Loading messages...</div>
+                ) : rooms.messages.length === 0 ? (
+                  <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>No messages yet. Start the conversation!</div>
+                ) : (
+                  rooms.messages.map((message) => {
+                    const senderName = message.senderAgentId ? (agentsMap.get(message.senderAgentId)?.name ?? message.senderAgentId.slice(0, 30)) : "You";
+                    const roomMessage: ChatMessageInfo = {
+                      id: message.id,
+                      sessionId: message.roomId,
+                      role: message.role,
+                      content: message.content,
+                      thinkingOutput: message.thinkingOutput ?? undefined,
+                      toolCalls: undefined,
+                      fallbackInfo: undefined,
+                      attachments: message.attachments,
+                      createdAt: message.createdAt,
+                    };
+                    return (
+                      <ChatMessageItem
+                        key={message.id}
+                        message={roomMessage}
+                        forcePlain={showAllAsPlain}
+                        agentName={senderName}
+                        hideAssistantIdentity={false}
+                        showAssistantModelTag={false}
+                        activeModelTag={null}
+                        activeModelProvider={null}
+                        activeSessionId={rooms.activeRoom?.id ?? null}
+                        mentionAgentsByName={mentionAgentsByName}
+                        roomContext={roomContext}
+                      />
+                    );
+                  })
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+            </>
+          ) : (
+            <div className="chat-room-empty-pane" data-testid="chat-rooms-empty-pane">Select a room or create one</div>
+          )}
+
+          {rooms.activeRoom && (
+            <div className="chat-input-area">
+              <div className="chat-input-row">
+                <div className="chat-input-wrapper">
+                  <textarea
+                    ref={inputRef}
+                    className="chat-input-textarea"
+                    placeholder="Type a message..."
+                    value={messageInput}
+                    onChange={handleInputChange}
+                    onKeyDown={handleInputKeyDown}
+                    onKeyUp={handleInputKeyUp}
+                    onClick={handleInputSelectionChange}
+                    onBlur={handleInputBlur}
+                    onFocus={handleInputFocus}
+                    onTouchStart={(event) => {
+                      if (typeof window === "undefined") return;
+                      if (window.innerWidth > 768) return;
+                      if (document.activeElement === event.currentTarget) return;
+                      event.preventDefault();
+                      event.currentTarget.focus({ preventScroll: true });
+                    }}
+                    rows={1}
+                    data-testid="chat-input"
+                  />
+                  <AgentMentionPopup
+                    agents={mentionAgents}
+                    filter={mentionFilter}
+                    highlightedIndex={mentionHighlightIndex}
+                    visible={mentionPopupVisible}
+                    onSelect={handleMentionSelect}
+                    position="below"
+                    roomMemberIds={roomContext?.memberIds}
+                    roomName={roomContext?.roomName}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="chat-input-send"
+                  onClick={() => {
+                    void handleSendDispatch();
+                  }}
+                  disabled={!messageInput.trim()}
+                  data-testid="chat-send-btn"
+                  style={{ touchAction: "manipulation" }}
+                >
+                  <Send size={16} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+      <div className={threadClassName} style={threadKeyboardStyle}>
         {/* Header - always rendered in desktop/tablet, only rendered in mobile when viewing a thread */}
-        {(activeSession || !isMobile) && (
+        {(hasThreadInView || !isMobile) && (
           <div className="chat-thread-header">
-            {isMobile && activeSession && (
+            {isMobile && hasThreadInView && (
               <button className="btn-icon" onClick={handleBack} data-testid="chat-back-btn">
                 <ChevronLeft size={16} />
               </button>
             )}
-            <Bot size={16} />
-            <span className="chat-thread-header-title">{threadHeaderTitle}</span>
-            {showThreadHeaderModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
+            <div className="chat-thread-header-identity" data-testid="chat-thread-header-identity">
+              {showMobileSessionSwitcher ? (
+                <div className="chat-mobile-session-menu" ref={mobileSessionMenuRef}>
+                  <button
+                    type="button"
+                    className="btn-icon chat-mobile-session-trigger"
+                    data-testid="chat-mobile-session-trigger"
+                    aria-haspopup="menu"
+                    aria-expanded={mobileSessionMenuOpen}
+                    onClick={() => setMobileSessionMenuOpen((open) => !open)}
+                  >
+                    {activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="md" /> : <Bot size={16} />}
+                    <span className="chat-thread-header-title">{threadHeaderTitle}</span>
+                    {showThreadHeaderModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
+                    <ChevronDown aria-hidden="true" />
+                  </button>
+                  {mobileSessionMenuOpen && (
+                    <div className="chat-mobile-session-dropdown" role="menu" data-testid="chat-mobile-session-dropdown">
+                      {filteredSessions.map((session) => (
+                        <button
+                          key={session.id}
+                          type="button"
+                          role="menuitem"
+                          className={`chat-mobile-session-option${activeSession?.id === session.id ? " chat-mobile-session-option--active" : ""}`}
+                          data-testid={`chat-mobile-session-option-${session.id}`}
+                          onClick={() => handleSessionClick(session.id)}
+                        >
+                          <span className="chat-mobile-session-option-title">{session.title || "Untitled"}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <>
+                  {activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="md" /> : <Bot size={16} />}
+                  <span className="chat-thread-header-title">{threadHeaderTitle}</span>
+                  {showThreadHeaderModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
+                </>
+              )}
+            </div>
+            {hasThreadInView && (
+              <button
+                type="button"
+                className={`chat-thread-header-render-toggle${showAllAsPlain ? " chat-thread-header-render-toggle--plain" : ""}`}
+                data-testid="chat-thread-render-toggle"
+                aria-label={showAllAsPlain ? "Show all messages as rendered Markdown" : "Show all messages as plain text"}
+                onClick={toggleAllAsPlain}
+              >
+                {showAllAsPlain ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+            )}
             {!isMobile && (
               <button
                 className="btn btn-sm btn-primary chat-thread-header-new-chat"
@@ -1691,44 +2348,41 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
         )}
 
         {/* Messages */}
-        <div className="chat-messages" ref={messagesContainerRef}>
+        <div className="chat-messages" ref={messagesContainerRef} onScroll={updateScrollState}>
           {isStreaming ? (
             <>
               {messages.map((message) => (
                 <ChatMessageItem
                   key={message.id}
                   message={message}
-                  forcePlain={plainTextMessageIds.has(message.id)}
+                  forcePlain={showAllAsPlain}
                   agentName={agentName}
+                  hideAssistantIdentity={hideAssistantIdentity}
                   showAssistantModelTag={showAssistantModelTag}
                   activeModelTag={activeModelTag}
+                  activeModelProvider={activeModelProvider}
                   activeSessionId={activeSession?.id ?? null}
                   mentionAgentsByName={mentionAgentsByName}
-                  onToggleRender={toggleMessageRenderMode}
+                  roomContext={null}
+                  copyAction={showProviderResponseCopy && message.role === "assistant" ? renderCopyAction(message.id, message.content) : undefined}
                 />
               ))}
               <div className="chat-message chat-message--assistant chat-message--streaming">
-                <div className="chat-message-avatar">
-                  <Bot size={14} />
-                  <span>{agentName}</span>
-                  {showAssistantModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
-                  <button
-                    type="button"
-                    className={`chat-message-render-toggle${plainTextMessageIds.has("__streaming__") ? " chat-message-render-toggle--plain" : ""}`}
-                    data-testid="chat-message-render-toggle"
-                    aria-label={plainTextMessageIds.has("__streaming__") ? "Show rendered markdown" : "Show plain text"}
-                    onClick={() => toggleMessageRenderMode("__streaming__")}
-                  >
-                    {plainTextMessageIds.has("__streaming__") ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
+                {!hideAssistantIdentity && (
+                  <div className="chat-message-avatar">
+                    {activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="sm" /> : <Bot size={14} />}
+                    <span>{agentName}</span>
+                    {showAssistantModelTag && <span className="chat-model-tag">{activeModelTag}</span>}
+                  </div>
+                )}
                 {streamingText ? (
-                  renderAssistantContent(streamingText, plainTextMessageIds.has("__streaming__"))
+                  renderAssistantContent(streamingText, showAllAsPlain)
                 ) : (
                   <div className="chat-message-content chat-message-content--waiting">
                     {streamingThinking ? "Thinking…" : "Connecting…"}
                   </div>
                 )}
+                {showProviderResponseCopy && streamingText && renderCopyAction("__streaming__", streamingText, "chat-copy-response-streaming")}
                 {renderToolCalls(streamingToolCalls)}
                 {streamingThinking && (
                   <details className="chat-message-thinking">
@@ -1757,19 +2411,33 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
                 <ChatMessageItem
                   key={message.id}
                   message={message}
-                  forcePlain={plainTextMessageIds.has(message.id)}
+                  forcePlain={showAllAsPlain}
                   agentName={agentName}
+                  hideAssistantIdentity={hideAssistantIdentity}
                   showAssistantModelTag={showAssistantModelTag}
                   activeModelTag={activeModelTag}
+                  activeModelProvider={activeModelProvider}
                   activeSessionId={activeSession?.id ?? null}
                   mentionAgentsByName={mentionAgentsByName}
-                  onToggleRender={toggleMessageRenderMode}
+                  roomContext={null}
+                  copyAction={showProviderResponseCopy && message.role === "assistant" ? renderCopyAction(message.id, message.content) : undefined}
                 />
               ))}
             </>
           )}
           <div ref={messagesEndRef} />
         </div>
+        {isUserScrolling && (
+          <button
+            type="button"
+            className="btn btn-sm chat-jump-to-latest"
+            data-testid="chat-jump-to-latest"
+            onClick={scrollToBottom}
+          >
+            <ChevronDown size={14} />
+            Latest
+          </button>
+        )}
 
         {/* Input */}
         {activeSession && (
@@ -1892,6 +2560,8 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
                   visible={mentionPopupVisible}
                   onSelect={handleMentionSelect}
                   position="below"
+                  roomMemberIds={roomContext?.memberIds}
+                  roomName={roomContext?.roomName}
                 />
                 <FileMentionPopup
                   visible={fileMention.mentionActive && !mentionPopupVisible}
@@ -1935,43 +2605,28 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
                 <button
                   type="button"
                   className="chat-input-send"
+                  // Keep keyboard up when sending. preventDefault fires on
+                  // pointerdown for touch pointers (BEFORE iOS blurs the
+                  // textarea — the synthesized mousedown is too late on
+                  // iOS), and on mousedown for desktop. Crucially we do NOT
+                  // call preventDefault on touchstart and we do NOT run the
+                  // action here — both of those broke quick taps. Click
+                  // still fires from the iOS touch sequence and runs the
+                  // action reliably.
                   onPointerDown={(event) => {
-                    if (typeof window === "undefined" || window.innerWidth > 768) return;
-                    event.preventDefault();
                     if (event.pointerType && event.pointerType !== "mouse") {
-                      handledMobileSendRef.current = true;
-                      markPreserveComposerFocus();
-                      focusComposerInput();
-                      void handleSend();
-                      window.setTimeout(() => {
-                        preserveComposerFocusRef.current = false;
-                      }, 1500);
+                      event.preventDefault();
                     }
                   }}
-                  onTouchStart={(event) => {
-                    if (typeof window === "undefined" || window.innerWidth > 768) return;
-                    event.preventDefault();
-                    handledMobileSendRef.current = true;
-                    markPreserveComposerFocus();
-                    focusComposerInput();
-                    void handleSend();
-                    window.setTimeout(() => {
-                      preserveComposerFocusRef.current = false;
-                    }, 1500);
-                  }}
                   onMouseDown={(event) => {
-                    if (typeof window === "undefined" || window.innerWidth > 768) return;
                     event.preventDefault();
                   }}
                   onClick={() => {
-                    if (handledMobileSendRef.current) {
-                      handledMobileSendRef.current = false;
-                      return;
-                    }
                     void handleSend();
                   }}
                   disabled={!messageInput.trim() && pendingAttachments.length === 0}
                   data-testid="chat-send-btn"
+                  style={{ touchAction: "manipulation" }}
                 >
                   <Send size={16} />
                 </button>
@@ -1980,6 +2635,20 @@ export function ChatView({ projectId, addToast }: ChatViewProps) {
           </div>
         )}
       </div>
+      )}
+
+      {chatRoomsEnabled && (
+        <CreateRoomModal
+          isOpen={createRoomOpen}
+          onClose={() => setCreateRoomOpen(false)}
+          projectId={projectId}
+          existingRoomNames={rooms.rooms.map((room) => room.name)}
+          onCreate={async (draft) => {
+            await rooms.createRoom({ name: draft.name, memberAgentIds: draft.memberAgentIds });
+            setCreateRoomOpen(false);
+          }}
+        />
+      )}
 
       {/* New Chat Dialog (rendered at root level) */}
       {showNewDialog && (

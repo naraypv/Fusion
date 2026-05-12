@@ -1552,15 +1552,17 @@ describe("POST /agents/generate/spec with projectId scoping", () => {
 
 describe("GET /workflow-step-templates", () => {
   let store: TaskStore;
+  let pluginRunner: { getPluginWorkflowStepTemplates?: () => Array<{ pluginId: string; template: { id: string; name: string; description: string; prompt: string; toolMode: "readonly" | "coding"; category: string; icon: string } }> };
 
   beforeEach(() => {
     store = createMockStore();
+    pluginRunner = {};
   });
 
   function buildApp() {
     const app = express();
     app.use(express.json());
-    app.use("/api", createApiRoutes(store));
+    app.use("/api", createApiRoutes(store, { pluginRunner: pluginRunner as any }));
     return app;
   }
 
@@ -1595,19 +1597,67 @@ describe("GET /workflow-step-templates", () => {
     expect(ids).toContain("browser-verification");
     expect(ids).toContain("frontend-ux-design");
   });
+
+  it("merges plugin templates into workflow-step-templates response", async () => {
+    pluginRunner.getPluginWorkflowStepTemplates = () => [
+      {
+        pluginId: "my-plugin",
+        template: {
+          id: "plugin:my-plugin:my-step",
+          name: "My Plugin Step",
+          description: "Plugin contributed step",
+          prompt: "Run plugin checks",
+          toolMode: "readonly",
+          category: "Plugin",
+          icon: "puzzle",
+        },
+      },
+    ];
+
+    const res = await GET(buildApp(), "/api/workflow-step-templates");
+
+    expect(res.status).toBe(200);
+    expect(res.body.templates.some((t: { id: string }) => t.id === "plugin:my-plugin:my-step")).toBe(true);
+  });
+
+  it("returns plugin-only templates endpoint", async () => {
+    pluginRunner.getPluginWorkflowStepTemplates = () => [
+      {
+        pluginId: "my-plugin",
+        template: {
+          id: "plugin:my-plugin:my-step",
+          name: "My Plugin Step",
+          description: "Plugin contributed step",
+          prompt: "Run plugin checks",
+          toolMode: "readonly",
+          category: "Plugin",
+          icon: "puzzle",
+        },
+      },
+    ];
+
+    const res = await GET(buildApp(), "/api/plugin-workflow-step-templates");
+
+    expect(res.status).toBe(200);
+    expect(res.body.templates).toHaveLength(1);
+    expect(res.body.templates[0].pluginId).toBe("my-plugin");
+    expect(res.body.templates[0].template.id).toBe("plugin:my-plugin:my-step");
+  });
 });
 
 describe("POST /workflow-step-templates/:id/create", () => {
   let store: TaskStore;
+  let pluginRunner: { getPluginWorkflowStepTemplates?: () => Array<{ pluginId: string; template: { id: string; name: string; description: string; prompt: string; toolMode: "readonly" | "coding"; category: string; icon: string } }> };
 
   beforeEach(() => {
     store = createMockStore();
+    pluginRunner = {};
   });
 
   function buildApp() {
     const app = express();
     app.use(express.json());
-    app.use("/api", createApiRoutes(store));
+    app.use("/api", createApiRoutes(store, { pluginRunner: pluginRunner as any }));
     return app;
   }
 
@@ -1701,6 +1751,45 @@ describe("POST /workflow-step-templates/:id/create", () => {
     });
   });
 
+  it("creates workflow step from plugin template", async () => {
+    pluginRunner.getPluginWorkflowStepTemplates = () => [
+      {
+        pluginId: "my-plugin",
+        template: {
+          id: "plugin:my-plugin:my-step",
+          name: "My Plugin Step",
+          description: "Plugin contributed step",
+          prompt: "Run plugin checks",
+          toolMode: "coding",
+          category: "Plugin",
+          icon: "puzzle",
+        },
+      },
+    ];
+    (store.listWorkflowSteps as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    (store.createWorkflowStep as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      id: "WS-999",
+      templateId: "plugin:my-plugin:my-step",
+      name: "My Plugin Step",
+      description: "Plugin contributed step",
+      prompt: "Run plugin checks",
+      toolMode: "coding",
+      enabled: true,
+      createdAt: "2026-01-01",
+      updatedAt: "2026-01-01",
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/workflow-step-templates/plugin:my-plugin:my-step/create", JSON.stringify({}), {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(201);
+    expect(store.createWorkflowStep).toHaveBeenCalledWith(expect.objectContaining({
+      templateId: "plugin:my-plugin:my-step",
+      name: "My Plugin Step",
+    }));
+  });
+
   it("returns 404 for non-existent template", async () => {
     const res = await REQUEST(buildApp(), "POST", "/api/workflow-step-templates/nonexistent/create", JSON.stringify({}), {
       "Content-Type": "application/json",
@@ -1773,6 +1862,7 @@ describe("Agent create/update routes", () => {
         reportsTo: agentId,
         runtimeConfig: { heartbeatIntervalMs: 60000 },
         permissions: { read: true },
+        permissionPolicy: { presetId: "approval-required" },
         instructionsPath: "docs/reviewer.md",
         instructionsText: "Check test quality.",
         soul: "Analytical and thorough.",
@@ -1790,6 +1880,16 @@ describe("Agent create/update routes", () => {
       reportsTo: agentId,
       runtimeConfig: { heartbeatIntervalMs: 60000 },
       permissions: { read: true },
+      permissionPolicy: {
+        presetId: "approval-required",
+        rules: {
+          git_write: "require-approval",
+          file_write_delete: "require-approval",
+          command_execution: "require-approval",
+          network_api: "require-approval",
+          task_agent_mutation: "require-approval",
+        },
+      },
       instructionsPath: "docs/reviewer.md",
       instructionsText: "Check test quality.",
       soul: "Analytical and thorough.",
@@ -1811,6 +1911,7 @@ describe("Agent create/update routes", () => {
         runtimeConfig: { heartbeatTimeoutMs: 120000 },
         pauseReason: "manual",
         permissions: { deploy: true },
+        permissionPolicy: { presetId: "locked-down" },
         totalInputTokens: 42,
         totalOutputTokens: 21,
         instructionsPath: "agents/infra.md",
@@ -1832,11 +1933,82 @@ describe("Agent create/update routes", () => {
       runtimeConfig: { heartbeatTimeoutMs: 120000 },
       pauseReason: "manual",
       permissions: { deploy: true },
+      permissionPolicy: {
+        presetId: "locked-down",
+        rules: {
+          git_write: "block",
+          file_write_delete: "block",
+          command_execution: "block",
+          network_api: "block",
+          task_agent_mutation: "block",
+        },
+      },
       totalInputTokens: 42,
       totalOutputTokens: 21,
       instructionsPath: "agents/infra.md",
       instructionsText: "Focus on reliability.",
       soul: "Pragmatic and efficient.",
+    });
+  });
+
+  it("POST /api/agents rejects invalid permissionPolicy preset", async () => {
+    const res = await REQUEST(
+      buildAgentApp(),
+      "POST",
+      "/api/agents",
+      JSON.stringify({
+        name: "Invalid Policy Agent",
+        role: "executor",
+        permissionPolicy: { presetId: "custom" },
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("permissionPolicy.presetId");
+  });
+
+  it("PATCH /api/agents/:id rejects invalid permissionPolicy payload shape", async () => {
+    const res = await REQUEST(
+      buildAgentApp(),
+      "PATCH",
+      `/api/agents/${agentId}`,
+      JSON.stringify({
+        permissionPolicy: "bad",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("permissionPolicy must be an object");
+  });
+
+  it("POST /api/agents normalizes policy rules from preset and ignores caller-supplied rules", async () => {
+    const res = await REQUEST(
+      buildAgentApp(),
+      "POST",
+      "/api/agents",
+      JSON.stringify({
+        name: "Normalized Policy Agent",
+        role: "executor",
+        permissionPolicy: {
+          presetId: "locked-down",
+          rules: {
+            "git-write": "allow",
+          },
+        },
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(res.body.permissionPolicy.presetId).toBe("locked-down");
+    expect(res.body.permissionPolicy.rules).toEqual({
+      git_write: "block",
+      file_write_delete: "block",
+      command_execution: "block",
+      network_api: "block",
+      task_agent_mutation: "block",
     });
   });
 
@@ -1941,11 +2113,16 @@ describe("Agent create/update routes", () => {
   });
 
   it("POST /api/agents/:id/state returns 400 for invalid state transitions", async () => {
+    const { AgentStore } = await import("@fusion/core");
+    const agentStore = new AgentStore({ rootDir: fusionDir });
+    await agentStore.init();
+    await agentStore.updateAgentState(agentId, "idle");
+
     const res = await REQUEST(
       buildAgentApp(),
       "POST",
       `/api/agents/${agentId}/state`,
-      JSON.stringify({ state: "terminated" }),
+      JSON.stringify({ state: "paused" }),
       { "Content-Type": "application/json" },
     );
 
@@ -3015,6 +3192,250 @@ describe("Messaging Routes", () => {
     expect(res.body.id).toBe("msg-runtime-1");
   });
 
+  it("triggers executeHeartbeat when wakeImmediately is true for agent recipients", async () => {
+    const executeHeartbeat = vi.fn().mockResolvedValue({ id: "run-1" });
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat, rootDir } as any,
+    }));
+
+    const res = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-wake-1",
+        toType: "agent",
+        content: "wake now",
+        type: "user-to-agent",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => {
+      expect(executeHeartbeat).toHaveBeenCalledWith({
+        agentId: "agent-wake-1",
+        source: "on_demand",
+        triggerDetail: "wake-on-message",
+      });
+    });
+  });
+
+  it("FN-3751: returns 201 immediately without waiting for executeHeartbeat to resolve", async () => {
+    let heartbeatResolved = false;
+    const executeHeartbeat = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            heartbeatResolved = true;
+            resolve({ id: "run-delayed" });
+          }, 500);
+        }),
+    );
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat, rootDir } as any,
+    }));
+
+    const startedAt = Date.now();
+    const res = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-wake-fast",
+        toType: "agent",
+        content: "wake without blocking send",
+        type: "user-to-agent",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(res.status).toBe(201);
+    expect(elapsedMs).toBeLessThan(100);
+    expect(heartbeatResolved).toBe(false);
+
+    await vi.waitFor(() => {
+      expect(executeHeartbeat).toHaveBeenCalledWith({
+        agentId: "agent-wake-fast",
+        source: "on_demand",
+        triggerDetail: "wake-on-message",
+      });
+    });
+  });
+
+  it("does not trigger executeHeartbeat when wakeImmediately is omitted/false or recipient is not an agent", async () => {
+    const executeHeartbeat = vi.fn().mockResolvedValue({ id: "run-1" });
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat, rootDir } as any,
+    }));
+
+    const noWake = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-no-wake",
+        toType: "agent",
+        content: "normal message",
+        type: "user-to-agent",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    const userRecipient = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "dashboard",
+        toType: "user",
+        content: "user message",
+        type: "system",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(noWake.status).toBe(201);
+    expect(userRecipient.status).toBe(201);
+    expect(executeHeartbeat).not.toHaveBeenCalled();
+  });
+
+  it("no-ops wakeImmediately when monitor root does not match and no scoped project context is provided", async () => {
+    const defaultExecuteHeartbeat = vi.fn().mockResolvedValue({ id: "run-default" });
+    const projectExecuteHeartbeat = vi.fn().mockResolvedValue({ id: "run-project" });
+
+    const engineManager = {
+      getAllEngines: vi.fn().mockReturnValue(new Map([
+        [
+          "project-1",
+          {
+            getWorkingDirectory: () => rootDir,
+            getHeartbeatMonitor: () => ({
+              executeHeartbeat: projectExecuteHeartbeat,
+              startRun: vi.fn(),
+              stopRun: vi.fn(),
+            }),
+          },
+        ],
+      ])),
+    };
+
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat: defaultExecuteHeartbeat, rootDir: join(rootDir, "other-project") } as any,
+      engineManager: engineManager as any,
+    }));
+
+    const res = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-project-scope",
+        toType: "agent",
+        content: "wake in scoped project",
+        type: "user-to-agent",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(defaultExecuteHeartbeat).not.toHaveBeenCalled();
+    expect(projectExecuteHeartbeat).not.toHaveBeenCalled();
+  });
+
+  it("returns created message even when wakeImmediately execution throws", async () => {
+    const executeHeartbeat = vi.fn().mockRejectedValue(new Error("wake failed"));
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat, rootDir } as any,
+    }));
+
+    const res = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-wake-failure",
+        toType: "agent",
+        content: "wake best effort",
+        type: "user-to-agent",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(res.body.toId).toBe("agent-wake-failure");
+    await vi.waitFor(() => {
+      expect(executeHeartbeat).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("supports metadata.wakeRecipient as an immediate-wake request", async () => {
+    const executeHeartbeat = vi.fn().mockResolvedValue({ id: "run-1" });
+    const wakeApp = express();
+    wakeApp.use(express.json());
+    wakeApp.use("/api", createApiRoutes(store, {
+      heartbeatMonitor: { executeHeartbeat, rootDir } as any,
+    }));
+
+    const res = await REQUEST(
+      wakeApp,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-wake-meta",
+        toType: "agent",
+        content: "wake via metadata",
+        type: "user-to-agent",
+        metadata: { wakeRecipient: true },
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => {
+      expect(executeHeartbeat).toHaveBeenCalledWith({
+        agentId: "agent-wake-meta",
+        source: "on_demand",
+        triggerDetail: "wake-on-message",
+      });
+    });
+  });
+
+  it("gracefully no-ops wakeImmediately when no heartbeat monitor is configured", async () => {
+    const res = await REQUEST(
+      app,
+      "POST",
+      "/api/messages",
+      JSON.stringify({
+        toId: "agent-no-monitor",
+        toType: "agent",
+        content: "wake request without monitor",
+        type: "user-to-agent",
+        wakeImmediately: true,
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(res.body.toId).toBe("agent-no-monitor");
+  });
+
   it("GET /api/messages/inbox returns dashboard inbox messages", async () => {
     const inboxMessage = messageStore.sendMessage({
       fromId: "agent-1",
@@ -3039,6 +3460,24 @@ describe("Messaging Routes", () => {
     expect(res.body.messages).toHaveLength(1);
     expect(res.body.messages[0].id).toBe(inboxMessage.id);
     expect(res.body.unreadCount).toBe(1);
+  });
+
+  it("dashboard inbox aggregates legacy dashboard user aliases", async () => {
+    messageStore.sendMessage({ fromId: "agent-1", fromType: "agent", toId: "dashboard", toType: "user", content: "A", type: "agent-to-user" });
+    messageStore.sendMessage({ fromId: "agent-1", fromType: "agent", toId: "user:dashboard", toType: "user", content: "B", type: "agent-to-user" });
+    messageStore.sendMessage({ fromId: "agent-1", fromType: "agent", toId: "User: user:dashboard", toType: "user", content: "C", type: "agent-to-user" });
+
+    const inbox = await GET(app, "/api/messages/inbox");
+    expect(inbox.status).toBe(200);
+    expect(inbox.body.messages).toHaveLength(3);
+
+    const unread = await GET(app, "/api/messages/unread-count");
+    expect(unread.body.unreadCount).toBe(3);
+    expect(unread.body.pendingApprovalCount).toBe(0);
+
+    const readAll = await REQUEST(app, "POST", "/api/messages/read-all");
+    expect(readAll.status).toBe(200);
+    expect(readAll.body.markedAsRead).toBe(3);
   });
 
   it("GET /api/messages/outbox returns dashboard sent messages", async () => {
@@ -3088,6 +3527,42 @@ describe("Messaging Routes", () => {
     expect(unread).toBeDefined();
     expect(res.status).toBe(200);
     expect(res.body.unreadCount).toBe(1);
+    expect(res.body.pendingApprovalCount).toBe(0);
+  });
+
+  it("GET /api/messages/unread-count includes pendingApprovalCount and excludes resolved approvals", async () => {
+    const { ApprovalRequestStore } = await import("@fusion/core");
+    const approvalStore = new ApprovalRequestStore(store.getDatabase());
+
+    const pending = approvalStore.create({
+      requester: { actorId: "agent-1", actorType: "agent", actorName: "Agent One" },
+      targetAction: {
+        category: "command_execution",
+        action: "npm test",
+        summary: "Run tests",
+        resourceType: "command",
+        resourceId: "npm test",
+      },
+    });
+    const resolved = approvalStore.create({
+      requester: { actorId: "agent-2", actorType: "agent", actorName: "Agent Two" },
+      targetAction: {
+        category: "command_execution",
+        action: "npm run lint",
+        summary: "Run lint",
+        resourceType: "command",
+        resourceId: "npm run lint",
+      },
+    });
+    approvalStore.decide(resolved.id, "denied", {
+      actor: { actorId: "user", actorType: "user", actorName: "User" },
+    });
+
+    const res = await GET(app, "/api/messages/unread-count");
+
+    expect(pending).toBeDefined();
+    expect(res.status).toBe(200);
+    expect(res.body.pendingApprovalCount).toBe(1);
   });
 
   it("POST /api/messages validates required fields and creates messages", async () => {
@@ -3124,6 +3599,16 @@ describe("Messaging Routes", () => {
           metadata: { replyTo: { messageId: "" } },
         },
         message: "metadata.replyTo.messageId must be a non-empty string",
+      },
+      {
+        body: {
+          toId: "agent-1",
+          toType: "agent",
+          content: "x",
+          type: "user-to-agent",
+          wakeImmediately: "yes",
+        },
+        message: "wakeImmediately must be a boolean",
       },
     ];
 
@@ -3284,6 +3769,44 @@ describe("Messaging Routes", () => {
     expect(ids).toHaveLength(2);
   });
 
+  it("GET /api/agents/mailbox/all returns aggregate agent-to-agent mailbox data", async () => {
+    const first = messageStore.sendMessage({
+      fromId: "agent-1",
+      fromType: "agent",
+      toId: "agent-2",
+      toType: "agent",
+      content: "first",
+      type: "agent-to-agent",
+    });
+    const second = messageStore.sendMessage({
+      fromId: "agent-2",
+      fromType: "agent",
+      toId: "agent-1",
+      toType: "agent",
+      content: "second",
+      type: "agent-to-agent",
+    });
+    messageStore.sendMessage({
+      fromId: "agent-1",
+      fromType: "agent",
+      toId: "dashboard",
+      toType: "user",
+      content: "ignore",
+      type: "agent-to-user",
+    });
+
+    messageStore.markAsRead(first.id);
+
+    const res = await GET(app, "/api/agents/mailbox/all");
+
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBe(2);
+    expect(res.body.unreadCount).toBe(1);
+    expect(res.body.messages).toHaveLength(2);
+    expect(res.body.messages[0].id).toBe(second.id);
+    expect(res.body.messages.every((m: { type: string }) => m.type === "agent-to-agent")).toBe(true);
+  });
+
   it("GET /api/agents/:id/mailbox returns mailbox summary and inbox messages", async () => {
     const agentId = "agent-mailbox";
     const msg = messageStore.sendMessage({
@@ -3313,11 +3836,14 @@ describe("Agent stale task-link sanitization", () => {
   let tempDir: string;
   let fusionDir: string;
   let agentId: string;
+  let routeDb: Database;
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), "kb-routes-agent-stale-"));
     fusionDir = join(tempDir, ".fusion");
     mkdirSync(fusionDir, { recursive: true });
+    routeDb = new Database(fusionDir, { inMemory: false });
+    routeDb.init();
 
     const { AgentStore } = await import("@fusion/core");
     const agentStore = new AgentStore({ rootDir: fusionDir });
@@ -3330,18 +3856,102 @@ describe("Agent stale task-link sanitization", () => {
   });
 
   afterEach(() => {
+    routeDb.close();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
   function buildAgentApp() {
     const store = createMockStore({
       getFusionDir: vi.fn().mockReturnValue(fusionDir),
+      getDatabase: vi.fn().mockReturnValue(routeDb),
     } as any);
     const app = express();
     app.use(express.json());
     app.use("/api", createApiRoutes(store));
     return app;
   }
+
+  async function createPendingApproval(requesterId: string) {
+    const { ApprovalRequestStore } = await import("@fusion/core");
+    const approvalStore = new ApprovalRequestStore(routeDb);
+    approvalStore.create({
+      requester: { actorId: requesterId, actorType: "agent", actorName: "Executor" },
+      targetAction: {
+        category: "command_execution",
+        action: "npm test",
+        summary: "Run tests",
+        resourceType: "command",
+        resourceId: "npm test",
+      },
+    });
+    }
+
+  it("GET /api/agents returns pendingApprovalCount=0 when no pending approvals exist", async () => {
+    const app = buildAgentApp();
+
+    const res = await GET(app, "/api/agents");
+
+    expect(res.status).toBe(200);
+    const agents = Array.isArray(res.body) ? res.body : [res.body];
+    const testAgent = agents.find((a: { id: string }) => a.id === agentId);
+    expect(testAgent).toBeDefined();
+    expect(testAgent.pendingApprovalCount).toBe(0);
+  });
+
+  it("GET /api/agents and /api/agents/:id include pendingApprovalCount for pending approvals", async () => {
+    const app = buildAgentApp();
+    await createPendingApproval(agentId);
+    await createPendingApproval(agentId);
+
+    const listRes = await GET(app, "/api/agents");
+    expect(listRes.status).toBe(200);
+    const agents = Array.isArray(listRes.body) ? listRes.body : [listRes.body];
+    const listed = agents.find((a: { id: string }) => a.id === agentId);
+    expect(listed).toBeDefined();
+    expect(listed.pendingApprovalCount).toBe(2);
+
+    const detailRes = await GET(app, `/api/agents/${agentId}`);
+    expect(detailRes.status).toBe(200);
+    expect(detailRes.body.pendingApprovalCount).toBe(2);
+  });
+
+  it("GET /api/agents pendingApprovalCount excludes approvals that are no longer pending", async () => {
+    const app = buildAgentApp();
+
+    const { ApprovalRequestStore } = await import("@fusion/core");
+    const approvalStore = new ApprovalRequestStore(routeDb);
+    const request = approvalStore.create({
+      requester: { actorId: agentId, actorType: "agent", actorName: "Executor" },
+      targetAction: {
+        category: "command_execution",
+        action: "npm test",
+        summary: "Run tests",
+        resourceType: "command",
+        resourceId: "npm test",
+      },
+    });
+    approvalStore.decide(request.id, "approved", {
+      actor: { actorId: "user", actorType: "user", actorName: "User" },
+    });
+    const res = await GET(app, "/api/agents");
+    expect(res.status).toBe(200);
+    const agents = Array.isArray(res.body) ? res.body : [res.body];
+    const listed = agents.find((a: { id: string }) => a.id === agentId);
+    expect(listed).toBeDefined();
+    expect(listed.pendingApprovalCount).toBe(0);
+  });
+
+  it("GET /api/agents pendingApprovalCount ignores approvals for missing agents", async () => {
+    const app = buildAgentApp();
+    await createPendingApproval("agent-missing");
+
+    const res = await GET(app, "/api/agents");
+    expect(res.status).toBe(200);
+    const agents = Array.isArray(res.body) ? res.body : [res.body];
+    const listed = agents.find((a: { id: string }) => a.id === agentId);
+    expect(listed).toBeDefined();
+    expect(listed.pendingApprovalCount).toBe(0);
+  });
 
   it("GET /api/agents omits taskId when linked task is done", async () => {
     const doneTaskId = "FN-DONE";

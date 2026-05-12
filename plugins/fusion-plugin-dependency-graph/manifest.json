@@ -7,7 +7,7 @@
     {
       "viewId": "graph",
       "label": "Graph",
-      "componentPath": "./src/DependencyGraphView.tsx",
+      "componentPath": "./dashboard-view",
       "icon": "Network",
       "placement": "more",
       "order": 40

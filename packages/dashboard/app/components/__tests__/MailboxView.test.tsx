@@ -4,6 +4,8 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { MailboxView } from "../MailboxView";
 import * as apiModule from "../../api";
 import * as viewportModule from "../../hooks/useViewportMode";
+import * as mobileKeyboardModule from "../../hooks/useMobileKeyboard";
+import * as sseBusModule from "../../sse-bus";
 import type { Agent } from "../../api";
 import type { Message } from "@fusion/core";
 
@@ -13,16 +15,32 @@ vi.mock("../../api", () => ({
   fetchOutbox: vi.fn(),
   fetchUnreadCount: vi.fn(),
   fetchAgentMailbox: vi.fn(),
+  fetchAllAgentMailbox: vi.fn(),
   markMessageRead: vi.fn(),
   markAllMessagesRead: vi.fn(),
   deleteMessage: vi.fn(),
   fetchConversation: vi.fn(),
   sendMessage: vi.fn(),
   fetchAgents: vi.fn(),
+  fetchApprovals: vi.fn(),
+  fetchApprovalDetail: vi.fn(),
+  decideApproval: vi.fn(),
 }));
 
 vi.mock("../../hooks/useViewportMode", () => ({
   useViewportMode: vi.fn(),
+}));
+
+vi.mock("../../hooks/useMobileKeyboard", () => ({
+  useMobileKeyboard: vi.fn(),
+}));
+
+const sseSubscriptions: Array<Record<string, () => void>> = [];
+vi.mock("../../sse-bus", () => ({
+  subscribeSse: vi.fn((_url: string, options: { events: Record<string, () => void> }) => {
+    sseSubscriptions.push(options.events);
+    return () => {};
+  }),
 }));
 
 // Mock lucide-react icons
@@ -48,13 +66,19 @@ const mockFetchInbox = vi.mocked(apiModule.fetchInbox);
 const mockFetchOutbox = vi.mocked(apiModule.fetchOutbox);
 const mockFetchUnreadCount = vi.mocked(apiModule.fetchUnreadCount);
 const mockFetchAgentMailbox = vi.mocked(apiModule.fetchAgentMailbox);
+const mockFetchAllAgentMailbox = vi.mocked(apiModule.fetchAllAgentMailbox);
 const mockFetchAgents = vi.mocked(apiModule.fetchAgents);
 const mockMarkMessageRead = vi.mocked(apiModule.markMessageRead);
 const mockMarkAllMessagesRead = vi.mocked(apiModule.markAllMessagesRead);
 const mockDeleteMessage = vi.mocked(apiModule.deleteMessage);
 const mockFetchConversation = vi.mocked(apiModule.fetchConversation);
 const mockSendMessage = vi.mocked(apiModule.sendMessage);
+const mockFetchApprovals = vi.mocked(apiModule.fetchApprovals);
+const mockFetchApprovalDetail = vi.mocked(apiModule.fetchApprovalDetail);
+const mockDecideApproval = vi.mocked(apiModule.decideApproval);
+const mockSubscribeSse = vi.mocked(sseBusModule.subscribeSse);
 const mockUseViewportMode = vi.mocked(viewportModule.useViewportMode);
+const mockUseMobileKeyboard = vi.mocked(mobileKeyboardModule.useMobileKeyboard);
 
 const mockAgents: Agent[] = [
   {
@@ -147,10 +171,19 @@ function makeOutboxResponse(messages: Message[]) {
 describe("MailboxView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
+    sseSubscriptions.length = 0;
     mockUseViewportMode.mockReturnValue("desktop");
+    mockUseMobileKeyboard.mockReturnValue({
+      keyboardOverlap: 0,
+      viewportHeight: null,
+      viewportOffsetTop: 0,
+      keyboardOpen: false,
+    });
     mockFetchUnreadCount.mockResolvedValue({ unreadCount: 2 });
     mockFetchAgents.mockResolvedValue(mockAgents);
     mockSendMessage.mockResolvedValue({ ...mockMessage, id: "msg-sent" });
+    mockFetchApprovals.mockResolvedValue({ requests: [], total: 0, pendingCount: 0 });
   });
 
   it("renders the mailbox view", async () => {
@@ -180,7 +213,7 @@ describe("MailboxView", () => {
     });
   });
 
-  it("renders all three tabs", async () => {
+  it("renders all four tabs", async () => {
     mockFetchInbox.mockResolvedValue({
       messages: [],
       unreadCount: 0,
@@ -192,6 +225,210 @@ describe("MailboxView", () => {
     expect(screen.getByTestId("mailbox-tab-inbox")).toBeDefined();
     expect(screen.getByTestId("mailbox-tab-outbox")).toBeDefined();
     expect(screen.getByTestId("mailbox-tab-agents")).toBeDefined();
+    expect(screen.getByTestId("mailbox-tab-approvals")).toBeDefined();
+  });
+
+  it("shows approvals pending badge and loads approvals tab", async () => {
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({
+      requests: [{
+        id: "apr-1",
+        status: "pending",
+        actionCategory: "command_execution",
+        actionSummary: "Run npm test",
+        agentId: "agent-001",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }],
+      total: 1,
+      pendingCount: 2,
+    });
+
+    render(<MailboxView {...defaultProps} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("mailbox-tab-approvals"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-approvals-pending-badge")).toHaveTextContent("2");
+      expect(screen.getByTestId("mailbox-approval-item-apr-1")).toBeDefined();
+    });
+  });
+
+  it("renders approval detail metadata and history", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({
+      requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", taskId: "FN-1", createdAt: now, updatedAt: now }],
+      total: 1,
+      pendingCount: 1,
+    });
+    mockFetchApprovalDetail.mockResolvedValue({
+      id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", taskId: "FN-1", createdAt: now, updatedAt: now,
+      requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now,
+      targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" },
+      history: [{ id: "evt-1", eventType: "created", actor: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, createdAt: now }],
+    });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-approval-detail")).toBeDefined();
+      expect(screen.getByText(/Requester: Agent 1/)).toBeDefined();
+      expect(screen.getByText(/Task: FN-1/)).toBeDefined();
+      expect(screen.getByTestId("mailbox-approval-history")).toBeDefined();
+    });
+  });
+
+  it("allows approving a pending approval request", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({
+      requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }],
+      total: 1,
+      pendingCount: 1,
+    });
+    mockFetchApprovalDetail.mockResolvedValue({
+      id: "apr-1",
+      status: "pending",
+      actionCategory: "command_execution",
+      actionSummary: "Run npm test",
+      agentId: "agent-001",
+      createdAt: now,
+      updatedAt: now,
+      requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" },
+      requestedAt: now,
+      targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" },
+      history: [{ id: "evt-1", eventType: "created", actor: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, createdAt: now }],
+    });
+    mockDecideApproval.mockResolvedValue({
+      id: "apr-1",
+      status: "approved",
+      actionCategory: "command_execution",
+      actionSummary: "Run npm test",
+      agentId: "agent-001",
+      createdAt: now,
+      updatedAt: now,
+      requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" },
+      requestedAt: now,
+      targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" },
+      history: [{ id: "evt-2", eventType: "approved", actor: { actorId: "user", actorType: "user", actorName: "User" }, createdAt: now }],
+    });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-approve")); });
+
+    await waitFor(() => {
+      expect(mockDecideApproval).toHaveBeenCalledWith("apr-1", { decision: "approve", comment: undefined }, undefined);
+    });
+  });
+
+  it("allows denying a pending approval request", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+    mockDecideApproval.mockResolvedValue({ id: "apr-1", status: "denied", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-deny")); });
+
+    await waitFor(() => {
+      expect(mockDecideApproval).toHaveBeenCalledWith("apr-1", { decision: "deny", comment: undefined }, undefined);
+    });
+  });
+
+  it("disables decision buttons while submission is pending", async () => {
+    const now = new Date().toISOString();
+    let resolveDecision: (() => void) | undefined;
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+    mockDecideApproval.mockImplementation(() => new Promise((resolve) => { resolveDecision = () => resolve({} as any); }));
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-approve")); });
+
+    expect(screen.getByTestId("mailbox-approval-approve")).toBeDisabled();
+    expect(screen.getByTestId("mailbox-approval-deny")).toBeDisabled();
+    expect(mockDecideApproval).toHaveBeenCalledTimes(1);
+    resolveDecision?.();
+  });
+
+  it("uses mobile stacked layout for approvals detail and back navigation", async () => {
+    const now = new Date().toISOString();
+    mockUseViewportMode.mockReturnValue("mobile");
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-approval-detail")).toBeDefined();
+      expect(screen.queryByTestId("mailbox-approval-list")).toBeNull();
+      expect(screen.getByTestId("mailbox-approval-back-to-list")).toBeDefined();
+    });
+
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-approval-back-to-list")); });
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-approval-list")).toBeDefined();
+    });
+  });
+
+  it("refreshes approvals on approval SSE events", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals.mockResolvedValue({ requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+
+    const latest = sseSubscriptions.at(-1);
+    expect(latest).toBeDefined();
+    await act(async () => {
+      latest?.["approval:requested"]?.();
+      latest?.["approval:updated"]?.();
+      latest?.["approval:decided"]?.();
+    });
+
+    await waitFor(() => {
+      expect(mockFetchApprovals).toHaveBeenCalled();
+      expect(mockSubscribeSse).toHaveBeenCalled();
+    });
+  });
+
+  it("moves decided requests into history view", async () => {
+    const now = new Date().toISOString();
+    mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+    mockFetchApprovals
+      .mockResolvedValueOnce({ requests: [{ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 1 })
+      .mockResolvedValueOnce({ requests: [], total: 0, pendingCount: 0 })
+      .mockResolvedValueOnce({ requests: [{ id: "apr-1", status: "approved", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now }], total: 1, pendingCount: 0 })
+      .mockResolvedValue({ requests: [], total: 0, pendingCount: 0 });
+    mockFetchApprovalDetail.mockResolvedValue({ id: "apr-1", status: "pending", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+    mockDecideApproval.mockResolvedValue({ id: "apr-1", status: "approved", actionCategory: "command_execution", actionSummary: "Run npm test", agentId: "agent-001", createdAt: now, updatedAt: now, requester: { actorId: "agent-001", actorType: "agent", actorName: "Agent 1" }, requestedAt: now, targetAction: { category: "command_execution", action: "bash", summary: "Run npm test", resourceType: "command", resourceId: "cmd" }, history: [] });
+
+    render(<MailboxView {...defaultProps} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-tab-approvals")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-item-apr-1")); });
+    await act(async () => { fireEvent.click(await screen.findByTestId("mailbox-approval-approve")); });
+    await act(async () => { fireEvent.click(screen.getByTestId("mailbox-approval-filter-history")); });
+
+    await waitFor(() => {
+      expect(mockFetchApprovals).toHaveBeenCalled();
+    });
   });
 
   it("shows inbox tab as active by default", async () => {
@@ -231,7 +468,7 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversations")).toBeDefined();
+      expect(screen.getByTestId("mailbox-inbox-list")).toBeDefined();
     });
   });
 
@@ -263,10 +500,15 @@ describe("MailboxView", () => {
     });
   });
 
-  it("groups messages by sender and shows unread count per group", async () => {
-    const secondMessage = { ...mockMessage, id: "msg-003", read: false };
+  it("renders separate inbox rows for independent messages from the same sender", async () => {
+    const secondMessage = {
+      ...mockMessage,
+      id: "msg-003",
+      content: "Second top-level message",
+      metadata: undefined,
+    };
     mockFetchInbox.mockResolvedValue({
-      messages: [mockMessage, secondMessage], // Same sender, both unread
+      messages: [mockMessage, secondMessage],
       unreadCount: 2,
       total: 2,
     });
@@ -274,10 +516,42 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      // Should show one conversation group with 2 unread
-      const group = screen.getByTestId("mailbox-conversation-agent:agent-001");
-      expect(group).toBeDefined();
-      expect(screen.getByTestId("mailbox-unread-badge-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-003")).toBeDefined();
+      expect(screen.getByTestId("mailbox-unread-dot-msg-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-unread-dot-msg-003")).toBeDefined();
+    });
+  });
+
+  it("opens the specific selected inbox row when same-sender messages are separate", async () => {
+    const secondMessage: Message = {
+      ...mockMessage,
+      id: "msg-003",
+      content: "Second top-level message",
+      createdAt: new Date(Date.now() + 1000).toISOString(),
+    };
+
+    mockFetchInbox.mockResolvedValue({
+      messages: [mockMessage, secondMessage],
+      unreadCount: 2,
+      total: 2,
+    });
+    mockFetchConversation.mockResolvedValue([secondMessage]);
+    mockMarkMessageRead.mockResolvedValue({ ...secondMessage, read: true });
+
+    render(<MailboxView {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-item-msg-003")).toBeDefined();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-003"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-message-body")).toHaveTextContent("Second top-level message");
+      expect(mockMarkMessageRead).toHaveBeenCalledWith("msg-003", undefined);
     });
   });
 
@@ -291,7 +565,7 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-unread-badge-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-unread-dot-msg-001")).toBeDefined();
     });
   });
 
@@ -362,11 +636,11 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -391,7 +665,7 @@ describe("MailboxView", () => {
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -416,6 +690,27 @@ describe("MailboxView", () => {
     });
   });
 
+  it("applies visual viewport CSS variables when mobile keyboard is open", async () => {
+    mockUseViewportMode.mockReturnValue("mobile");
+    mockUseMobileKeyboard.mockReturnValue({
+      keyboardOverlap: 240,
+      viewportHeight: 480,
+      viewportOffsetTop: 32,
+      keyboardOpen: true,
+    });
+    mockFetchInbox.mockResolvedValue({
+      messages: [],
+      unreadCount: 0,
+      total: 0,
+    });
+
+    render(<MailboxView {...defaultProps} />);
+
+    const mailboxView = await screen.findByTestId("mailbox-view");
+    expect(mailboxView.getAttribute("style")).toContain("--vv-offset-top: 32px");
+    expect(mailboxView.getAttribute("style")).toContain("--vv-height: 480px");
+  });
+
   it("keeps mobile single-pane flow for detail open and back navigation", async () => {
     mockUseViewportMode.mockReturnValue("mobile");
     mockFetchInbox.mockResolvedValue({
@@ -434,7 +729,7 @@ describe("MailboxView", () => {
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -465,11 +760,11 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-004")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-004"));
     });
 
     await waitFor(() => {
@@ -491,11 +786,11 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} onUnreadCountChange={onUnreadCountChange} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -543,11 +838,11 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -579,11 +874,11 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-001")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-001"));
     });
 
     await waitFor(() => {
@@ -653,19 +948,57 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-thread-root")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-thread-root"));
     });
 
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-conversation")).toBeDefined();
       const replyContext = screen.getByTestId("mailbox-reply-context-msg-thread-reply");
       expect(replyContext).toBeDefined();
-      expect(replyContext).toHaveClass("mailbox-reply-context");
+      expect(replyContext).toHaveClass("mailbox-reply-context-static");
       expect(screen.getByText(/Replying to Can you share your current status\?/)).toBeDefined();
+    });
+  });
+
+  it("does not pull unrelated same-sender messages into selected detail thread", async () => {
+    const root: Message = {
+      ...mockMessage,
+      id: "msg-thread-root-only",
+      content: "Root request",
+    };
+    const unrelated: Message = {
+      ...mockMessage,
+      id: "msg-unrelated",
+      content: "Independent update",
+      createdAt: new Date(Date.now() + 10_000).toISOString(),
+    };
+
+    mockFetchInbox.mockResolvedValue({
+      messages: [root],
+      unreadCount: 1,
+      total: 1,
+    });
+    mockFetchConversation.mockResolvedValue([root, unrelated]);
+    mockMarkMessageRead.mockResolvedValue({ ...root, read: true });
+
+    render(<MailboxView {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("mailbox-item-msg-thread-root-only")).toBeDefined();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-thread-root-only"));
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("mailbox-conversation")).toBeNull();
+      expect(screen.getByTestId("mailbox-message-body")).toHaveTextContent("Root request");
+      expect(screen.queryByText("Independent update")).toBeNull();
     });
   });
 
@@ -688,17 +1021,17 @@ describe("MailboxView", () => {
     render(<MailboxView {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByTestId("mailbox-conversation-agent:agent-001")).toBeDefined();
+      expect(screen.getByTestId("mailbox-item-msg-reply-single")).toBeDefined();
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByTestId("mailbox-conversation-agent:agent-001"));
+      fireEvent.click(screen.getByTestId("mailbox-item-msg-reply-single"));
     });
 
     await waitFor(() => {
       const replyContext = screen.getByTestId("mailbox-selected-reply-context");
       expect(replyContext).toBeDefined();
-      expect(replyContext).toHaveClass("mailbox-reply-context");
+      expect(replyContext).toHaveClass("mailbox-reply-context-static");
       expect(screen.getByTestId("mailbox-message-body")).toHaveTextContent("I have the answer now");
     });
   });
@@ -887,6 +1220,80 @@ describe("MailboxView", () => {
   });
 
   describe("agent mailbox sub-tabs", () => {
+    it("shows All agents option and renders aggregate stream without subtabs", async () => {
+      const aggregateMessage: Message = {
+        ...mockAgentToAgentMessage,
+        id: "msg-all-agents",
+        fromId: "agent-001",
+        toId: "agent-002",
+        type: "agent-to-agent",
+      };
+
+      mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+      mockFetchAllAgentMailbox.mockResolvedValue({
+        messages: [aggregateMessage],
+        total: 1,
+        unreadCount: 1,
+      });
+      mockFetchConversation.mockResolvedValue([aggregateMessage]);
+
+      render(<MailboxView {...defaultProps} />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("mailbox-tab-agents"));
+      });
+
+      fireEvent.change(screen.getByTestId("mailbox-agent-select"), { target: { value: "__all_agents__" } });
+
+      await waitFor(() => {
+        expect(mockFetchAllAgentMailbox).toHaveBeenCalledWith(undefined);
+        expect(screen.queryByTestId("mailbox-agent-subtabs")).toBeNull();
+        expect(screen.getByTestId("mailbox-item-participants-msg-all-agents")).toHaveTextContent("From: Agent: Test Agent 1 (agent-001)");
+        expect(screen.getByTestId("mailbox-item-participants-msg-all-agents")).toHaveTextContent("To: Agent: Test Agent 2 (agent-002)");
+      });
+    });
+
+    it("does not preselect a recipient when composing from All agents", async () => {
+      mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+      mockFetchAllAgentMailbox.mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
+
+      render(<MailboxView {...defaultProps} />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("mailbox-tab-agents"));
+      });
+      fireEvent.change(screen.getByTestId("mailbox-agent-select"), { target: { value: "__all_agents__" } });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("mailbox-compose-btn"));
+      });
+
+      await waitFor(() => {
+        const recipientSelect = screen.getByTestId("message-composer-recipient") as HTMLSelectElement;
+        expect(recipientSelect.value).toBe("");
+      });
+    });
+
+    it("refreshes all-agents mailbox on message SSE events", async () => {
+      mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+      mockFetchAllAgentMailbox.mockResolvedValue({ messages: [], total: 0, unreadCount: 0 });
+
+      render(<MailboxView {...defaultProps} />);
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("mailbox-tab-agents"));
+      });
+      fireEvent.change(screen.getByTestId("mailbox-agent-select"), { target: { value: "__all_agents__" } });
+
+      const latest = sseSubscriptions.at(-1);
+      await act(async () => {
+        latest?.["message:sent"]?.();
+      });
+
+      await waitFor(() => {
+        expect(mockFetchAllAgentMailbox).toHaveBeenCalled();
+      });
+    });
     it("shows inbox and outbox sub-tabs when agent is selected", async () => {
       mockFetchInbox.mockResolvedValue({
         messages: [],
@@ -972,6 +1379,58 @@ describe("MailboxView", () => {
       await waitFor(() => {
         expect(screen.getByText("Agent: Test Agent 2 (agent-002)")).toBeDefined();
       });
+    });
+
+    it("does not mark agent inbox messages as read when the dashboard user opens them", async () => {
+      const agentInboxMessage: Message = {
+        id: "msg-agent-unread",
+        fromId: "user-001",
+        fromType: "user",
+        toId: "agent-001",
+        toType: "agent",
+        content: "Important — please reply",
+        type: "user-to-agent",
+        read: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      mockFetchInbox.mockResolvedValue({ messages: [], unreadCount: 0, total: 0 });
+      mockFetchAgentMailbox.mockResolvedValue({
+        ownerId: "agent-001",
+        ownerType: "agent",
+        unreadCount: 1,
+        messages: [agentInboxMessage],
+        inbox: [agentInboxMessage],
+        outbox: [],
+      });
+      mockFetchConversation.mockResolvedValue([agentInboxMessage]);
+
+      render(<MailboxView {...defaultProps} />);
+
+      const agentsTab = screen.getByTestId("mailbox-tab-agents");
+      await act(async () => {
+        fireEvent.click(agentsTab);
+      });
+
+      fireEvent.change(screen.getByTestId("mailbox-agent-select"), { target: { value: "agent-001" } });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("mailbox-item-msg-agent-unread")).toBeDefined();
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("mailbox-item-msg-agent-unread"));
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("mailbox-message-detail")).toBeDefined();
+      });
+
+      // Critical: the dashboard user browsing an agent's mailbox MUST NOT
+      // consume the agent's unread state — the agent's heartbeat is the
+      // authoritative reader.
+      expect(mockMarkMessageRead).not.toHaveBeenCalled();
     });
 
     it("switches to outbox view when clicking outbox sub-tab", async () => {
@@ -1156,6 +1615,80 @@ describe("MailboxView", () => {
     });
   });
 
+  describe("resizable split pane", () => {
+    it("renders a desktop resize handle with separator aria semantics", async () => {
+      mockUseViewportMode.mockReturnValue("desktop");
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
+
+      render(<MailboxView {...defaultProps} projectId="proj-resize" />);
+
+      const handle = await screen.findByTestId("mailbox-split-resize-handle");
+      expect(handle.getAttribute("role")).toBe("separator");
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBeGreaterThan(0);
+    });
+
+    it("does not render the resize handle on mobile", async () => {
+      mockUseViewportMode.mockReturnValue("mobile");
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
+
+      render(<MailboxView {...defaultProps} />);
+
+      await screen.findByTestId("mailbox-view");
+      expect(screen.queryByTestId("mailbox-split-resize-handle")).toBeNull();
+    });
+
+    it("supports keyboard resize and Home/End clamping", async () => {
+      mockUseViewportMode.mockReturnValue("desktop");
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
+
+      render(<MailboxView {...defaultProps} projectId="proj-keys" />);
+
+      const handle = await screen.findByTestId("mailbox-split-resize-handle");
+      const initial = Number(handle.getAttribute("aria-valuenow"));
+
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+      const afterLeft = Number(handle.getAttribute("aria-valuenow"));
+      expect(afterLeft).toBeLessThan(initial);
+
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      const afterRight = Number(handle.getAttribute("aria-valuenow"));
+      expect(afterRight).toBeGreaterThanOrEqual(afterLeft);
+
+      fireEvent.keyDown(handle, { key: "Home" });
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(280);
+
+      fireEvent.keyDown(handle, { key: "End" });
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBeGreaterThanOrEqual(280);
+    });
+
+    it("persists and restores scoped mailbox sidebar width", async () => {
+      mockUseViewportMode.mockReturnValue("desktop");
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
+
+      const projectId = "proj-persist";
+      const storageKey = `kb:${projectId}:kb-dashboard-mailbox-sidebar-width`;
+      window.localStorage.setItem(storageKey, "360");
+
+      const { unmount } = render(<MailboxView {...defaultProps} projectId={projectId} />);
+
+      const handle = await screen.findByTestId("mailbox-split-resize-handle");
+      expect(Number(handle.getAttribute("aria-valuenow"))).toBe(360);
+
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      await waitFor(() => {
+        const savedWidth = Number(window.localStorage.getItem(storageKey));
+        expect(savedWidth).toBeGreaterThan(360);
+      });
+
+      unmount();
+      render(<MailboxView {...defaultProps} projectId={projectId} />);
+      const remountedHandle = await screen.findByTestId("mailbox-split-resize-handle");
+      const persistedWidth = Number(window.localStorage.getItem(storageKey));
+      expect(Number(remountedHandle.getAttribute("aria-valuenow"))).toBe(Math.round(persistedWidth));
+    });
+  });
+
   describe("mobile layout CSS regressions", () => {
     it("defines .mailbox-view base flex layout with min-height: 0", async () => {
       const fs = await import("fs");
@@ -1175,19 +1708,16 @@ describe("MailboxView", () => {
     it("defines desktop/tablet split-pane selectors under .mailbox-view scope", async () => {
       const css = loadAllAppCss();
 
-      const splitLayoutBlockMatch = css.match(/\.mailbox-view\s+\.mailbox-split-layout\s*\{([^}]*)\}/);
-      expect(splitLayoutBlockMatch).toBeTruthy();
-      const splitLayoutBlock = splitLayoutBlockMatch![1];
-      expect(splitLayoutBlock).toContain("display: grid;");
-      expect(splitLayoutBlock).toContain("min-height: 0;");
-      expect(splitLayoutBlock).toContain("grid-template-columns");
+      expect(css).toMatch(/\.mailbox-view\s+\.mailbox-split-layout\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*auto\s+auto\s+minmax\(0,\s*1fr\);[^}]*gap:\s*0;[^}]*min-height:\s*0;[^}]*\}/);
 
       const splitPaneBlockMatch = css.match(/\.mailbox-view\s+\.mailbox-split-list-pane,\s*\n\.mailbox-view\s+\.mailbox-split-detail-pane\s*\{([^}]*)\}/);
       expect(splitPaneBlockMatch).toBeTruthy();
       const splitPaneBlock = splitPaneBlockMatch![1];
       expect(splitPaneBlock).toContain("overflow-y: auto;");
-      expect(splitPaneBlock).toContain("border: 1px solid var(--border);");
+      expect(splitPaneBlock).toContain("border: var(--btn-border-width) solid var(--border);");
       expect(splitPaneBlock).toContain("background: var(--surface);");
+
+      expect(css).toMatch(/\.mailbox-view\s+\.mailbox-split-resize-handle\s*\{[^}]*cursor:\s*col-resize;[^}]*background:\s*color-mix\(in srgb,\s*var\(--border\)\s*70%,\s*transparent\);[^}]*\}/);
 
       const splitEmptyBlockMatch = css.match(/\.mailbox-view\s+\.mailbox-split-empty\s*\{([^}]*)\}/);
       expect(splitEmptyBlockMatch).toBeTruthy();
@@ -1212,14 +1742,16 @@ describe("MailboxView", () => {
       // Verify .mailbox-view selectors are in mobile section
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-header");
       expect(mailboxMobileSection).toMatch(/\.mailbox-modal \.mailbox-header-actions,\s*\.mailbox-view \.mailbox-header-actions\s*\{[^}]*gap:\s*var\(--space-sm\);[^}]*\}/);
-      expect(mailboxMobileSection).toMatch(/\.mailbox-modal \.mailbox-header-actions \.btn,[^}]*\.mailbox-view \.mailbox-header-actions \.btn-icon\s*\{[^}]*min-height:\s*36px;[^}]*\}/);
-      expect(mailboxMobileSection).toMatch(/\.mailbox-modal \.mailbox-header-actions \.btn-icon,[^}]*\.mailbox-view \.mailbox-header-actions \.btn-icon\s*\{[^}]*min-width:\s*36px;[^}]*display:\s*inline-flex;[^}]*\}/);
+      expect(mailboxMobileSection).toMatch(/\.mailbox-modal \.mailbox-header-actions \.btn,[^}]*\.mailbox-view \.mailbox-header-actions \.btn-icon\s*\{[^}]*min-height:\s*2\.25rem;[^}]*\}/);
+      expect(mailboxMobileSection).toMatch(/\.mailbox-modal \.mailbox-header-actions \.btn-icon,[^}]*\.mailbox-view \.mailbox-header-actions \.btn-icon\s*\{[^}]*min-width:\s*2\.25rem;[^}]*display:\s*inline-flex;[^}]*\}/);
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-tabs");
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-content");
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-split-layout");
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-split-list-pane");
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-split-detail-pane");
+      expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-split-resize-handle");
       expect(mailboxMobileSection).toContain(".mailbox-view .mailbox-empty");
+      expect(mailboxMobileSection).toMatch(/\.mailbox-view\s+\.mailbox-split-resize-handle\s*\{[^}]*display:\s*none;[^}]*\}/);
     });
 
     it("uses mobile-specific values for .mailbox-view content and FAB", async () => {
@@ -1250,23 +1782,24 @@ describe("MailboxView", () => {
       const path = await import("path");
       const css = loadAllAppCss();
 
-      const mailboxTabBlockMatch = css.match(/\.mailbox-tab\s*\{([^}]*)\}/);
-      expect(mailboxTabBlockMatch).toBeTruthy();
-      const mailboxTabBlock = mailboxTabBlockMatch![1];
-      expect(mailboxTabBlock).toContain("border-color: var(--border);");
-      expect(mailboxTabBlock).toContain("background: var(--surface);");
-      expect(mailboxTabBlock).not.toContain("border: none");
-      expect(mailboxTabBlock).not.toContain("background: none");
-      expect(mailboxTabBlock).not.toContain("border-bottom: 2px solid transparent");
+      expect(css).toMatch(/\.mailbox-tab\s*\{[^}]*border-color:\s*var\(--border\);[^}]*background:\s*var\(--surface\);[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-tab\s*\{[^}]*border:\s*none;[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-tab\s*\{[^}]*background:\s*none;[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-tab\s*\{[^}]*border-bottom:\s*2px\s+solid\s+transparent;[^}]*\}/);
 
-      const agentSubtabBlockMatch = css.match(/\.mailbox-agent-subtab\s*\{([^}]*)\}/);
-      expect(agentSubtabBlockMatch).toBeTruthy();
-      const agentSubtabBlock = agentSubtabBlockMatch![1];
-      expect(agentSubtabBlock).toContain("border-color: var(--border);");
-      expect(agentSubtabBlock).toContain("background: var(--surface);");
-      expect(agentSubtabBlock).not.toContain("border-radius: 0");
-      expect(agentSubtabBlock).not.toContain("border: none");
-      expect(agentSubtabBlock).not.toContain("background: transparent");
+      expect(css).toMatch(/\.mailbox-agent-subtab\s*\{[^}]*border-color:\s*var\(--border\);[^}]*background:\s*var\(--surface\);[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-agent-subtab\s*\{[^}]*border-radius:\s*0;[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-agent-subtab\s*\{[^}]*border:\s*none;[^}]*\}/);
+      expect(css).not.toMatch(/\.mailbox-agent-subtab\s*\{[^}]*background:\s*transparent;[^}]*\}/);
+    });
+
+    it("includes keyboard-overlap viewport anchoring rules for mailbox containers", async () => {
+      const css = loadAllAppCss();
+
+      expect(css).toContain('.mailbox-view[style*="--keyboard-overlap"],');
+      expect(css).toContain('.mailbox-modal[style*="--keyboard-overlap"]');
+      expect(css).toContain("height: var(--vv-height, 100dvh);");
+      expect(css).toContain("transform: translateY(var(--vv-offset-top, 0px));");
     });
 
     it("renders structural elements that mobile CSS targets", async () => {
@@ -1292,6 +1825,24 @@ describe("MailboxView", () => {
       // Verify content
       const content = container.querySelector(".mailbox-content");
       expect(content).toBeTruthy();
+    });
+
+    it("highlights deep-linked mailbox message from URL", async () => {
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      window.history.replaceState({}, "", "?view=mailbox&mailbox-message=msg-001#message-msg-001");
+
+      mockFetchInbox.mockResolvedValue(makeInboxResponse([mockMessage], 1));
+      mockFetchConversation.mockResolvedValue([mockMessage]);
+
+      render(<MailboxView {...defaultProps} />);
+
+      const messageNode = await screen.findByTestId("mailbox-message-detail");
+      await waitFor(() => {
+        expect(messageNode).toHaveAttribute("id", "mailbox-detail-message-msg-001");
+        expect(messageNode).toHaveClass("mailbox-message-highlight");
+      });
+      expect(scrollIntoView).toHaveBeenCalled();
     });
   });
 });

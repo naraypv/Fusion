@@ -125,6 +125,7 @@ async function loadCommandHandlers() {
   const { runAuth } = await import("./commands/auth.js");
   const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
   const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
+  const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = await import("./commands/memory-backup.js");
   const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice } = await import("./commands/mission.js");
   const { runPlansList, runPlansStatus, runPlansTransition } = await import("./commands/plans.js");
   const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
@@ -134,7 +135,7 @@ async function loadCommandHandlers() {
   const { runAgentImport } = await import("./commands/agent-import.js");
   const { runAgentExport } = await import("./commands/agent-export.js");
   const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = await import("./commands/message.js");
-  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable } = await import("./commands/plugin.js");
+  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = await import("./commands/plugin.js");
   const { runPluginCreate } = await import("./commands/plugin-scaffold.js");
   const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
@@ -183,6 +184,9 @@ async function loadCommandHandlers() {
     runBackupList,
     runBackupRestore,
     runBackupCleanup,
+    runMemoryBackupCreate,
+    runMemoryBackupList,
+    runMemoryBackupRestore,
     runMissionCreate,
     runMissionList,
     runMissionShow,
@@ -220,6 +224,11 @@ async function loadCommandHandlers() {
     runPluginUninstall,
     runPluginEnable,
     runPluginDisable,
+    runPluginSetupStatus,
+    runPluginSetup,
+    runPluginAvailable,
+    runPluginSettings,
+    runPluginRescan,
     runPluginCreate,
     runSkillsSearch,
     runSkillsInstall,
@@ -350,12 +359,24 @@ Usage:
   fn backup --list           List all database backups
   fn backup --restore <file> Restore database from a backup file
   fn backup --cleanup        Remove old backups exceeding retention limit
+  fn memory-backup --create [--scope <project|agents|all>]
+                             Create a memory backup immediately
+  fn memory-backup --list    List all memory backups
+  fn memory-backup --restore <dir>
+                             Restore memory from a backup directory snapshot
   fn plugin list | ls                List installed plugins
-  fn plugin install <path-or-package> Install a plugin from path or package
+  fn plugin install <path-or-package> [--ai-scan] Install a plugin from path or package
   fn plugin add <path-or-package>     Alias for plugin install
   fn plugin uninstall <id> [--force] Uninstall a plugin
   fn plugin enable <id>             Enable a plugin
   fn plugin disable <id>             Disable a plugin
+  fn plugin available                List built-in plugin catalog entries
+  fn plugin settings <id> [key] [value]
+                                      Read/update installed plugin settings
+  fn plugin rescan <id>              Rescan and reload a plugin
+  fn plugin setup-status <id>        Check plugin setup binary/runtime status
+  fn plugin setup <id> [--action install|uninstall]
+                                      Install or uninstall plugin setup binaries/runtimes
   fn plugin create <name>           Scaffold a new plugin project
   fn skills search <query>            Search skills.sh for agent skills
   fn skills search <query> --limit 5  Limit results
@@ -536,6 +557,9 @@ async function main() {
     runBackupList,
     runBackupRestore,
     runBackupCleanup,
+    runMemoryBackupCreate,
+    runMemoryBackupList,
+    runMemoryBackupRestore,
     runMissionCreate,
     runMissionList,
     runMissionShow,
@@ -573,6 +597,11 @@ async function main() {
     runPluginUninstall,
     runPluginEnable,
     runPluginDisable,
+    runPluginSetupStatus,
+    runPluginSetup,
+    runPluginAvailable,
+    runPluginSettings,
+    runPluginRescan,
     runPluginCreate,
     runSkillsSearch,
     runSkillsInstall,
@@ -1369,6 +1398,31 @@ async function main() {
         break;
       }
 
+      case "memory-backup": {
+        const create = args.includes("--create");
+        const list = args.includes("--list");
+        const restoreIdx = args.indexOf("--restore");
+        const restoreFile = restoreIdx !== -1 && restoreIdx + 1 < args.length ? args[restoreIdx + 1] : undefined;
+        const scopeIdx = args.indexOf("--scope");
+        const scope = scopeIdx !== -1 && scopeIdx + 1 < args.length ? args[scopeIdx + 1] : undefined;
+
+        if (create) {
+          if (scope && !["project", "agents", "all"].includes(scope)) {
+            console.error("Usage: fn memory-backup --create [--scope <project|agents|all>]");
+            process.exit(1);
+          }
+          await runMemoryBackupCreate({ projectName, scope: scope as "project" | "agents" | "all" | undefined });
+        } else if (list) {
+          await runMemoryBackupList(projectName);
+        } else if (restoreFile) {
+          await runMemoryBackupRestore(restoreFile, projectName);
+        } else {
+          console.error("Usage: fn memory-backup --create [--scope <project|agents|all>] | --list | --restore <filename>");
+          process.exit(1);
+        }
+        break;
+      }
+
       case "agent": {
         const subcommand = args[1];
         switch (subcommand) {
@@ -1472,10 +1526,10 @@ async function main() {
           case "add": {
             const source = args[2];
             if (!source) {
-              console.error("Usage: fn plugin install <path-or-package> (alias: fn plugin add <path-or-package>)");
+              console.error("Usage: fn plugin install <path-or-package> [--ai-scan] (alias: fn plugin add <path-or-package>)");
               process.exit(1);
             }
-            await runPluginInstall(source, { projectName });
+            await runPluginInstall(source, { projectName, aiScan: args.includes("--ai-scan") });
             break;
           }
           case "uninstall": {
@@ -1497,6 +1551,40 @@ async function main() {
             await runPluginDisable(id, { projectName });
             break;
           }
+          case "available": {
+            await runPluginAvailable();
+            break;
+          }
+          case "settings": {
+            const id = args[2];
+            if (!id) { console.error("Usage: fn plugin settings <id> [key] [value]"); process.exit(1); }
+            await runPluginSettings(id, args[3], args[4], { projectName });
+            break;
+          }
+          case "rescan": {
+            const id = args[2];
+            if (!id) { console.error("Usage: fn plugin rescan <id>"); process.exit(1); }
+            await runPluginRescan(id, { projectName });
+            break;
+          }
+          case "setup-status": {
+            const id = args[2];
+            if (!id) { console.error("Usage: fn plugin setup-status <id>"); process.exit(1); }
+            await runPluginSetupStatus(id, { projectName });
+            break;
+          }
+          case "setup": {
+            const id = args[2];
+            if (!id) { console.error("Usage: fn plugin setup <id> [--action install|uninstall]"); process.exit(1); }
+            const actionIndex = args.indexOf("--action");
+            const action = actionIndex >= 0 ? args[actionIndex + 1] : "install";
+            if (action !== "install" && action !== "uninstall") {
+              console.error("--action must be install or uninstall");
+              process.exit(1);
+            }
+            await runPluginSetup(id, { action, projectName });
+            break;
+          }
           case "create": {
             const pluginName = args[2];
             if (!pluginName) { console.error("Usage: fn plugin create <name>"); process.exit(1); }
@@ -1505,7 +1593,7 @@ async function main() {
           }
           default:
             console.error(`Unknown subcommand: plugin ${sub || ""}`);
-            console.log("Try: fn plugin list | install | add (alias for install) | uninstall | enable | disable | create");
+            console.log("Try: fn plugin list | install | add (alias for install) | uninstall | enable | disable | available | settings | rescan | setup-status | setup | create");
             process.exit(1);
         }
         break;

@@ -118,6 +118,25 @@ describe("useAgents", () => {
     expect(mockFetchAgents).toHaveBeenLastCalledWith({ state: "active", role: "executor", includeEphemeral: false }, undefined);
   });
 
+  it("refreshAgents reloads both list and stats in one call", async () => {
+    const { result } = renderHook(() => useAgents());
+
+    await waitFor(() => {
+      expect(mockFetchAgents).toHaveBeenCalled();
+      expect(mockFetchAgentStats).toHaveBeenCalled();
+    });
+
+    mockFetchAgents.mockClear();
+    mockFetchAgentStats.mockClear();
+
+    await act(async () => {
+      await result.current.refreshAgents();
+    });
+
+    expect(mockFetchAgents).toHaveBeenCalledTimes(1);
+    expect(mockFetchAgentStats).toHaveBeenCalledTimes(1);
+  });
+
   it("handles fetchAgents rejection gracefully", async () => {
     mockFetchAgents.mockRejectedValueOnce(new Error("agents failed"));
 
@@ -165,15 +184,15 @@ describe("useAgents", () => {
     mockFetchAgents.mockClear();
     mockFetchAgentStats.mockClear();
 
-    for (const event of ["agent:created", "agent:updated", "agent:deleted", "agent:stateChanged"]) {
+    for (const event of ["agent:created", "agent:updated", "agent:deleted", "agent:stateChanged", "approval:requested", "approval:updated", "approval:decided"]) {
       act(() => {
         es._emit(event);
       });
     }
 
     await waitFor(() => {
-      expect(mockFetchAgents).toHaveBeenCalledTimes(4);
-      expect(mockFetchAgentStats).toHaveBeenCalledTimes(4);
+      expect(mockFetchAgents).toHaveBeenCalledTimes(7);
+      expect(mockFetchAgentStats).toHaveBeenCalledTimes(7);
     });
   });
 

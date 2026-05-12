@@ -30,6 +30,7 @@ import type {
   AgentConfigRevision,
   AgentConfigSnapshot,
   AgentAccessState,
+  AgentPermissionPolicy,
   OrgTreeNode,
   InstructionsBundleConfig,
   AgentRating,
@@ -53,8 +54,18 @@ import {
 } from "./types.js";
 import type { RunMutationContext } from "./types.js";
 import type { TaskStore } from "./store.js";
+
+interface CheckoutLeaseContext {
+  nodeId?: string;
+  runId?: string;
+  leaseEpoch?: number;
+  renewedAt?: string;
+}
 import { computeAccessState } from "./agent-permissions.js";
+import { canAgentTakeImplementationTask, canAgentTakeImplementationTaskForExplicitRouting, formatRoleMismatchReason } from "./agent-role-policy.js";
+import { resolveEffectiveAgentPermissionPolicy } from "./agent-permission-policy.js";
 import { Database } from "./db.js";
+import { createAgentRunSnapshot, createAgentSnapshot, validateSnapshotEnvelope, type AgentRunSnapshot, type AgentSnapshot } from "./shared-mesh-state.js";
 
 /** Database row shape returned by SELECT on agentRatings. */
 interface AgentRatingRow {
@@ -119,10 +130,12 @@ interface AgentData {
   metadata: Record<string, unknown>;
   title?: string;
   icon?: string;
+  imageUrl?: string;
   reportsTo?: string;
   runtimeConfig?: Record<string, unknown>;
   pauseReason?: string;
   permissions?: Record<string, boolean>;
+  permissionPolicy?: AgentPermissionPolicy;
   totalInputTokens?: number;
   totalOutputTokens?: number;
   lastError?: string;
@@ -180,6 +193,9 @@ function resolveCreationRuntimeConfig(
   const rc: Record<string, unknown> = { ...(incoming ?? {}) };
   if (typeof rc.enabled !== "boolean") {
     rc.enabled = true;
+  }
+  if (typeof rc.autoClaimRelevantTasks !== "boolean") {
+    rc.autoClaimRelevantTasks = true;
   }
   if (typeof rc.heartbeatIntervalMs !== "number" || !Number.isFinite(rc.heartbeatIntervalMs)) {
     rc.heartbeatIntervalMs = DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS;
@@ -258,6 +274,7 @@ export class AgentStore extends EventEmitter {
     void this.db;
     await mkdir(this.agentsDir, { recursive: true });
     await this.importLegacyFileDataOnce();
+    await this.migrateTerminatedAgentStateOnce();
     await this.migrateHeartbeatProcedurePathOnce();
   }
 
@@ -473,6 +490,48 @@ export class AgentStore extends EventEmitter {
   }
 
   /**
+   * One-shot migration that rewrites legacy `state = "terminated"` agents to
+   * `state = "paused"` and preserves the origin via
+   * `pauseReason = "migrated-from-terminated"`.
+   *
+   * Heartbeat run rows intentionally keep their independent `terminated`
+   * terminal status; this migration only normalizes the agent lifecycle state.
+   */
+  private async migrateTerminatedAgentStateOnce(): Promise<void> {
+    const migrationKey = "removeTerminatedAgentState";
+    const migrationVersion = "1";
+    const row = this.db.prepare("SELECT value FROM __meta WHERE key = ?").get(migrationKey) as
+      | { value: string }
+      | undefined;
+    if (row?.value === migrationVersion) {
+      return;
+    }
+
+    const rows = this.db.prepare("SELECT * FROM agents WHERE state = 'terminated'").all() as unknown as AgentRow[];
+    let migratedCount = 0;
+    for (const row of rows) {
+      const agent = this.mapAgentRow(row);
+      const updated: Agent = {
+        ...agent,
+        state: "paused",
+        pauseReason: "migrated-from-terminated",
+        updatedAt: new Date().toISOString(),
+      };
+      await this.writeAgent(updated);
+      migratedCount += 1;
+    }
+
+    this.db.prepare(`
+      INSERT INTO __meta (key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(migrationKey, migrationVersion);
+    if (migratedCount > 0) {
+      this.db.bumpLastModified();
+    }
+  }
+
+  /**
    * Find the first non-ephemeral agent by exact name.
    *
    * Ephemeral task-worker/spawned agents are excluded so callers can use this
@@ -507,7 +566,7 @@ export class AgentStore extends EventEmitter {
   }
 
   /**
-   * Create a new agent with "idle" state.
+   * Create a new agent with a default state based on ephemeral classification.
    *
    * For non-ephemeral agents, ensures `runtimeConfig.heartbeatIntervalMs` is
    * persisted at creation time — previously it was only ever written when the
@@ -558,19 +617,28 @@ export class AgentStore extends EventEmitter {
     const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
       ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
 
+    const normalizedPermissionPolicy = ephemeral
+      ? input.permissionPolicy
+      : resolveEffectiveAgentPermissionPolicy(input.permissionPolicy);
+
     const agent: Agent = {
       id: agentId,
       name: normalizedName,
       role: input.role,
-      state: "idle",
+      // Non-ephemeral agents start active so they immediately participate in
+      // heartbeat scheduling; ephemeral/task-worker agents start idle and are
+      // activated by the engine when work is assigned.
+      state: ephemeral ? "idle" : "active",
       createdAt: now,
       updatedAt: now,
       metadata,
       ...(input.title && { title: input.title }),
       ...(input.icon && { icon: input.icon }),
+      ...(input.imageUrl && { imageUrl: input.imageUrl }),
       ...(input.reportsTo && { reportsTo: input.reportsTo }),
       ...(runtimeConfig && { runtimeConfig }),
       ...(input.permissions && { permissions: input.permissions }),
+      ...(normalizedPermissionPolicy && { permissionPolicy: normalizedPermissionPolicy }),
       ...(input.instructionsPath && { instructionsPath: input.instructionsPath }),
       ...(input.instructionsText && { instructionsText: input.instructionsText }),
       ...(input.soul && { soul: input.soul }),
@@ -1018,10 +1086,12 @@ export class AgentStore extends EventEmitter {
         updatedAt,
         ...("title" in updates && { title: updates.title }),
         ...("icon" in updates && { icon: updates.icon }),
+        ...("imageUrl" in updates && { imageUrl: updates.imageUrl }),
         ...("reportsTo" in updates && { reportsTo: updates.reportsTo }),
         ...("runtimeConfig" in updates && { runtimeConfig: updates.runtimeConfig }),
         ...("pauseReason" in updates && { pauseReason: updates.pauseReason }),
         ...("permissions" in updates && { permissions: updates.permissions }),
+        ...("permissionPolicy" in updates && { permissionPolicy: updates.permissionPolicy }),
         ...("lastError" in updates && { lastError: updates.lastError }),
         ...("totalInputTokens" in updates && { totalInputTokens: updates.totalInputTokens }),
         ...("totalOutputTokens" in updates && { totalOutputTokens: updates.totalOutputTokens }),
@@ -1166,8 +1236,6 @@ export class AgentStore extends EventEmitter {
         ...agent,
         state: newState,
         updatedAt: new Date().toISOString(),
-        // Clear lastError when transitioning away from terminated
-        ...(currentState === "terminated" && newState !== "terminated" && { lastError: undefined }),
       };
 
       await this.writeAgent(updated);
@@ -1185,6 +1253,29 @@ export class AgentStore extends EventEmitter {
    * @returns The updated agent
    */
   async assignTask(agentId: string, taskId: string | undefined, runContext?: RunMutationContext): Promise<Agent> {
+    const updated = await this.syncExecutionTaskLink(agentId, taskId);
+
+    // Emit agent:assigned only when assigning a task (not when clearing)
+    if (taskId !== undefined) {
+      this.emit("agent:assigned", updated, taskId);
+    }
+
+    // Log the assignment to the task when a non-empty taskId is provided
+    if (taskId && this.taskStore) {
+      await this.taskStore.logEntry(taskId, `Task assigned to agent ${agentId}`, undefined, runContext);
+    }
+
+    return updated;
+  }
+
+  /**
+   * Synchronize execution task ownership on an agent without firing
+   * assignment-side effects (`agent:assigned`, task assignment logs).
+   *
+   * Used by runtime execution bookkeeping so durable assigned agents can
+   * reflect active task ownership without triggering heartbeat assignment wakeups.
+   */
+  async syncExecutionTaskLink(agentId: string, taskId: string | undefined): Promise<Agent> {
     return this.withLock(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
@@ -1199,26 +1290,92 @@ export class AgentStore extends EventEmitter {
 
       await this.writeAgent(updated);
       this.emit("agent:updated", updated);
-
-      // Emit agent:assigned only when assigning a task (not when clearing)
-      if (taskId !== undefined) {
-        this.emit("agent:assigned", updated, taskId);
-      }
-
-      // Log the assignment to the task when a non-empty taskId is provided
-      if (taskId && this.taskStore) {
-        await this.taskStore.logEntry(taskId, `Task assigned to agent ${agentId}`, undefined, runContext);
-      }
-
       return updated;
     });
+  }
+
+  /**
+   * Claim task ownership for the calling agent with safety guards.
+   *
+   * Guards:
+   * - task must exist and not be paused
+   * - task must not be in terminal columns (done/archived)
+   * - task must not already be assigned to another agent
+   * - task checkout must be unheld or already held by this agent
+   *
+   * On success, updates both durable task assignment (assignedAgentId) and the
+   * agent's active execution linkage (agent.taskId). Task linkage is only updated
+   * after ownership + checkout checks pass.
+   */
+  async claimTaskForAgent(agentId: string, taskId: string, runContext?: RunMutationContext): Promise<{ ok: true; task: Task } | { ok: false; reason: string; task?: Task }> {
+    if (!this.taskStore) {
+      throw new Error("TaskStore not configured for task-claim operations");
+    }
+
+    const agent = await this.getAgent(agentId);
+    if (!agent) {
+      throw new Error(`Agent ${agentId} not found`);
+    }
+
+    let task: Task | null = null;
+    try {
+      task = await this.taskStore.getTask(taskId);
+    } catch {
+      task = null;
+    }
+    if (!task) {
+      return { ok: false, reason: "task_not_found" };
+    }
+
+    if (task.paused) {
+      return { ok: false, reason: "paused", task };
+    }
+
+    const isExplicitlyAssignedToAgent = task.assignedAgentId === agentId;
+    const roleAllowed = isExplicitlyAssignedToAgent
+      ? canAgentTakeImplementationTaskForExplicitRouting(agent, task)
+      : canAgentTakeImplementationTask(agent, task);
+    if (!roleAllowed) {
+      return { ok: false, reason: formatRoleMismatchReason(agent, task), task };
+    }
+
+    if (task.column === "done" || task.column === "archived") {
+      return { ok: false, reason: "terminal", task };
+    }
+
+    if (task.assignedAgentId && task.assignedAgentId !== agentId) {
+      return { ok: false, reason: "assigned_to_other", task };
+    }
+
+    if (task.checkedOutBy && task.checkedOutBy !== agentId) {
+      return { ok: false, reason: "checkout_conflict", task };
+    }
+
+    try {
+      await this.checkoutTask(agentId, taskId, undefined, runContext);
+    } catch (error) {
+      if (error instanceof CheckoutConflictError) {
+        return { ok: false, reason: "checkout_conflict", task };
+      }
+      throw error;
+    }
+
+    const claimedTask = await this.taskStore.updateTask(taskId, { assignedAgentId: agentId }, runContext);
+    await this.syncExecutionTaskLink(agentId, taskId);
+
+    return { ok: true, task: claimedTask };
   }
 
   /**
    * Acquire a checkout lease for a task.
    * Throws CheckoutConflictError when another agent already holds the lease.
    */
-  async checkoutTask(agentId: string, taskId: string, runContext?: RunMutationContext): Promise<Task> {
+  async checkoutTask(
+    agentId: string,
+    taskId: string,
+    leaseContext?: CheckoutLeaseContext,
+    runContext?: RunMutationContext,
+  ): Promise<Task> {
     if (!this.taskStore) {
       throw new Error("TaskStore not configured for checkout operations");
     }
@@ -1237,11 +1394,30 @@ export class AgentStore extends EventEmitter {
       throw new CheckoutConflictError(taskId, task.checkedOutBy, agentId);
     }
 
-    if (task.checkedOutBy === agentId) {
-      return task;
+    const nextEpoch = leaseContext?.leaseEpoch ?? task.checkoutLeaseEpoch ?? 0;
+    const nextRenewedAt = leaseContext?.renewedAt ?? new Date().toISOString();
+    const existingNodeId = task.checkoutNodeId;
+    const existingEpoch = task.checkoutLeaseEpoch ?? 0;
+
+    if (
+      task.checkedOutBy === agentId
+      && existingNodeId === (leaseContext?.nodeId ?? existingNodeId)
+      && existingEpoch === nextEpoch
+    ) {
+      return this.taskStore.updateTask(taskId, {
+        checkoutRunId: leaseContext?.runId ?? task.checkoutRunId ?? null,
+        checkoutLeaseRenewedAt: nextRenewedAt,
+      });
     }
 
-    const updated = await this.taskStore.updateTask(taskId, { checkedOutBy: agentId });
+    const updated = await this.taskStore.updateTask(taskId, {
+      checkedOutBy: agentId,
+      checkedOutAt: task.checkedOutBy === agentId ? task.checkedOutAt : undefined,
+      checkoutNodeId: leaseContext?.nodeId ?? null,
+      checkoutRunId: leaseContext?.runId ?? null,
+      checkoutLeaseRenewedAt: nextRenewedAt,
+      checkoutLeaseEpoch: nextEpoch,
+    });
     await this.taskStore.logEntry(taskId, `Checked out by agent ${agentId}`, undefined, runContext);
     return updated;
   }
@@ -1267,7 +1443,13 @@ export class AgentStore extends EventEmitter {
       return task;
     }
 
-    const updated = await this.taskStore.updateTask(taskId, { checkedOutBy: null });
+    const updated = await this.taskStore.updateTask(taskId, {
+      checkedOutBy: null,
+      checkedOutAt: null,
+      checkoutNodeId: null,
+      checkoutRunId: null,
+      checkoutLeaseRenewedAt: null,
+    });
     await this.taskStore.logEntry(taskId, `Released by agent ${agentId}`, undefined, runContext);
     return updated;
   }
@@ -1280,7 +1462,14 @@ export class AgentStore extends EventEmitter {
       throw new Error("TaskStore not configured for checkout operations");
     }
 
-    const updated = await this.taskStore.updateTask(taskId, { checkedOutBy: null });
+    const updated = await this.taskStore.updateTask(taskId, {
+      checkedOutBy: null,
+      checkedOutAt: null,
+      checkoutNodeId: null,
+      checkoutRunId: null,
+      checkoutLeaseRenewedAt: null,
+      checkoutLeaseEpoch: null,
+    });
     await this.taskStore.logEntry(taskId, "Checkout force-released", undefined, runContext);
     return updated;
   }
@@ -1350,11 +1539,9 @@ export class AgentStore extends EventEmitter {
       await this.endHeartbeatRun(activeRun.id, "terminated");
     }
 
-    // Normalize to terminated first when idle is not directly reachable.
-    if (agent.state !== "idle" && agent.state !== "terminated") {
-      agent = await this.updateAgentState(agentId, "terminated");
-    }
-
+    // Any non-idle state can transition directly to idle in the new
+    // lifecycle (see AGENT_VALID_TRANSITIONS in types.ts), so no
+    // intermediate hop is required.
     if (agent.state !== "idle") {
       agent = await this.updateAgentState(agentId, "idle");
     }
@@ -1488,11 +1675,25 @@ export class AgentStore extends EventEmitter {
    * @param agentId - The agent ID
    * @throws Error if agent not found
    */
-  async deleteAgent(agentId: string): Promise<void> {
+  async deleteAgent(agentId: string, options?: { force?: boolean; reassignTo?: string }): Promise<void> {
     await this.withLock(agentId, async () => {
       const agent = await this.getAgent(agentId);
       if (!agent) {
         throw new Error(`Agent ${agentId} not found`);
+      }
+
+      if (this.taskStore && typeof (this.taskStore as { getTasksByAssignedAgent?: unknown }).getTasksByAssignedAgent === "function") {
+        const assignedTasks = await this.taskStore.getTasksByAssignedAgent(agentId);
+        for (const task of assignedTasks) {
+          if (task.checkedOutBy === agentId && options?.force !== true) {
+            throw new Error(`Agent ${agentId} holds checkout for task ${task.id}; pass force=true to delete`);
+          }
+
+          await this.taskStore.updateTask(task.id, {
+            assignedAgentId: options?.reassignTo ?? null,
+            checkedOutBy: task.checkedOutBy === agentId ? null : undefined,
+          });
+        }
       }
 
       this.db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
@@ -1662,6 +1863,25 @@ export class AgentStore extends EventEmitter {
     return recentRuns
       .filter((run) => run.status !== "active")
       .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+  }
+
+  /**
+   * List every heartbeat run currently in `status = 'active'` across all
+   * agents. Used by self-healing to detect orphaned runs from prior process
+   * incarnations that crashed before calling endHeartbeatRun(). Without this
+   * sweep an active row blocks all subsequent timer ticks for the agent
+   * because HeartbeatTriggerScheduler.onTimerTick treats any active run as
+   * "already running".
+   */
+  async listActiveHeartbeatRuns(): Promise<AgentHeartbeatRun[]> {
+    const rows = this.db.prepare(`
+      SELECT data FROM agentRuns
+      WHERE status = 'active'
+      ORDER BY startedAt ASC
+    `).all() as Array<{ data: string }>;
+    return rows
+      .map((row) => this.parseJson<AgentHeartbeatRun | null>(row.data, null))
+      .filter((run): run is AgentHeartbeatRun => run !== null);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1985,6 +2205,88 @@ export class AgentStore extends EventEmitter {
     });
   }
 
+  getAgentSnapshot(): Promise<AgentSnapshot> {
+    return (async () => {
+      const agents = await this.listAgents({ includeEphemeral: true });
+      const blockedRows = this.db.prepare("SELECT agentId, data FROM agentBlockedStates ORDER BY updatedAt ASC").all() as Array<{ agentId: string; data: string }>;
+      const blockedStates = blockedRows
+        .map((row) => ({ agentId: row.agentId, state: this.parseJson<BlockedStateSnapshot | null>(row.data, null) }))
+        .filter((row): row is { agentId: string; state: BlockedStateSnapshot } => row.state !== null);
+      return createAgentSnapshot({ agents, blockedStates });
+    })();
+  }
+
+  async applyAgentSnapshot(snapshot: AgentSnapshot): Promise<{ appliedAgents: number; appliedBlockedStates: number }> {
+    validateSnapshotEnvelope(snapshot);
+    let appliedAgents = 0;
+    let appliedBlockedStates = 0;
+
+    for (const agent of snapshot.payload.agents) {
+      this.db.prepare(`INSERT INTO agents (id, name, role, state, taskId, createdAt, updatedAt, lastHeartbeatAt, metadata, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name=excluded.name, role=excluded.role, state=excluded.state, taskId=excluded.taskId, updatedAt=excluded.updatedAt,
+          lastHeartbeatAt=excluded.lastHeartbeatAt, metadata=excluded.metadata, data=excluded.data`)
+        .run(
+          agent.id,
+          agent.name,
+          agent.role,
+          agent.state,
+          agent.taskId ?? null,
+          agent.createdAt,
+          agent.updatedAt,
+          agent.lastHeartbeatAt ?? null,
+          JSON.stringify(agent.metadata ?? {}),
+          JSON.stringify(agent),
+        );
+      appliedAgents++;
+    }
+
+    for (const blocked of snapshot.payload.blockedStates) {
+      this.db.prepare(`INSERT INTO agentBlockedStates (agentId, data, updatedAt)
+        VALUES (?, ?, ?)
+        ON CONFLICT(agentId) DO UPDATE SET data=excluded.data, updatedAt=excluded.updatedAt`)
+        .run(blocked.agentId, JSON.stringify(blocked.state), blocked.state.recordedAt);
+      appliedBlockedStates++;
+    }
+
+    this.db.bumpLastModified();
+    return { appliedAgents, appliedBlockedStates };
+  }
+
+  getAgentRunSnapshot(limit?: number): AgentRunSnapshot {
+    const normalizedLimit = typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : undefined;
+    const query = normalizedLimit
+      ? "SELECT data FROM agentRuns ORDER BY startedAt DESC, rowid DESC LIMIT ?"
+      : "SELECT data FROM agentRuns ORDER BY startedAt ASC, rowid ASC";
+    const rows = normalizedLimit
+      ? (this.db.prepare(query).all(normalizedLimit) as Array<{ data: string }>)
+      : (this.db.prepare(query).all() as Array<{ data: string }>);
+    const parsed = rows
+      .map((row) => this.parseJson<AgentHeartbeatRun | null>(row.data, null))
+      .filter((run): run is AgentHeartbeatRun => run !== null);
+    const orderedRuns = normalizedLimit ? parsed.reverse() : parsed;
+    return createAgentRunSnapshot(orderedRuns);
+  }
+
+  async applyAgentRunSnapshot(snapshot: AgentRunSnapshot): Promise<{ applied: number; skipped: number }> {
+    validateSnapshotEnvelope(snapshot);
+    let applied = 0;
+    let skipped = 0;
+
+    for (const run of snapshot.payload.runs) {
+      const exists = this.db.prepare("SELECT 1 FROM agentRuns WHERE id = ?").get(run.id);
+      if (exists) {
+        skipped++;
+        continue;
+      }
+      await this.saveRun(run);
+      applied++;
+    }
+
+    return { applied, skipped };
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Private helpers
   // ─────────────────────────────────────────────────────────────────────────
@@ -2054,9 +2356,11 @@ export class AgentStore extends EventEmitter {
     | "role"
     | "title"
     | "icon"
+    | "imageUrl"
     | "reportsTo"
     | "runtimeConfig"
     | "permissions"
+    | "permissionPolicy"
     | "instructionsPath"
     | "instructionsText"
     | "soul"
@@ -2070,9 +2374,16 @@ export class AgentStore extends EventEmitter {
       role: snapshot.role,
       title: snapshot.title,
       icon: snapshot.icon,
+      imageUrl: snapshot.imageUrl,
       reportsTo: snapshot.reportsTo,
       runtimeConfig: snapshot.runtimeConfig ? { ...snapshot.runtimeConfig } : undefined,
       permissions: snapshot.permissions ? { ...snapshot.permissions } : undefined,
+      permissionPolicy: snapshot.permissionPolicy
+        ? {
+            presetId: snapshot.permissionPolicy.presetId,
+            rules: { ...snapshot.permissionPolicy.rules },
+          }
+        : undefined,
       instructionsPath: snapshot.instructionsPath,
       instructionsText: snapshot.instructionsText,
       soul: snapshot.soul,
@@ -2352,10 +2663,14 @@ export class AgentStore extends EventEmitter {
       metadata: data.metadata ?? {},
       title: data.title,
       icon: data.icon,
+      imageUrl: data.imageUrl,
       reportsTo: data.reportsTo,
       runtimeConfig: data.runtimeConfig,
       pauseReason: data.pauseReason,
       permissions: data.permissions,
+      permissionPolicy: isEphemeralAgent(data)
+        ? data.permissionPolicy
+        : resolveEffectiveAgentPermissionPolicy(data.permissionPolicy),
       totalInputTokens: data.totalInputTokens,
       totalOutputTokens: data.totalOutputTokens,
       lastError: data.lastError,
@@ -2381,10 +2696,12 @@ export class AgentStore extends EventEmitter {
       metadata: agent.metadata,
       title: agent.title,
       icon: agent.icon,
+      imageUrl: agent.imageUrl,
       reportsTo: agent.reportsTo,
       runtimeConfig: agent.runtimeConfig,
       pauseReason: agent.pauseReason,
       permissions: agent.permissions,
+      permissionPolicy: agent.permissionPolicy,
       totalInputTokens: agent.totalInputTokens,
       totalOutputTokens: agent.totalOutputTokens,
       lastError: agent.lastError,

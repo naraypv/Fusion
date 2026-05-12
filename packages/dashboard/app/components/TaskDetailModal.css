@@ -156,18 +156,63 @@
   border-radius: var(--radius-sm);
 }
 
+.detail-timestamps {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: var(--space-xs);
+  color: var(--text-dim);
+  margin-top: var(--space-xs);
+}
+
+.detail-timestamp-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+}
+
+.detail-timestamp-label {
+  color: var(--text-muted);
+}
+
+.detail-timestamp-separator {
+  color: var(--text-dim);
+}
+
 @media (max-width: 768px) {
   .detail-provenance {
     align-items: flex-start;
   }
+
+  .detail-timestamps {
+    display: flex;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .detail-timestamp-item {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .detail-timestamp-separator {
+    display: none;
+  }
+}
+
+.detail-meta-inline-controls {
+  --detail-priority-control-min-height: calc(var(--space-2xl) + var(--space-xs));
+
+  display: flex;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  gap: var(--space-xs);
 }
 
 .detail-priority-chip {
-  --detail-priority-control-min-height: calc(var(--space-2xl) + var(--space-xs));
-
   gap: var(--space-xs);
-  margin-left: var(--space-xs);
   min-height: var(--detail-priority-control-min-height);
+  box-sizing: border-box;
 }
 
 .detail-priority-chip--saving {
@@ -200,6 +245,39 @@
   color: var(--text);
   background: var(--surface);
   text-transform: uppercase;
+}
+
+.detail-execution-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-height: var(--detail-priority-control-min-height);
+  box-sizing: border-box;
+}
+
+.detail-execution-mode-toggle svg {
+  width: 1em;
+  height: 1em;
+}
+
+.detail-execution-mode-toggle--fast {
+  color: var(--color-warning);
+}
+
+.detail-execution-mode-toggle--fast svg {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 20%, transparent);
+  border-radius: var(--radius-pill);
+  padding: var(--space-xs);
+  box-shadow: var(--glow-warning);
+}
+
+.detail-execution-mode-toggle--saving {
+  opacity: 0.75;
+}
+
+.detail-execution-mode-toggle:disabled {
+  cursor: wait;
 }
 
 
@@ -397,6 +475,58 @@
   border-top: 1px solid var(--border);
 }
 
+.detail-github-tracking-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.detail-github-tracking-content {
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+}
+
+.detail-github-tracking-grid {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.detail-github-issue-state {
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.detail-github-issue-state--open {
+  color: var(--color-success);
+}
+
+.detail-github-issue-state--closed {
+  color: var(--text-muted);
+}
+
+.detail-github-tracking-controls {
+  margin-top: var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.detail-github-tracking-repo-row {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
+.detail-github-tracking-repo-row .input {
+  flex: 1;
+}
+
+.detail-github-tracking-error {
+  color: var(--color-error);
+}
+
 /* Agent Log tab: stretch to fill the remaining modal body height
    so the log viewer uses all available space above the action bar. */
 .detail-section--agent-log {
@@ -482,6 +612,11 @@
 
 .dep-trigger-wrap {
   position: relative;
+}
+
+.detail-blocking-item--stale {
+  color: var(--color-warning);
+  font-size: 0.75rem;
 }
 
 .modal-actions-spacer {
@@ -893,7 +1028,7 @@
 }
 
 .task-changes-tab .task-changes-stats {
-  margin-left: calc(16px + var(--space-sm)); /* align with text after icon + gap */
+  margin-left: calc(var(--space-lg) + var(--space-sm)); /* align with text after icon + gap */
 }
 
 /* Truncate parent dirs from the LEFT so the filename stays visible. JSX
@@ -1080,14 +1215,14 @@
 
   /* Larger touch targets for file entries on mobile */
   .changed-files-sidebar.mobile .changed-files-entry {
-    padding: 10px var(--space-md);
+    padding: calc(var(--space-sm) + var(--space-xs) / 2) var(--space-md);
     min-height: 36px;
   }
 
   /* Clearer active state on mobile */
   .changed-files-sidebar.mobile .changed-files-entry.active {
     background: var(--card-hover);
-    border-left: 3px solid var(--in-progress);
+    border-left: calc(var(--btn-border-width) * 3) solid var(--in-progress);
   }
 
   .changed-files-content.mobile {
@@ -1142,7 +1277,8 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-sm);
-    padding: 6px 12px;
+    min-height: calc(var(--space-2xl) + var(--space-xs));
+    padding: 0 var(--space-md);
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -1150,16 +1286,16 @@
     font-size: 13px;
     cursor: pointer;
     transition: background var(--transition-fast);
-    margin-right: 8px;
+    margin-right: var(--space-sm);
   }
 
   .changed-files-back-button:hover {
     background: var(--card-hover);
   }
 
-  .changed-files-back-button:focus {
+  .changed-files-back-button:focus-visible {
     outline: none;
-    box-shadow: var(--focus-ring);
+    box-shadow: var(--focus-ring-strong);
   }
 
   .detail-section--spec {
@@ -1201,7 +1337,7 @@
   width: 14px;
   height: 14px;
   border: 2px solid var(--border);
-  border-top-color: var(--text-secondary);
+  border-top-color: var(--text-muted);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -1433,9 +1569,9 @@
     grid-template-columns: 1fr;
   }
 
-  .detail-priority-chip {
-    margin-left: 0;
-    margin-top: var(--space-xs);
+  .detail-github-tracking-repo-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .detail-priority-select {
@@ -1473,8 +1609,8 @@
   /* Mobile dropdown menus — position above action bar, constrained to viewport */
   .detail-actions-menu,
   .detail-move-menu {
-    bottom: calc(100% + 4px);
-    max-width: calc(100vw - 28px);
+    bottom: calc(100% + var(--space-xs));
+    max-width: calc(100vw - calc(var(--space-lg) + var(--space-md)));
     max-height: calc(100dvh - 120px);
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
@@ -1550,3 +1686,4 @@
   }
 
 }
+

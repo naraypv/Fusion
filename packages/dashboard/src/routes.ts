@@ -8,19 +8,12 @@ declare module "express" {
 }
 import multer from "multer";
 import { resolve, sep, join, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as nodeFs from "node:fs";
 import os from "node:os";
 import v8 from "node:v8";
 
-import type {
-  AccountCredentialSummary,
-  AddAccountResult,
-  TaskStore,
-  ScheduleType,
-  ActivityEventType,
-  ModelPreset,
-  RoutineTriggerType,
-} from "@fusion/core";
+import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType, WorkflowStepTemplate } from "@fusion/core";
 import {
   type Task,
   type PiExtensionEntry,
@@ -41,6 +34,7 @@ import {
 } from "@fusion/core";
 import type { ServerOptions } from "./server.js";
 import { verifyWebhookSignature } from "./github-webhooks.js";
+import { maybeCreateTrackingIssue } from "./github-tracking.js";
 import { AiSessionStore, SESSION_CLEANUP_DEFAULT_MAX_AGE_MS } from "./ai-session-store.js";
 import { getSession as getPlanningSession, cleanupSession as cleanupPlanningSession } from "./planning.js";
 import { getSubtaskSession, cleanupSubtaskSession } from "./subtask-breakdown.js";
@@ -58,7 +52,7 @@ import {
   sendErrorResponse,
   unauthorized,
 } from "./api-error.js";
-import { resolvePluginManifest } from "./plugin-routes.js";
+import { createPluginRouter, resolvePluginManifest } from "./plugin-routes.js";
 import { hermesRuntimeMetadata } from "@fusion-plugin-examples/hermes-runtime";
 import { openclawRuntimeMetadata } from "@fusion-plugin-examples/openclaw-runtime";
 
@@ -94,11 +88,56 @@ const BUNDLED_PLUGIN_RUNTIMES: Array<{
     version: "1.0.0",
   },
 ];
+const BUNDLED_PLUGIN_IDS = new Set([
+  "fusion-plugin-dependency-graph",
+  "fusion-plugin-reports",
+  "fusion-plugin-whatsapp-chat",
+  "fusion-plugin-roadmap",
+  "fusion-plugin-hermes-runtime",
+  "fusion-plugin-openclaw-runtime",
+  "fusion-plugin-paperclip-runtime",
+  "fusion-plugin-cursor-runtime",
+]);
+
+function extractBundledPluginId(pathInput: string): string | null {
+  const normalized = pathInput.replace(/\\/gu, "/").replace(/\/+$/u, "").trim();
+  if (BUNDLED_PLUGIN_IDS.has(normalized)) {
+    return normalized;
+  }
+
+  for (const pluginId of BUNDLED_PLUGIN_IDS) {
+    if (normalized.endsWith(`/plugins/${pluginId}`)) {
+      return pluginId;
+    }
+  }
+
+  return null;
+}
+
+function resolveBundledPluginDirInDashboard(pluginId: string): string | null {
+  const moduleDir = resolve(fileURLToPath(import.meta.url), "..");
+  const dashboardPackageRoot = resolve(moduleDir, "..");
+  const candidates = [
+    join(dashboardPackageRoot, "dist", "plugins", pluginId),
+    join(dashboardPackageRoot, "plugins", pluginId),
+    join(dashboardPackageRoot, "..", "..", "plugins", pluginId),
+  ];
+
+  for (const candidate of candidates) {
+    if (nodeFs.existsSync(join(candidate, "manifest.json"))) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 import { createSessionDiagnostics } from "./ai-session-diagnostics.js";
 import { createApiRoutesContext } from "./routes/context.js";
 import { registerTaskWorkflowRoutes } from "./routes/register-task-workflow-routes.js";
 import { registerPlanningSubtaskRoutes } from "./routes/register-planning-subtask-routes.js";
 import { registerChatRoutes } from "./routes/register-chat-routes.js";
+import { registerChatRoomRoutes } from "./routes/register-chat-room-routes.js";
 import { registerSettingsMemoryRoutes } from "./routes/register-settings-memory-routes.js";
 import { registerMessagingScriptRoutes } from "./routes/register-messaging-scripts.js";
 import { registerGitGitHubRoutes } from "./routes/register-git-github.js";
@@ -127,6 +166,7 @@ import { registerRuntimeProviderRoutes } from "./routes/register-runtime-provide
 import { registerFnBinaryRoutes } from "./routes/register-fn-binary-routes.js";
 import { registerUpdateCheckRoutes } from "./routes/register-update-check-routes.js";
 import { registerIntegratedRouters, registerIntegratedDevServerRouter } from "./routes/register-integrated-routers.js";
+import { registerApprovalRoutes } from "./routes/register-approval-routes.js";
 import { runGitCommand } from "./routes/resolve-diff-base.js";
 
 const TASK_DETAIL_ACTIVITY_LOG_LIMIT = 500;
@@ -167,12 +207,12 @@ export interface AuthStorageLike {
       onProgress?: (message: string) => void;
       signal?: AbortSignal;
     },
-  ): Promise<AddAccountResult | void>;
+  ): Promise<void>;
   logout(provider: string): void;
   /** Get providers that accept API keys (non-OAuth). Returns provider id and name. */
   getApiKeyProviders?(): Array<{ id: string; name: string }>;
   /** Save an API key for a provider. Creates or overwrites the existing key. */
-  setApiKey?(providerId: string, apiKey: string): AddAccountResult | void;
+  setApiKey?(providerId: string, apiKey: string): void;
   /** Remove the stored API key for a provider. No-op if not set. */
   clearApiKey?(providerId: string): void;
   /** Check if a provider has an API key configured. */
@@ -181,10 +221,6 @@ export interface AuthStorageLike {
   getApiKey?(providerId: string): string | null | undefined | Promise<string | null | undefined>;
   /** Get raw stored credentials for usage providers. */
   get?(providerId: string): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
-  /** List configured account records without returning raw credentials. */
-  listAccounts?(providerId?: string): AccountCredentialSummary[];
-  /** Remove one account record without requiring provider-wide logout. */
-  removeAccount?(accountId: string): boolean;
 }
 
 /**
@@ -307,7 +343,12 @@ async function discoverDashboardPiExtensions(cwd: string): Promise<PiExtensionSe
   };
 }
 
-import { createFnAgent as engineCreateFnAgentForRefine, promptWithFallback as enginePromptWithFallback } from "@fusion/engine";
+import {
+  createFnAgent as engineCreateFnAgentForRefine,
+  getExemptToolNames as engineGetExemptToolNames,
+  promptWithFallback as enginePromptWithFallback,
+  reloadExemptTools as engineReloadExemptTools,
+} from "@fusion/engine";
 
 // Test-injectable override; defaults to the statically imported engine binding.
 let createFnAgentForRefine: typeof import("@fusion/engine").createFnAgent | undefined = engineCreateFnAgentForRefine;
@@ -981,14 +1022,17 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   });
   registerChatRoutes(routeContext, {
     parseLastEventId,
+    replayBufferedSSE,
     validateOptionalModelField,
     upload,
   });
+  registerChatRoomRoutes(routeContext);
   registerMessagingScriptRoutes(routeContext);
   registerGitGitHubRoutes(routeContext);
   registerFilesTerminalWorkspaceRoutes(routeContext);
   registerAgentsProjectsNodesRoutes(routeContext);
   registerPluginsAutomationRoutes(routeContext);
+  registerApprovalRoutes(routeContext);
 
   // HeartbeatMonitor for triggering agent execution runs
   const heartbeatMonitor = options?.heartbeatMonitor;
@@ -1273,6 +1317,33 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
       }
 
       res.json({ success: true, source });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * POST /api/action-gate/reload
+   * Reloads action-gate exempt tools from defaults or a provided override list.
+   */
+  router.post("/action-gate/reload", async (req, res) => {
+    try {
+      const body = (req.body && typeof req.body === "object") ? (req.body as Record<string, unknown>) : {};
+      const hasTools = Object.hasOwn(body, "tools");
+      if (hasTools) {
+        const tools = body.tools;
+        if (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string")) {
+          throw badRequest("Request body must provide tools as string[] when present");
+        }
+        engineReloadExemptTools(tools);
+      } else {
+        engineReloadExemptTools();
+      }
+
+      res.json({ ok: true, tools: engineGetExemptToolNames() });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -2888,7 +2959,13 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   router.get("/workflow-step-templates", async (_req, res) => {
     try {
       const { WORKFLOW_STEP_TEMPLATES } = await import("@fusion/core");
-      res.json({ templates: WORKFLOW_STEP_TEMPLATES });
+      const pluginTemplates = options?.pluginRunner?.getPluginWorkflowStepTemplates?.() ?? [];
+      res.json({
+        templates: [
+          ...WORKFLOW_STEP_TEMPLATES,
+          ...pluginTemplates.map(({ template }) => template),
+        ],
+      });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -2906,7 +2983,12 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     try {
       const { store: scopedStore } = await getProjectContext(req);
       const { WORKFLOW_STEP_TEMPLATES } = await import("@fusion/core");
-      const template = WORKFLOW_STEP_TEMPLATES.find((t) => t.id === req.params.id);
+      let template: WorkflowStepTemplate | undefined = WORKFLOW_STEP_TEMPLATES.find((t) => t.id === req.params.id);
+
+      if (!template) {
+        const pluginTemplates = options?.pluginRunner?.getPluginWorkflowStepTemplates?.() ?? [];
+        template = pluginTemplates.find(({ template: pluginTemplate }) => pluginTemplate.id === req.params.id)?.template;
+      }
 
       if (!template) {
         throw notFound(`Template '${req.params.id}' not found`);
@@ -2928,6 +3010,18 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
       });
 
       res.status(201).json(step);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.get("/plugin-workflow-step-templates", (_req, res) => {
+    try {
+      const templates = options?.pluginRunner?.getPluginWorkflowStepTemplates?.() ?? [];
+      res.json({ templates });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -3046,6 +3140,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   registerAgentCoreListCreateRoutes(routeContext, {
     sanitizeAgentTaskLinks,
     validateAgentInstructionsPayload,
+    upload,
   });
 
   registerAgentImportExportRoutes(routeContext);
@@ -3053,6 +3148,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   registerAgentCoreRoutes(routeContext, {
     sanitizeAgentTaskLinks,
     validateAgentInstructionsPayload,
+    upload,
   });
 
   registerAgentRuntimeRoutes(routeContext, {
@@ -3084,7 +3180,6 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // Keep this call at the current position to preserve precedence with
   // surrounding route handlers. registerIntegratedRouters() mounts:
   // - /missions
-  // - /roadmaps
   // - /insights
   // - /todos
   registerIntegratedRouters({
@@ -3141,6 +3236,30 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
         return String(a.slot.slotId).localeCompare(String(b.slot.slotId));
       });
     res.json(normalizedSlots);
+  });
+
+  /**
+   * GET /api/plugins/ui-contributions
+   * Get all structured UI contributions from active plugins.
+   */
+  router.get("/plugins/ui-contributions", async (_req: Request, res: Response) => {
+    const contributions = options?.pluginLoader?.getPluginUiContributions() ?? [];
+    const normalizedContributions = contributions
+      .map((entry) => ({
+        pluginId: entry.pluginId,
+        contribution: {
+          ...entry.contribution,
+          order: entry.contribution.order ?? null,
+        },
+      }))
+      .sort((a, b) => {
+        const orderA = typeof a.contribution.order === "number" ? a.contribution.order : Number.MAX_SAFE_INTEGER;
+        const orderB = typeof b.contribution.order === "number" ? b.contribution.order : Number.MAX_SAFE_INTEGER;
+        if (orderA !== orderB) return orderA - orderB;
+        if (a.pluginId !== b.pluginId) return a.pluginId.localeCompare(b.pluginId);
+        return a.contribution.contributionId.localeCompare(b.contribution.contributionId);
+      });
+    res.json(normalizedContributions);
   });
 
 
@@ -3210,7 +3329,15 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
       const plugin = await pluginStore.getPlugin(id);
       res.json(plugin.settings);
     } catch (err: unknown) {
-      if (err instanceof Error && (err instanceof Error ? err.message : String(err)).includes("not found")) {
+      const isNotFoundError = err instanceof Error && (err instanceof Error ? err.message : String(err)).includes("not found");
+      const isBundledFallback = BUNDLED_PLUGIN_RUNTIMES.some((r) => r.pluginId === id);
+      if (isNotFoundError && isBundledFallback) {
+        // Bundled runtime plugins can be surfaced in settings before they've
+        // been lazily installed. Return empty defaults so cards can open.
+        res.json({});
+        return;
+      }
+      if (isNotFoundError) {
         throw notFound(`Plugin "${id}" not found`);
       }
       throw internalError(err instanceof Error ? err.message : "Unknown error");
@@ -3313,20 +3440,66 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
         throw badRequest("Plugin install mode is not supported: plugin loader not available");
       }
 
+      const aiScanOnLoad = body.aiScanOnLoad;
+      if (aiScanOnLoad !== undefined && typeof aiScanOnLoad !== "boolean") {
+        throw badRequest("'aiScanOnLoad' must be a boolean when provided");
+      }
+
+      const requestPath = (body.path as string).trim();
+      const absoluteRequestPath = isAbsolute(requestPath) ? requestPath : resolve(process.cwd(), requestPath);
+
+      let manifestPathForInstall = absoluteRequestPath;
+      let manifestResolutionError: ApiError | null = null;
+      let attemptedBundledLookup = false;
+
+      try {
+        await resolvePluginManifest(manifestPathForInstall);
+      } catch (err) {
+        if (err instanceof ApiError && err.statusCode === 404) {
+          manifestResolutionError = err;
+          const bundledPluginId = extractBundledPluginId(requestPath) ?? extractBundledPluginId(absoluteRequestPath);
+          if (bundledPluginId) {
+            attemptedBundledLookup = true;
+            const bundledPath = resolveBundledPluginDirInDashboard(bundledPluginId);
+            if (bundledPath) {
+              manifestPathForInstall = bundledPath;
+            }
+          }
+        } else {
+          throw err;
+        }
+      }
+
+      if (manifestResolutionError && manifestPathForInstall === absoluteRequestPath) {
+        if (attemptedBundledLookup) {
+          throw notFound(
+            `Plugin install path not found: ${requestPath}. `
+            + "Checked resolved local path and bundled plugin locations.",
+          );
+        }
+        throw manifestResolutionError;
+      }
+
       // Resolve manifest — supports package root and dist-folder selections
-      const { manifestDir, manifest } = await resolvePluginManifest(body.path as string);
+      const { manifestDir, manifest } = await resolvePluginManifest(manifestPathForInstall);
 
       try {
         const plugin = await pluginStore.registerPlugin({
           manifest,
           path: manifestDir,
+          ...(typeof aiScanOnLoad === "boolean" ? { aiScanOnLoad } : {}),
         });
 
-        // If enabled, try to load the plugin
+        // If enabled, try to load it. If load fails while aiScanOnLoad=true,
+        // remove the new registration so install does not leave a broken record.
         if (plugin.enabled) {
           try {
             await options.pluginLoader.loadPlugin(plugin.id);
           } catch (loadErr) {
+            if (plugin.aiScanOnLoad) {
+              await pluginStore.unregisterPlugin(plugin.id);
+              throw badRequest(loadErr instanceof Error ? loadErr.message : String(loadErr));
+            }
             runtimeLogger.child("plugin-routes").error(`Failed to load plugin ${plugin.id}`, {
               error: loadErr instanceof Error ? loadErr.message : String(loadErr),
             });
@@ -3335,6 +3508,9 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
 
         res.status(201).json(plugin);
       } catch (err: unknown) {
+        if (err instanceof ApiError) {
+          throw err;
+        }
         if (err instanceof Error && (err instanceof Error ? err.message : String(err)).includes("already registered")) {
           throw conflict(err instanceof Error ? err.message : String(err));
         }
@@ -3437,6 +3613,167 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   });
 
   /**
+   * PATCH /api/plugins/:id
+   * Update plugin config.
+   * Body: { aiScanOnLoad: boolean }
+   */
+  router.patch("/plugins/:id", async (req: Request, res: Response) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const pluginStore = scopedStore.getPluginStore();
+    const id = req.params.id as string;
+
+    if (!req.body || typeof req.body !== "object" || typeof (req.body as { aiScanOnLoad?: unknown }).aiScanOnLoad !== "boolean") {
+      throw badRequest("Request body must be { aiScanOnLoad: boolean }");
+    }
+
+    try {
+      const plugin = await pluginStore.updatePlugin(id, {
+        aiScanOnLoad: (req.body as { aiScanOnLoad: boolean }).aiScanOnLoad,
+      });
+      res.json(plugin);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes("not found")) {
+        throw notFound(`Plugin "${id}" not found`);
+      }
+      throw internalError(err instanceof Error ? err.message : "Failed to update plugin");
+    }
+  });
+
+  /**
+   * POST /api/plugins/:id/rescan
+   * Trigger a fresh plugin scan/load gate via reload or load flow.
+   */
+  router.post("/plugins/:id/rescan", async (req: Request, res: Response) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const pluginStore = scopedStore.getPluginStore();
+    const id = req.params.id as string;
+
+    let plugin: import("@fusion/core").PluginInstallation;
+    try {
+      plugin = await pluginStore.getPlugin(id);
+    } catch {
+      throw notFound(`Plugin "${id}" not found`);
+    }
+
+    if (!options?.pluginLoader) {
+      throw internalError("Plugin loader not available");
+    }
+
+    try {
+      if (plugin.state === "started" && options.pluginRunner?.reloadPlugin) {
+        await options.pluginRunner.reloadPlugin(id);
+      } else if (plugin.enabled) {
+        await options.pluginLoader.loadPlugin(id);
+      }
+    } catch (reloadErr) {
+      runtimeLogger.child("plugin-routes").error(`Failed to rescan plugin ${id}`, {
+        error: reloadErr instanceof Error ? reloadErr.message : String(reloadErr),
+      });
+    }
+
+    res.json(await pluginStore.getPlugin(id));
+  });
+
+  /**
+   * GET /api/plugins/:id/setup-status
+   * Check plugin setup status.
+   */
+  router.get("/plugins/:id/setup-status", async (req: Request, res: Response) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const pluginStore = scopedStore.getPluginStore();
+    const id = req.params.id as string;
+
+    let plugin: import("@fusion/core").PluginInstallation;
+    try {
+      plugin = await pluginStore.getPlugin(id);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message.includes("not found")) {
+        throw notFound(`Plugin "${id}" not found`);
+      }
+      throw internalError(err instanceof Error ? err.message : "Unknown error");
+    }
+
+    if (!options?.pluginRunner?.checkPluginSetup || !options?.pluginRunner?.getPluginSetupInfo) {
+      throw internalError("Plugin runner not available");
+    }
+
+    const setupInfo = options.pluginRunner.getPluginSetupInfo();
+    const hasSetup = setupInfo.some((entry) => entry.pluginId === id);
+
+    if (!hasSetup) {
+      res.json({ hasSetup: false });
+      return;
+    }
+
+    if (plugin.state !== "started") {
+      res.json({
+        hasSetup: true,
+        setupCheckDeferred: true,
+        deferredReason: "plugin-not-started",
+        pluginState: plugin.state,
+      });
+      return;
+    }
+
+    const status = await options.pluginRunner.checkPluginSetup(id);
+    res.json({ hasSetup: true, ...status });
+  });
+
+  /**
+   * POST /api/plugins/:id/setup/install
+   * Trigger plugin setup install hook.
+   */
+  router.post("/plugins/:id/setup/install", async (req: Request, res: Response) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const pluginStore = scopedStore.getPluginStore();
+    const id = req.params.id as string;
+
+    const plugin = await pluginStore.getPlugin(id);
+    if (!plugin.enabled) {
+      throw badRequest("Plugin must be enabled before setup install");
+    }
+
+    if (!options?.pluginRunner?.installPluginSetup || !options?.pluginRunner?.getPluginSetupInfo) {
+      throw internalError("Plugin runner not available");
+    }
+
+    const setupInfo = options.pluginRunner.getPluginSetupInfo();
+    const setup = setupInfo.find((entry) => entry.pluginId === id);
+    if (!setup?.hooks.install) {
+      throw badRequest("Plugin has no install hook");
+    }
+
+    const result = await options.pluginRunner.installPluginSetup(id);
+    res.json(result ?? { success: true });
+  });
+
+  /**
+   * POST /api/plugins/:id/setup/uninstall
+   * Trigger plugin setup uninstall hook.
+   */
+  router.post("/plugins/:id/setup/uninstall", async (req: Request, res: Response) => {
+    const { store: scopedStore } = await getProjectContext(req);
+    const pluginStore = scopedStore.getPluginStore();
+    const id = req.params.id as string;
+
+    await pluginStore.getPlugin(id);
+
+    if (!options?.pluginRunner?.uninstallPluginSetup || !options?.pluginRunner?.getPluginSetupInfo) {
+      throw internalError("Plugin runner not available");
+    }
+
+    const setupInfo = options.pluginRunner.getPluginSetupInfo();
+    const setup = setupInfo.find((entry) => entry.pluginId === id);
+    if (!setup) {
+      res.json({ success: true });
+      return;
+    }
+
+    const result = await options.pluginRunner.uninstallPluginSetup(id);
+    res.json(result ?? { success: true });
+  });
+
+  /**
    * PUT /api/plugins/:id/settings
    * Update plugin settings.
    * Body: { settings: Record<string, unknown>, projectId?: string }
@@ -3455,6 +3792,38 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
 
     if (!settings || typeof settings !== "object") {
       throw badRequest("Request body must have a 'settings' object");
+    }
+
+    // Auto-install bundled runtime plugins (Hermes/OpenClaw/Paperclip) on
+    // first save. The Settings UI surfaces these as fallback cards before
+    // they're actually registered, so the first PUT must lazily install them
+    // rather than 404. The host (CLI) injects ensureBundledPluginInstalled
+    // because dashboard doesn't know the on-disk bundle layout.
+    const isBundledFallback = BUNDLED_PLUGIN_RUNTIMES.some((r) => r.pluginId === id);
+    if (isBundledFallback && options?.ensureBundledPluginInstalled) {
+      let alreadyRegistered = true;
+      try {
+        await pluginStore.getPlugin(id);
+      } catch {
+        alreadyRegistered = false;
+      }
+      if (!alreadyRegistered) {
+        try {
+          const installOk = await options.ensureBundledPluginInstalled(id);
+          if (!installOk) {
+            throw internalError(
+              `Bundled plugin "${id}" is unavailable in this build and could not be auto-installed`,
+            );
+          }
+        } catch (installErr) {
+          if (installErr instanceof ApiError) {
+            throw installErr;
+          }
+          throw internalError(
+            `Failed to auto-install bundled plugin "${id}": ${installErr instanceof Error ? installErr.message : String(installErr)}`,
+          );
+        }
+      }
     }
 
     try {
@@ -4179,6 +4548,19 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
   // precedence unchanged relative to existing wildcard handlers.
   registerIntegratedDevServerRouter({ router, store });
 
+  if (options?.pluginStore && options?.pluginLoader) {
+    const pluginRunner = options.pluginRunner as Parameters<typeof createPluginRouter>[2];
+    router.use(
+      "/plugins",
+      createPluginRouter(
+        options.pluginStore,
+        options.pluginLoader,
+        pluginRunner,
+        store,
+      ),
+    );
+  }
+
   // Scripts and messaging routes are registered by registerMessagingScriptRoutes().
 
   router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
@@ -4413,6 +4795,21 @@ async function executeAiPromptStep(
   }
 }
 
+async function maybeCreateTaskTrackingIssue(taskStore: TaskStore, task: Task): Promise<void> {
+  const projectSettings = await taskStore.getSettings();
+  const globalSettings = (await taskStore.getGlobalSettingsStore?.()?.getSettings?.()) ?? {};
+  try {
+    await maybeCreateTrackingIssue(task, {
+      taskStore,
+      projectSettings,
+      globalSettings,
+      logger: console,
+    });
+  } catch {
+    // best-effort only
+  }
+}
+
 async function executeCreateTaskStep(
   step: import("@fusion/core").AutomationStep,
   startedAt: string,
@@ -4443,6 +4840,7 @@ async function executeCreateTaskStep(
         sourceMetadata: { stepId: step.id },
       },
     });
+    await maybeCreateTaskTrackingIssue(taskStore, task);
 
     return {
       stepId: step.id,

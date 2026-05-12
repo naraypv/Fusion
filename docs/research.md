@@ -2,7 +2,7 @@
 
 [← Docs index](./README.md)
 
-Fusion Research lets you create bounded research runs that search, fetch, and synthesize information from configured providers, then turn structured findings into actionable tasks — all from the dashboard, CLI, or agent sessions.
+Fusion Research lets you create bounded research runs that search, fetch, and synthesize information with built-in web tools by default, then turn structured findings into actionable tasks — all from the dashboard, CLI, or agent sessions.
 
 ---
 
@@ -35,7 +35,7 @@ Research is **not** a replacement for reading source code or local docs — use 
 
 ## Prerequisites
 
-Research requires provider configuration before runs can execute. If setup is incomplete, the dashboard shows a setup prompt and CLI/agent tools return actionable error codes.
+Research requires the experimental feature flag. Web search works out of the box using built-in agent tools, and external provider setup is optional advanced configuration.
 
 ### 1. Enable the feature flag
 
@@ -49,23 +49,28 @@ The Research view is gated behind an experimental feature flag. Set in global se
 }
 ```
 
-This also reveals the **Research Defaults** and **Research** settings sections in the dashboard Settings modal.
+This also reveals the **Research Defaults** and **Research** settings sections in the dashboard Settings modal, and enables agent/CLI research tools (`fn_research_*`).
 
-### 2. Configure a web search provider
+### 2. Built-in web search is the default
 
-Set `researchGlobalWebSearchProvider` in global settings to one of the supported backends:
+By default, `researchGlobalWebSearchProvider` resolves to `"builtin"`. Search and fetch run through the agent runtime's native `WebSearch` and `WebFetch` tools, so no API key is required for baseline usage.
+
+### 3. Optional: external search backends
+
+You can opt into external providers in global settings:
 
 | Provider | Required settings |
 |---|---|
+| `"builtin"` | No API key required (default) |
 | `"searxng"` | `researchGlobalSearxngUrl` — URL of your SearXNG instance |
 | `"brave"` | `researchGlobalBraveApiKey` — Brave Search API key |
 | `"google"` | `researchGlobalGoogleSearchApiKey` + `researchGlobalGoogleSearchCx` — Google Custom Search credentials |
 | `"tavily"` | `researchGlobalTavilyApiKey` — Tavily API key |
-| `"none"` | Disables web search (other sources still work) |
+| `"none"` | Disables web search (Page Fetch, Local Docs, GitHub, and LLM synthesis can still run) |
 
 API keys are stored through Fusion's auth credential pipeline (`/api/auth/api-key`), not in settings JSON directly.
 
-### 3. (Optional) Configure synthesis model
+### 4. (Optional) Configure synthesis model
 
 If LLM synthesis is enabled (default: on), set a synthesis provider and model:
 
@@ -78,7 +83,7 @@ If LLM synthesis is enabled (default: on), set a synthesis provider and model:
 }
 ```
 
-If no synthesis model is configured, the synthesis phase may fail with a `PROVIDER_UNAVAILABLE` error.
+If no synthesis model is configured, Research falls back to the global default model lane. If no global default model is resolvable, synthesis may fail with a `PROVIDER_UNAVAILABLE` error.
 
 ### Settings hierarchy
 
@@ -208,7 +213,7 @@ See [CLI Reference → `fn research`](./cli-reference.md) for the full command r
 
 ## API Reference
 
-All research endpoints are under `/api/research`. The router is registered in `packages/dashboard/src/routes/register-integrated-routes.ts`.
+All research endpoints are under `/api/research`. The router is registered in `packages/dashboard/src/routes/register-integrated-routers.ts`.
 
 ### Runs
 
@@ -234,7 +239,9 @@ All research endpoints are under `/api/research`. The router is registered in `p
 | `GET` | `/research/runs/:id/export` | Export run (query param: `format` = `markdown`, `json`, `html`) |
 | `POST` | `/research/runs/:id/exports` | Create an export record |
 | `GET` | `/research/runs/:id/exports` | List exports for a run |
-| `GET` | `/research/exports/:exportId` | Get a specific export |
+| `GET` | `/research/exports/:exportId` | Download/get a specific persisted export |
+
+> Note: CLI/core export formats and server export endpoint formats are intentionally not identical today. CLI/core accept `pdf`, while the server run export endpoint documents `markdown`, `json`, and `html`.
 
 ### Task Integration
 
@@ -272,6 +279,8 @@ When `available` is `false`, the response includes `reason` and `setupInstructio
 
 AI agents (triage, executor, and custom roles) can use research tools during planning and execution sessions. These tools are registered in the pi extension (`packages/cli/src/extension.ts`).
 
+Additionally, planning-mode sessions and the LLM synthesis agent can opt into runtime builtin `WebSearch`/`WebFetch` tools (when the selected runtime supports them), complementing configured research providers.
+
 ### Available tools
 
 | Tool | Description |
@@ -280,6 +289,7 @@ AI agents (triage, executor, and custom roles) can use research tools during pla
 | `fn_research_list` | List recent runs. Parameters: `status`, `limit` |
 | `fn_research_get` | Get a run's structured findings. Parameters: `id` |
 | `fn_research_cancel` | Cancel an active run. Parameters: `id` |
+| `fn_research_retry` | Retry a failed/timed-out run when retryable. Parameters: `id` |
 
 ### Tool responses
 
@@ -291,10 +301,10 @@ All tools return:
 
 Before creating runs, `fn_research_run` checks:
 1. Research is enabled in settings
-2. At least one search provider is configured
-3. Required API keys are present
+2. Web search is available (`"builtin"` by default, or an explicitly configured external backend)
+3. Required API keys are present for external providers
 
-If any check fails, the tool returns an actionable error with setup guidance instead of crashing.
+If a check fails, the tool returns an actionable error with setup guidance instead of crashing. In practice, with the default `"builtin"` backend, provider-setup errors are mostly limited to explicit external-provider selections or explicit `"none"` opt-out.
 
 ### Best practices for agents
 
@@ -427,7 +437,7 @@ When all retries are exhausted, the run transitions to `retry_exhausted`.
 | Symptom | Cause | Resolution |
 |---|---|---|
 | "Research is disabled in settings" | `researchGlobalEnabled` or `researchSettings.enabled` is `false` | Enable in Settings → Research |
-| "Research provider is not configured" | No search provider credentials set | Add API key for your chosen provider in Settings |
+| "Research provider is not configured" | Web search was explicitly disabled (`researchGlobalWebSearchProvider: "none"`) or external provider setup is incomplete | Re-enable builtin search, or finish configuring your selected external provider in Settings |
 | "Missing API key for {provider}" | Auth credential not found | Configure provider credentials in Settings → Authentication |
 | Run stuck in `queued` | Engine not running or no available concurrency slots | Start the project engine; check `maxConcurrentRuns` |
 | Run times out | Provider slow or `maxDurationMs` too low | Increase timeout in project research settings |

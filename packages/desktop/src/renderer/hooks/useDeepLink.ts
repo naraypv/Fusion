@@ -39,7 +39,8 @@ export function useDeepLink(): UseDeepLinkResult {
       return;
     }
 
-    const unsubscribe = electronAPI.onDeepLink((rawLink: string) => {
+    const unsubscribe = electronAPI.onDeepLink((deepLinkPayload) => {
+      const rawLink = typeof deepLinkPayload === "string" ? deepLinkPayload : deepLinkPayload.raw;
       const parsed = parseDeepLink(rawLink);
       if (parsed) {
         setLastDeepLink(parsed);

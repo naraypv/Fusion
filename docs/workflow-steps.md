@@ -49,6 +49,27 @@ The **Browser Verification** template uses browser automation style checks and i
 
 The **Frontend UX Design** template verifies visual polish and consistency with existing UI patterns and design tokens, including visual hierarchy, spacing/typography consistency, color/token consistency, component reuse, responsive behavior, and fit with existing design language.
 
+> **FN-3906 auto-skip behavior:** The pre-merge orchestrator now auto-skips the built-in `frontend-ux-design` step before pause/defer checks when the task diff scope has no frontend/UI files. Scope relevance includes extensions (`.tsx`, `.jsx`, `.vue`, `.svelte`, `.astro`, `.html`, `.css`, `.scss`, `.sass`, `.less`, `.styl`), common UI path segments (`/components/`, `/app/components/`, `/dashboard/`, `/frontend/`, `/ui/`, `/styles/`, `/themes/`, `/design-system/`, `/design-tokens/`), and token/theme filenames (`tokens.(ts|js|json|css)`, `theme.(ts|js|json|css)`). If scope capture is uncertain (error/empty list), the step falls back to normal execution and relies on the agent-side FAST-BAIL rule.
+
+## Plugin-Contributed Steps
+
+Installed plugins can also provide **workflow step templates** that you enable from **Settings → Workflow Steps**, just like Fusion’s built-in quality gates.
+
+Plugin-contributed templates appear in the same workflow-step chooser/UI as built-ins. In that chooser, plugin entries are labeled/grouped as plugin-contributed (including plugin attribution in the template metadata) so you can distinguish them from Fusion-provided templates.
+
+Once added, plugin-contributed workflow steps behave like other steps: they support the same `prompt` or `script` execution modes, `pre-merge` or `post-merge` phases, and `defaultOn` behavior for new tasks.
+
+For plugin installation and authoring details, see the [Plugin Authoring Guide](./PLUGIN_AUTHORING.md) (Section 16: Registering Workflow Steps).
+
+## Creating Workflow Steps in the Dashboard
+
+From **Settings → Workflow Steps**, clicking **Add Workflow Step** now opens a chooser first:
+
+- **Built-in templates** are shown immediately so you can add review/QA steps with one click
+- **Custom workflow step** opens the manual form for fully custom prompt/script steps
+
+The custom path is always available, even while templates are still loading or if template loading fails.
+
 ## Model Overrides for Prompt Steps
 
 A prompt-mode workflow step can set its own model with:

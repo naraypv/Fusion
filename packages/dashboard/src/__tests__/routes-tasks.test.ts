@@ -44,6 +44,8 @@ const mockCentralListProjects = vi.fn().mockResolvedValue([]);
 const mockCentralInit = vi.fn().mockResolvedValue(undefined);
 const mockCentralClose = vi.fn().mockResolvedValue(undefined);
 const mockCentralReconcileProjectStatuses = vi.fn().mockResolvedValue(undefined);
+const mockCentralGetLocalNode = vi.fn().mockResolvedValue({ id: "node-local" });
+const mockCentralListNodes = vi.fn().mockResolvedValue([]);
 const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile } = vi.hoisted(() => ({
   mockPerformUpdateCheck: vi.fn(),
   mockClearUpdateCheckCache: vi.fn(),
@@ -104,6 +106,8 @@ vi.mock("@fusion/core", async (importOriginal) => {
       close: mockCentralClose,
       listProjects: mockCentralListProjects,
       reconcileProjectStatuses: mockCentralReconcileProjectStatuses,
+      getLocalNode: mockCentralGetLocalNode,
+      listNodes: mockCentralListNodes,
     })),
   });
 });
@@ -175,6 +179,7 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     listTasks: vi.fn().mockResolvedValue([]),
     searchTasks: vi.fn().mockResolvedValue([]),
     createTask: vi.fn(),
+    createTaskWithReservedId: undefined,
     moveTask: vi.fn(),
     updateTask: vi.fn(),
     deleteTask: vi.fn(),
@@ -204,7 +209,14 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     deleteTaskDocument: vi.fn().mockResolvedValue(undefined),
     updatePrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
+    linkGithubIssue: vi.fn().mockResolvedValue(undefined),
+    recordActivity: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getDistributedTaskIdAllocator: vi.fn().mockReturnValue({
+      reserveDistributedTaskId: vi.fn().mockResolvedValue({ reservationId: "res-1", taskId: "FN-7001" }),
+      commitDistributedTaskIdReservation: vi.fn().mockResolvedValue({}),
+      abortDistributedTaskIdReservation: vi.fn().mockResolvedValue({}),
+    }),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -668,6 +680,150 @@ describe("POST /tasks", () => {
         settings: { autoSummarizeTitles: undefined },
       }),
     );
+  });
+
+  it("attempts tracking issue creation for explicit task-level override when defaults are unset", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "task",
+      repo: "repo",
+      number: 42,
+      htmlUrl: "https://github.com/task/repo/issues/42",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ githubAuthMode: "token", githubAuthToken: "tok" });
+    const linkGithubIssue = store.linkGithubIssue as ReturnType<typeof vi.fn>;
+    const recordActivity = store.recordActivity as ReturnType<typeof vi.fn>;
+    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      githubTracking: { enabled: true, repoOverride: "task/repo" },
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({
+        description: "Track this task",
+        githubTracking: { enabled: true, repoOverride: "task/repo" },
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "task", repo: "repo" }));
+    expect(linkGithubIssue).toHaveBeenCalledWith("FN-001", expect.objectContaining({ owner: "task", repo: "repo", number: 42 }));
+    expect(recordActivity).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ type: "github-issue-created" }) }));
+    createIssueSpy.mockRestore();
+  });
+
+  it("uses store.createTask for local task creation", async () => {
+    const createTask = vi.fn().mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-7001",
+      column: "triage",
+      createdAt: "2026-05-05T00:00:00.000Z",
+      updatedAt: "2026-05-05T00:00:00.000Z",
+      nodeId: "node-target",
+    });
+    const storeWithCreate = createMockStore({ createTask });
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(storeWithCreate));
+
+    const res = await REQUEST(
+      app,
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Big initiative", nodeId: "node-target" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(createTask).toHaveBeenCalledWith(
+      expect.objectContaining({ description: "Big initiative", nodeId: "node-target" }),
+      expect.objectContaining({ settings: { autoSummarizeTitles: undefined } }),
+    );
+    expect((storeWithCreate.getDistributedTaskIdAllocator as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when nodeId is not a string", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Task", nodeId: 123 }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("nodeId must be a string");
+  });
+
+  it("returns 500 when store.createTask throws", async () => {
+    const createTask = vi.fn().mockRejectedValue(new Error("Task ID already exists: FN-7001"));
+    const storeWithCreate = createMockStore({ createTask });
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(storeWithCreate));
+
+    const res = await REQUEST(
+      app,
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Big initiative" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("Task ID already exists: FN-7001");
+  });
+
+  it("forwards branch and baseBranch on create", async () => {
+    const createdTask = {
+      ...FAKE_TASK_DETAIL,
+      column: "triage",
+      branch: "fusion/fn-branch",
+      baseBranch: "main",
+    };
+    (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue(createdTask);
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({
+        description: "Task with branch fields",
+        branch: " fusion/fn-branch ",
+        baseBranch: " main ",
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(201);
+    expect(store.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        branch: "fusion/fn-branch",
+        baseBranch: "main",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("returns 400 when create branch payload is not a string", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/tasks",
+      JSON.stringify({ description: "Task", branch: 10 }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("branch must be a string");
+    expect(store.createTask).not.toHaveBeenCalled();
   });
 
   it("forwards model overrides when both provider and id are supplied", async () => {
@@ -1382,6 +1538,79 @@ describe("POST /tasks", () => {
   });
 });
 
+describe("PATCH /tasks/:id branch fields", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = createMockStore();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("forwards trimmed branch and baseBranch values", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      branch: "fusion/fn-123",
+      baseBranch: "main",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-001",
+      JSON.stringify({ branch: " fusion/fn-123 ", baseBranch: " main " }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({
+      branch: "fusion/fn-123",
+      baseBranch: "main",
+    }));
+  });
+
+  it("treats empty-string patch values as clears (null)", async () => {
+    (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      branch: undefined,
+      baseBranch: undefined,
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-001",
+      JSON.stringify({ branch: "   ", baseBranch: "" }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", expect.objectContaining({
+      branch: null,
+      baseBranch: null,
+    }));
+  });
+
+  it("returns 400 for invalid branch payload types", async () => {
+    const res = await REQUEST(
+      buildApp(),
+      "PATCH",
+      "/api/tasks/FN-001",
+      JSON.stringify({ branch: 42 }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("branch must be a string or null");
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+});
+
 describe("POST /subtasks/*", () => {
   let store: TaskStore;
 
@@ -1628,6 +1857,216 @@ describe("POST /subtasks/*", () => {
     expect(store.updateTask).toHaveBeenCalledWith("FN-102", { dependencies: ["FN-101"] });
   });
 
+  it("subtask batch creation attempts tracking issue creation and links metadata", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockResolvedValue({
+      owner: "task",
+      repo: "repo",
+      number: 55,
+      htmlUrl: "https://github.com/task/repo/issues/55",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      githubTrackingDefaultRepo: "task/repo",
+      githubAuthMode: "token",
+      githubAuthToken: "tok",
+    });
+    (store.createTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-103", title: "First", column: "triage", githubTracking: { enabled: true } });
+
+    const start = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/start-streaming",
+      JSON.stringify({ description: "Break this feature into subtasks" }),
+      { "Content-Type": "application/json" },
+    );
+
+    const createRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/create-tasks",
+      JSON.stringify({
+        sessionId: start.body.sessionId,
+        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(createRes.status).toBe(201);
+    expect(createIssueSpy).toHaveBeenCalledWith(expect.objectContaining({ owner: "task", repo: "repo" }));
+    expect(store.linkGithubIssue).toHaveBeenCalledWith("FN-103", expect.objectContaining({ owner: "task", repo: "repo", number: 55 }));
+    expect(store.recordActivity).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ type: "github-issue-created" }) }));
+    createIssueSpy.mockRestore();
+  });
+
+  it("subtask batch creation remains successful when tracking issue creation fails", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue").mockRejectedValue(new Error("boom"));
+
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      githubTrackingDefaultRepo: "task/repo",
+      githubAuthMode: "token",
+      githubAuthToken: "tok",
+    });
+    (store.createTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-104", title: "First", column: "triage", githubTracking: { enabled: true } });
+
+    const start = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/start-streaming",
+      JSON.stringify({ description: "Break this feature into subtasks" }),
+      { "Content-Type": "application/json" },
+    );
+
+    const createRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/create-tasks",
+      JSON.stringify({
+        sessionId: start.body.sessionId,
+        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.tasks).toHaveLength(1);
+    expect(createIssueSpy).toHaveBeenCalledTimes(1);
+    createIssueSpy.mockRestore();
+  });
+
+  it("subtask batch creation does not recreate tracking issue when task is already linked", async () => {
+    const createIssueSpy = vi.spyOn(GitHubClient.prototype, "createIssue");
+
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      githubTrackingDefaultRepo: "task/repo",
+      githubAuthMode: "token",
+      githubAuthToken: "tok",
+    });
+    (store.createTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ...FAKE_TASK_DETAIL,
+        id: "FN-105",
+        title: "First",
+        column: "triage",
+        githubTracking: {
+          enabled: true,
+          issue: { owner: "task", repo: "repo", number: 9, url: "https://github.com/task/repo/issues/9" },
+        },
+      });
+
+    const start = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/start-streaming",
+      JSON.stringify({ description: "Break this feature into subtasks" }),
+      { "Content-Type": "application/json" },
+    );
+
+    const createRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/create-tasks",
+      JSON.stringify({
+        sessionId: start.body.sessionId,
+        subtasks: [{ tempId: "subtask-1", title: "First", description: "Do first" }],
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(createRes.status).toBe(201);
+    expect(createIssueSpy).not.toHaveBeenCalled();
+    createIssueSpy.mockRestore();
+  });
+
+  it("applies explicit branch selection to created subtasks", async () => {
+    (store.createTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-201", title: "First", column: "triage" });
+
+    const start = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/start-streaming",
+      JSON.stringify({ description: "Break this feature into subtasks" }),
+      { "Content-Type": "application/json" },
+    );
+
+    const createRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/create-tasks",
+      JSON.stringify({
+        sessionId: start.body.sessionId,
+        branchSelection: { mode: "custom-new", branchName: "feature/planning", baseBranch: "main" },
+        subtasks: [
+          { tempId: "subtask-1", title: "First", description: "Do first" },
+        ],
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(createRes.status).toBe(201);
+    expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
+      branch: "feature/planning",
+      baseBranch: "main",
+      branchContext: {
+        groupId: `planning:${start.body.sessionId}`,
+        source: "planning",
+        assignmentMode: "shared",
+        inheritedBaseBranch: "main",
+      },
+    }));
+  });
+
+  it("derives per-task branches when requested", async () => {
+    (store.createTask as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-301", title: "First", column: "triage" })
+      .mockResolvedValueOnce({ ...FAKE_TASK_DETAIL, id: "FN-302", title: "Second", column: "triage" });
+
+    const start = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/start-streaming",
+      JSON.stringify({ description: "Break this feature into subtasks" }),
+      { "Content-Type": "application/json" },
+    );
+
+    const createRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/subtasks/create-tasks",
+      JSON.stringify({
+        sessionId: start.body.sessionId,
+        branchSelection: { mode: "custom-new", branchName: "feature/planning" },
+        branchAssignment: { mode: "per-task-derived" },
+        subtasks: [
+          { tempId: "subtask-1", title: "First Task", description: "Do first" },
+          { tempId: "subtask-2", title: "Second Task", description: "Do second" },
+        ],
+      }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(createRes.status).toBe(201);
+    expect(store.createTask).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      branch: "feature/planning/first-task",
+      branchContext: expect.objectContaining({
+        groupId: `planning:${start.body.sessionId}`,
+        source: "planning",
+        assignmentMode: "per-task-derived",
+      }),
+    }));
+    expect(store.createTask).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      branch: "feature/planning/second-task",
+      branchContext: expect.objectContaining({
+        groupId: `planning:${start.body.sessionId}`,
+        source: "planning",
+        assignmentMode: "per-task-derived",
+      }),
+    }));
+  });
+
   it("returns 404 for invalid subtask session during batch creation", async () => {
     const res = await REQUEST(
       buildApp(),
@@ -1856,3 +2295,96 @@ describe("POST /subtasks/*", () => {
   });
 });
 
+
+describe("POST /tasks/:id/review/address", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = createMockStore({ updateStep: vi.fn() } as unknown as Partial<TaskStore>);
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("resumes in-review tasks to in-progress using selected review payload", async () => {
+    const taskWithReview = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-001",
+      column: "in-review",
+      status: "awaiting-user-review",
+      assignedAgentId: null,
+      steps: [{ id: "s1", title: "Step 1", status: "done" }],
+      reviewState: {
+        source: "reviewer-agent",
+        items: [{ id: "ri-1", body: "Fix tests", summary: "Fix tests", author: { login: "reviewer" }, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
+        addressing: [],
+      },
+    };
+    const movedTask = { ...taskWithReview, column: "in-progress", status: null, sessionFile: null, assignedAgentId: null };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithReview).mockResolvedValueOnce({ ...taskWithReview, reviewState: { ...taskWithReview.reviewState, addressing: [{ itemId: "ri-1", status: "queued", selectedAt: new Date().toISOString() }] } });
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
+    (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-1", source: "reviewer-agent", summary: "Fix tests", body: "Fix tests" }] }), { "Content-Type": "application/json" });
+
+    expect(res.status).toBe(200);
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress", { preserveProgress: true });
+    expect(store.updateStep).toHaveBeenCalledWith("FN-001", 0, "pending");
+  });
+
+  it("for in-progress tasks injects steering without moving task", async () => {
+    const taskWithReview = {
+      ...FAKE_TASK_DETAIL,
+      id: "FN-001",
+      column: "in-progress",
+      sessionFile: "active.session.json",
+      reviewState: {
+        source: "pull-request",
+        items: [{ id: "ri-1", body: "Fix tests", summary: "Fix tests", author: { login: "reviewer" }, createdAt: new Date().toISOString(), path: "src/a.ts", line: 4 }],
+        addressing: [],
+      },
+    };
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithReview).mockResolvedValueOnce(taskWithReview);
+    (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-1", source: "pr-review", summary: "Fix tests", body: "Fix tests", filePath: "src/a.ts", lineNumber: 4 }] }), { "Content-Type": "application/json" });
+
+    expect(res.status).toBe(200);
+    expect(store.moveTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects empty selection", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-001", reviewState: { source: "reviewer-agent", items: [], addressing: [] } });
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [] }), { "Content-Type": "application/json" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("selectedItems must be a non-empty array");
+  });
+
+  it("rejects unsupported review source", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({ ...FAKE_TASK_DETAIL, id: "FN-001", reviewState: { source: "reviewer-agent", items: [{ id: "ri-1", body: "x", summary: "x", author: { login: "reviewer" }, createdAt: new Date().toISOString() }], addressing: [] } });
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-1", source: "other", summary: "x", body: "x" }] }), { "Content-Type": "application/json" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Unsupported review source");
+  });
+
+  it("rejects source mismatch and unknown item ids", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      id: "FN-001",
+      reviewState: { source: "pull-request", items: [{ id: "ri-1", body: "x", summary: "x", author: { login: "reviewer" }, createdAt: new Date().toISOString() }], addressing: [] },
+    });
+
+    const mismatch = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-1", source: "reviewer-agent", summary: "x", body: "x" }] }), { "Content-Type": "application/json" });
+    expect(mismatch.status).toBe(400);
+    expect(mismatch.body.error).toContain("does not match task review mode");
+
+    const unknown = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-2", source: "pr-review", summary: "x", body: "x" }] }), { "Content-Type": "application/json" });
+    expect(unknown.status).toBe(400);
+    expect(unknown.body.error).toContain("must reference existing review items");
+    expect(store.createTask).not.toHaveBeenCalled();
+  });
+});

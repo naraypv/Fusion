@@ -609,7 +609,7 @@ describe("PlanningModeModal", () => {
       });
 
       expect(screen.getByDisplayValue("Recovered summary description from persisted session")).toBeDefined();
-      expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("L");
+      expect((screen.getByRole("combobox", { name: "Suggested Size" }) as HTMLSelectElement).value).toBe("L");
       expect(screen.getByText("Deliverable A")).toBeDefined();
       expect(screen.getByText("Deliverable B")).toBeDefined();
     });
@@ -806,8 +806,217 @@ describe("PlanningModeModal", () => {
       fireEvent.click(createSingleTaskButton);
 
       await waitFor(() => {
-        expect(mockCreateTaskFromPlanning).toHaveBeenCalledWith("session-complete-2", resumedSummary, undefined);
+        expect(mockCreateTaskFromPlanning).toHaveBeenCalledWith(
+          "session-complete-2",
+          expect.objectContaining({ ...resumedSummary, priority: "normal" }),
+          undefined,
+        );
       });
+    });
+
+    it("submits selected summary priority when creating a single task", async () => {
+      const resumedSummary: PlanningSummary = {
+        title: "Resume-to-task-priority",
+        description: "Recovered summary for priority",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: ["Implement", "Verify"],
+      };
+
+      mockFetchAiSession.mockResolvedValueOnce({
+        id: "session-complete-priority",
+        type: "planning",
+        status: "complete",
+        title: "Resume-to-task-priority",
+        inputPayload: JSON.stringify({ initialPlan: "Recover and create with priority" }),
+        conversationHistory: "[]",
+        currentQuestion: null,
+        result: JSON.stringify(resumedSummary),
+        thinkingOutput: "",
+        error: null,
+        projectId: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      render(
+        <PlanningModeModal
+          isOpen={true}
+          onClose={mockOnClose}
+          onTaskCreated={mockOnTaskCreated}
+          onTasksCreated={vi.fn()}
+          tasks={mockTasks}
+          resumeSessionId="session-complete-priority"
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("Create Single Task")).toBeDefined();
+      });
+
+      fireEvent.change(screen.getByRole("combobox", { name: "Priority" }), {
+        target: { value: "high" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Create Single Task" }));
+
+      await waitFor(() => {
+        expect(mockCreateTaskFromPlanning).toHaveBeenCalledWith(
+          "session-complete-priority",
+          expect.objectContaining({ priority: "high" }),
+          undefined,
+        );
+      });
+    });
+
+    it("preserves per-subtask priority selections when creating tasks from breakdown", async () => {
+      const resumedSummary: PlanningSummary = {
+        title: "Resume-to-breakdown-priority",
+        description: "Recovered summary for breakdown priority",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: ["Implement", "Verify"],
+      };
+
+      mockFetchAiSession.mockResolvedValueOnce({
+        id: "session-breakdown-priority",
+        type: "planning",
+        status: "complete",
+        title: "Resume-to-breakdown-priority",
+        inputPayload: JSON.stringify({ initialPlan: "Recover and break down with priority" }),
+        conversationHistory: "[]",
+        currentQuestion: null,
+        result: JSON.stringify(resumedSummary),
+        thinkingOutput: "",
+        error: null,
+        projectId: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      mockStartPlanningBreakdown.mockResolvedValueOnce({
+        sessionId: "session-breakdown-priority",
+        subtasks: [
+          {
+            id: "subtask-1",
+            title: "First subtask",
+            description: "First description",
+            suggestedSize: "M",
+            dependsOn: [],
+          },
+        ],
+      });
+      mockCreateTasksFromPlanning.mockResolvedValueOnce({ tasks: [] });
+
+      render(
+        <PlanningModeModal
+          isOpen={true}
+          onClose={mockOnClose}
+          onTaskCreated={mockOnTaskCreated}
+          onTasksCreated={vi.fn()}
+          tasks={mockTasks}
+          resumeSessionId="session-breakdown-priority"
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Break into Tasks" })).toBeDefined();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Break into Tasks" }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Create Tasks" })).toBeDefined();
+      });
+
+      const prioritySelect = screen.getAllByRole("combobox", { name: "Priority" })[0];
+      fireEvent.change(prioritySelect, { target: { value: "urgent" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create Tasks" }));
+
+      await waitFor(() => {
+        expect(mockCreateTasksFromPlanning).toHaveBeenCalledWith(
+          "session-breakdown-priority",
+          [expect.objectContaining({ id: "subtask-1", priority: "urgent" })],
+          undefined,
+        );
+      });
+    });
+
+    it("refines a resumed complete session without blank question view", async () => {
+      const resumedSummary: PlanningSummary = {
+        title: "Resume-and-refine",
+        description: "Recovered summary for refine",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: ["Implement", "Verify"],
+      };
+      const refinedQuestion: PlanningQuestion = {
+        id: "q-refine",
+        type: "text",
+        question: "Which part should we refine?",
+        description: "Refine follow-up",
+      };
+
+      mockFetchAiSession.mockResolvedValueOnce({
+        id: "session-complete-refine",
+        type: "planning",
+        status: "complete",
+        title: "Resume-and-refine",
+        inputPayload: JSON.stringify({ initialPlan: "Recover and refine" }),
+        conversationHistory: "[]",
+        currentQuestion: null,
+        result: JSON.stringify(resumedSummary),
+        thinkingOutput: "",
+        error: null,
+        projectId: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      let streamHandlers: any;
+      mockConnectPlanningStream.mockImplementationOnce((_sessionId: string, _projectId: string | undefined, handlers: any) => {
+        streamHandlers = handlers;
+        return {
+          close: vi.fn(),
+          isConnected: vi.fn().mockReturnValue(true),
+        };
+      });
+      mockRespondToPlanning.mockImplementationOnce(async () => {
+        setTimeout(() => {
+          streamHandlers?.onQuestion?.(refinedQuestion);
+        }, 10);
+        return { type: "question", data: refinedQuestion };
+      });
+
+      render(
+        <PlanningModeModal
+          isOpen={true}
+          onClose={mockOnClose}
+          onTaskCreated={mockOnTaskCreated}
+          onTasksCreated={vi.fn()}
+          tasks={mockTasks}
+          resumeSessionId="session-complete-refine"
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: "Refine Further" })).toBeDefined();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Refine Further" }));
+
+      await waitFor(() => {
+        expect(mockRespondToPlanning).toHaveBeenCalledWith(
+          "session-complete-refine",
+          { refine: true },
+          undefined,
+          expect.any(String),
+        );
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText("Which part should we refine?")).toBeDefined();
+      });
+      expect(screen.queryByText("No active question in session")).toBeNull();
     });
   });
 
@@ -1089,12 +1298,15 @@ describe("PlanningModeModal", () => {
         expect(screen.getByText("What is the scope?")).toBeDefined();
       });
 
-      fireEvent.click(screen.getByText("Medium"));
-      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+      const mediumOption = await screen.findByText("Medium");
+      fireEvent.click(mediumOption);
+
+      const continueBtn = await screen.findByRole("button", { name: "Continue" });
+      fireEvent.click(continueBtn);
 
       await waitFor(() => {
         expect(screen.getByText("What are the key requirements?")).toBeDefined();
-      });
+      }, { timeout: 5000 });
 
       expect(screen.getByTestId("conversation-history")).toBeDefined();
       expect(screen.getByText("What is the scope?")).toBeDefined();

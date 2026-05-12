@@ -1,5 +1,5 @@
 import type { JSX } from "react";
-import { Bot, Heart, Activity, Pause, Square } from "lucide-react";
+import { Bot, Heart, Activity, Pause } from "lucide-react";
 import type { Agent } from "../api";
 import { resolveHeartbeatIntervalMs } from "./heartbeatIntervals";
 
@@ -94,7 +94,6 @@ function isTaskWorkerAgent(agent: AgentHealthInput): boolean {
  * state, runtimeConfig, and last heartbeat timestamp.
  *
  * Health labels (in priority order):
- * - "Terminated" — agent.state === "terminated"
  * - "Error" — agent.state === "error" (uses lastError if available)
  * - "Paused" — agent.state === "paused" (uses pauseReason if available)
  * - "Running" — agent.state === "running", or a detected task worker in "active"
@@ -107,21 +106,28 @@ function isTaskWorkerAgent(agent: AgentHealthInput): boolean {
  * @param agent - The agent object (partial Agent shape is accepted)
  * @returns A health status object with label, icon, color, and stateDerived metadata
  */
+function getHeartbeatRepairMetadata(agent: AgentHealthInput): {
+  repairedAt?: string;
+  staleAtRepair?: boolean;
+  staleRepairReason?: string;
+} {
+  const metadata = agent.metadata as Record<string, unknown> | null | undefined;
+  const raw = metadata?.heartbeatTimerRepair;
+  if (!raw || typeof raw !== "object") return {};
+  const value = raw as Record<string, unknown>;
+  return {
+    repairedAt: typeof value.repairedAt === "string" ? value.repairedAt : undefined,
+    staleAtRepair: typeof value.staleAtRepair === "boolean" ? value.staleAtRepair : undefined,
+    staleRepairReason: typeof value.staleRepairReason === "string" ? value.staleRepairReason : undefined,
+  };
+}
+
 export function getAgentHealthStatus(agent: AgentHealthInput): AgentHealthStatus {
   const { state, lastHeartbeatAt, lastError, pauseReason, runtimeConfig } = agent;
   const isTaskWorker = isTaskWorkerAgent(agent);
   const isHeartbeatEnabled = isTaskWorker || runtimeConfig?.enabled !== false;
 
-  // Terminal states - these always take precedence
-  if (state === "terminated") {
-    return {
-      label: "Terminated",
-      icon: <Square size={14} />,
-      color: "var(--state-error-text)",
-      stateDerived: true,
-    };
-  }
-
+  // Explicit non-running states always take precedence.
   if (state === "error") {
     return {
       label: lastError ?? "Error",
@@ -167,6 +173,21 @@ export function getAgentHealthStatus(agent: AgentHealthInput): AgentHealthStatus
       color: "var(--text-secondary)",
       stateDerived: false,
     };
+  }
+
+  const heartbeatRepair = getHeartbeatRepairMetadata(agent);
+  if (heartbeatRepair.staleAtRepair && heartbeatRepair.repairedAt) {
+    const repairedMs = Date.parse(heartbeatRepair.repairedAt);
+    const lastHeartbeatMs = Date.parse(lastHeartbeatAt);
+    if (Number.isFinite(repairedMs) && Number.isFinite(lastHeartbeatMs) && lastHeartbeatMs < repairedMs) {
+      return {
+        label: "Unresponsive",
+        icon: <Activity size={14} />,
+        color: "var(--state-error-text)",
+        stateDerived: false,
+        reason: heartbeatRepair.staleRepairReason ?? "Heartbeat scheduler repaired a missing timer; waiting for recovery heartbeat",
+      };
+    }
   }
 
   // Every non-task-worker agent has an effective interval — either explicitly

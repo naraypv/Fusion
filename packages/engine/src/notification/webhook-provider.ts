@@ -5,6 +5,7 @@ import type {
   NotificationResult,
 } from "@fusion/core";
 import { schedulerLog } from "../logger.js";
+import { buildNtfyClickUrl } from "../notifier.js";
 
 export interface WebhookProviderConfig {
   /** Webhook endpoint URL */
@@ -13,6 +14,24 @@ export interface WebhookProviderConfig {
   webhookFormat: "slack" | "discord" | "generic";
   /** Events to send (empty = all events) */
   events?: string[];
+  /** Dashboard host for click-through deep links */
+  dashboardHost?: string;
+  /** Project identifier for deep links */
+  projectId?: string;
+}
+
+function resolveParticipantLabel(
+  metadata: NotificationPayload["metadata"] | undefined,
+  kind: "from" | "to",
+): string {
+  const nameKey = kind === "from" ? "fromName" : "toName";
+  const idKey = kind === "from" ? "fromId" : "toId";
+  const name = typeof metadata?.[nameKey] === "string" ? metadata[nameKey].trim() : "";
+  if (name.length > 0) {
+    return name;
+  }
+  const id = typeof metadata?.[idKey] === "string" ? metadata[idKey].trim() : "";
+  return id.length > 0 ? id : kind === "from" ? "agent" : "recipient";
 }
 
 export class WebhookNotificationProvider implements NotificationProvider {
@@ -49,6 +68,8 @@ export class WebhookNotificationProvider implements NotificationProvider {
       webhookUrl,
       webhookFormat,
       events: Array.isArray(config.events) ? config.events.filter((event): event is string => typeof event === "string") : [],
+      dashboardHost: typeof config.dashboardHost === "string" ? config.dashboardHost : undefined,
+      projectId: typeof config.projectId === "string" ? config.projectId : undefined,
     };
 
     this.abortController?.abort();
@@ -135,6 +156,17 @@ export class WebhookNotificationProvider implements NotificationProvider {
         return "Pipeline gridlocked";
       case "fallback-used":
         return `Fusion recovered by switching from ${String(payload.metadata?.primaryModel ?? "primary model")} to ${String(payload.metadata?.fallbackModel ?? "fallback model")} (${String(payload.metadata?.triggerPoint ?? "unknown trigger")})`;
+      case "message:agent-to-user": {
+        const from = resolveParticipantLabel(payload.metadata, "from");
+        const preview = typeof payload.metadata?.preview === "string" ? payload.metadata.preview : "(no preview)";
+        return `From: ${from} → You: ${preview}`;
+      }
+      case "message:agent-to-agent": {
+        const from = resolveParticipantLabel(payload.metadata, "from");
+        const to = resolveParticipantLabel(payload.metadata, "to");
+        const preview = typeof payload.metadata?.preview === "string" ? payload.metadata.preview : "(no preview)";
+        return `From: ${from} → To: ${to}: ${preview}`;
+      }
       default:
         return `Event "${event}" for task ${identifier}`;
     }
@@ -163,6 +195,11 @@ export class WebhookNotificationProvider implements NotificationProvider {
       return { content: message };
     }
 
+    const messageId = typeof payload.metadata?.messageId === "string" ? payload.metadata.messageId : undefined;
+
+    const fromLabel = resolveParticipantLabel(payload.metadata, "from");
+    const toLabel = resolveParticipantLabel(payload.metadata, "to");
+
     return {
       event: payload.event,
       timestamp: new Date().toISOString(),
@@ -170,7 +207,22 @@ export class WebhookNotificationProvider implements NotificationProvider {
         id: payload.taskId,
         title: payload.taskTitle,
       },
-      metadata: payload.metadata,
+      metadata: {
+        ...payload.metadata,
+        ...(payload.event === "message:agent-to-user" || payload.event === "message:agent-to-agent"
+          ? {
+            fromName: typeof payload.metadata?.fromName === "string" ? payload.metadata.fromName : fromLabel,
+            toName: typeof payload.metadata?.toName === "string" ? payload.metadata.toName : toLabel,
+          }
+          : {}),
+      },
+      clickUrl: buildNtfyClickUrl({
+        dashboardHost: this.config.dashboardHost,
+        projectId: this.config.projectId,
+        taskId: payload.taskId,
+        messageId,
+        view: "mailbox",
+      }),
     };
   }
 }

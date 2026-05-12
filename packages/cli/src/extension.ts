@@ -14,7 +14,11 @@ import {
   type ResearchRun,
   type ResearchRunStatus,
   RESEARCH_RUN_STATUSES,
+  isResearchExperimentalEnabled,
   resolveResearchSettings,
+  canAgentTakeImplementationTaskForExplicitRouting,
+  formatRoleMismatchReason,
+  resolveAgentProvisioningPolicy,
 } from "@fusion/core";
 import {
   getGhErrorMessage,
@@ -22,6 +26,7 @@ import {
   isGhAvailable,
   runGhJsonAsync,
 } from "@fusion/core/gh-cli";
+import { fetchWebContent } from "@fusion/engine";
 import { resolve, basename, extname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -88,6 +93,8 @@ function getFusionDir(cwd: string): string {
 async function validateAssignableAgentId(
   cwd: string,
   agentId: string,
+  task?: Pick<Task, "id" | "column"> | null,
+  override = false,
 ): Promise<string | null> {
   const { AgentStore, isEphemeralAgent } = await import("@fusion/core");
   const agentStore = new AgentStore({ rootDir: getFusionDir(cwd) });
@@ -99,7 +106,26 @@ async function validateAssignableAgentId(
   if (isEphemeralAgent(agent)) {
     return `Cannot assign task to ephemeral/runtime agent ${agentId}`;
   }
+  if (task && !override && !canAgentTakeImplementationTaskForExplicitRouting(agent, task)) {
+    return formatRoleMismatchReason(agent, task);
+  }
   return null;
+}
+
+function normalizeNullableStringInput(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.toLowerCase() === "null") {
+    return null;
+  }
+
+  return trimmed;
 }
 
 const INSIGHT_CATEGORIES: InsightCategory[] = [
@@ -120,39 +146,109 @@ const INSIGHT_CATEGORIES: InsightCategory[] = [
   "trends",
 ];
 
-const INSIGHT_STATUSES: InsightStatus[] = ["generated", "confirmed", "stale", "dismissed"];
+const INSIGHT_STATUSES: InsightStatus[] = ["generated", "confirmed", "stale", "dismissed", "archived"];
 const INSIGHT_RUN_STATUSES: InsightRunStatus[] = ["pending", "running", "completed", "failed", "cancelled"];
 const INSIGHT_RUN_TRIGGERS: InsightRunTrigger[] = ["schedule", "manual", "task_completion", "merge_event", "api"];
+
+function getTaskSourceAgentLabel(task: Pick<Task, "sourceMetadata" | "sourceAgentId">): string | undefined {
+  const metadataAgentName = task.sourceMetadata?.agentName;
+  if (typeof metadataAgentName === "string" && metadataAgentName.trim().length > 0) {
+    return metadataAgentName.trim();
+  }
+
+  if (typeof task.sourceAgentId === "string" && task.sourceAgentId.trim().length > 0) {
+    return task.sourceAgentId.trim();
+  }
+
+  return undefined;
+}
+
+function getTaskSourceLabel(task: Pick<Task, "sourceType" | "sourceMetadata" | "sourceAgentId" | "sourceParentTaskId">): string | undefined {
+  switch (task.sourceType) {
+    case "dashboard_ui":
+      return "Dashboard";
+    case "quick_chat":
+      return "Quick Chat";
+    case "chat_session":
+      return "Chat Session";
+    case "agent_heartbeat": {
+      const sourceAgent = getTaskSourceAgentLabel(task);
+      return sourceAgent ? `Agent (${sourceAgent})` : "Agent";
+    }
+    case "automation": {
+      const sourceAgent = getTaskSourceAgentLabel(task);
+      return sourceAgent ? `Automation (${sourceAgent})` : "Automation";
+    }
+    case "cron":
+      return "Scheduled Task";
+    case "workflow_step":
+      return "Workflow Step";
+    case "github_import": {
+      const issueUrl = task.sourceMetadata?.issueUrl;
+      return typeof issueUrl === "string" && issueUrl.length > 0
+        ? `GitHub Import (${issueUrl})`
+        : "GitHub Import";
+    }
+    case "research": {
+      const findingLabel = task.sourceMetadata?.findingLabel;
+      if (typeof findingLabel === "string" && findingLabel.length > 0) {
+        return `Research (${findingLabel})`;
+      }
+      const runId = task.sourceMetadata?.runId;
+      return typeof runId === "string" && runId.length > 0
+        ? `Research (${runId})`
+        : "Research";
+    }
+    case "task" + "_refine":
+      return task.sourceParentTaskId ? `Refinement of ${task.sourceParentTaskId}` : "Refinement";
+    case "task" + "_duplicate":
+      return task.sourceParentTaskId ? `Duplicate of ${task.sourceParentTaskId}` : "Duplicate";
+    case "cli":
+      return "CLI";
+    case "api":
+      return "API";
+    case "recovery":
+      return "Recovery";
+    default:
+      return undefined;
+  }
+}
 
 function formatTaskLine(t: Task): string {
   const label =
     t.title || t.description.slice(0, 60) + (t.description.length > 60 ? "…" : "");
+  const source = getTaskSourceLabel(t);
+  const sourceSuffix = source ? ` [via: ${source}]` : "";
   const deps = t.dependencies.length ? ` [deps: ${t.dependencies.join(", ")}]` : "";
   const paused = t.paused ? " (paused)" : "";
-  return `${t.id}  ${label}${deps}${paused}`;
+  return `${t.id}  ${label}${sourceSuffix}${deps}${paused}`;
 }
 
 async function getResearchAvailability(store: TaskStore): Promise<{ ok: boolean; code?: string; message?: string }> {
   const settings = await store.getSettings();
+  if (!isResearchExperimentalEnabled(settings)) {
+    return { ok: false, code: "feature-disabled", message: "Research tools are disabled. Enable experimentalFeatures.researchView first." };
+  }
+
   const resolved = resolveResearchSettings(settings);
   if (!resolved.enabled) {
     return { ok: false, code: "feature-disabled", message: "Research is disabled in settings." };
   }
 
-  const backend = (resolved.searchProvider as string | undefined) ?? settings.researchGlobalWebSearchProvider;
-  const configured = backend === "searxng"
-    ? Boolean(settings.researchGlobalSearxngUrl)
-    : backend === "brave"
-      ? Boolean(settings.researchGlobalBraveApiKey)
-      : backend === "google"
-        ? Boolean(settings.researchGlobalGoogleSearchApiKey && settings.researchGlobalGoogleSearchCx)
-        : backend === "tavily"
-          ? Boolean(settings.researchGlobalTavilyApiKey)
-          : false;
-
-  if (!backend) {
-    return { ok: false, code: "provider-unavailable", message: "Research provider is not configured. Set research provider credentials in Settings." };
-  }
+  const backend = (resolved.searchProvider as string | undefined) ?? settings.researchGlobalWebSearchProvider ?? "builtin";
+  const configured = backend === "builtin"
+    ? true
+    : backend === "none"
+      ? false
+      : backend === "searxng"
+        ? Boolean(settings.researchGlobalSearxngUrl)
+        : backend === "brave"
+          ? Boolean(settings.researchGlobalBraveApiKey)
+          : backend === "google"
+            ? Boolean(settings.researchGlobalGoogleSearchApiKey && settings.researchGlobalGoogleSearchCx)
+            : backend === "tavily"
+              ? Boolean(settings.researchGlobalTavilyApiKey)
+              : false;
 
   if (!configured) {
     return { ok: false, code: "missing-credentials", message: `Missing credentials for ${backend}. Add provider keys in Authentication and verify Research defaults.` };
@@ -251,6 +347,19 @@ async function fetchGitHubIssuesViaGh(
   }
 }
 
+function buildGitHubIssueSource(owner: string, repo: string, issue: { number: number; html_url: string }) {
+  return {
+    sourceIssue: {
+      provider: "github" as const,
+      repository: `${owner}/${repo}`,
+      externalIssueId: String(issue.number),
+      issueNumber: issue.number,
+      url: issue.html_url,
+    },
+    sourceMetadata: { issueUrl: issue.html_url, issueNumber: issue.number },
+  };
+}
+
 async function fetchGitHubIssueViaGh(
   owner: string,
   repo: string,
@@ -302,8 +411,11 @@ export default function kbExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
 
-      if (params.agentId !== undefined) {
-        const error = await validateAssignableAgentId(ctx.cwd, params.agentId);
+      const normalizedAgentId = normalizeNullableStringInput(params.agentId);
+
+      if (normalizedAgentId !== undefined && normalizedAgentId !== null) {
+        const candidateTask: Pick<Task, "id" | "column"> = { id: "<new>", column: "todo" };
+        const error = await validateAssignableAgentId(ctx.cwd ?? process.cwd(), normalizedAgentId, candidateTask);
         if (error) {
           return {
             content: [{ type: "text", text: error }],
@@ -316,7 +428,7 @@ export default function kbExtension(pi: ExtensionAPI) {
       const task = await store.createTask({
         description: params.description.trim(),
         dependencies: params.depends,
-        assignedAgentId: params.agentId,
+        assignedAgentId: normalizedAgentId === null ? undefined : normalizedAgentId,
         source: { sourceType: "api" },
       });
 
@@ -420,8 +532,9 @@ export default function kbExtension(pi: ExtensionAPI) {
         updatedFields.push("dependencies");
       }
       if (params.agentId !== undefined) {
-        if (params.agentId !== null) {
-          const error = await validateAssignableAgentId(ctx.cwd, params.agentId);
+        const normalizedAgentId = normalizeNullableStringInput(params.agentId);
+        if (typeof normalizedAgentId === "string") {
+          const error = await validateAssignableAgentId(ctx.cwd ?? process.cwd(), normalizedAgentId, task);
           if (error) {
             return {
               content: [{ type: "text", text: error }],
@@ -430,11 +543,12 @@ export default function kbExtension(pi: ExtensionAPI) {
             };
           }
         }
-        updates.assignedAgentId = params.agentId;
+        updates.assignedAgentId = normalizedAgentId;
         updatedFields.push("agentId");
       }
       if (params.nodeId !== undefined) {
-        const validation = validateNodeOverrideChange(task, params.nodeId ?? null);
+        const normalizedNodeId = normalizeNullableStringInput(params.nodeId);
+        const validation = validateNodeOverrideChange(task, normalizedNodeId ?? null);
         if (!validation.allowed) {
           return {
             content: [{ type: "text", text: validation.message ?? "Node override change blocked" }],
@@ -442,7 +556,7 @@ export default function kbExtension(pi: ExtensionAPI) {
             details: { error: validation.reason },
           };
         }
-        updates.nodeId = params.nodeId;
+        updates.nodeId = normalizedNodeId;
         updatedFields.push("nodeId");
       }
 
@@ -550,6 +664,10 @@ export default function kbExtension(pi: ExtensionAPI) {
       );
       if (task.dependencies.length) {
         lines.push(`Dependencies: ${task.dependencies.join(", ")}`);
+      }
+      const sourceLabel = getTaskSourceLabel(task);
+      if (sourceLabel) {
+        lines.push(`Created via: ${sourceLabel}`);
       }
       if (task.paused) lines.push("Status: PAUSED");
       lines.push("");
@@ -708,12 +826,13 @@ export default function kbExtension(pi: ExtensionAPI) {
     name: "fn_task_retry",
     label: "fn: Retry Task",
     description:
-      "Retry a failed task — clears the error state. Tasks in other columns move to todo; tasks in in-review stay in-place for auto-merge retry.",
+      "Retry a failed task — clears the error state. Non-review failures move to todo; in-review execution failures move to todo preserving progress; in-review merge failures stay in-place for auto-merge retry.",
     promptSnippet: "Retry a failed Fusion task (clears error, moves to todo or stays in in-review)",
     promptGuidelines: [
       "Use when a task has failed and needs to be retried",
       "Only tasks in 'failed' or 'stuck-killed' state can be retried",
-      "Tasks in 'in-review' stay in in-review — only the error/retry state is cleared, and the auto-merge system re-attempts",
+      "In-review tasks with incomplete steps (pending/in-progress) move to todo with preserveProgress so execution can resume",
+      "In-review tasks with all steps done stay in in-review and reset merge retry state for auto-merge re-attempt",
       "Tasks in other columns are moved to the todo column with error state cleared",
     ],
     parameters: Type.Object({
@@ -744,12 +863,26 @@ export default function kbExtension(pi: ExtensionAPI) {
         };
       }
       
-      // In-review retry: keep the task in in-review, clear only error/retry state
+      // In-review retry: distinguish between execution failures and merge failures.
       if (task.column === 'in-review') {
+        const hasIncompleteSteps =
+          task.steps.length > 0 &&
+          task.steps.some((s: { status: string }) => s.status === "pending" || s.status === "in-progress");
+
+        if (hasIncompleteSteps) {
+          await store.updateTask(params.id, { status: null, error: null, stuckKillCount: 0 });
+          await store.logEntry(params.id, "Retry requested via Fusion extension (execution failure in-review → todo, preserving progress)");
+          await store.moveTask(params.id, "todo", { preserveProgress: true });
+          return {
+            content: [{ type: "text", text: `Retried ${params.id} → todo (execution failure, preserving step progress)` }],
+            details: { taskId: params.id, newColumn: 'todo' },
+          };
+        }
+
         await store.updateTask(params.id, { status: null, error: null, stuckKillCount: 0, mergeRetries: 0 });
-        await store.logEntry(params.id, "Retry requested via Fusion extension (in-review retry, mergeRetries reset)");
+        await store.logEntry(params.id, "Retry requested via Fusion extension (in-review merge retry, mergeRetries reset)");
         return {
-          content: [{ type: "text", text: `Retried ${params.id} → in-review (merge retry state cleared, task stays in in-review)` }],
+          content: [{ type: "text", text: `Retried ${params.id} → in-review (merge retry state cleared)` }],
           details: { taskId: params.id, newColumn: 'in-review' },
         };
       }
@@ -988,21 +1121,16 @@ export default function kbExtension(pi: ExtensionAPI) {
         const body = issue.body?.trim() || "(no description)";
         const description = `${body}\n\nSource: ${sourceUrl}`;
 
+        const source = buildGitHubIssueSource(owner, repo, issue);
         const task = await store.createTask({
           title: title || undefined,
           description,
           column: "triage",
           dependencies: [],
-          sourceIssue: {
-            provider: "github",
-            repository: `${owner}/${repo}`,
-            externalIssueId: String(issue.number),
-            issueNumber: issue.number,
-            url: issue.html_url,
-          },
+          sourceIssue: source.sourceIssue,
           source: {
             sourceType: "github_import",
-            sourceMetadata: { issueUrl: issue.html_url },
+            sourceMetadata: source.sourceMetadata,
           },
         });
 
@@ -1085,21 +1213,16 @@ export default function kbExtension(pi: ExtensionAPI) {
       const body = issue.body?.trim() || "(no description)";
       const description = `${body}\n\nSource: ${sourceUrl}`;
 
+      const source = buildGitHubIssueSource(owner, repo, issue);
       const task = await store.createTask({
         title: title || undefined,
         description,
         column: "triage",
         dependencies: [],
-        sourceIssue: {
-          provider: "github",
-          repository: `${owner}/${repo}`,
-          externalIssueId: String(issue.number),
-          issueNumber: issue.number,
-          url: issue.html_url,
-        },
+        sourceIssue: source.sourceIssue,
         source: {
           sourceType: "github_import",
-          sourceMetadata: { issueUrl: issue.html_url },
+          sourceMetadata: source.sourceMetadata,
         },
       });
 
@@ -1277,6 +1400,54 @@ export default function kbExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "fn_web_fetch",
+    label: "fn: Web Fetch",
+    description: "Lightweight URL fetch (no JS rendering). Use agent-browser skill for JS-heavy pages.",
+    parameters: Type.Object({
+      url: Type.String({ description: "URL to fetch (http/https)" }),
+      prompt: Type.Optional(Type.String({ description: "Optional extraction hint for downstream summarization" })),
+      timeoutMs: Type.Optional(Type.Number({ description: "Timeout in milliseconds (default: 30000)" })),
+      maxBytes: Type.Optional(Type.Number({ description: "Max bytes to return (default: 512000)" })),
+    }),
+    promptSnippet: "Fetch and extract readable text from a webpage URL",
+    promptGuidelines: [
+      "Use for lightweight GET requests where JS rendering is not required.",
+      "For JS-rendered pages or complex browsing flows, use agent-browser skill instead.",
+    ],
+    async execute(_toolCallId, params) {
+      const result = await fetchWebContent(params.url, {
+        timeoutMs: params.timeoutMs,
+        maxBytes: params.maxBytes,
+      });
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `URL: ${result.finalUrl}`,
+            `Status: ${result.status}`,
+            `Content-Type: ${result.contentType}`,
+            params.prompt ? `Prompt: ${params.prompt}` : undefined,
+            result.title ? `Title: ${result.title}` : undefined,
+            "",
+            result.content,
+            result.truncated ? "\n[truncated to maxBytes]" : "",
+          ].filter(Boolean).join("\n"),
+        }],
+        details: {
+          finalUrl: result.finalUrl,
+          status: result.status,
+          contentType: result.contentType,
+          title: result.title,
+          truncated: result.truncated,
+          bytesRead: result.bytesRead,
+          promptSnippet: params.prompt ? params.prompt.slice(0, 200) : undefined,
+          promptGuidelines: "Lightweight fetch only; for JS-rendered pages, use agent-browser skill.",
+        },
+      };
+    },
+  });
+
   // ── Research Tools ──────────────────────────────────────────────
 
   pi.registerTool({
@@ -1353,6 +1524,14 @@ export default function kbExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
+      const availability = await getResearchAvailability(store);
+      if (!availability.ok) {
+        return {
+          content: [{ type: "text", text: availability.message! }],
+          details: { runs: [], setup: { code: availability.code, message: availability.message } },
+        };
+      }
+
       const runs = store.getResearchStore().listRuns({ status: params.status as ResearchRunStatus | undefined, limit: params.limit ?? 10 });
       const text = runs.length ? runs.map((run) => `- ${run.id} [${run.status}] ${run.query}`).join("\n") : "No research runs found.";
       return { content: [{ type: "text", text }], details: { runs: runs.map(toResearchRunDetails) } };
@@ -1366,11 +1545,35 @@ export default function kbExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
+      const availability = await getResearchAvailability(store);
+      if (!availability.ok) {
+        return {
+          content: [{ type: "text", text: availability.message! }],
+          details: {
+            runId: params.id,
+            status: "unavailable",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: availability.message,
+            setup: { code: availability.code, message: availability.message },
+          },
+        };
+      }
+
       const run = store.getResearchStore().getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text", text: `Research run ${params.id} not found.` }],
-          details: { runId: params.id, status: "missing", summary: null, findings: [], citations: [], error: "not found", setup: null },
+          details: {
+            runId: params.id,
+            status: "missing",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: "not found",
+            setup: { code: "NOT_FOUND", message: `Research run ${params.id} not found.` },
+          },
         };
       }
       return { content: [{ type: "text", text: `Research run ${run.id} is ${run.status}.` }], details: toResearchRunDetails(run) };
@@ -1384,12 +1587,38 @@ export default function kbExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
+      const availability = await getResearchAvailability(store);
+      if (!availability.ok) {
+        return {
+          content: [{ type: "text", text: availability.message! }],
+          isError: true,
+          details: {
+            runId: params.id,
+            status: "unavailable",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: availability.message,
+            setup: { code: availability.code, message: availability.message },
+          },
+        };
+      }
+
       const researchStore = store.getResearchStore();
       const run = researchStore.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text", text: `Research run ${params.id} not found.` }],
-          details: { runId: params.id, status: "missing", summary: null, findings: [], citations: [], error: "not found", setup: null },
+          isError: true,
+          details: {
+            runId: params.id,
+            status: "missing",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: "not found",
+            setup: { code: "NOT_FOUND", message: `Research run ${params.id} not found.` },
+          },
         };
       }
 
@@ -1420,13 +1649,38 @@ export default function kbExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
+      const availability = await getResearchAvailability(store);
+      if (!availability.ok) {
+        return {
+          content: [{ type: "text", text: availability.message! }],
+          isError: true,
+          details: {
+            runId: params.id,
+            status: "unavailable",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: availability.message,
+            setup: { code: availability.code, message: availability.message },
+          },
+        };
+      }
+
       const researchStore = store.getResearchStore();
       const run = researchStore.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text", text: `Research run ${params.id} not found.` }],
           isError: true,
-          details: { runId: params.id, status: "missing", summary: null, findings: [], citations: [], error: "not found", setup: null },
+          details: {
+            runId: params.id,
+            status: "missing",
+            summary: null,
+            findings: [],
+            citations: [],
+            error: "not found",
+            setup: { code: "NOT_FOUND", message: `Research run ${params.id} not found.` },
+          },
         };
       }
       const isRetryExhausted = run.status === "retry_exhausted" || run.lifecycle?.errorCode === "RETRY_EXHAUSTED";
@@ -2154,7 +2408,7 @@ export default function kbExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use to pause an agent that is currently running or active",
       "Stopped agents can be resumed with fn_agent_start",
-      "Agents in 'idle', 'error', or 'terminated' state cannot be stopped",
+      "Agents in 'idle', 'error', or already-paused state cannot be stopped",
     ],
     parameters: Type.Object({
       id: Type.String({ description: "Agent ID to stop (e.g., agent-abc123)" }),
@@ -2268,6 +2522,129 @@ export default function kbExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── fn_agent_create ─────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "fn_agent_create",
+    label: "fn: Create Agent",
+    description: "Create a new non-ephemeral agent.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Agent name" }),
+      role: Type.Union([
+        Type.Literal("triage"),
+        Type.Literal("executor"),
+        Type.Literal("reviewer"),
+        Type.Literal("merger"),
+        Type.Literal("engineer"),
+        Type.Literal("custom"),
+      ], { description: "Agent role/capability" }),
+      soul: Type.Optional(Type.String({ description: "Agent personality/identity text" })),
+      instructions_text: Type.Optional(Type.String({ description: "Inline custom instructions" })),
+      instructions_path: Type.Optional(Type.String({ description: "Path to instructions markdown" })),
+      reportsTo: Type.Optional(Type.String({ description: "Manager agent ID" })),
+      heartbeat_interval_ms: Type.Optional(Type.Number({ minimum: 1000 })),
+      heartbeat_timeout_ms: Type.Optional(Type.Number({ minimum: 5000 })),
+      max_concurrent_runs: Type.Optional(Type.Number({ minimum: 1 })),
+      message_response_mode: Type.Optional(Type.Union([Type.Literal("immediate"), Type.Literal("on-heartbeat")])),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { AgentStore, ApprovalRequestStore } = await import("@fusion/core");
+      const agentStore = new AgentStore({ rootDir: getFusionDir(ctx.cwd) });
+      await agentStore.init();
+      const store = await getStore(ctx.cwd);
+      const caller = { id: "user", role: "user", isPrivileged: true } as const;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_create",
+        caller,
+        settings: await store.getSettings(),
+      });
+
+      if (!caller.isPrivileged && params.reportsTo !== undefined && params.reportsTo !== caller.id) {
+        return {
+          content: [{ type: "text" as const, text: "ERROR: You can only create agents that report to you" }],
+          details: { outcome: "denied", matchedRule: "privileged-caller", effectiveMode: policy.effectiveMode },
+        };
+      }
+
+      if (policy.decision === "require-approval") {
+        const approvalStore = new ApprovalRequestStore(store.getDatabase());
+        const request = approvalStore.create({
+          requester: { actorId: "user", actorType: "user", actorName: "CLI User" },
+          targetAction: { category: "agent_provisioning", action: "create", summary: `Create agent ${params.name} (${params.role})`, resourceType: "agent", resourceId: "", context: { tool: "fn_agent_create", params } },
+        });
+        return { content: [{ type: "text" as const, text: `Approval required. Request ${request.id} created.` }], details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode } };
+      }
+
+      const runtimeConfig: Record<string, unknown> = {
+        ...(params.heartbeat_interval_ms !== undefined ? { heartbeatIntervalMs: params.heartbeat_interval_ms } : {}),
+        ...(params.heartbeat_timeout_ms !== undefined ? { heartbeatTimeoutMs: params.heartbeat_timeout_ms } : {}),
+        ...(params.max_concurrent_runs !== undefined ? { maxConcurrentRuns: params.max_concurrent_runs } : {}),
+        ...(params.message_response_mode !== undefined ? { messageResponseMode: params.message_response_mode } : {}),
+      };
+      const created = await agentStore.createAgent({
+        name: params.name,
+        role: params.role as never,
+        ...(params.soul !== undefined ? { soul: params.soul } : {}),
+        ...(params.instructions_text !== undefined ? { instructionsText: params.instructions_text } : {}),
+        ...(params.instructions_path !== undefined ? { instructionsPath: params.instructions_path } : {}),
+        ...(params.reportsTo !== undefined ? { reportsTo: params.reportsTo } : {}),
+        ...(Object.keys(runtimeConfig).length > 0 ? { runtimeConfig } : {}),
+      });
+
+      return {
+        content: [{ type: "text" as const, text: `Created agent ${created.name} (${created.id})` }],
+        details: { outcome: "created", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agent: created, agentId: created.id },
+      };
+    },
+  });
+
+  // ── fn_agent_delete ─────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "fn_agent_delete",
+    label: "fn: Delete Agent",
+    description: "Delete a non-ephemeral agent.",
+    parameters: Type.Object({
+      agent_id: Type.String({ description: "Agent ID to delete" }),
+      force: Type.Optional(Type.Boolean({ description: "Force delete when holding checkout" })),
+      reassign_to: Type.Optional(Type.String({ description: "Optional replacement agent for assigned tasks" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { AgentStore, ApprovalRequestStore } = await import("@fusion/core");
+      const agentStore = new AgentStore({ rootDir: getFusionDir(ctx.cwd) });
+      await agentStore.init();
+      const store = await getStore(ctx.cwd);
+      const caller = { id: "user", role: "user", isPrivileged: true } as const;
+      const policy = resolveAgentProvisioningPolicy({
+        tool: "fn_agent_delete",
+        caller,
+        settings: await store.getSettings(),
+      });
+
+      if (policy.decision === "require-approval") {
+        const approvalStore = new ApprovalRequestStore(store.getDatabase());
+        const request = approvalStore.create({
+          requester: { actorId: "user", actorType: "user", actorName: "CLI User" },
+          targetAction: { category: "agent_provisioning", action: "delete", summary: `Delete agent ${params.agent_id}`, resourceType: "agent", resourceId: params.agent_id, context: { tool: "fn_agent_delete", params } },
+        });
+        return { content: [{ type: "text" as const, text: `Approval required. Request ${request.id} created.` }], details: { outcome: "pending_approval", approvalRequestId: request.id, matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: params.agent_id } };
+      }
+
+      if (policy.decision === "deny") {
+        return {
+          content: [{ type: "text" as const, text: `DENIED: agent delete blocked by policy (${policy.matchedRule})` }],
+          details: { outcome: "denied", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: params.agent_id },
+        };
+      }
+
+      await agentStore.deleteAgent(params.agent_id, { force: params.force === true, reassignTo: params.reassign_to });
+      return {
+        content: [{ type: "text" as const, text: `Deleted ${params.agent_id}` }],
+        details: { outcome: "deleted", matchedRule: policy.matchedRule, effectiveMode: policy.effectiveMode, agentId: params.agent_id },
+      };
+    },
+  });
+
   // ── fn_list_agents ───────────────────────────────────────────────
 
   pi.registerTool({
@@ -2355,6 +2732,7 @@ export default function kbExtension(pi: ExtensionAPI) {
       "Use fn_list_agents first to find available agents and their capabilities",
       "The task is created in 'todo' and assigned to the target agent",
       "Cannot delegate to ephemeral/runtime agents",
+      "Implementation tasks use executor by default; durable engineer supports explicit routing without override, other non-executor roles require override=true",
       "Optionally specify dependencies on other tasks",
     ],
     parameters: Type.Object({
@@ -2363,11 +2741,15 @@ export default function kbExtension(pi: ExtensionAPI) {
       dependencies: Type.Optional(
         Type.Array(Type.String(), { description: "Task IDs this new task depends on (e.g. [\"KB-001\"]" }),
       ),
+      override: Type.Optional(
+        Type.Boolean({ description: "Set true to bypass executor-role assignment policy" }),
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       // Validate target agent exists and is not ephemeral
-      const agentError = await validateAssignableAgentId(ctx.cwd, params.agent_id);
+      const delegateTask: Pick<Task, "id" | "column"> = { id: "<new>", column: "todo" };
+      const agentError = await validateAssignableAgentId(ctx.cwd ?? process.cwd(), params.agent_id, delegateTask, params.override === true);
       if (agentError) {
         return {
           content: [{ type: "text", text: `ERROR: ${agentError}` }],
@@ -2388,7 +2770,10 @@ export default function kbExtension(pi: ExtensionAPI) {
         dependencies: params.dependencies,
         column: "todo",
         assignedAgentId: params.agent_id,
-        source: { sourceType: "api" },
+        source: {
+          sourceType: "api",
+          ...(params.override === true ? { sourceMetadata: { executorRoleOverride: true } } : {}),
+        },
       });
 
       const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";

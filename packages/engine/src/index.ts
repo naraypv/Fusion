@@ -1,21 +1,36 @@
 export { AgentLogger, type AgentLoggerOptions, summarizeToolArgs } from "./agent-logger.js";
+export { reloadExemptTools, addToExemptTools, getExemptToolNames } from "./agent-action-gate.js";
 export {
   createTaskCreateTool,
   createTaskDocumentReadTool,
   createTaskDocumentWriteTool,
   createTaskLogTool,
+  createSendMessageTool,
+  createReadMessagesTool,
   taskCreateParams,
   taskDocumentReadParams,
   taskDocumentWriteParams,
   taskLogParams,
+  executeApprovedAgentProvisioning,
 } from "./agent-tools.js";
 export { AgentSemaphore, PRIORITY_MERGE, PRIORITY_EXECUTE, PRIORITY_SPECIFY } from "./concurrency.js";
 export { TriageProcessor, type TriageProcessorOptions } from "./triage.js";
 export { TaskExecutor, type TaskExecutorOptions } from "./executor.js";
+export { collectTaskEvaluationEvidence } from "./evaluator-evidence.js";
 export { Scheduler, type SchedulerOptions } from "./scheduler.js";
+export { MeshLeaseManager, type MeshLeaseManagerOptions, type LeaseRecoveryContext } from "./mesh-lease-manager.js";
 export { MissionAutopilot, type MissionAutopilotOptions } from "./mission-autopilot.js";
 export { MissionExecutionLoop, type MissionExecutionLoopOptions, type ValidationResult, loopLog } from "./mission-execution-loop.js";
-export { aiMergeTask, type MergerOptions } from "./merger.js";
+export {
+  aiMergeTask,
+  listAutostashOrphans,
+  applyAutostashBySha,
+  dropAutostashBySha,
+  getAutostashDiff,
+  notifyAutostashOrphans,
+  type MergerOptions,
+  type AutostashOrphanRecord,
+} from "./merger.js";
 export { reviewStep, type ReviewType, type ReviewVerdict, type ReviewResult, type ReviewOptions } from "./reviewer.js";
 export { createFnAgent, promptWithFallback, describeModel, setHostExtensionPaths, getHostExtensionPaths, type AgentOptions, type AgentResult } from "./pi.js";
 
@@ -55,6 +70,7 @@ export {
   type SkillDiagnostic,
 } from "./skill-resolver.js";
 export { AgentReflectionService, type AgentReflectionServiceOptions } from "./agent-reflection.js";
+export { AgentSelfImproveService, type AgentSelfImproveServiceOptions } from "./agent-self-improve.js";
 export {
   buildAgentChatPrompt,
   resolveAgentInstructionsWithRatings,
@@ -65,7 +81,9 @@ export {
 } from "./agent-instructions.js";
 export { HEARTBEAT_PROCEDURE, HEARTBEAT_SYSTEM_PROMPT, HEARTBEAT_NO_TASK_SYSTEM_PROMPT } from "./agent-heartbeat.js";
 export { WorktreePool, scanIdleWorktrees, cleanupOrphanedWorktrees, reapOrphanWorktrees } from "./worktree-pool.js";
+export { generateReservedWorktreeName, generateWorktreeName, planTaskWorktreePath, slugify } from "./worktree-names.js";
 export { createLogger, type Logger } from "./logger.js";
+export { fetchWebContent, assertSafeUrl, WebFetchError, type WebFetchOptions, type WebFetchResult, type WebFetchErrorCode } from "./web-fetch.js";
 export { isUsageLimitError, UsageLimitPauser } from "./usage-limit-detector.js";
 export { withRateLimitRetry } from "./rate-limit-retry.js";
 export { ResearchOrchestrator, type ResearchOrchestratorOptions, type ResearchOrchestratorStatus, type ResearchOrchestratorStartOptions } from "./research-orchestrator.js";
@@ -108,6 +126,7 @@ export {
   buildNtfyClickUrl,
   sendNtfyNotification,
   formatTaskIdentifier,
+  getActiveNotificationService,
   type NtfyNotifierOptions,
   type NtfyNotificationPriority,
   type NtfyNotificationConfigInput,

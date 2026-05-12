@@ -1,9 +1,20 @@
+
 /** Valid thinking effort levels for AI agent sessions, controlling the cost/quality tradeoff of reasoning. */
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export const COLUMNS = ["triage", "todo", "in-progress", "in-review", "done", "archived"] as const;
 export type Column = (typeof COLUMNS)[number];
+
+export const DEFAULT_COLUMN: Column = "triage";
+
+export function isColumn(value: unknown): value is Column {
+  return typeof value === "string" && (COLUMNS as readonly string[]).includes(value);
+}
+
+export function normalizeColumn(value: unknown, fallback: Column = DEFAULT_COLUMN): Column {
+  return isColumn(value) ? value : fallback;
+}
 
 /** Ordered task-priority levels for the core task domain contract. */
 export const TASK_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
@@ -14,6 +25,17 @@ export type TaskPriority = (typeof TASK_PRIORITIES)[number];
  * callers omit the priority field.
  */
 export const DEFAULT_TASK_PRIORITY: TaskPriority = "normal";
+
+/**
+ * Dashboard high-fan-out blocker threshold. A blocker is considered high impact
+ * when at least this many active todo tasks are waiting on it.
+ */
+export const HIGH_FANOUT_BLOCKER_TODO_THRESHOLD = 5;
+
+/**
+ * Default age gate (ms) before a high fan-out blocker is escalated in dashboards.
+ */
+export const STALE_HIGH_FANOUT_BLOCKER_AGE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 
 /**
  * Execution mode for task implementation.
@@ -160,14 +182,6 @@ export interface ModelPreset {
   validatorModelId?: string;
 }
 
-export interface ModelFallbackChainEntry {
-  provider?: string;
-  modelId?: string;
-  accountId?: string;
-  accountProvider?: string;
-  enabled?: boolean;
-}
-
 /** A reusable workflow step definition that can run after task implementation. */
 /** Execution mode for a workflow step. */
 export type WorkflowStepMode = "prompt" | "script";
@@ -224,7 +238,10 @@ export type NtfyNotificationEvent =
   | "awaiting-user-review"
   | "planning-awaiting-input"
   | "gridlock"
-  | "fallback-used";
+  | "fallback-used"
+  | "memory-dreams-processed"
+  | "message:agent-to-user"
+  | "message:agent-to-agent";
 
 /** Known notification event types. Providers may support additional custom events. */
 export const NOTIFICATION_EVENTS = [
@@ -236,6 +253,9 @@ export const NOTIFICATION_EVENTS = [
   "planning-awaiting-input",
   "gridlock",
   "fallback-used",
+  "memory-dreams-processed",
+  "message:agent-to-user",
+  "message:agent-to-agent",
 ] as const;
 
 /** Notification event type. Known events plus provider-specific custom events. */
@@ -329,6 +349,8 @@ export interface WorkflowStepTemplate {
   category: string;
   /** Optional icon identifier for UI (e.g., "file-text", "shield") */
   icon?: string;
+  /** Optional default enabled state for plugin-provided templates. */
+  enabled?: boolean;
 }
 
 /** Built-in workflow step templates available for one-click creation. */
@@ -565,6 +587,27 @@ export interface IssueInfo {
   lastCheckedAt?: string;
 }
 
+export interface TaskGithubTrackedIssue {
+  owner: string;
+  repo: string;
+  number: number;
+  url: string;
+  nodeId?: string;
+  createdAt: string;
+  lastSyncedAt?: string;
+}
+
+export interface TaskGithubTracking {
+  /** Per-task enabled override. When undefined, project/global default applies. */
+  enabled?: boolean;
+  /** "owner/repo" override; when undefined, project/global default repo applies. */
+  repoOverride?: string;
+  /** Linked GitHub issue. Set after issue creation succeeds. Cleared via unlinkGithubIssue(). */
+  issue?: TaskGithubTrackedIssue;
+  /** ISO-8601 of the most recent manual unlink, retained for audit. */
+  unlinkedAt?: string;
+}
+
 /**
  * Durable provenance metadata for tasks imported from external issue trackers.
  *
@@ -693,6 +736,177 @@ export interface TaskCommentInput {
   author: string;
 }
 
+export type TaskReviewMode = "pull-request" | "direct";
+export type TaskReviewSource = "github-pr" | "reviewer-agent";
+export type TaskReviewDecision = "approved" | "changes-requested" | "commented" | "pending";
+export type TaskReviewVerdict = "APPROVE" | "REVISE" | "RETHINK" | "UNAVAILABLE";
+export type TaskReviewerType = "plan" | "code";
+export type TaskReviewItemStatus = "queued" | "in-progress" | "addressed" | "failed";
+
+export interface LegacyTaskReviewItem {
+  id: string;
+  source: TaskReviewSource;
+  status: TaskReviewItemStatus;
+  summary: string;
+  body?: string;
+  filePath?: string;
+  line?: number;
+  commentUrl?: string;
+  reviewer?: string;
+  createdAt: string;
+  updatedAt: string;
+  addressedAt?: string;
+  failedReason?: string;
+}
+
+export interface TaskReview {
+  mode: TaskReviewMode;
+  source: TaskReviewSource;
+  decision: TaskReviewDecision;
+  summary?: string;
+  latestRefreshAt?: string;
+  selectedItemIds?: string[];
+  items: LegacyTaskReviewItem[];
+}
+
+export type PrCheckState =
+  | "success"
+  | "pending"
+  | "failure"
+  | "cancelled"
+  | "timed_out"
+  | "action_required"
+  | "neutral"
+  | "skipped"
+  | "stale"
+  | "startup_failure";
+
+export interface PrCheckStatus {
+  name: string;
+  required: boolean;
+  state: PrCheckState;
+}
+
+export interface TaskReviewAuthor {
+  login: string;
+}
+
+export interface PrTaskReviewSummaryReviewer {
+  login: string;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "PENDING";
+  submittedAt?: string;
+}
+
+export interface PrTaskReviewSummary {
+  reviewDecision: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
+  reviewers: PrTaskReviewSummaryReviewer[];
+  blockingReasons: string[];
+  checks: PrCheckStatus[];
+}
+
+export interface TaskReviewStateItem {
+  id: string;
+  threadId?: string;
+  githubCommentId?: number;
+  path?: string;
+  diffSide?: string;
+  body: string;
+  author: TaskReviewAuthor;
+  createdAt: string;
+  updatedAt?: string;
+  state?: string;
+  htmlUrl?: string;
+  isResolved?: boolean;
+  source?: TaskReviewSource;
+  reviewType?: TaskReviewerType;
+  verdict?: TaskReviewVerdict;
+  step?: number;
+  summary?: string;
+}
+
+export type ReviewAddressingStatus = "queued" | "in-progress" | "addressed" | "failed";
+
+export interface ReviewAddressingSnapshot {
+  itemId: string;
+  sourceMode: "pull-request" | "reviewer-agent";
+  source: "pr-review" | "reviewer-agent";
+  summary: string;
+  body: string;
+  authorLogin?: string;
+  filePath?: string;
+  lineNumber?: number;
+  threadId?: string;
+  url?: string;
+}
+
+export interface ReviewAddressingRecord {
+  itemId: string;
+  status: ReviewAddressingStatus;
+  selectedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+  stale?: boolean;
+  snapshot?: ReviewAddressingSnapshot;
+}
+
+export interface ReviewerTaskReviewSummary {
+  verdict?: TaskReviewVerdict;
+  reviewType?: TaskReviewerType;
+  summary?: string;
+}
+
+export type TaskReviewRefreshSource = "manual" | "auto" | "initial-load";
+export type TaskReviewRefreshStatus = "idle" | "refreshing" | "ready" | "error";
+
+export interface TaskReviewState {
+  source: "pull-request" | "reviewer-agent";
+  lastRefreshedAt?: string;
+  refreshSource?: TaskReviewRefreshSource;
+  refreshStatus?: TaskReviewRefreshStatus;
+  refreshError?: string;
+  summary?: PrTaskReviewSummary | ReviewerTaskReviewSummary;
+  items: TaskReviewStateItem[];
+  addressing: ReviewAddressingRecord[];
+}
+
+export interface TaskReviewSummary {
+  reviewDecision?: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
+  reviewers?: PrTaskReviewSummaryReviewer[];
+  blockingReasons?: string[];
+  checks?: PrCheckStatus[];
+  verdict?: TaskReviewVerdict;
+  reviewType?: TaskReviewerType;
+  summary?: string;
+}
+
+export interface TaskReviewDataItem {
+  itemId: string;
+  sourceMode: "pull-request" | "reviewer-agent";
+  title: string;
+  body: string;
+  author: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  url?: string;
+  filePath?: string;
+  line?: number;
+  threadId?: string;
+  reviewState?: string | null;
+  isResolved?: boolean;
+  progressStatus?: "queued" | "in-progress" | "addressed" | "failed" | null;
+}
+
+export type TaskReviewItem = TaskReviewDataItem;
+
+export interface TaskReviewData {
+  mode: "pull-request" | "reviewer-agent";
+  refreshable: boolean;
+  fetchedAt: string | null;
+  summary: TaskReviewSummary | null;
+  items: TaskReviewItem[];
+}
+
 export interface TaskDocument {
   /** UUID primary key */
   id: string;
@@ -758,6 +972,9 @@ export interface TaskDocumentWithTask extends TaskDocument {
 
 export const DOCUMENT_KEY_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
+/** Shared GitHub owner/repo slug validation for repo override inputs. */
+export const REPO_OVERRIDE_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
 export function validateDocumentKey(key: string): void {
   if (!DOCUMENT_KEY_RE.test(key)) {
     throw new Error(
@@ -785,7 +1002,11 @@ export interface MergeDetails {
   mergeCommitMessage?: string;
   mergedAt?: string;
   mergeConfirmed?: boolean;
+  noOpMerge?: boolean;
+  noOpReason?: string;
   prNumber?: number;
+  mergeTargetBranch?: string;
+  mergeTargetSource?: "task-base-branch" | "task-branch-context" | "project-default" | "legacy-main";
   resolutionStrategy?: "ai" | "auto-resolve" | "theirs" | "ours" | "abort";
   resolutionMethod?: "ai" | "auto" | "mixed" | "theirs" | "ours" | "abort";
   attemptsMade?: 1 | 2 | 3;
@@ -863,8 +1084,21 @@ export interface TaskSource {
   sourceMetadata?: Record<string, unknown>;
 }
 
+export type TaskBranchGroupSource = "planning" | "mission";
+
+export type TaskBranchAssignmentMode = "shared" | "per-task-derived";
+
+export interface TaskBranchContext {
+  groupId: string;
+  source: TaskBranchGroupSource;
+  assignmentMode: TaskBranchAssignmentMode;
+  inheritedBaseBranch?: string;
+}
+
 export interface Task {
   id: string;
+  /** Immutable lineage identity used for durable commit/task attribution. */
+  lineageId?: string;
   title?: string;
   description: string;
   /**
@@ -889,19 +1123,21 @@ export interface Task {
   paused?: boolean;
   /** When set, this task was paused because the agent with this ID was paused. Cleared when the agent resumes. Distinct from user-initiated pause. */
   pausedByAgentId?: string;
-  /** Git branch name (or task ID) to use as the starting point when
-   *  creating this task's worktree. Set by the scheduler when a task's
-   *  explicit dependency or `blockedBy` task is in-review with an
-   *  unmerged branch. The executor reads this to branch from the
-   *  dependency's branch instead of HEAD. Cleared after worktree creation. */
+  /** Configured merge target/base branch for this task (task intent).
+   *  Defaults to the project default branch when omitted. */
   baseBranch?: string;
-  /** Actual git branch name used for this task's worktree. May differ from
+  /** Actual git working branch name used for this task's worktree. May differ from
    *  the conventional `fn/{task-id}` when conflict recovery generated a
-   *  unique suffixed name (e.g., `fn/fn-042-2`). The merger and PR systems
-   *  read this field instead of deriving the branch from the task ID. */
+   *  unique suffixed name (e.g., `fn/fn-042-2`). */
   branch?: string;
-  /** Base commit SHA for creating this task's worktree. Used with baseBranch
-   *  to establish the exact starting point for the worktree. */
+  /** Optional planning/mission branch-group metadata carried across related tasks. */
+  branchContext?: TaskBranchContext;
+  /** Internal execution-only provenance for dependency-start handoff.
+   *  When set, the scheduler asked executor to start from an upstream dependency
+   *  branch. This is transient execution state and should be cleared after use. */
+  executionStartBranch?: string;
+  /** Base commit SHA for creating this task's worktree. Used with the start ref
+   *  chosen for the worktree to establish the exact starting point. */
   baseCommitSha?: string;
   /** List of files modified by this task (populated during execution) */
   modifiedFiles?: string[];
@@ -912,11 +1148,20 @@ export interface Task {
   attachments?: TaskAttachment[];
   steeringComments?: SteeringComment[];
   comments?: TaskComment[];
+  /** Structured review metadata shown in the Review tab (legacy contract). */
+  review?: TaskReview;
+  /** Structured review metadata shown in the Review tab (canonical contract). */
+  reviewState?: TaskReviewState;
   /** PR information for tasks linked to GitHub pull requests */
   prInfo?: PrInfo;
   mergeDetails?: MergeDetails;
   /** Issue information for tasks imported from GitHub issues */
   issueInfo?: IssueInfo;
+  /**
+   * Per-task tracking metadata for Fusion-emitted GitHub issues.
+   * Distinct from issueInfo/sourceIssue, which describe imported source issues.
+   */
+  githubTracking?: TaskGithubTracking;
   /** Durable source provenance for the originating external issue. */
   sourceIssue?: TaskSourceIssue;
   log: TaskLogEntry[];
@@ -1037,6 +1282,14 @@ export interface Task {
   checkedOutBy?: string;
   /** ISO-8601 timestamp when the checkout lease was acquired. */
   checkedOutAt?: string;
+  /** Node ID currently owning the checkout lease. */
+  checkoutNodeId?: string;
+  /** Owning run/session ID for the checkout lease when known. */
+  checkoutRunId?: string;
+  /** ISO-8601 timestamp of the last successful lease renewal heartbeat. */
+  checkoutLeaseRenewedAt?: string;
+  /** Monotonically increasing lease generation used to prevent stale reclaim attempts. */
+  checkoutLeaseEpoch?: number;
   /** Path to the persisted agent session file, enabling pause/resume without
    *  losing conversation context. Set when execution starts; cleared on
    *  completion or terminal failure. */
@@ -1076,7 +1329,16 @@ export interface InboxTask {
 
 export interface TaskCreateInput {
   title?: string;
+  /** Optional lineage override for trusted replication/import paths only. */
+  lineageId?: string;
   description: string;
+  /** Configured merge target/base branch for this task (task intent).
+   *  Defaults to the project default branch when omitted. */
+  baseBranch?: string;
+  /** Actual git working branch name used for this task's worktree. */
+  branch?: string;
+  /** Optional planning/mission branch-group metadata carried across related tasks. */
+  branchContext?: TaskBranchContext;
   /** Durable source provenance for the originating external issue. */
   sourceIssue?: TaskSourceIssue;
   /** Optional persisted aggregate token usage snapshot for task creation/import paths. */
@@ -1132,6 +1394,8 @@ export interface TaskCreateInput {
   nodeId?: string;
   /** Optional explicit user assignment for this task (used during review handoff) */
   assigneeUserId?: string;
+  /** Per-task GitHub issue tracking overrides for Fusion-created linked issues. */
+  githubTracking?: Pick<TaskGithubTracking, "enabled" | "repoOverride">;
   /** Review level for task execution — controls review rigor: 0=None, 1=Plan Only, 2=Plan and Code, 3=Full */
   reviewLevel?: number;
   /** Execution mode for task implementation.
@@ -1142,6 +1406,25 @@ export interface TaskCreateInput {
 }
 
 // ── Todo List Types ──────────────────────────────────────────────────────
+
+export interface MeshReplicatedTaskCreatePayload {
+  replicationVersion: 1;
+  reservationId: string;
+  taskId: string;
+  sourceNodeId: string;
+  createdAt: string;
+  updatedAt: string;
+  prompt: string;
+  input: TaskCreateInput;
+}
+
+export interface MeshReplicatedTaskApplyResult {
+  task: Task;
+  applied: boolean;
+}
+
+/** Canonical version for shared-state snapshots exchanged across mesh nodes. */
+export const SHARED_STATE_SNAPSHOT_VERSION = 1 as const;
 
 export interface TodoList {
   id: string;
@@ -1231,7 +1514,7 @@ export interface DaemonTokenSettings {
  * The dashboard UI shows these under a "Global" section.
  */
 /** Web search backend for auto-research provider. */
-export type WebSearchBackend = "searxng" | "brave" | "google" | "tavily" | "none";
+export type WebSearchBackend = "builtin" | "searxng" | "brave" | "google" | "tavily" | "none";
 
 export interface ResearchEnabledSources {
   webSearch: boolean;
@@ -1266,6 +1549,26 @@ export interface ResearchProjectSettings {
   limits?: ResearchProjectLimits;
 }
 
+export type EvalFollowUpPolicy = "disabled" | "suggest-only" | "auto-create";
+
+export interface EvalProjectSettings {
+  enabled?: boolean;
+  intervalMs?: number;
+  evaluatorProvider?: string;
+  evaluatorModelId?: string;
+  followUpPolicy?: EvalFollowUpPolicy;
+  retentionDays?: number;
+}
+
+export interface ResolvedEvalSettings {
+  enabled: boolean;
+  intervalMs: number;
+  evaluatorProvider?: string;
+  evaluatorModelId?: string;
+  followUpPolicy: EvalFollowUpPolicy;
+  retentionDays: number;
+}
+
 export interface GlobalSettings {
   /** Theme mode preference: dark, light, or system (follows OS). Default: "dark". */
   themeMode?: ThemeMode;
@@ -1289,11 +1592,6 @@ export interface GlobalSettings {
    *  model fails due to transient provider-side issues such as rate limits or
    *  overloaded capacity. Must be set together with `fallbackProvider`. */
   fallbackModelId?: string;
-  /** Ordered global fallback chain. Up to 10 enabled entries are tried in
-   *  priority order after the primary model. */
-  modelFallbackChain?: ModelFallbackChainEntry[];
-  /** When true, route Fusion LLM calls through the DSPy declarative bridge. */
-  routeAllLlmCallsViaDspy?: boolean;
   /** Default thinking effort level for AI agent sessions.
    *  Controls how much reasoning effort the model uses — higher levels
    *  produce better results but cost more. When undefined, the engine
@@ -1383,6 +1681,9 @@ export interface GlobalSettings {
    *  header. Defaults to true (visible). The button is also hidden once the
    *  user has clicked it (tracked client-side in localStorage). */
   showGitHubStarButton?: boolean;
+  /** Global fallback GitHub tracking repo in `owner/repo` format (FN-3868).
+   *  Used when a project has no githubTrackingDefaultRepo. */
+  githubTrackingDefaultRepo?: string;
   /** Cadence for automatic update checks. The dashboard's `/update-check`
    *  route uses this to decide whether to consult npm or return a cached
    *  result.
@@ -1510,8 +1811,13 @@ export interface GlobalSettings {
    *  logs for `tool`, `tool_result`, and `tool_error` entries. Very large tool
    *  payloads may still be clipped server-side to keep dashboard log reads
    *  responsive. When false, tool timeline rows are still stored, but their
-   *  verbose `detail` payload is omitted to reduce log size/noise. */
+   *  verbose `detail` payload is omitted to reduce log size/noise. Distinct
+   *  from `persistAgentThinkingLog`, which controls `thinking` rows. */
   persistAgentToolOutput?: boolean;
+  /** When true, persist `thinking` log entries from agent reasoning deltas.
+   *  Default: false (suppressed). This only affects persisted `thinking` rows
+   *  and does not change normal assistant text/tool output behavior. */
+  persistAgentThinkingLog?: boolean;
   /** Research defaults shared across all projects.
    * Project settings may override these via `researchSettings`. */
   researchGlobalDefaults?: ResearchGlobalDefaults;
@@ -1531,7 +1837,7 @@ export interface GlobalSettings {
   /** Default maximum number of synthesis rounds per run.
    *  Default: 2. */
   researchGlobalMaxSynthesisRounds?: number;
-  /** Web search backend for auto-research. Default: "none" (disabled). */
+  /** Web search backend for auto-research. Default: "builtin". */
   researchGlobalWebSearchProvider?: WebSearchBackend;
   /** SearXNG instance URL (required when researchGlobalWebSearchProvider is "searxng"). */
   researchGlobalSearxngUrl?: string;
@@ -1616,6 +1922,9 @@ export interface RemoteAccessProjectSettings {
   lifecycle: RemoteAccessLifecycleConfig;
 }
 
+/** GitHub authentication strategy used by project issue-tracking settings (FN-3868). */
+export type GithubAuthMode = "gh-cli" | "token";
+
 /**
  * Project-level settings stored in `.fusion/config.json`.
  *
@@ -1698,11 +2007,20 @@ export interface ProjectSettings {
   unavailableNodePolicy?: UnavailableNodePolicy;
   /** Project-level research configuration overrides. */
   researchSettings?: ResearchProjectSettings;
-  /** Ordered project fallback chain. Up to 10 enabled entries override the
-   *  global chain for this project. */
-  projectModelFallbackChain?: ModelFallbackChainEntry[];
-  /** Project override for DSPy LLM routing. Undefined inherits the global toggle. */
-  projectRouteAllLlmCallsViaDspy?: boolean;
+  /** Project-level scheduled eval configuration overrides. */
+  evalSettings?: EvalProjectSettings;
+  /** Enable scheduled evaluation batches for recently completed tasks. */
+  taskEvaluationEnabled?: boolean;
+  /** Cron expression for scheduled task-evaluation batches. */
+  taskEvaluationSchedule?: string;
+  /** Optional provider override for scheduled task evaluation runs. */
+  taskEvaluationProvider?: string;
+  /** Optional model override for scheduled task evaluation runs. */
+  taskEvaluationModelId?: string;
+  /** Follow-up policy for scheduled task evaluation findings. */
+  taskEvaluationFollowUpPolicy?: "off" | "suggest" | "create";
+  /** Optional retention window (days) for task evaluation history. */
+  taskEvaluationRetention?: number;
   /** Enable or disable the research subsystem for this project.
    *  When undefined, falls back to global settings.
    *  @deprecated Prefer researchSettings.enabled */
@@ -1824,6 +2142,8 @@ export interface ProjectSettings {
    *  lock files (ours), generated files (theirs), and trivial whitespace conflicts
    *  without spawning an AI agent. Default: true. */
   smartConflictResolution?: boolean;
+  /** Drop stale merger autostashes older than this age in hours. Minimum 1. Default: 24. */
+  mergerAutostashMaxAgeHours?: number;
   /** When true, the merger fetches the remote and rebases the task branch
    *  onto the latest `<remote>/<defaultBranch>` before attempting to merge
    *  it back into the main branch. This catches upstream changes from
@@ -1871,6 +2191,13 @@ export interface ProjectSettings {
    *  remain in triage with status "awaiting-approval" until a user approves
    *  or rejects the plan. Default: false. */
   requirePlanApproval?: boolean;
+  /** Approval policy for agent provisioning tools (fn_agent_create/fn_agent_delete). */
+  agentProvisioning?: {
+    approvalMode?: AgentProvisioningApprovalMode;
+    trustedRoles?: string[];
+    trustedAgentIds?: string[];
+    alwaysApproveDelete?: boolean;
+  };
   /** When true, enforces that task specifications (PROMPT.md) are refreshed if they
    *  become stale. Stale specs are detected based on specStalenessMaxAgeMs.
    *  Default: false. */
@@ -1882,8 +2209,12 @@ export interface ProjectSettings {
   /** Timeout in milliseconds for detecting stuck tasks. When a task's agent session
    *  shows no activity (no text deltas, tool calls, or progress updates) for longer
    *  than this duration, the task is considered stuck and will be terminated and retried.
-   *  Default: undefined (disabled). Suggested value: 600000 (10 minutes). */
+   *  Default: 600000 (10 minutes). Set to 0 to disable. */
   taskStuckTimeoutMs?: number;
+  /** Age threshold in milliseconds before a blocker with high todo fan-out is escalated.
+   *  Blocker age is measured from columnMovedAt when available, otherwise updatedAt.
+   *  Only blockers currently in in-progress or in-review are eligible. */
+  staleHighFanoutBlockerAgeThresholdMs?: number;
   /** TTL in milliseconds for persisted AI planning/subtask/mission interview sessions.
    *  Sessions older than this cutoff are expired by the dashboard session cleanup loop.
    *  Valid range: 600000 (10 minutes) to 2592000000 (30 days).
@@ -1905,6 +2236,12 @@ export interface ProjectSettings {
   /** Maximum number of times the stuck-task detector can kill and re-queue a task
    *  before it is marked as permanently failed. Default: 6. */
   maxStuckKills?: number;
+  /** When the stuck-task detector kills and re-queues a task, preserve the
+   *  task's step progress (step statuses + currentStep) instead of resetting
+   *  every step to `pending`. The worktree and branch are still cleared so
+   *  the retry gets a fresh checkout, but completed steps stay completed so
+   *  the agent can resume from where it left off. Default: true. */
+  preserveProgressOnStuckRequeue?: boolean;
   /** Maximum number of times the self-healing manager may auto-revive a task parked
    *  in `in-review` with a failed pre-merge workflow step. Each revival injects the
    *  failure feedback into `PROMPT.md`, resets steps, and sends the task back through
@@ -1939,6 +2276,18 @@ export interface ProjectSettings {
   /** Optional template used for GitHub issue comments posted on task completion.
    *  Supports `{taskId}` and `{taskTitle}` placeholders. */
   githubCommentTemplate?: string;
+  /** When true, new tasks default GitHub tracking to enabled for this project (FN-3868).
+   *  Default: false. */
+  githubTrackingEnabledByDefault?: boolean;
+  /** Project default GitHub tracking repo in `owner/repo` format (FN-3868).
+   *  Falls back to global githubTrackingDefaultRepo when unset. */
+  githubTrackingDefaultRepo?: string;
+  /** GitHub auth strategy for issue-tracking API calls in this project (FN-3868).
+   *  Default: "gh-cli". */
+  githubAuthMode?: GithubAuthMode;
+  /** Personal access token used when githubAuthMode is "token" (FN-3868).
+   *  Stored as a plain settings string in this phase. */
+  githubAuthToken?: string;
   /** When true, automatic database backups are enabled. Default: false. */
   autoBackupEnabled?: boolean;
   /** Cron expression for backup schedule. Default: "0 2 * * *" (daily at 2 AM). */
@@ -1947,6 +2296,21 @@ export interface ProjectSettings {
   autoBackupRetention?: number;
   /** Directory for backup files, relative to project root. Default: ".fusion/backups". */
   autoBackupDir?: string;
+  /** When true, scheduled memory backups are enabled. Default: false. */
+  memoryBackupEnabled?: boolean;
+  /** Cron expression for memory backup schedule. Default: "0 3 * * *" (daily at 3 AM). */
+  memoryBackupSchedule?: string;
+  /** Number of memory backups to retain (oldest deleted when exceeded). Default: 14. */
+  memoryBackupRetention?: number;
+  /** Directory for memory backup snapshots, relative to project root.
+   *  Default: ".fusion/backups/memory". */
+  memoryBackupDir?: string;
+  /** Scope of memory backup snapshots.
+   *  - "project": backups `.fusion/memory` only
+   *  - "agents": backups `.fusion/agent-memory` only
+   *  - "all": backups both project and per-agent memory
+   *  Default: "all". */
+  memoryBackupScope?: "project" | "agents" | "all";
   /** When true, tasks created without titles but with descriptions longer than 200
    *  characters will automatically receive an AI-generated title (max 60 chars).
    *  Default: false. */
@@ -2110,6 +2474,7 @@ export {
   DEFAULT_SETTINGS,
   GLOBAL_SETTINGS_KEYS,
   PROJECT_SETTINGS_KEYS,
+  isGlobalOnlySettingsKey,
   isGlobalSettingsKey,
   isProjectSettingsKey,
 } from "./settings-schema.js";
@@ -2119,10 +2484,108 @@ export interface BoardConfig {
   settings?: Settings;
 }
 
+export interface DistributedTaskIdReserveInput {
+  prefix: string;
+  nodeId: string;
+  ttlMs?: number;
+}
+
+export interface DistributedTaskIdReserveResult {
+  reservationId: string;
+  taskId: string;
+  sequence: number;
+  expiresAt: string;
+  committedClusterTaskCount: number;
+}
+
+export interface DistributedTaskIdCommitInput {
+  reservationId: string;
+  nodeId: string;
+}
+
+export interface DistributedTaskIdCommitResult {
+  reservationId: string;
+  taskId: string;
+  sequence: number;
+  committedClusterTaskCount: number;
+  committedAt: string;
+}
+
+export interface DistributedTaskIdAbortInput {
+  reservationId: string;
+  nodeId: string;
+  reason: "abort" | "expired" | "failed-create";
+}
+
+export interface DistributedTaskIdAbortResult {
+  reservationId: string;
+  taskId: string;
+  sequence: number;
+  committedClusterTaskCount: number;
+  abortedAt: string;
+}
+
+export interface DistributedTaskIdStateInput {
+  prefix: string;
+}
+
+export interface DistributedTaskIdStateResult {
+  nextSequence: number;
+  committedClusterTaskCount: number;
+  activeReservationCount: number;
+  burnedReservationCount: number;
+  lastCommittedTaskId?: string;
+}
+
+export interface AutostashOrphanRecord {
+  sha: string;
+  ref: string;
+  label: string;
+  sourceTaskId: string | null;
+  createdAt: string | null;
+  changedPaths: string[];
+  classification: "subsumed" | "live" | "unknown";
+  /** Merge/recovery phase that created this stash label when known. */
+  sourcePhase?: string | null;
+  /** Task that detected/surfaced this orphan in the current run. */
+  detectedByTaskId?: string | null;
+  /** ISO timestamp when this orphan was surfaced in the current run. */
+  detectedAt?: string | null;
+}
+
+/**
+ * Outcome of restoring the developer's pre-merge autostash after the merge
+ * completes. Surfaced on MergeResult so the UI / dashboard can show whether
+ * the dev's uncommitted work was reapplied cleanly, AI-resolved, or left
+ * stashed for manual recovery.
+ *
+ * Background: when rootDir is the developer's primary checkout, the merger
+ * stashes any uncommitted edits before running its hard resets, then applies
+ * them back at the end. Historically a pop conflict would log a warning and
+ * silently leave the stash in place — developers had no way to discover this
+ * had happened. See `restoreUnrelatedRootDirChanges` in merger.ts.
+ */
+export type AutostashOutcome =
+  | { status: "no-changes" }
+  | { status: "restored"; stashSha: string }
+  | {
+      status: "ai-resolved";
+      stashSha: string;
+      conflictedFiles: string[];
+    }
+  | {
+      status: "conflict-needs-manual";
+      stashSha: string;
+      conflictedFiles: string[];
+      message: string;
+    }
+  | { status: "failed"; stashSha?: string; errorMessage: string };
+
 export interface MergeResult extends MergeDetails {
   task: Task;
   branch: string;
   merged: boolean;
+  noOp?: boolean;
   worktreeRemoved: boolean;
   branchDeleted: boolean;
   error?: string;
@@ -2130,8 +2593,33 @@ export interface MergeResult extends MergeDetails {
   pushedToRemote?: boolean;
   /** Error message if push to remote failed. Non-fatal — merge is already committed locally. */
   pushError?: string;
+  /** Outcome of restoring the developer's pre-merge autostash, when one was
+   *  created. Absent when the working tree was already clean at merge start. */
+  autostash?: AutostashOutcome;
   /** Internal flag to track if a build retry has been attempted. Not persisted. */
   _buildRetried?: boolean;
+}
+
+export type TaskCommitAssociationMatchSource =
+  | "canonical-lineage-trailer"
+  | "legacy-task-id-trailer"
+  | "legacy-subject"
+  | "manual-reconciliation";
+
+export type TaskCommitAssociationConfidence = "canonical" | "legacy" | "ambiguous";
+
+export interface TaskCommitAssociation {
+  id: string;
+  taskLineageId: string;
+  taskIdSnapshot: string;
+  commitSha: string;
+  commitSubject: string;
+  authoredAt: string;
+  matchedBy: TaskCommitAssociationMatchSource;
+  confidence: TaskCommitAssociationConfidence;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export const COLUMN_LABELS: Record<Column, string> = {
@@ -2170,6 +2658,8 @@ export const VALID_TRANSITIONS: Record<Column, Column[]> = {
  */
 export interface ArchivedTaskEntry {
   id: string;
+  /** Immutable lineage identity preserved across archive/restore. */
+  lineageId: string;
   title?: string;
   description: string;
   /**
@@ -2189,12 +2679,17 @@ export interface ArchivedTaskEntry {
   executionMode?: ExecutionMode;
   prInfo?: PrInfo;
   issueInfo?: IssueInfo;
+  githubTracking?: TaskGithubTracking;
   /** Durable source provenance for the originating external issue. */
   sourceIssue?: TaskSourceIssue;
   /** Attachment metadata (filenames, mime types, etc.) without file content */
   attachments?: TaskAttachment[];
   /** User and agent comments remain searchable in the archive DB. */
   comments?: TaskComment[];
+  /** Structured review metadata shown in the Review tab (legacy contract). */
+  review?: TaskReview;
+  /** Structured review metadata shown in the Review tab (canonical contract). */
+  reviewState?: TaskReviewState;
   /** Reconstructed prompt content at archive time, without attachment blobs. */
   prompt?: string;
   /** Agent log retention mode used when this archive entry was written. */
@@ -2230,6 +2725,8 @@ export interface ArchivedTaskEntry {
   baseBranch?: string;
   /** Actual git branch name used for this task's worktree */
   branch?: string;
+  /** Optional planning/mission branch-group metadata carried across related tasks. */
+  branchContext?: TaskBranchContext;
   /** Base commit SHA for the task's worktree */
   baseCommitSha?: string;
   /** List of files modified by this task */
@@ -2346,6 +2843,8 @@ export interface NodeMeshState {
   nodeName: string;
   /** Optional base URL (undefined for local nodes). */
   nodeUrl: string | undefined;
+  /** Runtime node type for this snapshot. */
+  nodeType: NodeConfig["type"];
   /** Current node status. */
   status: NodeStatus;
   /** Latest metrics payload for the node. */
@@ -2356,6 +2855,16 @@ export interface NodeMeshState {
   connectedAt: string;
   /** Expanded peer list for the node. */
   knownPeers: PeerNode[];
+}
+
+/** Cluster-wide mesh topology snapshot merged from local and remote mesh reads. */
+export interface MeshClusterSnapshot {
+  /** ISO timestamp when this aggregate snapshot was assembled. */
+  collectedAt: string;
+  /** Node ID that assembled and served the snapshot. */
+  sourceNodeId: string;
+  /** Deduplicated per-node mesh snapshots keyed by nodeId semantically. */
+  nodes: NodeMeshState[];
 }
 
 /** Lightweight mesh discovery record for propagating peer awareness. */
@@ -2391,6 +2900,112 @@ export interface PeerInfo {
 }
 
 /** Request payload sent when a node initiates a peer sync. */
+export interface SnapshotBase {
+  version: number;
+  exportedAt: string;
+  checksum: string;
+}
+
+export type MeshWriteQueueStatus = "pending" | "replaying" | "applied" | "failed";
+
+export interface MeshSnapshotQuery {
+  nodeId: string;
+  projectId?: string | null;
+  scope: string;
+}
+
+export interface MeshSnapshotRecordInput {
+  nodeId: string;
+  projectId?: string | null;
+  scope: string;
+  payload: Record<string, unknown>;
+  snapshotVersion: string;
+  capturedAt: string;
+  sourceNodeId?: string | null;
+  sourceRunId?: string | null;
+  staleAfter?: string | null;
+}
+
+export interface MeshSnapshotRecord extends MeshSnapshotRecordInput {
+  updatedAt: string;
+}
+
+export interface MeshWriteQueueInput {
+  originNodeId: string;
+  targetNodeId: string;
+  projectId?: string | null;
+  scope: string;
+  entityType: string;
+  entityId: string;
+  operation: string;
+  payload: Record<string, unknown>;
+  intentVersion: string;
+}
+
+export interface MeshWriteQueueFilter {
+  originNodeId?: string;
+  targetNodeId?: string;
+  status?: MeshWriteQueueStatus;
+}
+
+export interface MeshWriteQueueEntry extends MeshWriteQueueInput {
+  id: string;
+  status: MeshWriteQueueStatus;
+  attemptCount: number;
+  lastAttemptAt?: string | null;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt?: string | null;
+}
+
+export interface MeshWriteApplyResult {
+  appliedAt?: string;
+}
+
+export interface MeshWriteFailureResult {
+  lastError: string;
+}
+
+export interface MeshWriteReplaySummary {
+  replayed: number;
+  applied: number;
+  failed: number;
+  queuedWriteIds: string[];
+}
+
+export interface MeshDegradedReadState {
+  mode: "fresh" | "degraded";
+  asOf: string;
+  sourceNodeId: string | null;
+  snapshotVersion: string | null;
+  stalenessMs: number;
+  queueDepth: number;
+  pendingWriteCount: number;
+  failedWriteCount: number;
+}
+
+export interface SharedMeshStatePayload {
+  taskMetadata?: SnapshotBase & { payload: { tasks: Task[] } };
+  missionHierarchy?: SnapshotBase & {
+    payload: {
+      missions: import("./mission-types.js").Mission[];
+      milestones: import("./mission-types.js").Milestone[];
+      slices: import("./mission-types.js").Slice[];
+      features: import("./mission-types.js").MissionFeature[];
+      missionEvents: import("./mission-types.js").MissionEvent[];
+      assertions: import("./mission-types.js").MissionContractAssertion[];
+      featureAssertionLinks: import("./mission-types.js").FeatureAssertionLink[];
+    };
+  };
+  agents?: SnapshotBase & { payload: { agents: Agent[]; blockedStates: { agentId: string; state: BlockedStateSnapshot }[] } };
+  agentRuns?: SnapshotBase & { payload: { runs: AgentHeartbeatRun[] } };
+  activityLog?: SnapshotBase & { payload: { entries: ActivityLogEntry[] } };
+  runAudit?: SnapshotBase & { payload: { entries: RunAuditEvent[] } };
+  projectSettings?: SnapshotBase & { payload: { global: GlobalSettings; projects?: Record<string, ProjectSettings> } };
+  authMaterial?: SnapshotBase & { payload: { providerAuth?: Record<string, ProviderAuthEntry> } };
+}
+
 export interface PeerSyncRequest {
   /** Node ID of the sender. */
   senderNodeId: string;
@@ -2402,6 +3017,8 @@ export interface PeerSyncRequest {
   timestamp: string;
   /** Optional settings sync payload included in the request. */
   settings?: SettingsSyncPayload;
+  /** Optional shared-state payload included in the request. */
+  sharedState?: SharedMeshStatePayload;
 }
 
 /** Response payload returned after a peer sync exchange. */
@@ -2418,6 +3035,8 @@ export interface PeerSyncResponse {
   timestamp: string;
   /** Optional settings sync payload included in the response. */
   settings?: SettingsSyncPayload;
+  /** Optional shared-state payload included in the response. */
+  sharedState?: SharedMeshStatePayload;
 }
 
 /** A single provider's authentication credential for sync transport. */
@@ -2428,6 +3047,12 @@ export interface ProviderAuthEntry {
   key?: string;
   /** OAuth access token (for "oauth" type). Omitted for API key providers. */
   accessToken?: string;
+  /** OAuth refresh token (for "oauth" type). */
+  refreshToken?: string;
+  /** OAuth credential expiry epoch milliseconds. */
+  expires?: number;
+  /** Optional OAuth account identifier. */
+  accountId?: string;
   /** Whether this credential has been validated. */
   authenticated?: boolean;
 }
@@ -3107,6 +3732,33 @@ export interface RegisteredProject {
 /** @deprecated Use RegisteredProject instead */
 export type ProjectInfo = RegisteredProject;
 
+/** A persisted per-project, per-node working directory path mapping. */
+export interface ProjectNodePathMapping {
+  /** Project ID reference */
+  projectId: string;
+  /** Node ID reference */
+  nodeId: string;
+  /** Absolute working-directory path for this project on this node */
+  path: string;
+  /** ISO-8601 timestamp of creation */
+  createdAt: string;
+  /** ISO-8601 timestamp of last update */
+  updatedAt: string;
+}
+
+/** Input payload for creating/updating a project-node path mapping. */
+export interface ProjectNodePathMappingUpsertInput {
+  projectId: string;
+  nodeId: string;
+  path: string;
+}
+
+/** Input payload for deleting a project-node path mapping. */
+export interface ProjectNodePathMappingDeleteInput {
+  projectId: string;
+  nodeId: string;
+}
+
 /** Health metrics for a registered project */
 export interface ProjectHealth {
   /** Project ID reference */
@@ -3181,6 +3833,7 @@ export interface PlanningSummary {
   title: string;
   description: string;
   suggestedSize: "S" | "M" | "L";
+  priority?: TaskPriority;
   suggestedDependencies: string[];
   keyDeliverables: string[];
 }
@@ -3205,17 +3858,16 @@ export interface PlanningSession {
 // ── Agent Types ────────────────────────────────────────────────────────────
 
 /** Agent lifecycle states */
-export const AGENT_STATES = ["idle", "active", "running", "paused", "error", "terminated"] as const;
+export const AGENT_STATES = ["idle", "active", "running", "paused", "error"] as const;
 export type AgentState = (typeof AGENT_STATES)[number];
 
 /** Valid state transitions for agents */
 export const AGENT_VALID_TRANSITIONS: Record<AgentState, AgentState[]> = {
   idle: ["active"],
-  active: ["running", "paused", "terminated"],
-  running: ["active", "paused", "error", "terminated"],
-  paused: ["active", "terminated"],
-  error: ["active", "terminated"],
-  terminated: ["idle", "active", "running"], // Can be restarted or reset
+  active: ["idle", "running", "paused", "error"],
+  running: ["idle", "active", "paused", "error"],
+  paused: ["idle", "active"],
+  error: ["idle", "active"],
 };
 
 /**
@@ -3487,6 +4139,230 @@ export const AGENT_PERMISSIONS = [
 /** A single canonical permission string. */
 export type AgentPermission = (typeof AGENT_PERMISSIONS)[number];
 
+/**
+ * Canonical v1 action categories for permanent-agent runtime gating.
+ *
+ * `none` is a classifier-only result for positively-recognized read-only actions.
+ * It is never stored as a policy rule key.
+ */
+export const PERMANENT_AGENT_ACTION_CATEGORIES = [
+  "git_write",
+  "file_write_delete",
+  "command_execution",
+  "network_api",
+  "task_agent_mutation",
+  "none",
+] as const;
+
+/** A single v1 permanent-agent action category. */
+export type PermanentAgentActionCategory = (typeof PERMANENT_AGENT_ACTION_CATEGORIES)[number];
+
+/** Sensitive runtime categories covered by policy rules (excludes classifier-only `none`). */
+export type PermanentAgentSensitiveActionCategory = Exclude<PermanentAgentActionCategory, "none">;
+
+/** Runtime action categories governed by agent permission policy presets. */
+export const AGENT_PERMISSION_POLICY_ACTION_CATEGORIES: readonly PermanentAgentSensitiveActionCategory[] = [
+  "git_write",
+  "file_write_delete",
+  "command_execution",
+  "network_api",
+  "task_agent_mutation",
+] as const;
+
+export const AGENT_PROVISIONING_APPROVAL_MODES = ["always", "trusted-only", "never"] as const;
+export type AgentProvisioningApprovalMode = (typeof AGENT_PROVISIONING_APPROVAL_MODES)[number];
+
+/** A single runtime action category governed by permission policy. */
+export type AgentPermissionPolicyActionCategory = PermanentAgentSensitiveActionCategory;
+export type ApprovalRequestActionCategory = AgentPermissionPolicyActionCategory | "agent_provisioning";
+
+/** How a runtime action category is handled by permission policy. */
+export type AgentPermissionPolicyDisposition = "allow" | "block" | "require-approval";
+
+/** Minimum portable permanent-agent gating context consumed by engine runtime wrappers. */
+export interface PermanentAgentGatingContext {
+  permissionPolicy?: {
+    presetId: string;
+    rules: Partial<Record<PermanentAgentSensitiveActionCategory, AgentPermissionPolicyDisposition>>;
+  };
+  requester?: ApprovalRequestActorSnapshot;
+  taskId?: string;
+  runId?: string;
+  sessionId?: string;
+  createApprovalRequest?: (input: {
+    category: AgentPermissionPolicyActionCategory;
+    toolName: string;
+    args: Record<string, unknown>;
+  }) => Promise<ApprovalRequest | null>;
+  findPendingApprovalRequest?: (dedupeKey: string) => Promise<ApprovalRequest | null>;
+}
+
+/** Built-in permission policy preset identifiers for permanent agents. */
+export const AGENT_PERMISSION_POLICY_PRESET_IDS = ["unrestricted", "approval-required", "locked-down"] as const;
+
+/** A single built-in permission policy preset identifier. */
+export type AgentPermissionPolicyPresetId = (typeof AGENT_PERMISSION_POLICY_PRESET_IDS)[number];
+
+/** Canonical category->disposition map for a permission policy. */
+export type AgentPermissionPolicyRules = Record<
+  AgentPermissionPolicyActionCategory,
+  AgentPermissionPolicyDisposition
+>;
+
+/** First-class persisted permission policy contract for permanent agents. */
+export interface AgentPermissionPolicy {
+  presetId: AgentPermissionPolicyPresetId;
+  rules: AgentPermissionPolicyRules;
+}
+
+/** Approval request lifecycle statuses. */
+export const APPROVAL_REQUEST_STATUSES = ["pending", "approved", "denied", "completed"] as const;
+
+/** A single approval request lifecycle status. */
+export type ApprovalRequestStatus = (typeof APPROVAL_REQUEST_STATUSES)[number];
+
+/** Append-only audit event types for approval requests. */
+export const APPROVAL_REQUEST_AUDIT_EVENT_TYPES = [
+  "created",
+  "approved",
+  "denied",
+  "completed",
+] as const;
+
+/** A single append-only audit event type for approval requests. */
+export type ApprovalRequestAuditEventType = (typeof APPROVAL_REQUEST_AUDIT_EVENT_TYPES)[number];
+
+/** Immutable actor identity snapshot captured at request/audit event time. */
+export interface ApprovalRequestActorSnapshot {
+  actorId: string;
+  actorType: "agent" | "user" | "system";
+  actorName: string;
+}
+
+/** Legacy action-category aliases accepted for backward compatibility. */
+export const LEGACY_AGENT_PERMISSION_POLICY_ACTION_CATEGORY_ALIASES = [
+  "file_write",
+  "file_delete",
+  "command_execute",
+  "network_access",
+  "task_mutation",
+  "agent_mutation",
+] as const;
+
+export type LegacyAgentPermissionPolicyActionCategory =
+  (typeof LEGACY_AGENT_PERMISSION_POLICY_ACTION_CATEGORY_ALIASES)[number];
+
+/** Canonical + compatibility action-category input accepted at boundaries. */
+export type ApprovalRequestActionCategoryInput =
+  | ApprovalRequestActionCategory
+  | LegacyAgentPermissionPolicyActionCategory;
+
+/** Normalize legacy action-category aliases to canonical v1 categories. */
+export function normalizeApprovalRequestActionCategory(
+  category: ApprovalRequestActionCategoryInput,
+): ApprovalRequestActionCategory {
+  switch (category) {
+    case "file_write":
+    case "file_delete":
+      return "file_write_delete";
+    case "command_execute":
+      return "command_execution";
+    case "network_access":
+      return "network_api";
+    case "task_mutation":
+    case "agent_mutation":
+      return "task_agent_mutation";
+    case "agent_provisioning":
+      return "agent_provisioning";
+    default:
+      return category;
+  }
+}
+
+/** Action payload gated by an approval request. */
+export interface ApprovalRequestTargetAction {
+  category: ApprovalRequestActionCategory;
+  action: string;
+  summary: string;
+  resourceType: string;
+  resourceId: string;
+  context?: Record<string, unknown>;
+}
+
+/** Append-only audit event row for approval request history. */
+export interface ApprovalRequestAuditEvent {
+  id: string;
+  requestId: string;
+  eventType: ApprovalRequestAuditEventType;
+  actor: ApprovalRequestActorSnapshot;
+  note?: string;
+  createdAt: string;
+}
+
+/** Durable approval request record used by engine and dashboard surfaces. */
+export interface ApprovalRequest {
+  id: string;
+  status: ApprovalRequestStatus;
+  requester: ApprovalRequestActorSnapshot;
+  targetAction: ApprovalRequestTargetAction;
+  taskId?: string;
+  runId?: string;
+  requestedAt: string;
+  decidedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Create input for a new pending approval request. */
+export interface ApprovalRequestCreateInput {
+  requester: ApprovalRequestActorSnapshot;
+  targetAction: Omit<ApprovalRequestTargetAction, "category"> & {
+    category: ApprovalRequestActionCategoryInput;
+  };
+  taskId?: string;
+  runId?: string;
+}
+
+/** Input for pending->approved / pending->denied decisions. */
+export interface ApprovalRequestDecisionInput {
+  actor: ApprovalRequestActorSnapshot;
+  note?: string;
+}
+
+/** Input for approved->completed transition. */
+export interface ApprovalRequestCompletionInput {
+  actor: ApprovalRequestActorSnapshot;
+  note?: string;
+}
+
+/** Query filters for approval request listings. */
+export interface ApprovalRequestListInput {
+  status?: ApprovalRequestStatus;
+  requesterActorId?: string;
+  taskId?: string;
+  runId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** True when a transition is valid for approval request lifecycle rules. */
+export function isValidApprovalRequestTransition(
+  from: ApprovalRequestStatus,
+  to: ApprovalRequestStatus,
+): boolean {
+  if (from === to) {
+    return true;
+  }
+  if (from === "pending") {
+    return to === "approved" || to === "denied";
+  }
+  if (from === "approved") {
+    return to === "completed";
+  }
+  return false;
+}
+
 /** Describes how an agent's task assignment capability was determined. */
 export type TaskAssignSource =
   | "role_default" // Granted automatically by role (e.g., scheduler gets tasks:assign)
@@ -3547,6 +4423,8 @@ export interface Agent {
   title?: string;
   /** Custom icon identifier */
   icon?: string;
+  /** Uploaded avatar image URL */
+  imageUrl?: string;
   /** Agent ID this agent reports to (org hierarchy) */
   reportsTo?: string;
   /** Runtime configuration. Supports: AgentHeartbeatConfig keys (heartbeatIntervalMs, heartbeatTimeoutMs, maxConcurrentRuns) */
@@ -3555,12 +4433,16 @@ export interface Agent {
   pauseReason?: string;
   /** Capability permission flags */
   permissions?: Record<string, boolean>;
+  /** Runtime action gating policy (preset + normalized category rules). */
+  permissionPolicy?: AgentPermissionPolicy;
   /** Cumulative input tokens across all runs */
   totalInputTokens?: number;
   /** Cumulative output tokens across all runs */
   totalOutputTokens?: number;
   /** Last error message */
   lastError?: string;
+  /** Number of currently pending approvals requested by this agent. */
+  pendingApprovalCount?: number;
   /** Path to a markdown file containing custom instructions (resolved relative to project root).
    *  Must end in `.md`, no `..` traversal. Max 500 chars. */
   instructionsPath?: string;
@@ -3590,12 +4472,20 @@ export type MessageResponseMode = "immediate" | "on-heartbeat";
 export interface AgentHeartbeatConfig {
   /** Whether heartbeat triggers are enabled for this agent (default: true) */
   enabled?: boolean;
+  /** Whether this agent should auto-claim relevant unowned tasks during no-task heartbeats (default: true when unset). */
+  autoClaimRelevantTasks?: boolean;
   /** Polling interval in ms (default: 30000). Min: 1000 */
   heartbeatIntervalMs?: number;
   /** Heartbeat timeout in ms (default: 60000). Min: 5000 */
   heartbeatTimeoutMs?: number;
   /** Max concurrent heartbeat runs per agent (default: 1). Min: 1 */
   maxConcurrentRuns?: number;
+  /** Whether periodic self-improvement is enabled (default: true) */
+  selfImproveEnabled?: boolean;
+  /** Interval between self-improvement cycles in ms (default: 14400000 = 4h). Min: 3600000 (1h) */
+  selfImproveIntervalMs?: number;
+  /** ISO timestamp of last self-improvement run */
+  lastSelfImproveAt?: string;
   /**
    * How this agent responds to incoming messages.
    * "immediate" triggers a heartbeat run when a message arrives.
@@ -3604,6 +4494,21 @@ export interface AgentHeartbeatConfig {
   messageResponseMode?: MessageResponseMode;
   /** Per-agent budget governance configuration. When set, enables budget tracking and enforcement. */
   budgetConfig?: AgentBudgetConfig;
+  /**
+   * When true, the engine fires a catch-up heartbeat at server startup if the
+   * agent's last heartbeat is older than its interval — i.e., the server was
+   * down across a scheduled tick. Default: false.
+   */
+  runMissedHeartbeatOnStartup?: boolean;
+  /**
+   * When true (default), an agent's heartbeat runs and its task execution session can run
+   * concurrently. When false, the two paths serialize: a heartbeat will not start while the
+   * agent's bound task has an active executor session, and an executor session will not start
+   * while the agent has an active heartbeat run.
+   *
+   * Permanent agents only — ignored for ephemeral agents. Default: true when unset.
+   */
+  allowParallelExecution?: boolean;
 }
 
 /** Per-agent budget configuration, stored in agent.runtimeConfig.budgetConfig */
@@ -3670,9 +4575,11 @@ export interface AgentCreateInput {
   metadata?: Record<string, unknown>;
   title?: string;
   icon?: string;
+  imageUrl?: string;
   reportsTo?: string;
   runtimeConfig?: Record<string, unknown>;
   permissions?: Record<string, boolean>;
+  permissionPolicy?: AgentPermissionPolicy;
   instructionsPath?: string;
   instructionsText?: string;
   soul?: string;
@@ -3688,10 +4595,12 @@ export interface AgentUpdateInput {
   metadata?: Record<string, unknown>;
   title?: string;
   icon?: string;
+  imageUrl?: string;
   reportsTo?: string;
   runtimeConfig?: Record<string, unknown>;
   pauseReason?: string;
   permissions?: Record<string, boolean>;
+  permissionPolicy?: AgentPermissionPolicy;
   lastError?: string;
   totalInputTokens?: number;
   totalOutputTokens?: number;
@@ -3785,9 +4694,11 @@ export interface AgentConfigSnapshot {
   role: AgentCapability;
   title?: string;
   icon?: string;
+  imageUrl?: string;
   reportsTo?: string;
   runtimeConfig?: Record<string, unknown>;
   permissions?: Record<string, boolean>;
+  permissionPolicy?: AgentPermissionPolicy;
   instructionsPath?: string;
   instructionsText?: string;
   soul?: string;
@@ -3913,9 +4824,16 @@ export function agentToConfigSnapshot(agent: Agent): AgentConfigSnapshot {
     role: agent.role,
     title: agent.title,
     icon: agent.icon,
+    imageUrl: agent.imageUrl,
     reportsTo: agent.reportsTo,
     runtimeConfig: agent.runtimeConfig ? { ...agent.runtimeConfig } : undefined,
     permissions: agent.permissions ? { ...agent.permissions } : undefined,
+    permissionPolicy: agent.permissionPolicy
+      ? {
+          presetId: agent.permissionPolicy.presetId,
+          rules: { ...agent.permissionPolicy.rules },
+        }
+      : undefined,
     instructionsPath: agent.instructionsPath,
     instructionsText: agent.instructionsText,
     soul: agent.soul,
@@ -3941,9 +4859,11 @@ export function diffConfigSnapshots(
     "role",
     "title",
     "icon",
+    "imageUrl",
     "reportsTo",
     "runtimeConfig",
     "permissions",
+    "permissionPolicy",
     "instructionsPath",
     "instructionsText",
     "soul",
@@ -4125,6 +5045,24 @@ export interface MigrationResult {
 /** Participant types for message routing */
 export type ParticipantType = "agent" | "user" | "system";
 
+/** Canonical recipient ID for dashboard user mailbox routing. */
+export const DASHBOARD_USER_ID = "dashboard";
+
+const DASHBOARD_USER_ALIASES = new Set([DASHBOARD_USER_ID, "user:dashboard", "User: user:dashboard"]);
+
+/** Normalize participant identity for durable mailbox routing. */
+export function normalizeMessageParticipant(id: string, type: ParticipantType): { id: string; type: ParticipantType } {
+  if (type !== "user") {
+    return { id, type };
+  }
+
+  if (DASHBOARD_USER_ALIASES.has(id)) {
+    return { id: DASHBOARD_USER_ID, type };
+  }
+
+  return { id, type };
+}
+
 /** Message types/categories */
 export type MessageType = "agent-to-agent" | "agent-to-user" | "user-to-agent" | "system";
 
@@ -4138,6 +5076,12 @@ export interface MessageReplyReference {
 export interface MessageMetadata extends Record<string, unknown> {
   /** Optional link to the original message when this message is a reply. */
   replyTo?: MessageReplyReference;
+  /**
+   * If true, the recipient agent is woken immediately on receipt regardless
+   * of their own `messageResponseMode` setting. Sender-initiated override —
+   * use sparingly for urgent messages. Ignored when recipient is a user.
+   */
+  wakeRecipient?: boolean;
 }
 
 /** Message record stored in the system */
@@ -4198,16 +5142,22 @@ export interface MessageFilter {
 
 /** Validate mailbox metadata, including reply-link contract when present. */
 export function validateMessageMetadata(metadata: MessageMetadata | undefined): void {
-  if (!metadata || metadata.replyTo === undefined) {
+  if (!metadata) {
     return;
   }
 
-  if (typeof metadata.replyTo !== "object" || metadata.replyTo === null || Array.isArray(metadata.replyTo)) {
-    throw new Error("metadata.replyTo must be an object");
+  if (metadata.replyTo !== undefined) {
+    if (typeof metadata.replyTo !== "object" || metadata.replyTo === null || Array.isArray(metadata.replyTo)) {
+      throw new Error("metadata.replyTo must be an object");
+    }
+
+    if (typeof metadata.replyTo.messageId !== "string" || metadata.replyTo.messageId.trim().length === 0) {
+      throw new Error("metadata.replyTo.messageId must be a non-empty string");
+    }
   }
 
-  if (typeof metadata.replyTo.messageId !== "string" || metadata.replyTo.messageId.trim().length === 0) {
-    throw new Error("metadata.replyTo.messageId must be a non-empty string");
+  if (metadata.wakeRecipient !== undefined && typeof metadata.wakeRecipient !== "boolean") {
+    throw new Error("metadata.wakeRecipient must be a boolean");
   }
 }
 
@@ -4232,16 +5182,14 @@ export { PROMPT_KEY_CATALOG } from "./prompt-overrides.js";
 export { getErrorMessage } from "./error-message.js";
 export {
   resolveExecutionSettingsModel,
-  resolveModelFallbackChain,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
-  resolveRouteAllLlmCallsViaDspy,
   resolveTaskExecutionModel,
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,
   resolveTitleSummarizerSettingsModel,
   resolveValidatorSettingsModel,
 } from "./model-resolution.js";
-export type { ResolvedModelFallbackEntry, ResolvedModelSelection } from "./model-resolution.js";
+export type { ResolvedModelSelection } from "./model-resolution.js";
 export { resolveResearchSettings } from "./research-settings.js";
 export type { ResolvedResearchSettings } from "./research-settings.js";

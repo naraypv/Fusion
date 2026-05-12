@@ -1,5 +1,67 @@
 # @fusion-plugin-examples/dependency-graph
 
+## 0.1.16
+
+### Patch Changes
+
+- @fusion/core@0.27.0
+- @fusion/dashboard@0.27.0
+- @fusion/plugin-sdk@0.27.0
+
+## 0.1.15
+
+### Patch Changes
+
+- @fusion/core@0.26.0
+- @fusion/dashboard@0.26.0
+- @fusion/plugin-sdk@0.26.0
+
+## 0.1.14
+
+### Patch Changes
+
+- @fusion/core@0.25.0
+- @fusion/dashboard@0.25.0
+- @fusion/plugin-sdk@0.25.0
+
+## 0.1.13
+
+### Patch Changes
+
+- @fusion/core@0.24.0
+- @fusion/dashboard@0.24.0
+- @fusion/plugin-sdk@0.24.0
+
+## 0.1.12
+
+### Patch Changes
+
+- @fusion/core@0.23.0
+- @fusion/plugin-sdk@0.23.0
+
+## 0.1.11
+
+### Patch Changes
+
+- Updated dependencies [e658e8e]
+- Updated dependencies [aecc050]
+  - @fusion/core@0.22.0
+  - @fusion/plugin-sdk@0.22.0
+
+## 0.1.10
+
+### Patch Changes
+
+- @fusion/core@0.21.0
+- @fusion/plugin-sdk@0.21.0
+
+## 0.1.9
+
+### Patch Changes
+
+- @fusion/core@0.20.0
+- @fusion/plugin-sdk@0.20.0
+
 ## 0.1.8
 
 ### Patch Changes

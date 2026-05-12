@@ -20,8 +20,12 @@ import {
   TrendingUp,
   ExternalLink,
   Archive,
+  ArchiveRestore,
   Clock,
+  Settings,
 } from "lucide-react";
+import { CustomModelDropdown } from "./CustomModelDropdown";
+import { fetchModels, updateGlobalSettings, type ModelInfo } from "../api";
 import { useInsights, type InsightSection } from "../hooks/useInsights";
 import type { InsightCategory } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
@@ -31,6 +35,7 @@ interface InsightsViewProps {
   addToast: (message: string, type?: ToastType) => void;
   onClose?: () => void;
   onCreateTask?: (payload: { insightId: string; title: string; description: string }) => Promise<void>;
+  models?: ModelInfo[];
 }
 
 const CATEGORY_ICONS: Record<InsightCategory, React.ComponentType<{ size?: number; className?: string }>> = {
@@ -51,7 +56,7 @@ const CATEGORY_ICONS: Record<InsightCategory, React.ComponentType<{ size?: numbe
   other: Sparkles,
 };
 
-export function InsightsView({ projectId, addToast, onClose, onCreateTask }: InsightsViewProps) {
+export function InsightsView({ projectId, addToast, onClose, onCreateTask, models: modelsProp }: InsightsViewProps) {
   const {
     sections,
     loading,
@@ -63,13 +68,97 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
     runInsights,
     dismiss,
     createTask: createTaskFromInsight,
+    archive = async () => {},
+    unarchive = async () => {},
+    toggleShowArchived = () => {},
     dismissStates,
     createTaskStates,
+    archiveStates = new Map(),
+    unarchiveStates = new Map(),
     totalCount,
+    archivedCount = 0,
+    showArchived = false,
   } = useInsights(projectId);
 
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [statusType, setStatusType] = useState<"success" | "error" | "info">("info");
+
+  const [showModelConfig, setShowModelConfig] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string>(
+    () => localStorage.getItem("fusion-insight-model") ?? ""
+  );
+
+  // Fetch models internally if not provided via prop
+  const [fetchedModels, setFetchedModels] = useState<ModelInfo[]>([]);
+  const [favoriteProviders, setFavoriteProviders] = useState<string[]>([]);
+  const [favoriteModels, setFavoriteModels] = useState<string[]>([]);
+  const [resolvedPlanningProvider, setResolvedPlanningProvider] = useState<string | undefined>();
+  useEffect(() => {
+    if (modelsProp) return;
+    fetchModels()
+      .then((res) => {
+        setFetchedModels(res.models);
+        setFavoriteProviders(res.favoriteProviders);
+        setFavoriteModels(res.favoriteModels);
+        setResolvedPlanningProvider(res.resolvedPlanningProvider);
+
+        // Clear persisted model override if the model is no longer available
+        const savedModel = localStorage.getItem("fusion-insight-model");
+        if (savedModel) {
+          const available = res.models.some((m) => `${m.provider}/${m.id}` === savedModel);
+          if (!available) {
+            localStorage.removeItem("fusion-insight-model");
+            setSelectedModel("");
+          }
+        }
+      })
+      .catch(() => {});
+  }, [modelsProp]);
+  const models = modelsProp ?? fetchedModels;
+
+  // Auto-promote the resolved planning provider as a favorite when the user
+  // hasn't explicitly starred any providers. This ensures the provider they
+  // actively use always appears at the top of the dropdown.
+  const effectiveFavoriteProviders = useMemo(() => {
+    if (favoriteProviders.length > 0) return favoriteProviders;
+    if (resolvedPlanningProvider) return [resolvedPlanningProvider];
+    return [];
+  }, [favoriteProviders, resolvedPlanningProvider]);
+
+  const handleToggleProviderFavorite = useCallback(async (provider: string) => {
+    const isFavorite = favoriteProviders.includes(provider);
+    const next = isFavorite
+      ? favoriteProviders.filter((p) => p !== provider)
+      : [provider, ...favoriteProviders];
+    setFavoriteProviders(next);
+    try {
+      await updateGlobalSettings({ favoriteProviders: next, favoriteModels });
+    } catch {
+      setFavoriteProviders(favoriteProviders);
+    }
+  }, [favoriteProviders, favoriteModels]);
+
+  const handleToggleModelFavorite = useCallback(async (modelId: string) => {
+    const isFavorite = favoriteModels.includes(modelId);
+    const next = isFavorite
+      ? favoriteModels.filter((m) => m !== modelId)
+      : [modelId, ...favoriteModels];
+    setFavoriteModels(next);
+    try {
+      await updateGlobalSettings({ favoriteProviders, favoriteModels: next });
+    } catch {
+      setFavoriteModels(favoriteModels);
+    }
+  }, [favoriteModels, favoriteProviders]);
+
+  const handleModelChange = useCallback((value: string) => {
+    setSelectedModel(value);
+    if (value) {
+      localStorage.setItem("fusion-insight-model", value);
+    } else {
+      localStorage.removeItem("fusion-insight-model");
+    }
+  }, []);
 
   const populatedSections = useMemo(
     () => sections.filter((section) => section.items.length > 0),
@@ -106,17 +195,38 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
     try {
       setStatusMessage("Generating insights...");
       setStatusType("info");
-      await runInsights();
+
+      let modelProvider: string | undefined;
+      let modelId: string | undefined;
+      if (selectedModel) {
+        const slashIdx = selectedModel.indexOf("/");
+        if (slashIdx !== -1) {
+          const provider = selectedModel.slice(0, slashIdx);
+          const id = selectedModel.slice(slashIdx + 1);
+          if (provider && id) {
+            modelProvider = provider;
+            modelId = id;
+          }
+        }
+      }
+
+      await runInsights(modelProvider, modelId);
       setStatusMessage("Insight generation started");
       setStatusType("success");
       addToast("Insight generation started", "success");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to start generation";
+      if (message === "Insight generation is already running") {
+        setStatusMessage("Insight generation is already running. Showing the active run.");
+        setStatusType("info");
+        addToast("Insight generation is already running", "info");
+        return;
+      }
       setStatusMessage(message);
       setStatusType("error");
       addToast(message, "error");
     }
-  }, [runInsights, addToast]);
+  }, [runInsights, addToast, selectedModel]);
 
   const handleDismiss = useCallback(
     async (id: string, title: string) => {
@@ -135,6 +245,44 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
       }
     },
     [dismiss, addToast],
+  );
+
+  const handleArchive = useCallback(
+    async (id: string, title: string) => {
+      try {
+        setStatusMessage(`Archiving "${title}"...`);
+        setStatusType("info");
+        await archive(id);
+        setStatusMessage(`Archived "${title}"`);
+        setStatusType("success");
+        addToast(`Insight archived: ${title}`, "success");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to archive insight";
+        setStatusMessage(message);
+        setStatusType("error");
+        addToast(message, "error");
+      }
+    },
+    [archive, addToast],
+  );
+
+  const handleUnarchive = useCallback(
+    async (id: string, title: string) => {
+      try {
+        setStatusMessage(`Unarchiving "${title}"...`);
+        setStatusType("info");
+        await unarchive(id);
+        setStatusMessage(`Unarchived "${title}"`);
+        setStatusType("success");
+        addToast(`Insight unarchived: ${title}`, "success");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to unarchive insight";
+        setStatusMessage(message);
+        setStatusType("error");
+        addToast(message, "error");
+      }
+    },
+    [unarchive, addToast],
   );
 
   const handleCreateTask = useCallback(
@@ -213,31 +361,61 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
             {activeSection.items.map((insight) => {
               const dismissState = dismissStates.get(insight.id);
               const createState = createTaskStates.get(insight.id);
+              const archiveState = archiveStates.get(insight.id);
+              const unarchiveState = unarchiveStates.get(insight.id);
               const isDismissInFlight = dismissState?.running ?? false;
               const isCreateInFlight = createState?.running ?? false;
+              const isArchiveInFlight = archiveState?.running ?? false;
+              const isUnarchiveInFlight = unarchiveState?.running ?? false;
+              const isArchived = insight.status === "archived";
               const isAnyActionInFlight = activeSection.items.some(
-                (item) => dismissStates.get(item.id)?.running || createTaskStates.get(item.id)?.running,
+                (item) =>
+                  dismissStates.get(item.id)?.running ||
+                  createTaskStates.get(item.id)?.running ||
+                  archiveStates.get(item.id)?.running ||
+                  unarchiveStates.get(item.id)?.running,
               );
 
               return (
-                <li key={insight.id} className="insight-item" data-insight-id={insight.id}>
+                <li key={insight.id} className={`insight-item${isArchived ? " insight-item--archived" : ""}`} data-insight-id={insight.id}>
                   <div className="insight-item-header">
                     <h4 className="insight-item-title">{insight.title}</h4>
                     <div className="insight-item-actions">
-                      <button
-                        className="insight-item-action-btn"
-                        onClick={() => void handleCreateTask(insight.id, insight.title)}
-                        disabled={isCreateInFlight || isAnyActionInFlight}
-                        title="Create task from this insight"
-                        aria-label="Create task from this insight"
-                        data-testid={`create-task-${insight.id}`}
-                      >
-                        {isCreateInFlight ? (
-                          <RefreshCw size={20} className="spin" />
-                        ) : (
-                          <Plus size={20} />
-                        )}
-                      </button>
+                      {isArchived ? (
+                        <button
+                          className="insight-item-action-btn"
+                          onClick={() => void handleUnarchive(insight.id, insight.title)}
+                          disabled={isUnarchiveInFlight || isAnyActionInFlight}
+                          title="Unarchive this insight"
+                          aria-label="Unarchive this insight"
+                          data-testid={`unarchive-${insight.id}`}
+                        >
+                          {isUnarchiveInFlight ? <RefreshCw size={20} className="spin" /> : <ArchiveRestore size={20} />}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            className="insight-item-action-btn"
+                            onClick={() => void handleCreateTask(insight.id, insight.title)}
+                            disabled={isCreateInFlight || isAnyActionInFlight}
+                            title="Create task from this insight"
+                            aria-label="Create task from this insight"
+                            data-testid={`create-task-${insight.id}`}
+                          >
+                            {isCreateInFlight ? <RefreshCw size={20} className="spin" /> : <Plus size={20} />}
+                          </button>
+                          <button
+                            className="insight-item-action-btn"
+                            onClick={() => void handleArchive(insight.id, insight.title)}
+                            disabled={isArchiveInFlight || isAnyActionInFlight}
+                            title="Archive this insight"
+                            aria-label="Archive this insight"
+                            data-testid={`archive-${insight.id}`}
+                          >
+                            {isArchiveInFlight ? <RefreshCw size={20} className="spin" /> : <Archive size={20} />}
+                          </button>
+                        </>
+                      )}
                       <button
                         className="insight-item-action-btn"
                         onClick={() => void handleDismiss(insight.id, insight.title)}
@@ -299,6 +477,17 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
               <X size={16} />
             </button>
           )}
+          {archivedCount > 0 && (
+            <button
+              className="btn btn-sm insights-show-archived-toggle"
+              onClick={toggleShowArchived}
+              aria-label={showArchived ? "Hide archived insights" : "Show archived insights"}
+              data-testid="toggle-archived-insights"
+            >
+              <Archive size={14} />
+              {showArchived ? "Hide Archived" : `Show Archived (${archivedCount})`}
+            </button>
+          )}
           <button
             className="btn btn-sm"
             onClick={() => void refresh()}
@@ -308,6 +497,17 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
           >
             <RefreshCw size={14} className={loading ? "spin" : ""} />
             Refresh
+          </button>
+          <button
+            className="btn btn-sm insights-model-toggle"
+            onClick={() => setShowModelConfig((prev) => !prev)}
+            aria-label="Configure insight generation model"
+            aria-expanded={showModelConfig}
+            data-testid="toggle-model-config"
+            title={selectedModel ? `Model: ${selectedModel}` : "Configure model"}
+          >
+            <Settings size={14} />
+            {selectedModel && <span className="insights-model-indicator" />}
           </button>
           <button
             className="btn btn-primary btn-sm"
@@ -330,6 +530,27 @@ export function InsightsView({ projectId, addToast, onClose, onCreateTask }: Ins
           </button>
         </div>
       </div>
+
+      {showModelConfig && (
+        <div className="insights-model-config" data-testid="model-config">
+          <label htmlFor="insight-model-select" className="insights-model-label">
+            Model
+          </label>
+          <CustomModelDropdown
+            models={models}
+            value={selectedModel}
+            onChange={handleModelChange}
+            placeholder="Use planning default"
+            label="Insight generation model"
+            disabled={isRunInFlight}
+            id="insight-model-select"
+            favoriteProviders={effectiveFavoriteProviders}
+            favoriteModels={favoriteModels}
+            onToggleFavorite={handleToggleProviderFavorite}
+            onToggleModelFavorite={handleToggleModelFavorite}
+          />
+        </div>
+      )}
 
       <div
         className="insights-status-region"

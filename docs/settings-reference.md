@@ -38,13 +38,15 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `defaultModelId` | `string` | `undefined` | Default AI model ID. |
 | `fallbackProvider` | `string` | `undefined` | Fallback provider when the primary default model hits transient provider failures. |
 | `fallbackModelId` | `string` | `undefined` | Fallback model ID (must pair with `fallbackProvider`). |
-| `defaultThinkingLevel` | `"off" \| "minimal" \| "low" \| "medium" \| "high"` | `undefined` | Default reasoning effort for AI sessions. |
+| `defaultThinkingLevel` | `"off" \| "minimal" \| "low" \| "medium" \| "high"` | `undefined` | Default reasoning effort for AI sessions. If a provider/runtime rejects simultaneous `thinking` and `reasoning_effort` parameters, Fusion retries without the explicit thinking override instead of failing the run. |
 | `ntfyEnabled` | `boolean` | `false` | Enable ntfy push notifications. |
 | `ntfyTopic` | `string` | `undefined` | ntfy topic name. |
 | `ntfyBaseUrl` | `string` | `undefined` | Optional custom ntfy server base URL (must use `http://` or `https://`). If blank/unset, Fusion uses `https://ntfy.sh` for both runtime and test notifications. |
-| `ntfyEvents` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used")[]` | `["in-review","merged","failed","awaiting-approval","awaiting-user-review","planning-awaiting-input","gridlock","fallback-used"]` | Event types that trigger ntfy notifications. `planning-awaiting-input` fires when planning mode is waiting on user input. `gridlock` fires when all schedulable todo tasks are blocked; delivery is cooldown-throttled (first alert immediately, then suppressed for 15 minutes until gridlock resolves). `fallback-used` fires when Fusion recovers from a retryable model failure by switching to a configured fallback model. |
+| `ntfyEvents` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `["in-review","merged","failed","awaiting-approval","awaiting-user-review","planning-awaiting-input","gridlock","fallback-used","memory-dreams-processed","message:agent-to-user","message:agent-to-agent"]` | Event types that trigger ntfy notifications. `planning-awaiting-input` fires when planning mode is waiting on user input. `gridlock` fires when all schedulable todo tasks are blocked; delivery is cooldown-throttled (first alert immediately, then suppressed for 15 minutes until gridlock resolves). `fallback-used` fires when Fusion recovers from a retryable model failure by switching to a configured fallback model. `memory-dreams-processed` fires when manual dream processing writes a new `DREAMS.md` entry (project and/or agent); disable it via ntfy/webhook event filters if you want to opt out. `message:agent-to-user` fires when an agent sends a direct message to the user. `message:agent-to-agent` fires when an agent sends a message to another agent (including replies). If you use a custom `ntfyEvents` list, this event must be present (or `ntfyEvents` must be unset so defaults apply) for agent-to-agent inbox notifications to send. |
 | `ntfyDashboardHost` | `string` | `undefined` | Dashboard host used to build deep links in notifications. |
 | `webhookEnabled` | `boolean` | `false` | Enable webhook notifications for task lifecycle events. Part of the legacy flat settings; prefer `notificationProviders` for new setups. |
+
+In **Settings → Notifications**, use **Test message notification** to exercise the full mailbox-message dispatch pipeline (`NotificationService.dispatch` → provider delivery), not just a raw ntfy POST.
 | `webhookUrl` | `string` | `undefined` | Webhook endpoint URL. Must be `http://` or `https://`. Part of legacy flat settings. |
 | `webhookFormat` | `"slack" \| "discord" \| "generic"` | `"generic"` | Webhook payload format. Part of legacy flat settings. |
 | `webhookEvents` | `string[]` | `[]` | Event filter for webhook notifications. Empty/omitted means all events. Part of legacy flat settings. |
@@ -57,6 +59,7 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `openrouterModelSync` | `boolean` | `true` | Sync OpenRouter model catalog into model pickers at startup. |
 | `opencodeGoModelSync` | `boolean` | `true` | Sync opencode-go model catalog at startup via `opencode models opencode --refresh`, normalizing discovered `opencode/...` IDs into the `opencode-go` provider surface used by `/api/models`. |
 | `updateCheckEnabled` | `boolean` | `true` | When enabled, Fusion performs a daily npm registry check for new `@runfusion/fusion` versions and shows update notices in CLI/dashboard. |
+| `githubTrackingDefaultRepo` | `string` | `undefined` | Global fallback issue-tracking repo (`owner/repo`) used when task-level tracking is enabled and no project/task override is set. This key is dual-scope: global saves go through `PUT /api/settings/global` (Settings → Global General). |
 | `autoReloadOnVersionChange` | `boolean` | `true` | When enabled (default), the dashboard automatically reloads when a new build version is detected via `/version.json` polling or service worker activation. Set to `false` to suppress automatic reloads — the user must manually refresh to pick up updates. |
 | `modelOnboardingComplete` | `boolean` | `undefined` | Whether AI onboarding has been completed or dismissed. |
 | `executionGlobalProvider` | `string` | `undefined` | Global baseline provider for task execution. Project `executionProvider` overrides this. |
@@ -71,7 +74,7 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `daemonPort` | `number` | `4040` | Port for daemon/serve mode binding. |
 | `daemonHost` | `string` | `"127.0.0.1"` | Host for daemon/serve mode binding. Defaults to localhost only; pass `"0.0.0.0"` to expose on all interfaces. |
 | `settingsSyncEnabled` | `boolean` | `false` | Enable automatic settings synchronization between nodes. |
-| `settingsSyncAuth` | `boolean` | `false` | Include model auth credentials in settings sync operations. |
+| `settingsSyncAuth` | `boolean` | `false` | Include auth-material snapshots (`sharedState.authMaterial` and auth sync endpoints) when settings sync is enabled. Ignored when `settingsSyncEnabled` is `false`. |
 | `settingsSyncInterval` | `number` | `900000` | Automatic sync interval in ms. Valid values: `300000`, `900000`, `1800000`, `3600000`. |
 | `settingsSyncConflictResolution` | `"last-write-wins" \| "always-ask" \| "keep-local" \| "keep-remote"` | `"last-write-wins"` | Conflict strategy for divergent synced settings. |
 | `dashboardCurrentNodeId` | `string` | `undefined` | Currently selected dashboard node ID. Restores the last-viewed node on fresh browser/PWA sessions. `undefined` means viewing the local node. |
@@ -79,13 +82,14 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 > Mesh lifecycle note: settings sync is executed by the process-level `PeerExchangeService` started by `fn serve`/`fn dashboard`. `InProcessRuntime` does not instantiate settings-sync mesh services per project.
 | `dashboardCurrentProjectIdByNode` | `Record<string, string>` | `undefined` | Map of node ID to last-selected project ID. Use key `"local"` for the local node. Persists project context across browser restarts and PWA sessions. |
 | `persistAgentToolOutput` | `boolean` | `true` | Controls whether detailed `detail` payloads are persisted for `tool`, `tool_result`, and `tool_error` agent log entries. When disabled, tool timeline rows are still recorded, but verbose payloads are omitted. |
-| `researchGlobalDefaults` | `ResearchGlobalDefaults` | `{ searchProvider: undefined, synthesisProvider: undefined, synthesisModelId: undefined, enabledSources: { webSearch: true, pageFetch: true, github: false, localDocs: true, llmSynthesis: true }, maxSourcesPerRun: 20, defaultExportFormat: "markdown" }` | Global Research defaults shared by all projects. Project overrides come from `researchSettings`. |
+| `persistAgentThinkingLog` | `boolean` | `false` | Controls whether `thinking`/reasoning agent log entries are persisted. When disabled (default), only persisted `thinking` rows are suppressed; normal assistant text output and tool rows are unchanged. |
+| `researchGlobalDefaults` | `ResearchGlobalDefaults` | `{ searchProvider: "builtin", synthesisProvider: undefined, synthesisModelId: undefined, enabledSources: { webSearch: true, pageFetch: true, github: false, localDocs: true, llmSynthesis: true }, maxSourcesPerRun: 20, defaultExportFormat: "markdown" }` | Global Research defaults shared by all projects. Web search defaults to the built-in WebSearch/WebFetch-backed provider; project overrides come from `researchSettings`. |
 | `researchGlobalEnabled` | `boolean` | `true` | Enable or disable the research subsystem globally. When false, dashboard/API/CLI/agent entrypoints reject new runs. |
 | `researchGlobalMaxConcurrentRuns` | `number` | `3` | Maximum concurrent research runs across all projects. |
 | `researchGlobalDefaultTimeout` | `number` | `300000` | Default timeout for end-to-end research runs in milliseconds (5 minutes). |
 | `researchGlobalMaxSourcesPerRun` | `number` | `20` | Maximum number of sources per research run. |
 | `researchGlobalMaxSynthesisRounds` | `number` | `2` | Maximum synthesis rounds per research run. |
-| `researchGlobalWebSearchProvider` | `"searxng" \| "brave" \| "google" \| "tavily" \| "none"` | `"none"` | Web search backend for research. Default: `"none"` (disabled). |
+| `researchGlobalWebSearchProvider` | `"builtin" \| "searxng" \| "brave" \| "google" \| "tavily" \| "none"` | `"builtin"` | Web search backend for research. Default: `"builtin"` (uses agent-native WebSearch/WebFetch tools with no API key requirement). |
 | `researchGlobalSearxngUrl` | `string` | `undefined` | SearXNG instance URL (required when provider is `"searxng"`). |
 | `researchGlobalBraveApiKey` | `string` | `undefined` | Brave Search API key (required when provider is `"brave"`). |
 | `researchGlobalGoogleSearchApiKey` | `string` | `undefined` | Google Custom Search API key (required when provider is `"google"`). |
@@ -96,7 +100,7 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `researchGlobalMaxSearchResults` | `number` | `undefined` | Maximum search results per provider query. |
 | `researchGlobalFetchTimeoutMs` | `number` | `30000` | Timeout for individual HTTP fetches in milliseconds. |
 | `researchGlobalUserAgent` | `string` | `"FusionResearchBot/1.0"` | User-Agent header for HTTP requests made by research providers. |
-| `experimentalFeatures` | `Record<string, boolean>` | `{}` | Global-scoped experimental feature flags. Includes `experimentalFeatures.researchView` for standalone Research route visibility. |
+| `experimentalFeatures` | `Record<string, boolean>` | `{}` | Global-scoped experimental feature flags. Includes `experimentalFeatures.researchView`, which gates all Research surfaces and tools (dashboard view, engine task-session tools, and CLI `fn_research_*` tools), and `experimentalFeatures.evalsView`, which gates Evals surfaces (dashboard view, Settings → Scheduled Evals, and scheduled-eval cron execution). |
 | `remoteAccess` | `RemoteAccessSettings` | `{ activeProvider: null, providers: {...}, tokenStrategy: {...}, lifecycle: {...} }` | Global-scoped remote access provider + token strategy configuration used by Remote Access routes and tunnel lifecycle controls. |
 
 ### Notification providers (pluggable)
@@ -130,7 +134,7 @@ When `id` is `"webhook"`, the provider `config` supports:
 |---|---|---:|---|
 | `webhookUrl` | `string` | _required_ | Must be a valid `http://` or `https://` URL. |
 | `webhookFormat` | `"slack" \| "discord" \| "generic"` | `"generic"` | Invalid/omitted values fall back to `"generic"`. |
-| `events` | `string[]` | `[]` | Event filter list. Empty/omitted means all events are sent. |
+| `events` | `string[]` | `[]` | Event filter list. Empty/omitted means all events are sent. Includes `memory-dreams-processed` for DREAMS.md updates from manual dream processing. |
 
 #### ntfy provider config
 
@@ -140,7 +144,7 @@ When `id` is `"ntfy"` in `notificationProviders`, the provider `config` supports
 |---|---|---:|---|
 | `topic` | `string` | _required_ | ntfy topic name (1–64 chars, alphanumeric + `-_`). |
 | `ntfyBaseUrl` | `string` | `"https://ntfy.sh"` | Optional custom ntfy server URL. |
-| `events` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock")[]` | `DEFAULT_NTFY_EVENTS` | Event filter list used by the provider. For `gridlock`, enabled events are still cooldown-throttled at runtime (15-minute suppression window, reset on full resolution). |
+| `events` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `DEFAULT_NTFY_EVENTS` | Event filter list used by the provider. For `gridlock`, enabled events are still cooldown-throttled at runtime (15-minute suppression window, reset on full resolution). `memory-dreams-processed` is emitted when manual dream processing appends a new project/agent `DREAMS.md` entry. `message:agent-to-user`/`message:agent-to-agent` are emitted for mailbox messages and deep-link to the specific message when `dashboardHost` is configured. |
 | `dashboardHost` | `string` | `undefined` | Dashboard host for deep links in notifications. |
 
 Disable daily update checks globally:
@@ -159,7 +163,7 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 |---|---|---:|---|
 | `globalPause` | `boolean` | `false` | Hard stop: terminate active engine sessions and pause scheduling immediately. |
 | `globalPauseReason` | `string` | `undefined` | Optional reason for `globalPause` (`"rate-limit"` for automatic pauses, `"manual"` for user-triggered pauses). Cleared on unpause. |
-| `enginePaused` | `boolean` | `false` | Soft pause: stop dispatching new work while letting active sessions finish. Clearing `enginePaused` resumes runtime scheduling and, when `autoMerge` is enabled, immediately re-sweeps eligible `in-review` tasks back into the auto-merge queue (paused/blocked/failed review tasks remain skipped). |
+| `enginePaused` | `boolean` | `false` | Soft pause: stop dispatching new work while letting active sessions finish. While paused (including shared pause windows with `globalPause`), stuck-task polling/timers are suspended so paused wall-clock time does not count against `taskStuckTimeoutMs`. Clearing pause state resumes runtime scheduling and gives tracked active sessions a fresh stuck-task grace window before normal detection resumes; when `autoMerge` is enabled, eligible `in-review` tasks are re-swept into the auto-merge queue (paused/blocked/failed review tasks remain skipped). |
 | `maxConcurrent` | `number` | `2` | Max concurrent task-lane AI agents (planning, executor, merge). |
 | `maxTriageConcurrent` | `number` | `2` | Max concurrent planning agents. |
 | `globalMaxConcurrent` | `number` | `4` | System-wide max concurrent agents across all projects. |
@@ -170,6 +174,7 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `unavailableNodePolicy` | `"block" \| "fallback-local"` | `"block"` | Project routing policy used during scheduler dispatch when a task resolves to a remote node and node health is known. `"block"` keeps the task in `todo` if the node is unhealthy; `"fallback-local"` reroutes dispatch to local execution. See [Architecture → Task Routing Architecture](./architecture.md#task-routing-architecture). |
 
 | `groupOverlappingFiles` | `boolean` | `true` | Serialize execution when file scopes overlap. |
+| `pluginTrustPolicy` | `"off" | "warn" | "enforce"` | `"warn"` | Plugin provenance enforcement mode: `off` records verification metadata only, `warn` blocks only `invalid` signatures, `enforce` allows only `verified-trusted` or `trusted-local`. |
 | `overlapIgnorePaths` | `string[]` | `[]` | Optional project-relative file or directory paths to exclude from overlap blocking (for example `docs` or `generated/openapi.json`). Entries are trimmed, deduplicated, and must not be absolute or contain `..` traversal. |
 | `autoMerge` | `boolean` | `true` | Auto-finalize tasks from `in-review`. |
 | `mergeStrategy` | `"direct" \| "pull-request"` | `"direct"` | Completion mode (local direct merge vs PR-first). |
@@ -202,15 +207,18 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `defaultPresetBySize` | `{ S?: string; M?: string; L?: string }` | `{}` | Mapping for `S`/`M`/`L` → preset ID. |
 | `autoResolveConflicts` | `boolean` | `true` | Enable automatic merge conflict resolution. |
 | `smartConflictResolution` | `boolean` | `true` | Alias/preferred flag for smart conflict handling. |
+| `mergerAutostashMaxAgeHours` | `number` | `24` | Maximum autostash age in hours before startup/periodic stale-stash sweep drops `fusion-merger-autostash:*` leftovers (minimum `1`). |
 | `strictScopeEnforcement` | `boolean` | `false` | Block merges on out-of-scope file changes. |
 | `buildRetryCount` | `number` | `0` | Build retry attempts during merge. |
-| `verificationFixRetries` | `number` | `3` | Auto-fix retry attempts when verification fails during merge. |
+| `verificationFixRetries` | `number` | `3` | In-merge auto-fix retry attempts after deterministic test/build verification failures (0-3). |
 | `buildTimeoutMs` | `number` | `300000` | Build timeout in milliseconds (5 minutes). |
 | `requirePlanApproval` | `boolean` | `false` | Require manual approval before planning → todo. |
+| `agentProvisioning` | `{ approvalMode?: "always" \| "trusted-only" \| "never"; trustedRoles?: string[]; trustedAgentIds?: string[]; alwaysApproveDelete?: boolean }` | `{}` | Approval policy for `fn_agent_create`/`fn_agent_delete` (`approvalMode` default `trusted-only`, delete approvals default on via `alwaysApproveDelete: true`). |
 | `completionDocumentationMode` | `"off" \| "changeset" \| "changelog"` | `"off"` | Controls triage prompt injection for release-note artifacts in future task specs. `"changeset"` requires `.changeset/*.md` workflow guidance; `"changelog"` requires updating an existing changelog file (without inventing a new one); `"off"` disables this automation. |
 | `specStalenessEnabled` | `boolean` | `false` | Enforce automatic re-planning for stale plans. |
 | `specStalenessMaxAgeMs` | `number` | `21600000` | Spec staleness threshold in ms (6 hours). |
 | `taskStuckTimeoutMs` | `number` | `undefined` | Inactivity timeout for stuck-task recovery. |
+| `staleHighFanoutBlockerAgeThresholdMs` | `number` | `7200000` | Age threshold (ms) before high-fan-out blockers escalate in dashboard task cards/footer. Applies only to blockers currently in `in-progress`/`in-review`; age is computed from `columnMovedAt ?? updatedAt`. |
 | `aiSessionTtlMs` | `number` | `604800000` | TTL in ms for persisted planning/subtask/mission sessions (7 days). |
 | `aiSessionCleanupIntervalMs` | `number` | `3600000` | Interval in ms for AI session cleanup sweeps (1 hour). |
 | `autoUnpauseEnabled` | `boolean` | `true` | Auto-unpause after rate-limit-triggered pauses; manual pauses stay paused until explicitly unpaused by the user. |
@@ -227,11 +235,20 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `autoUpdatePrStatus` | `boolean` | `false` | Auto-refresh PR status badges. |
 | `githubCommentOnDone` | `boolean` | `false` | When enabled, tasks imported from GitHub issues post a completion comment to the source issue when the task moves to `done`. |
 | `githubCommentTemplate` | `string` | `undefined` | Optional issue comment template used by `githubCommentOnDone`. Supports `{taskId}` and `{taskTitle}` placeholders. If unset, Fusion uses a default completion message. |
+| `githubTrackingEnabledByDefault` | `boolean` | `false` | Project-level default for enabling issue tracking on new tasks. Even when this is false, issue creation can still occur per task if tracking is explicitly enabled. |
+| `githubTrackingDefaultRepo` | `string` | `undefined` | Project default issue-tracking repo (`owner/repo`) used before global fallback for tracked task creation (precedence: task override → project default → global default). This key is dual-scope: project saves go through `PUT /api/settings` (Settings → Merge). |
+| `githubAuthMode` | `"gh-cli" \| "token"` | `"gh-cli"` | Project GitHub auth strategy used by tracking lifecycle integration. `"gh-cli"` requires an installed/authenticated `gh` CLI. `"token"` requires a non-empty `githubAuthToken` (or `GITHUB_TOKEN` env fallback). Tracking lifecycle auth is strict per selected mode (no cross-fallback). |
+| `githubAuthToken` | `string` | `undefined` | Optional project PAT used when `githubAuthMode` is `"token"` (takes precedence over server startup token for tracking flows). |
 | `autoCreatePr` | `boolean` | `false` | Auto-create PRs for completed tasks. |
 | `autoBackupEnabled` | `boolean` | `false` | Enable scheduled DB backups. |
 | `autoBackupSchedule` | `string` | `"0 2 * * *"` | Backup cron schedule. |
 | `autoBackupRetention` | `number` | `7` | Number of backups to retain. |
 | `autoBackupDir` | `string` | `".fusion/backups"` | Relative backup directory path. |
+| `memoryBackupEnabled` | `boolean` | `false` | Enable scheduled memory backups. |
+| `memoryBackupSchedule` | `string` | `"0 3 * * *"` | Memory backup cron schedule. |
+| `memoryBackupRetention` | `number` | `14` | Number of memory backups to retain. |
+| `memoryBackupDir` | `string` | `".fusion/backups/memory"` | Relative memory backup directory path. |
+| `memoryBackupScope` | `"project" \| "agents" \| "all"` | `"all"` | Backup scope: project memory, agent memory, or both. |
 | `autoSummarizeTitles` | `boolean` | `false` | Auto-generate titles for long untitled descriptions across dashboard/API task creation and agent/tool-created tasks. |
 | `useAiMergeCommitSummary` | `boolean` | `false` | Use AI-generated merge commit summaries instead of raw step-commit subject lists. |
 | `titleSummarizerProvider` | `string` | `undefined` | Provider for title summarization. |
@@ -243,6 +260,13 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `insightExtractionEnabled` | `boolean` | `false` | Enable scheduled memory insight extraction. |
 | `insightExtractionSchedule` | `string` | `"0 2 * * *"` | Insight extraction cron schedule. |
 | `insightExtractionMinIntervalMs` | `number` | `86400000` | Minimum interval between extractions (24h). |
+| `evalSettings` | `EvalProjectSettings` | `{ enabled: false, intervalMs: 86400000, evaluatorProvider: undefined, evaluatorModelId: undefined, followUpPolicy: "suggest-only", retentionDays: 30 }` | Project-scoped scheduled eval configuration (enablement, interval, evaluator model override, follow-up policy, retention). |
+| `taskEvaluationEnabled` | `boolean` | `false` | Legacy flat eval key. Prefer `evalSettings.enabled`. |
+| `taskEvaluationSchedule` | `string` | `"0 5 * * *"` | Legacy flat eval key for cron-based automation compatibility. |
+| `taskEvaluationProvider` | `string` | `undefined` | Legacy flat eval key. Prefer `evalSettings.evaluatorProvider`. |
+| `taskEvaluationModelId` | `string` | `undefined` | Legacy flat eval key. Prefer `evalSettings.evaluatorModelId`. |
+| `taskEvaluationFollowUpPolicy` | `"off" \| "suggest" \| "create"` | `"off"` | Legacy flat eval key. Prefer `evalSettings.followUpPolicy`. |
+| `taskEvaluationRetention` | `number` | `undefined` | Legacy flat eval key. Prefer `evalSettings.retentionDays`. |
 | `memoryEnabled` | `boolean` | `true` | Enable project memory integration. |
 | `memoryBackendType` | `string` | `"qmd"` | Memory backend type. Built-ins include `qmd` (Quantized Memory Distillation, default), `file`, and `readonly`; custom backends can also be registered. |
 | `memoryAutoSummarizeEnabled` | `boolean` | `false` | Enable automatic memory summarization when memory exceeds threshold. |
@@ -286,18 +310,55 @@ This applies to:
 - run limits (`maxConcurrentRuns`, `maxSourcesPerRun`, `maxDurationMs`, `requestTimeoutMs`)
 - export default (`defaultExportFormat`)
 
-The standalone Research route is feature-gated separately via `experimentalFeatures.researchView`.
+Research is globally feature-gated via `experimentalFeatures.researchView`.
 When that flag is disabled, the Settings modal also hides both Research sections (`Research Defaults` and project `Research`) and falls back to the first visible section if a hidden research section is requested directly.
 
 Research failures are normalized to a shared error-code contract (`FEATURE_DISABLED`, `MISSING_CREDENTIALS`, `PROVIDER_UNAVAILABLE`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`, `RUN_CANCELLED`, `RETRY_EXHAUSTED`, `INVALID_TRANSITION`, `NON_RETRYABLE_PROVIDER_ERROR`, `INTERNAL_ERROR`) with retryability metadata so dashboard, API, CLI, and agent tooling show consistent recovery guidance.
 
 Recovery entrypoints in the dashboard:
-- **Settings → Research Defaults**: fix missing default provider configuration and provider-level readiness.
+- **Settings → Research Defaults**: choose between builtin web search (default) or optional external provider configuration.
 - **Settings → Authentication**: repair missing provider credentials (`MISSING_CREDENTIALS`).
 - **Settings → Research (project)**: re-enable project research or source toggles when runs are blocked by project settings.
-- **Settings → Experimental Features**: enable `researchView` when the standalone Research route/surfaces are hidden.
+- **Settings → Experimental Features**: enable `researchView` when Research surfaces or `fn_research_*` tools report feature-disabled.
+
+### Authentication troubleshooting (mobile OAuth fallback)
+
+When an OAuth provider returns a localhost callback that this dashboard host cannot open directly, use the **manual code** fallback in Settings/Onboarding:
+- Tap **Login** for the provider, complete sign-in in the browser, then paste either the final redirect URL or the authorization code into the fallback textbox.
+- On mobile/coarse-pointer layouts, the fallback textbox now auto-scrolls into view on focus (and after keyboard viewport shifts) so the paste/submit path remains usable.
 
 **Credential storage rule:** API keys for Research providers are not stored in settings JSON. They are managed through the existing auth storage pipeline (`/api/auth/status`, `POST /api/auth/api-key`, `DELETE /api/auth/api-key`) and persisted in auth credential storage with masked hints in API responses.
+
+### Scheduled eval settings (project scope)
+
+`evalSettings` is project-scoped and validated on `PUT /api/settings` with these rules:
+
+- `intervalMs`: integer in `[60000, 604800000]`
+- `retentionDays`: integer in `[1, 365]`
+- `followUpPolicy`: one of `"disabled" | "suggest-only" | "auto-create"`
+- `evaluatorProvider` and `evaluatorModelId` must be provided together or both omitted
+
+Model resolution for scheduled eval execution uses `resolveEvalSettings(settings)`:
+
+1. `evalSettings.evaluatorProvider` + `evalSettings.evaluatorModelId` when both are set
+2. Validator lane fallback from `resolveValidatorSettingsModel(settings)` when unset
+3. Non-model defaults: `enabled=false`, `intervalMs=86400000`, `followUpPolicy="suggest-only"`, `retentionDays=30`
+
+Follow-up policy meanings:
+
+- `disabled`: do not emit follow-up suggestions/tasks
+- `suggest-only`: emit suggestions without automatic task creation
+- `auto-create`: permit automatic task creation for qualifying follow-ups
+
+### Plugin trust policy (project scope)
+
+`pluginTrustPolicy` controls loader behavior after signature verification:
+
+- `off`: always continue load decisions based on existing plugin lifecycle checks; signature/trust metadata is still persisted
+- `warn`: block only `invalid` signatures (tampered/corrupt). `unsigned` and `verified-untrusted` remain loadable with warnings
+- `enforce`: allow only `verified-trusted` and `trusted-local`; block `verified-untrusted`, `unsigned`, and `invalid`
+
+`trusted-local` is reserved for bundled in-repo plugin paths so existing shipped plugins remain usable without retro-signing.
 
 ### Node Routing settings (project scope)
 
@@ -315,8 +376,11 @@ Routing precedence for task dispatch is:
 
 Fusion also stores `projects.nodeId` in the **central registry database** (`~/.fusion/fusion-central.db`). That value is a multi-project runtime placement field used by `ProjectManager` (for selecting remote vs local project runtime), not the same setting as `defaultNodeId` task dispatch routing.
 
+Node-specific project working directories are persisted separately in central DB table `projectNodePathMappings` (`projectId` + `nodeId` + `path`). Do not treat `projects.nodeId` as the path source of truth.
+
 - `defaultNodeId` (project settings): task-level dispatch default
 - `projects.nodeId` (central registry): which node hosts the project runtime in multi-project mode
+- `projectNodePathMappings.path` (central registry): working-directory path for that project on that specific node
 
 See also:
 - [Task Management → Node Routing](./task-management.md#node-routing)
@@ -415,6 +479,12 @@ Short-lived token bounds are enforced server-side:
 
 ---
 
+### Server-owned GET `/api/settings` fields
+
+- `trackingAuthAvailable` (`boolean`) is computed server-side from `githubAuthMode` + credential/runtime availability for tracking lifecycle calls.
+- `trackingAuthReason` (`"token_missing" | "gh_not_installed" | "gh_not_authenticated" | "invalid_mode" | null`) explains unavailability when `trackingAuthAvailable` is false.
+- These fields are response-only and are stripped from `PUT /api/settings` payloads.
+
 ## Model Selection Hierarchy
 
 Fusion uses a dual-scope model settings system with five lanes. Global settings provide baseline defaults, and project settings provide per-project overrides.
@@ -430,12 +500,26 @@ Fusion uses a dual-scope model settings system with five lanes. Global settings 
 
 ### Executor model
 
-1. Per-task `modelProvider` + `modelId`
+1. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set
+2. Per-task `modelProvider` + `modelId`
+3. Project `executionProvider` + `executionModelId`
+4. Global `executionGlobalProvider` + `executionGlobalModelId`
+5. Project `defaultProviderOverride` + `defaultModelIdOverride`
+6. Global `defaultProvider` + `defaultModelId`
+7. Automatic provider/model resolution
+
+### Heartbeat model (durable agents)
+
+Heartbeat sessions for durable agents use this order:
+
+1. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when present
 2. Project `executionProvider` + `executionModelId`
 3. Global `executionGlobalProvider` + `executionGlobalModelId`
 4. Project `defaultProviderOverride` + `defaultModelIdOverride`
 5. Global `defaultProvider` + `defaultModelId`
 6. Automatic provider/model resolution
+
+When heartbeat has both (1) and (2-5), the runtime model is used as primary and the execution-lane model is passed as fallback. On timer-triggered runs, unrecoverable missing-provider credential/registry failures complete as `heartbeat_model_unavailable` instead of permanently setting the durable agent to `state=error`.
 
 ### Reviewer model
 
@@ -448,9 +532,12 @@ Fusion uses a dual-scope model settings system with five lanes. Global settings 
 
 ### Merger model
 
-1. Project `defaultProviderOverride` + `defaultModelIdOverride`
-2. Global `defaultProvider` + `defaultModelId`
-3. Automatic provider/model resolution
+1. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set
+2. Project `defaultProviderOverride` + `defaultModelIdOverride`
+3. Global `defaultProvider` + `defaultModelId`
+4. Automatic provider/model resolution
+
+For post-merge prompt workflow steps, explicit step-level `modelProvider` + `modelId` overrides take precedence over the merger lane above.
 
 ### Title summarization model
 
@@ -541,6 +628,8 @@ The fallback ensures tasks continue executing even if the configured runtime plu
 
 To use plugin-provided runtimes like Paperclip, Hermes, or OpenClaw:
 
+> Scope model: plugin installation + plugin settings are global (shared across projects), while plugin enabled/disabled state and runtime status are project-scoped.
+
 1. Install one or more runtime plugins:
 
 ```bash
@@ -549,7 +638,9 @@ fn plugin install ./plugins/fusion-plugin-hermes-runtime
 fn plugin install ./plugins/fusion-plugin-openclaw-runtime
 ```
 
-> 💡 In the dashboard, go to **Settings → Plugins → Fusion Plugins**. The **Bundled Plugins** section surfaces Agent Browser, Hermes, Paperclip, OpenClaw, and Droid directly from shipped manifests, shows install status, and provides one-click install actions for plugins that are not yet installed.
+> 💡 In the dashboard, go to **Settings → Plugins → Fusion Plugins**. The **Bundled Plugins** section surfaces Agent Browser, Hermes, Paperclip, OpenClaw, Droid, Dependency Graph, and Reports directly from shipped manifests, shows install status, and provides one-click install actions for plugins that are not yet installed.
+>
+> ℹ️ Bundled runtime plugins (`fusion-plugin-paperclip-runtime`, `fusion-plugin-hermes-runtime`, `fusion-plugin-openclaw-runtime`) support lazy install semantics in settings: the card can open before installation (initial `GET /api/plugins/:id/settings` returns empty/default settings instead of 404), and the first save triggers auto-install (`PUT /api/plugins/:id/settings`). They are **not** auto-installed at app boot or npm install time. If a bundled asset is genuinely unavailable in the current build, save returns an explicit server error instead of a late plugin-not-found 404.
 
 2. Create agents with the appropriate `runtimeConfig`:
 
@@ -587,29 +678,37 @@ fn plugin install ./plugins/fusion-plugin-openclaw-runtime
 
 For more details, see the [Paperclip Runtime Plugin documentation](../plugins/fusion-plugin-paperclip-runtime/README.md), [Hermes Runtime Plugin documentation](../plugins/fusion-plugin-hermes-runtime/README.md), and [OpenClaw Runtime Plugin documentation](../plugins/fusion-plugin-openclaw-runtime/README.md).
 
-### OpenClaw Gateway Configuration
+### OpenClaw Runtime Configuration
 
-The OpenClaw runtime plugin connects to a running OpenClaw gateway instance through its OpenAI-compatible HTTP API. You can configure the gateway connection using plugin settings or environment variables.
+The OpenClaw runtime plugin is CLI-first. Fusion invokes `openclaw agent --json` directly and defaults to embedded local mode (`--local`). Gateway mode is optional via `useGateway: true`.
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `gatewayUrl` | `string` | `http://127.0.0.1:18789` | URL of the OpenClaw gateway instance |
-| `gatewayToken` | `string` | (none) | Authentication token for the gateway |
-| `agentId` | `string` | `"main"` | OpenClaw agent ID to use for sessions |
+| `binaryPath` | `string` | `openclaw` | Path to the OpenClaw binary. |
+| `agentId` | `string` | `"main"` | OpenClaw agent ID used for `--agent`. |
+| `model` | `string` | (OpenClaw default) | Optional model override passed as `--model`. |
+| `thinking` | `string` | `"off"` | Thinking level passed as `--thinking`. |
+| `cliTimeoutSec` | `number` | `0` | OpenClaw-side timeout (`--timeout`, 0 = no OpenClaw timeout). |
+| `cliTimeoutMs` | `number` | `300000` | Fusion-side hard kill timeout for each subprocess turn. |
+| `useGateway` | `boolean` | `false` | When true, omit `--local` and allow OpenClaw's gateway path. |
 
 | Setting | Environment Variable | Default if Unset |
 |---|---|---|
-| `gatewayUrl` | `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` |
-| `gatewayToken` | `OPENCLAW_GATEWAY_TOKEN` | (none — unauthenticated) |
+| `binaryPath` | `OPENCLAW_BIN` | `openclaw` |
 | `agentId` | `OPENCLAW_AGENT_ID` | `main` |
+| `model` | `OPENCLAW_MODEL` | (OpenClaw default) |
+| `thinking` | `OPENCLAW_THINKING` | `off` |
+| `cliTimeoutSec` | `OPENCLAW_TIMEOUT_SEC` | `0` |
+| `cliTimeoutMs` | `OPENCLAW_CLI_TIMEOUT_MS` | `300000` |
+| `useGateway` | `OPENCLAW_USE_GATEWAY` | `false` |
 
 Resolution priority is: plugin settings (`PluginContext.settings`) → environment variables → built-in defaults.
 
-> ℹ️ These are **plugin-level** settings configured when the OpenClaw runtime plugin is installed/enabled (for example in the dashboard Plugin Manager or plugin config). They are not agent-level `runtimeConfig` fields. Agents only need `runtimeConfig.runtimeHint: "openclaw"`; gateway connection details are handled by the plugin.
+> ℹ️ These are **plugin-level** settings configured when the OpenClaw runtime plugin is installed/enabled. They are not agent-level `runtimeConfig` fields. Agents only need `runtimeConfig.runtimeHint: "openclaw"`.
 
-> ⚠️ `gatewayToken` is a secret. Never log it or commit it to version control. For production, prefer setting `OPENCLAW_GATEWAY_TOKEN` in the environment.
+OpenClaw tool-control uses the supported MCP CLI surface (`openclaw mcp set` + profile-scoped `--profile` runs) when custom Fusion tools are present; built-ins (`read`, `write`, `edit`, `bash`, `grep`, `find`) remain filtered from that MCP bridge.
 
-For additional gateway/runtime details, see the [OpenClaw Runtime Plugin documentation](../plugins/fusion-plugin-openclaw-runtime/README.md).
+For runtime details, see the [OpenClaw Runtime Plugin documentation](../plugins/fusion-plugin-openclaw-runtime/README.md).
 
 ---
 
@@ -741,7 +840,25 @@ To clear all overrides, set `promptOverrides` to `null`:
 
 ### 4) Agent runtime configuration (example agent config)
 
-Runtime selection is configured at the agent level via `runtimeConfig`. These examples show agents configured to use Paperclip, Hermes, and OpenClaw runtime hints:
+Runtime selection is configured at the agent level via `runtimeConfig`. These examples show agents configured to use Paperclip, Hermes, and OpenClaw runtime hints.
+
+Common heartbeat/runtime keys on `runtimeConfig` include:
+
+| Field | Type | Description |
+|---|---|---|
+| `heartbeatIntervalMs` | `number` | Per-agent heartbeat interval |
+| `heartbeatTimeoutMs` | `number` | Per-agent heartbeat timeout |
+| `maxConcurrentRuns` | `number` | Per-agent concurrent heartbeat limit |
+| `messageResponseMode` | `"immediate" \| "on-heartbeat"` | Wake on message immediately or process during periodic heartbeat |
+| `runMissedHeartbeatOnStartup` | `boolean` | Default `false`. When enabled, startup triggers one catch-up heartbeat if the agent's `lastHeartbeatAt` is older than its resolved heartbeat interval (server was down across a scheduled tick). |
+| `allowParallelExecution` | `boolean` | Permanent agents only. Default `true` when unset. Set `false` to serialize heartbeat and executor sessions symmetrically (heartbeat won't start while executor is active, and executor won't start while heartbeat is active); `false` is explicitly persisted while unset/`true` keeps parallel behavior. |
+| `selfImproveEnabled` | `boolean` | Enables periodic self-improvement prompts |
+| `selfImproveIntervalMs` | `number` | Delay between self-improvement cycles (default 4h, minimum 1h) |
+| `lastSelfImproveAt` | `string` | Last self-improvement checkpoint timestamp (managed by heartbeat monitor) |
+
+Configure these per agent in **Agents → Agent Detail → Settings → Heartbeat Settings** (dashboard), or by updating agent `runtimeConfig` via the Agents API/CLI config flows.
+
+These examples show agents configured to use Paperclip, Hermes, and OpenClaw runtime hints:
 
 ```json
 {
@@ -834,10 +951,11 @@ Common built-in dashboard flags include:
 - `skillsView`
 - `nodesView`
 - `devServerView`
-- `todoView`
+- `todoView` (enables dashboard Todo View; see [Todo View](./todo-view.md))
 - `researchView`
+- `evalsView` (gates Evals dashboard view, Settings → Scheduled Evals section, and scheduled-eval cron execution)
 - `remoteAccess`
-- `agentOnboarding` (gates the planning-style New Agent onboarding flow in Agents view)
+- `agentOnboarding` (enables the **AI Interview** option inside the New Agent dialog)
 
 ---
 
@@ -911,6 +1029,25 @@ Standard cron format: `minute hour day-of-month month day-of-week`
 | `0 2 * * *` | Daily at 2:00 AM (default) |
 | `0 */6 * * *` | Every 6 hours |
 | `0 9 * * 1` | Weekly on Monday at 9:00 AM |
+
+### Memory Backups
+
+Memory backups snapshot memory files into timestamped directories under `memoryBackupDir` (default: `.fusion/backups/memory`).
+
+- Project memory source: `.fusion/memory/**`
+- Agent memory source: `.fusion/agent-memory/**`
+- Snapshot layout:
+  - `memory-YYYY-MM-DD-HHMMSS/project/...`
+  - `memory-YYYY-MM-DD-HHMMSS/agents/<agentId>/...`
+
+CLI commands:
+
+- `fn memory-backup --create` — Create a memory backup now.
+- `fn memory-backup --create --scope <project|agents|all>` — Override scope for this run.
+- `fn memory-backup --list` — List memory backup snapshots.
+- `fn memory-backup --restore <filename>` — Restore from a snapshot directory.
+
+The default schedule is `0 3 * * *` (daily at 3:00 AM), offset from database backups (`0 2 * * *`).
 
 ### Scheduling Scope
 

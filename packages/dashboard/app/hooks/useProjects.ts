@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { ProjectInfo } from "../api";
 import {
   fetchProjectsAcrossNodes,
+  hasNodeMappingsSupport,
   registerProject,
-  reportDashboardPerf,
   unregisterProject,
   updateProject,
   type ProjectCreateInput,
   type ProjectInfoWithSource,
+  type ProjectNodeAvailability,
 } from "../api";
 
 export interface UseProjectsResult {
@@ -30,6 +31,43 @@ export interface UseProjectsResult {
 const POLL_INTERVAL_MS = 5000; // 5 seconds
 const VISIBILITY_REFRESH_DEBOUNCE_MS = 1000;
 
+function normalizeNodeMappings(project: ProjectInfoWithSource): ProjectNodeAvailability[] {
+  const mappingSource = hasNodeMappingsSupport(project)
+    ? (project.nodeMappings ?? project.projectNodeMappings ?? project.pathMappings ?? [])
+    : [];
+
+  const normalizedMappings = mappingSource
+    .filter((mapping) => Boolean(mapping?.nodeId) && Boolean(mapping?.path))
+    .map((mapping) => ({
+      nodeId: mapping.nodeId,
+      nodeName: mapping.nodeName,
+      path: mapping.path,
+      available: mapping.available !== false,
+    }));
+
+  if (normalizedMappings.length > 0) {
+    return normalizedMappings;
+  }
+
+  if (project.nodeId && project.path) {
+    return [{
+      nodeId: project.nodeId,
+      nodeName: project._sourceNodeName,
+      path: project.path,
+      available: true,
+    }];
+  }
+
+  return [];
+}
+
+function normalizeProjects(projects: ProjectInfoWithSource[]): ProjectInfoWithSource[] {
+  return projects.map((project) => ({
+    ...project,
+    nodeMappings: normalizeNodeMappings(project),
+  }));
+}
+
 /**
  * Hook for fetching and managing projects.
  * Automatically polls for updates every 5 seconds.
@@ -47,7 +85,7 @@ export function useProjects(): UseProjectsResult {
     try {
       setError(null);
       const data = await fetchProjectsAcrossNodes();
-      setProjects(data);
+      setProjects(normalizeProjects(data));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch projects");
       // Don't clear existing projects on error - keep showing stale data
@@ -63,19 +101,16 @@ export function useProjects(): UseProjectsResult {
       const t0 = performance.now();
       try {
         const data = await fetchProjectsAcrossNodes();
+        const normalizedData = normalizeProjects(data);
         const elapsed = Math.round(performance.now() - t0);
-        const msg = `initial fetchProjectsAcrossNodes took ${elapsed}ms (${data.length} projects)`;
-        console.log(`[useProjects] ${msg}`);
-        reportDashboardPerf("[useProjects]", msg);
+        console.log(`[useProjects] initial fetchProjectsAcrossNodes took ${elapsed}ms (${normalizedData.length} projects)`);
         if (!cancelled) {
-          setProjects(data);
+          setProjects(normalizedData);
           setError(null);
         }
       } catch (err) {
         const elapsed = Math.round(performance.now() - t0);
-        const msg = `initial fetch failed after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`;
-        console.warn(`[useProjects] ${msg}`);
-        reportDashboardPerf("[useProjects]", msg);
+        console.warn(`[useProjects] initial fetch failed after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`);
         if (!cancelled) {
           setError(err instanceof Error ? err.message : "Failed to fetch projects");
         }

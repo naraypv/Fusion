@@ -11,9 +11,23 @@ import type { InsightCategory, InsightStatus } from "@fusion/core";
 vi.mock("../../api", () => ({
   fetchInsights: vi.fn(),
   dismissInsight: vi.fn(),
+  archiveInsight: vi.fn(),
+  unarchiveInsight: vi.fn(),
   triggerInsightRun: vi.fn(),
+  fetchInsightRun: vi.fn(),
   fetchInsightRuns: vi.fn(),
   getInsightCreateTaskData: vi.fn(),
+  ApiRequestError: class ApiRequestError extends Error {
+    status: number;
+    details?: Record<string, unknown>;
+
+    constructor(message: string, status: number, details?: Record<string, unknown>) {
+      super(message);
+      this.name = "ApiRequestError";
+      this.status = status;
+      this.details = details;
+    }
+  },
 }));
 
 // Mock lucide-react icons used in the view
@@ -40,14 +54,21 @@ vi.mock("lucide-react", () => ({
 import {
   fetchInsights,
   dismissInsight,
+  archiveInsight,
+  unarchiveInsight,
   triggerInsightRun,
+  fetchInsightRun,
   fetchInsightRuns,
   getInsightCreateTaskData,
+  ApiRequestError,
 } from "../../api";
 
 const mockFetchInsights = vi.mocked(fetchInsights);
 const mockDismissInsight = vi.mocked(dismissInsight);
+const mockArchiveInsight = vi.mocked(archiveInsight);
+const mockUnarchiveInsight = vi.mocked(unarchiveInsight);
 const mockTriggerInsightRun = vi.mocked(triggerInsightRun);
+const mockFetchInsightRun = vi.mocked(fetchInsightRun);
 const mockFetchInsightRuns = vi.mocked(fetchInsightRuns);
 const mockGetInsightCreateTaskData = vi.mocked(getInsightCreateTaskData);
 
@@ -274,7 +295,7 @@ describe("useInsights", () => {
         await result.current.runInsights();
       });
 
-      expect(mockTriggerInsightRun).toHaveBeenCalledWith("manual", undefined, "project-1");
+      expect(mockTriggerInsightRun).toHaveBeenCalledWith("manual", undefined, "project-1", undefined, undefined);
       expect(result.current.latestRun?.status).toBe("completed");
       expect(result.current.isRunInFlight).toBe(false);
       expect(mockFetchInsights.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -316,6 +337,88 @@ describe("useInsights", () => {
       expect(result.current.isRunInFlight).toBe(false);
       // Initial load only; failed run should not trigger refresh.
       expect(mockFetchInsights).toHaveBeenCalledTimes(1);
+    });
+
+    it("should hydrate latestRun and set friendly error on structured active-run conflict", async () => {
+      mockFetchInsights.mockResolvedValue({ insights: [], count: 0 });
+      mockFetchInsightRuns.mockResolvedValue({ runs: [] });
+      mockFetchInsightRun.mockResolvedValue({
+        id: "RUN-2",
+        projectId: "project-1",
+        trigger: "manual",
+        status: "running",
+        summary: null,
+        error: null,
+        insightsCreated: 0,
+        insightsUpdated: 0,
+        inputMetadata: {},
+        outputMetadata: {},
+        createdAt: "2024-01-01T00:00:00Z",
+        startedAt: "2024-01-01T00:00:01Z",
+        completedAt: null,
+      });
+      mockTriggerInsightRun.mockRejectedValue(
+        new ApiRequestError("backend raw conflict", 409, {
+          code: "ACTIVE_RUN_CONFLICT",
+          activeRunId: "RUN-2",
+          activeRunStatus: "running",
+        }),
+      );
+
+      const { result } = renderHook(() => useInsights("project-1"));
+
+      await waitFor(() => {
+        expect(result.current.loading).toBe(false);
+      });
+
+      await act(async () => {
+        await expect(result.current.runInsights()).rejects.toBeInstanceOf(Error);
+      });
+
+      expect(mockFetchInsightRun).toHaveBeenCalledWith("RUN-2", "project-1");
+      expect(result.current.latestRun?.id).toBe("RUN-2");
+      expect(result.current.runError).toBe("Insight generation is already running");
+      expect(result.current.isRunInFlight).toBe(false);
+    });
+
+    it("should clear stale runError on orphan-recovery success path", async () => {
+      mockFetchInsights.mockResolvedValue({ insights: [], count: 0 });
+      mockFetchInsightRuns.mockResolvedValue({ runs: [] });
+      mockTriggerInsightRun
+        .mockRejectedValueOnce(new Error("Previous failure"))
+        .mockResolvedValueOnce({
+          id: "RUN-3",
+          projectId: "project-1",
+          trigger: "manual",
+          status: "completed",
+          summary: "Recovered and completed",
+          error: null,
+          insightsCreated: 1,
+          insightsUpdated: 0,
+          inputMetadata: {},
+          outputMetadata: {},
+          createdAt: "2024-01-01T00:00:00Z",
+          startedAt: "2024-01-01T00:00:01Z",
+          completedAt: "2024-01-01T00:00:10Z",
+        });
+
+      const { result } = renderHook(() => useInsights("project-1"));
+
+      await waitFor(() => {
+        expect(result.current.loading).toBe(false);
+      });
+
+      await act(async () => {
+        await expect(result.current.runInsights()).rejects.toThrow("Previous failure");
+      });
+      expect(result.current.runError).toBe("Previous failure");
+
+      await act(async () => {
+        await result.current.runInsights();
+      });
+
+      expect(result.current.latestRun?.id).toBe("RUN-3");
+      expect(result.current.runError).toBeNull();
     });
 
     it("should propagate trigger errors and always clear in-flight state", async () => {
@@ -453,6 +556,7 @@ describe("useInsights", () => {
       });
 
       expect(mockGetInsightCreateTaskData).toHaveBeenCalledWith("INS-1", "project-1");
+      expect(mockArchiveInsight).toHaveBeenCalledWith("INS-1", "project-1");
       expect(taskData).toEqual({
         title: "Implement Feature X",
         description: "Detailed description of the feature",
@@ -489,6 +593,74 @@ describe("useInsights", () => {
 
       // Test that createTask throws
       await expect(result.current.createTask("INS-1")).rejects.toThrow("Create task failed");
+    });
+  });
+
+  describe("archive lifecycle", () => {
+    it("archives and unarchives an insight", async () => {
+      const insight = {
+        id: "INS-1",
+        projectId: "project-1",
+        title: "Keep me",
+        content: "Content",
+        category: "features" as InsightCategory,
+        status: "confirmed" as InsightStatus,
+        fingerprint: "fp1",
+        provenance: { trigger: "manual" },
+        lastRunId: null,
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-01T00:00:00Z",
+      };
+      mockFetchInsights.mockResolvedValue({ insights: [insight], count: 1 });
+      mockFetchInsightRuns.mockResolvedValue({ runs: [] });
+      mockArchiveInsight.mockResolvedValue({ ...insight, status: "archived" as InsightStatus });
+      mockUnarchiveInsight.mockResolvedValue({ ...insight, status: "confirmed" as InsightStatus });
+
+      const { result } = renderHook(() => useInsights("project-1"));
+      await waitFor(() => expect(result.current.loading).toBe(false));
+
+      await act(async () => {
+        await result.current.archive("INS-1");
+      });
+      expect(mockArchiveInsight).toHaveBeenCalledWith("INS-1", "project-1");
+      expect(result.current.archivedCount).toBe(1);
+
+      await act(async () => {
+        await result.current.unarchive("INS-1");
+      });
+      expect(mockUnarchiveInsight).toHaveBeenCalledWith("INS-1", "project-1");
+      expect(result.current.archivedCount).toBe(0);
+    });
+
+    it("toggleShowArchived hides and shows archived insights", async () => {
+      const archivedInsight = {
+        id: "INS-A",
+        projectId: "project-1",
+        title: "Archived insight",
+        content: "Hidden by default",
+        category: "features" as InsightCategory,
+        status: "archived" as InsightStatus,
+        fingerprint: "fpA",
+        provenance: { trigger: "manual" },
+        lastRunId: null,
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-01T00:00:00Z",
+      };
+      mockFetchInsights.mockResolvedValue({ insights: [archivedInsight], count: 1 });
+      mockFetchInsightRuns.mockResolvedValue({ runs: [] });
+
+      const { result } = renderHook(() => useInsights("project-1"));
+      await waitFor(() => expect(result.current.loading).toBe(false));
+
+      expect(result.current.archivedCount).toBe(1);
+      expect(result.current.totalCount).toBe(0);
+
+      act(() => {
+        result.current.toggleShowArchived();
+      });
+
+      expect(result.current.showArchived).toBe(true);
+      expect(result.current.totalCount).toBe(1);
     });
   });
 

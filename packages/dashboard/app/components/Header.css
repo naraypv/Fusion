@@ -27,6 +27,38 @@
   max-width: none;
 }
 
+.header-branch-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-2xl) * 5), 100%), 1fr));
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.header-branch-filter-label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  color: var(--text-muted);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+}
+
+.header-branch-filter-select {
+  width: 100%;
+  min-height: calc(var(--space-xl) + var(--space-sm) / 2);
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-sm);
+  font-size: calc(var(--space-sm) + var(--space-xs) + var(--space-xs) / 4);
+}
+
+.header-branch-filter-select:focus-visible {
+  border-color: var(--todo);
+  box-shadow: var(--focus-ring);
+  outline: none;
+}
+
 .header-left {
   display: flex;
   align-items: center;
@@ -406,7 +438,7 @@
   padding: 0 4px;
   border-radius: 8px;
   background: var(--triage);
-  color: #fff;
+  color: var(--cta-text);
   font-size: 10px;
   font-weight: 700;
   line-height: 16px;
@@ -624,6 +656,7 @@
   justify-content: center;
   width: 28px;
   height: 28px;
+  position: relative;
   background: none;
   border: none;
   border-radius: var(--radius-sm);
@@ -652,6 +685,12 @@
   color: var(--bg);
 }
 
+.header-chat-unread-dot {
+  position: absolute;
+  top: calc(var(--space-xs) * -1);
+  right: calc(var(--space-xs) * -1);
+}
+
 /* === View Toggle Overflow Dropdown === */
 .view-toggle-overflow-menu {
   position: absolute;
@@ -663,6 +702,8 @@
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   min-width: 140px;
+  max-height: min(70vh, calc(var(--space-2xl) * 17));
+  overflow-y: auto;
   z-index: 200;
   padding: var(--space-xs) 0;
 }
@@ -947,6 +988,14 @@
   /* Mobile search expanded — inside header-floating-search container */
   .mobile-search-expanded {
     width: 100%;
+  }
+
+  .header-branch-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .header-branch-filter-select {
+    min-height: calc(var(--space-xl) + var(--space-md));
   }
 
   /* Mobile: compact node label, no dropdown */

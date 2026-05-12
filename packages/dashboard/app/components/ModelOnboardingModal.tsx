@@ -10,7 +10,6 @@ import {
   logoutProvider,
   cancelProviderLogin,
   submitProviderManualCode,
-  addCliAccountProvider,
   saveApiKey,
   clearApiKey,
   fetchModels,
@@ -24,6 +23,7 @@ import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { ProviderIcon } from "./ProviderIcon";
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
+import { CursorCliProviderCard } from "./CursorCliProviderCard";
 import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
 import { LoginInstructions } from "./LoginInstructions";
 import { OAuthManualCodeForm } from "./OAuthManualCodeForm";
@@ -37,6 +37,7 @@ import {
   getPendingAuthLoginUiState,
   savePendingAuthLoginUiState,
 } from "../utils/pendingAuthLoginUiState";
+import { useShellConnection } from "../hooks/useShellConnection";
 
 const mapLegacyCustomProviderToConfig = (
   provider: CustomProvider | CustomProviderConfig,
@@ -89,7 +90,6 @@ const PROVIDER_INFO: Record<string, ProviderInfo> = {
   "openai-codex": { description: "Codex models by OpenAI — optimized for coding tasks" },
   google: { description: "Gemini models — multimodal with strong reasoning" },
   gemini: { description: "Gemini models — multimodal with strong reasoning" },
-  "google-gemini-cli": { description: "Gemini CLI OAuth — Google account login for coding agents" },
   ollama: {
     description: "Run open-source models locally on your machine",
     apiKeyInfo: {
@@ -175,7 +175,6 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   openrouter: "OpenRouter",
   google: "Google",
   gemini: "Gemini",
-  "google-gemini-cli": "Google Gemini CLI",
   minimax: "MiniMax",
   ollama: "Ollama",
   zai: "Zhipu AI",
@@ -183,28 +182,6 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   "kimi-coding": "Kimi Coding",
   moonshot: "Moonshot",
 };
-
-function areStringRecordsEqual(left: Record<string, string>, right: Record<string, string>): boolean {
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => left[key] === right[key]);
-}
-
-function areManualCodeRecordsEqual(
-  left: Record<string, ManualOAuthCodeInfo>,
-  right: Record<string, ManualOAuthCodeInfo>,
-): boolean {
-  const leftKeys = Object.keys(left);
-  if (leftKeys.length !== Object.keys(right).length) return false;
-  return leftKeys.every((key) => {
-    const leftConfig = left[key];
-    const rightConfig = right[key];
-    return Boolean(rightConfig)
-      && leftConfig.prompt === rightConfig.prompt
-      && leftConfig.placeholder === rightConfig.placeholder
-      && leftConfig.helpText === rightConfig.helpText;
-  });
-}
 
 function getProviderDisplayName(providerId: string): string {
   if (PROVIDER_DISPLAY_NAMES[providerId]) {
@@ -223,12 +200,13 @@ function getProviderDisplayName(providerId: string): string {
     .join(" ");
 }
 
-const QUICK_START_PROVIDER_IDS = ["anthropic", "openai", "google", "gemini", "google-gemini-cli", "ollama"] as const;
+const QUICK_START_PROVIDER_IDS = ["anthropic", "openai", "google", "gemini", "ollama"] as const;
 
 const ONBOARDING_CURATED_PROVIDER_FAMILY_ORDER = [
   "anthropic",
   "claude-cli",
   "droid-cli",
+  "cursor-cli",
   "llama-cpp",
   "openai-codex",
   "gemini",
@@ -245,7 +223,6 @@ const ONBOARDING_PROVIDER_FAMILY_ALIASES: Record<string, (typeof ONBOARDING_CURA
   "openai-codex": "openai-codex",
   google: "gemini",
   gemini: "gemini",
-  "google-gemini-cli": "gemini",
   minimax: "minimax",
   kimi: "kimi",
   moonshot: "kimi",
@@ -254,7 +231,7 @@ const ONBOARDING_PROVIDER_FAMILY_ALIASES: Record<string, (typeof ONBOARDING_CURA
 };
 
 const ONBOARDING_PROVIDER_ALIAS_ORDER: Record<string, string[]> = {
-  gemini: ["google", "gemini", "google-gemini-cli"],
+  gemini: ["google", "gemini"],
   kimi: ["kimi", "moonshot", "kimi-coding"],
 };
 
@@ -623,6 +600,11 @@ export function ModelOnboardingModal({
   const [showCustomProviderForm, setShowCustomProviderForm] = useState(false);
   const [customProviderSaving, setCustomProviderSaving] = useState(false);
   const [customProviderError, setCustomProviderError] = useState<string | undefined>();
+  const [shellProfileName, setShellProfileName] = useState("Remote Server");
+  const [shellServerUrl, setShellServerUrl] = useState("");
+  const [shellAuthToken, setShellAuthToken] = useState("");
+  const [shellConnectionSaving, setShellConnectionSaving] = useState(false);
+  const [shellConnectionError, setShellConnectionError] = useState<string | null>(null);
   const apiKeySuccessTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const onboardingContentRef = useRef<HTMLDivElement | null>(null);
   const modalRef = useRef<HTMLDivElement | null>(null);
@@ -634,6 +616,7 @@ export function ModelOnboardingModal({
   });
   const pollCountRef = useRef<number>(0);
   const previousCreatedTaskRef = useRef<Task | null | undefined>(firstCreatedTask);
+  const { shellApi, state: shellState } = useShellConnection();
   const hasTrackedWizardOpenRef = useRef(false);
   const resumedFromStep = persistedState?.currentStep;
   const isResumedFlow = !!persistedState && persistedState.currentStep !== "complete";
@@ -744,6 +727,12 @@ export function ModelOnboardingModal({
       setGhCliStatus(ghCli);
       setLoginInstructions((prev) => {
         const next: Record<string, string> = {};
+        for (const [providerId, instructions] of Object.entries(prev)) {
+          const provider = visibleProviders.find((candidate) => candidate.id === providerId);
+          if (provider && !provider.authenticated && provider.loginInProgress) {
+            next[providerId] = instructions;
+          }
+        }
         for (const provider of visibleProviders) {
           if (provider.loginInProgress && provider.loginInstructions?.trim()) {
             next[provider.id] = provider.loginInstructions;
@@ -754,13 +743,7 @@ export function ModelOnboardingModal({
             next[provider.id] = pending.instructions;
           }
         }
-        for (const [providerId, instructions] of Object.entries(prev)) {
-          const provider = visibleProviders.find((candidate) => candidate.id === providerId);
-          if (provider && provider.loginInProgress && !(providerId in next)) {
-            next[providerId] = instructions;
-          }
-        }
-        return areStringRecordsEqual(prev, next) ? prev : next;
+        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
       });
       setManualCodeConfigs((prev) => {
         const next: Record<string, ManualOAuthCodeInfo> = {};
@@ -776,11 +759,11 @@ export function ModelOnboardingModal({
         }
         for (const [providerId, manualCode] of Object.entries(prev)) {
           const provider = visibleProviders.find((candidate) => candidate.id === providerId);
-          if (provider && provider.loginInProgress && !(providerId in next)) {
+          if (provider && !provider.authenticated && provider.loginInProgress) {
             next[providerId] = manualCode;
           }
         }
-        return areManualCodeRecordsEqual(prev, next) ? prev : next;
+        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
       });
       setLoginOutcomes((prev) => {
         let changed = false;
@@ -1152,13 +1135,7 @@ export function ModelOnboardingModal({
       pollCountRef.current = 0;
 
       try {
-        const usesCliAccountLogin =
-          providerId === "claude-cli" ||
-          providerId === "cursor" ||
-          providerId === "google-gemini-cli";
-        const { url, instructions, manualCode } = usesCliAccountLogin
-          ? await addCliAccountProvider(providerId)
-          : await loginProvider(providerId);
+        const { url, instructions, manualCode } = await loginProvider(providerId);
         if (instructions?.trim()) {
           setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
         }
@@ -1166,9 +1143,7 @@ export function ModelOnboardingModal({
           setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
         }
         savePendingAuthLoginUiState(providerId, { instructions, manualCode });
-        if (url) {
-          window.open(appendTokenQuery(url), "_blank");
-        }
+        window.open(appendTokenQuery(url), "_blank");
 
         // Poll for auth completion
         pollIntervalRef.current = setInterval(async () => {
@@ -1694,11 +1669,10 @@ export function ModelOnboardingModal({
     onComplete();
   }, [completeOnboarding, onComplete]);
 
-  if (!isOpen) return null;
-
   const githubStatus = getGitHubStatus();
 
   const aiProviders = authProviders.filter((provider) => provider.id !== "github");
+  const showShellConnectionSetup = shellState.host !== "web" && !shellState.activeProfileId;
   const orderedAiProviders = [...aiProviders].sort(compareOnboardingProviders);
   const hasOauthProviders = orderedAiProviders.some((provider) => !provider.type || provider.type === "oauth");
   const hasApiKeyProviders = orderedAiProviders.some((provider) => provider.type === "api_key");
@@ -1707,6 +1681,36 @@ export function ModelOnboardingModal({
   const hasProjectSelected = Boolean(projectId);
   // True when on GitHub step but skipped AI setup (no AI provider connected)
   const aiSetupSkipped = step === "github" && !hasAiProvider;
+
+  const saveShellConnectionProfile = useCallback(async () => {
+    if (!shellApi) {
+      return;
+    }
+    setShellConnectionError(null);
+    setShellConnectionSaving(true);
+    try {
+      const saved = await shellApi.saveProfile({
+        name: shellProfileName,
+        serverUrl: shellServerUrl,
+        authToken: shellAuthToken.trim() ? shellAuthToken : null,
+      });
+      try {
+        await shellApi.setActiveProfile(saved.id);
+      } catch (error) {
+        setShellConnectionError(getErrorMessage(error) || "Saved profile but failed to activate it");
+        return;
+      }
+      setShellServerUrl("");
+      setShellAuthToken("");
+      addToast("Remote server profile saved", "success");
+    } catch (error) {
+      setShellConnectionError(getErrorMessage(error) || "Failed to save shell connection");
+    } finally {
+      setShellConnectionSaving(false);
+    }
+  }, [shellApi, shellProfileName, shellServerUrl, shellAuthToken, addToast]);
+
+  if (!isOpen) return null;
 
   const selectedModelDisplayName = (() => {
     if (!selectedModel) {
@@ -1848,17 +1852,18 @@ export function ModelOnboardingModal({
         <ClaudeCliProviderCard
           key={provider.id}
           authenticated={provider.authenticated}
-          accounts={provider.accounts}
-          addAccountBusy={authActionInProgress === "claude-cli"}
-          loginInProgress={provider.loginInProgress || authActionInProgress === "claude-cli"}
-          instructions={loginInstructions["claude-cli"]}
-          manualCode={manualCodeConfigs["claude-cli"]}
-          manualCodeValue={manualCodeInputs["claude-cli"] ?? ""}
-          manualCodeSubmitInProgress={manualCodeSubmitInProgress === "claude-cli"}
-          onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "claude-cli": value }))}
-          onManualCodeSubmit={() => void handleSubmitManualCode("claude-cli")}
-          onCancelLogin={() => void handleCancelLogin("claude-cli")}
-          onAddAccount={() => handleLogin("claude-cli")}
+          onToggled={() => {
+            void loadAuthStatus();
+          }}
+        />
+      );
+    }
+
+    if (provider.id === "cursor-cli" && provider.type === "cli") {
+      return (
+        <CursorCliProviderCard
+          key={provider.id}
+          authenticated={provider.authenticated}
           onToggled={() => {
             void loadAuthStatus();
           }}
@@ -2139,6 +2144,52 @@ export function ModelOnboardingModal({
               <p className="onboarding-helper-text">
                 Research runs require provider credentials and an enabled Research View. After onboarding, verify these in Settings → Authentication and Settings → Experimental Features.
               </p>
+
+              {showShellConnectionSetup && (
+                <div className="card">
+                  <h3 className="onboarding-section-title">Connect remote Fusion server</h3>
+                  <p className="onboarding-helper-text">
+                    Your native shell needs an active remote profile before dashboard handoff can complete.
+                  </p>
+                  <label htmlFor="onboarding-shell-profile-name" className="onboarding-apikey-field-label">Profile name</label>
+                  <input
+                    id="onboarding-shell-profile-name"
+                    className="input"
+                    value={shellProfileName}
+                    onChange={(event) => setShellProfileName(event.target.value)}
+                  />
+                  <label htmlFor="onboarding-shell-server-url" className="onboarding-apikey-field-label">Server URL</label>
+                  <input
+                    id="onboarding-shell-server-url"
+                    className="input"
+                    placeholder="https://your-fusion-host"
+                    value={shellServerUrl}
+                    onChange={(event) => setShellServerUrl(event.target.value)}
+                  />
+                  <label htmlFor="onboarding-shell-token" className="onboarding-apikey-field-label">Auth token (optional)</label>
+                  <input
+                    id="onboarding-shell-token"
+                    className="input"
+                    type="password"
+                    value={shellAuthToken}
+                    onChange={(event) => setShellAuthToken(event.target.value)}
+                  />
+                  {shellConnectionError && <small className="field-error">{shellConnectionError}</small>}
+                  <div className="onboarding-apikey-input-row">
+                    <button type="button" className="btn btn-sm" onClick={() => void shellApi?.openConnectionManager()}>
+                      Open manager
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => void saveShellConnectionProfile()}
+                      disabled={!shellServerUrl.trim() || shellConnectionSaving}
+                    >
+                      {shellConnectionSaving ? "Saving…" : "Save remote server"}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Provider connection status summary */}
               {!authLoading && authProviders.length > 0 && (

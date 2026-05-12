@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   syncInsightExtractionAutomation: vi.fn(),
   syncAutoSummarizeAutomation: vi.fn(),
   syncMemoryDreamsAutomation: vi.fn(),
+  syncScheduledEvalBatchAutomation: vi.fn(),
   automationStoreInit: vi.fn(async () => undefined),
   createAiPromptExecutor: vi.fn(async () => vi.fn()),
   cronRunnerStart: vi.fn(),
@@ -39,6 +40,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
     syncInsightExtractionAutomation: mocks.syncInsightExtractionAutomation,
     syncAutoSummarizeAutomation: mocks.syncAutoSummarizeAutomation,
     syncMemoryDreamsAutomation: mocks.syncMemoryDreamsAutomation,
+    syncScheduledEvalBatchAutomation: mocks.syncScheduledEvalBatchAutomation,
   });
 });
 
@@ -286,6 +288,22 @@ describe("ProjectEngine notification ownership wiring", () => {
     expect(mocks.notificationServiceStop).toHaveBeenCalledTimes(1);
     expect(mocks.notifierStop).toHaveBeenCalledTimes(1);
   });
+
+  it("does not recreate notification listeners on repeated start calls, preventing duplicate merged delivery", async () => {
+    const engine = createEngine({ skipNotifier: false, projectId: "proj_for_notifier" });
+
+    await engine.start();
+    await engine.start();
+
+    // Root cause guard: if ProjectEngine.start is called more than once, it should not
+    // wire a second NotificationService/NtfyNotifier pair for the same store.
+    expect(NotificationService).toHaveBeenCalledTimes(1);
+    expect(NtfyNotifier).toHaveBeenCalledTimes(1);
+    expect(mocks.notificationServiceStart).toHaveBeenCalledTimes(1);
+    expect(mocks.notifierStart).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
 });
 
 describe("ProjectEngine PR monitoring wiring", () => {
@@ -340,12 +358,15 @@ describe("ProjectEngine auto-summarize wiring", () => {
     expect(mocks.syncInsightExtractionAutomation).toHaveBeenCalledTimes(1);
     expect(mocks.syncAutoSummarizeAutomation).toHaveBeenCalledTimes(1);
     expect(mocks.syncMemoryDreamsAutomation).toHaveBeenCalledTimes(1);
+    expect(mocks.syncScheduledEvalBatchAutomation).toHaveBeenCalledTimes(1);
 
     const insightSettings = mocks.syncInsightExtractionAutomation.mock.calls[0][1];
     const autoSummarizeSettings = mocks.syncAutoSummarizeAutomation.mock.calls[0][1];
     const memoryDreamsSettings = mocks.syncMemoryDreamsAutomation.mock.calls[0][1];
+    const scheduledEvalSettings = mocks.syncScheduledEvalBatchAutomation.mock.calls[0][1];
     expect(autoSummarizeSettings).toBe(insightSettings);
     expect(memoryDreamsSettings).toBe(insightSettings);
+    expect(scheduledEvalSettings).toBe(insightSettings);
 
     const cronRunnerStartOrder = mocks.cronRunnerStart.mock.invocationCallOrder[0];
     expect(mocks.syncInsightExtractionAutomation.mock.invocationCallOrder[0]).toBeLessThan(
@@ -355,6 +376,9 @@ describe("ProjectEngine auto-summarize wiring", () => {
       cronRunnerStartOrder,
     );
     expect(mocks.syncMemoryDreamsAutomation.mock.invocationCallOrder[0]).toBeLessThan(
+      cronRunnerStartOrder,
+    );
+    expect(mocks.syncScheduledEvalBatchAutomation.mock.invocationCallOrder[0]).toBeLessThan(
       cronRunnerStartOrder,
     );
 
@@ -1561,6 +1585,142 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
 
     await engine.stop();
   });
+
+  it("calls stuck detector pause/resume hooks for enginePaused transitions", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("calls stuck detector pause/resume hooks for globalPause transitions", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true },
+      { ...baseSettings, globalPause: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false },
+      { ...baseSettings, globalPause: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("does not resume stuck detector until both global and engine pause are cleared", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause, resume }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true, enginePaused: true },
+      { ...baseSettings, globalPause: false, enginePaused: false },
+    );
+    expect(pause).toHaveBeenCalledTimes(1);
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false, enginePaused: true },
+      { ...baseSettings, globalPause: true, enginePaused: true },
+    );
+    expect(resume).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false, enginePaused: false },
+      { ...baseSettings, globalPause: false, enginePaused: true },
+    );
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
+
+  it("reserves stuck-detector checkNow for timeout-setting changes", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+
+    const checkNow = vi.fn(async () => undefined);
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get: () => ({ pause: vi.fn(), resume: vi.fn(), checkNow }),
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: true },
+      { ...baseSettings, globalPause: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, globalPause: false },
+      { ...baseSettings, globalPause: true },
+    );
+
+    expect(checkNow).not.toHaveBeenCalled();
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, taskStuckTimeoutMs: 600_000 },
+      { ...baseSettings, taskStuckTimeoutMs: 300_000 },
+    );
+
+    expect(checkNow).toHaveBeenCalledTimes(1);
+
+    await engine.stop();
+  });
 });
 
 describe("ProjectEngine swallowed error hardening", () => {
@@ -1606,7 +1766,7 @@ describe("ProjectEngine swallowed error hardening", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Auto-merge: failed to read settings for task:moved on FN-001"),
+      expect.stringContaining("Auto-merge handoff (FN-001) failed: db locked"),
     );
 
     await engine.stop();
@@ -1786,6 +1946,220 @@ describe("ProjectEngine swallowed error hardening", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Stuck-timeout change: detector.checkNow() failed"),
     );
+
+    await engine.stop();
+  });
+
+  it("warns when stuck-detector pause/resume hooks throw", async () => {
+    const mockStore = createMockStore(baseSettings);
+    mocks.currentStore = mockStore.store;
+    const engine = createEngine();
+    await engine.start();
+    warnSpy.mockClear();
+
+    const runtime = engine.getRuntime() as unknown as object;
+    Object.defineProperty(runtime, "stuckTaskDetector", {
+      get() {
+        return {
+          pause: () => {
+            throw new Error("pause hook failed");
+          },
+          resume: () => {
+            throw new Error("resume hook failed");
+          },
+        };
+      },
+      configurable: true,
+    });
+
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: true },
+      { ...baseSettings, enginePaused: false },
+    );
+    await mockStore.emitSettingsUpdated(
+      { ...baseSettings, enginePaused: false },
+      { ...baseSettings, enginePaused: true },
+    );
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Engine pause: stuck detector pause hook failed"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Engine unpause: stuck detector resume hook failed"),
+    );
+
+    await engine.stop();
+  });
+});
+
+describe("ProjectEngine stale mergeActive rescue (FN-3900)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("task:moved into in-review clears leaked mergeActive entry before enqueue", async () => {
+    vi.useFakeTimers();
+
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-leaked",
+      column: "in-review",
+      paused: false,
+      status: null,
+      mergeRetries: 0,
+    });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      mergeQueue: string[];
+      mergeActive: Set<string>;
+      activeMergeTaskId: string | null;
+      internalEnqueueMerge: (taskId: string) => void;
+    };
+
+    await engine.start();
+    privateEngine.mergeActive = new Set(["FN-leaked"]);
+    privateEngine.mergeQueue = [];
+    privateEngine.activeMergeTaskId = null;
+
+    const originalEnqueue = privateEngine.internalEnqueueMerge.bind(privateEngine);
+    const enqueueSpy = vi.spyOn(privateEngine, "internalEnqueueMerge").mockImplementation((taskId: string) => {
+      expect(privateEngine.mergeActive.has("FN-leaked")).toBe(false);
+      return originalEnqueue(taskId);
+    });
+    const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+    const taskMovedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+      | ((payload: { task: { id: string; column: string; paused?: boolean }; to: string }) => Promise<void>)
+      | undefined;
+    if (!taskMovedHandler) throw new Error("task:moved handler was not registered");
+
+    await taskMovedHandler({
+      task: { id: "FN-leaked", column: "in-review", paused: false },
+      to: "in-review",
+    });
+
+    await vi.advanceTimersByTimeAsync(350);
+
+    expect(enqueueSpy).toHaveBeenCalledWith("FN-leaked");
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/clearing stale mergeActive before enqueue/));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("FN-leaked"));
+
+    await engine.stop();
+  });
+
+  it("internalEnqueueMerge warns and skips direct leaked mergeActive entries", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      mergeQueue: string[];
+      mergeActive: Set<string>;
+      activeMergeTaskId: string | null;
+      internalEnqueueMerge: (taskId: string) => void;
+    };
+    const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+    await engine.start();
+
+    privateEngine.mergeActive = new Set(["FN-leaked2"]);
+    privateEngine.mergeQueue = [];
+    privateEngine.activeMergeTaskId = null;
+
+    privateEngine.internalEnqueueMerge("FN-leaked2");
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("mergeActive entry is leaked"));
+    expect(privateEngine.mergeQueue).toEqual([]);
+    expect(mocks.aiMergeTask).not.toHaveBeenCalled();
+
+    await engine.stop();
+  });
+
+  it.each([
+    { scenario: "queued", mergeQueue: ["FN-live"], activeMergeTaskId: null },
+    { scenario: "active", mergeQueue: [], activeMergeTaskId: "FN-live" },
+  ])(
+    "internalEnqueueMerge does not warn for live mergeActive entry ($scenario)",
+    async ({ mergeQueue, activeMergeTaskId }) => {
+      const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+      mocks.currentStore = mockStore.store;
+
+      const engine = createEngine();
+      const privateEngine = engine as unknown as {
+        mergeQueue: string[];
+        mergeActive: Set<string>;
+        activeMergeTaskId: string | null;
+        internalEnqueueMerge: (taskId: string) => void;
+      };
+      const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+      await engine.start();
+
+      privateEngine.mergeActive = new Set(["FN-live"]);
+      privateEngine.mergeQueue = [...mergeQueue];
+      privateEngine.activeMergeTaskId = activeMergeTaskId;
+      const queueBefore = [...privateEngine.mergeQueue];
+
+      privateEngine.internalEnqueueMerge("FN-live");
+
+      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("mergeActive entry is leaked"));
+      expect(privateEngine.mergeQueue).toEqual(queueBefore);
+
+      await engine.stop();
+    },
+  );
+
+  it("task:moved rescue does not clear legitimate active mergeActive entry", async () => {
+    vi.useFakeTimers();
+
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    mockStore.store.getTask.mockResolvedValue({
+      id: "FN-busy",
+      column: "in-review",
+      paused: false,
+      status: null,
+      mergeRetries: 0,
+    });
+    mocks.currentStore = mockStore.store;
+
+    const engine = createEngine();
+    const privateEngine = engine as unknown as {
+      mergeQueue: string[];
+      mergeActive: Set<string>;
+      activeMergeTaskId: string | null;
+      internalEnqueueMerge: (taskId: string) => void;
+    };
+
+    await engine.start();
+    privateEngine.mergeActive = new Set(["FN-busy"]);
+    privateEngine.activeMergeTaskId = "FN-busy";
+    privateEngine.mergeQueue = [];
+
+    const enqueueSpy = vi.spyOn(privateEngine, "internalEnqueueMerge");
+    const warnSpy = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+    const taskMovedHandler = mockStore.store.on.mock.calls.find((c: unknown[]) => c[0] === "task:moved")?.[1] as
+      | ((payload: { task: { id: string; column: string; paused?: boolean }; to: string }) => Promise<void>)
+      | undefined;
+    if (!taskMovedHandler) throw new Error("task:moved handler was not registered");
+
+    await taskMovedHandler({
+      task: { id: "FN-busy", column: "in-review", paused: false },
+      to: "in-review",
+    });
+
+    await vi.advanceTimersByTimeAsync(350);
+
+    expect(enqueueSpy).toHaveBeenCalledWith("FN-busy");
+    expect(privateEngine.mergeActive.has("FN-busy")).toBe(true);
+    expect(privateEngine.activeMergeTaskId).toBe("FN-busy");
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/clearing stale mergeActive/));
 
     await engine.stop();
   });

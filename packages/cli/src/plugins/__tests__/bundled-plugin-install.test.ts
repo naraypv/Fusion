@@ -22,13 +22,24 @@ vi.mock("@fusion/core", () => ({
 }));
 
 // Import SUT after mocks are in place
-import { ensureBundledDependencyGraphPluginInstalled } from "../bundled-plugin-install.js";
+import {
+  BUNDLED_PLUGIN_IDS,
+  ensureBundledDependencyGraphPluginInstalled,
+  ensureBundledCursorRuntimePluginInstalled,
+  ensureBundledPluginInstalled,
+  resolvePluginEntryPath,
+} from "../bundled-plugin-install.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
 const BUNDLED_PLUGIN_ID = "fusion-plugin-dependency-graph";
+const HERMES_PLUGIN_ID = "fusion-plugin-hermes-runtime";
+const CURSOR_PLUGIN_ID = "fusion-plugin-cursor-runtime";
+const ROADMAP_PLUGIN_ID = "fusion-plugin-roadmap";
+const REPORTS_PLUGIN_ID = "fusion-plugin-reports";
+const CLI_PRINTING_PRESS_PLUGIN_ID = "fusion-plugin-cli-printing-press";
 
-function makeManifest(overrides?: Partial<{ id: string; version: string }>) {
+function makeManifest(overrides?: Partial<{ id: string; version: string; name: string }>) {
   return {
     id: BUNDLED_PLUGIN_ID,
     name: "Dependency Graph",
@@ -38,7 +49,7 @@ function makeManifest(overrides?: Partial<{ id: string; version: string }>) {
       {
         viewId: "graph",
         label: "Graph",
-        componentPath: "./src/DependencyGraphView.tsx",
+        componentPath: "./dashboard-view",
         icon: "Network",
         placement: "more",
         order: 40,
@@ -130,7 +141,11 @@ function makePluginLoader() {
 function setupBundleExists(manifestOverrides?: Partial<{ id: string; version: string }>) {
   const manifest = makeManifest(manifestOverrides);
   mockExistsSync.mockImplementation((p: string) => {
-    if (typeof p === "string" && p.endsWith("manifest.json") && p.includes("dist")) return true;
+    if (typeof p !== "string") return false;
+    if (p.endsWith("manifest.json") && p.includes("dist")) return true;
+    if (p.includes("dist") && (p.endsWith("/bundled.js") || p.endsWith("/src/index.ts") || p.endsWith("/dist/index.js"))) {
+      return true;
+    }
     return false;
   });
   mockReadFile.mockResolvedValue(JSON.stringify(manifest));
@@ -170,7 +185,9 @@ async function getResolvedBundledPath(): Promise<string> {
     probeLoader as unknown as import("@fusion/core").PluginLoader,
   );
   const call = probeStore.registerPlugin.mock.calls[0];
-  return (call?.[0] as { path: string })?.path ?? "";
+  const path = (call?.[0] as { path: string })?.path ?? "";
+  expect(path.endsWith(".js") || path.endsWith(".ts")).toBe(true);
+  return path;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -179,7 +196,40 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("resolvePluginEntryPath", () => {
+  it("prefers bundled.js when both bundled and source entries exist", () => {
+    mockExistsSync.mockImplementation((p: string) => p.endsWith("/src/index.ts") || p.endsWith("/bundled.js"));
+    expect(resolvePluginEntryPath("/tmp/plugin")).toBe("/tmp/plugin/bundled.js");
+  });
+
+  it("prefers bundled.js when source entry is unavailable", () => {
+    mockExistsSync.mockImplementation((p: string) => p.endsWith("/bundled.js"));
+    expect(resolvePluginEntryPath("/tmp/plugin")).toBe("/tmp/plugin/bundled.js");
+  });
+
+  it("prefers dist/index.js when bundled.js is unavailable", () => {
+    mockExistsSync.mockImplementation((p: string) => p.endsWith("/src/index.ts") || p.endsWith("/dist/index.js"));
+    expect(resolvePluginEntryPath("/tmp/plugin")).toBe("/tmp/plugin/dist/index.js");
+  });
+
+  it("falls back to src/index.ts for workspace-dev plugins without build outputs", () => {
+    mockExistsSync.mockImplementation((p: string) => p.endsWith("/src/index.ts"));
+    expect(resolvePluginEntryPath("/tmp/plugin")).toBe("/tmp/plugin/src/index.ts");
+  });
+});
+
 describe("ensureBundledDependencyGraphPluginInstalled", () => {
+  it("includes roadmap plugin in bundled plugin ids", () => {
+    expect(BUNDLED_PLUGIN_IDS).toContain(ROADMAP_PLUGIN_ID);
+  });
+
+  it("includes CLI printing press plugin in bundled plugin ids", () => {
+    expect(BUNDLED_PLUGIN_IDS).toContain(CLI_PRINTING_PRESS_PLUGIN_ID);
+  });
+
+  it("includes reports plugin in bundled plugin ids", () => {
+    expect(BUNDLED_PLUGIN_IDS).toContain(REPORTS_PLUGIN_ID);
+  });
   it("fresh install: registers and loads the plugin when not in DB", async () => {
     setupBundleExists();
     const store = makePluginStore();
@@ -221,7 +271,7 @@ describe("ensureBundledDependencyGraphPluginInstalled", () => {
     expect(result).toBe("already-installed");
     expect(store.updatePlugin).not.toHaveBeenCalled();
     expect(store.registerPlugin).not.toHaveBeenCalled();
-    expect(loader.loadPlugin).not.toHaveBeenCalled();
+    expect(loader.loadPlugin).toHaveBeenCalledWith(BUNDLED_PLUGIN_ID);
   });
 
   it("already installed with stale path → updates path to current bundled path", async () => {
@@ -321,5 +371,107 @@ describe("ensureBundledDependencyGraphPluginInstalled", () => {
         loader as unknown as import("@fusion/core").PluginLoader,
       ),
     ).rejects.toThrow("Invalid plugin manifest");
+  });
+
+  it("registers Cursor runtime through the dedicated helper", async () => {
+    const manifest = makeManifest({ id: CURSOR_PLUGIN_ID, name: "Cursor Runtime" });
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p.endsWith("manifest.json") && p.includes(CURSOR_PLUGIN_ID)) return true;
+      if (p.endsWith("/src/index.ts") && p.includes(CURSOR_PLUGIN_ID)) return true;
+      return false;
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(manifest));
+    mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
+
+    const store = makePluginStore();
+    const loader = makePluginLoader();
+
+    const result = await ensureBundledCursorRuntimePluginInstalled(
+      store as unknown as import("@fusion/core").PluginStore,
+      loader as unknown as import("@fusion/core").PluginLoader,
+    );
+
+    expect(result).toBe("installed");
+    expect(store.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({ manifest: expect.objectContaining({ id: CURSOR_PLUGIN_ID }) }),
+    );
+  });
+
+  it("registers roadmap plugin via generic bundled installer", async () => {
+    const manifest = makeManifest({ id: ROADMAP_PLUGIN_ID, name: "Roadmaps" });
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p.endsWith("manifest.json") && p.includes(ROADMAP_PLUGIN_ID)) return true;
+      if (p.endsWith("/src/index.ts") && p.includes(ROADMAP_PLUGIN_ID)) return true;
+      return false;
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(manifest));
+    mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
+
+    const store = makePluginStore();
+    const loader = makePluginLoader();
+
+    const result = await ensureBundledPluginInstalled(
+      store as unknown as import("@fusion/core").PluginStore,
+      loader as unknown as import("@fusion/core").PluginLoader,
+      ROADMAP_PLUGIN_ID,
+    );
+
+    expect(result).toBe("installed");
+    expect(store.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({ manifest: expect.objectContaining({ id: ROADMAP_PLUGIN_ID }) }),
+    );
+  });
+
+  it("registers reports plugin via generic bundled installer", async () => {
+    const manifest = makeManifest({ id: REPORTS_PLUGIN_ID, name: "Reports" });
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p.endsWith("manifest.json") && p.includes(REPORTS_PLUGIN_ID)) return true;
+      if (p.endsWith("/src/index.ts") && p.includes(REPORTS_PLUGIN_ID)) return true;
+      return false;
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(manifest));
+    mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
+
+    const store = makePluginStore();
+    const loader = makePluginLoader();
+
+    const result = await ensureBundledPluginInstalled(
+      store as unknown as import("@fusion/core").PluginStore,
+      loader as unknown as import("@fusion/core").PluginLoader,
+      REPORTS_PLUGIN_ID,
+    );
+
+    expect(result).toBe("installed");
+    expect(store.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({ manifest: expect.objectContaining({ id: REPORTS_PLUGIN_ID }) }),
+    );
+    const registerCall = store.registerPlugin.mock.calls[0]?.[0] as { path: string };
+    expect(registerCall.path).toContain(REPORTS_PLUGIN_ID);
+  });
+
+  it("registers Hermes from bundled.js when bundled, src, and dist entries all exist", async () => {
+    const manifest = makeManifest({ id: HERMES_PLUGIN_ID, name: "Hermes Runtime" });
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p.endsWith("manifest.json") && p.includes(HERMES_PLUGIN_ID)) return true;
+      if (p.endsWith("/bundled.js") && p.includes(HERMES_PLUGIN_ID)) return true;
+      if (p.endsWith("/src/index.ts") && p.includes(HERMES_PLUGIN_ID)) return true;
+      if (p.endsWith("/dist/index.js") && p.includes(HERMES_PLUGIN_ID)) return true;
+      return false;
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(manifest));
+    mockValidatePluginManifest.mockReturnValue({ valid: true, errors: [] });
+
+    const store = makePluginStore();
+    const loader = makePluginLoader();
+
+    const result = await ensureBundledPluginInstalled(
+      store as unknown as import("@fusion/core").PluginStore,
+      loader as unknown as import("@fusion/core").PluginLoader,
+      HERMES_PLUGIN_ID,
+    );
+
+    expect(result).toBe("installed");
+    const registerCall = store.registerPlugin.mock.calls[0]?.[0] as { path: string };
+    expect(registerCall.path).toContain(`${HERMES_PLUGIN_ID}/bundled.js`);
   });
 });

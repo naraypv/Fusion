@@ -1,24 +1,10 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { EventEmitter } from "node:events";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import {
   HeartbeatMonitor,
-  HeartbeatTriggerScheduler,
-  isBlockedStateDuplicate,
   type AgentSession,
-  type HeartbeatExecutionOptions,
-  HEARTBEAT_SYSTEM_PROMPT,
-  HEARTBEAT_NO_TASK_SYSTEM_PROMPT,
-  HEARTBEAT_PROCEDURE,
-  HEARTBEAT_NO_TASK_PROCEDURE,
 } from "../agent-heartbeat.js";
-import { AgentLogger } from "../agent-logger.js";
-import * as agentTools from "../agent-tools.js";
-import type { AgentStore, AgentHeartbeatRun, TaskStore, TaskDetail, Agent, MessageStore, Message, AgentBudgetStatus } from "@fusion/core";
-import { createMockStore, createMockSession, createMockMessageStore, createMessage, createBudgetStatus } from "./heartbeat-test-helpers.js";
+import type { AgentStore, AgentHeartbeatRun, TaskStore, Agent, Message } from "@fusion/core";
+import { createMockStore, createMockSession, createMockMessageStore, createMessage } from "./heartbeat-test-helpers.js";
 vi.mock("../logger.js", async () => {
   const { createMockLogger, formatMockError } = await import("./heartbeat-test-helpers.js");
   return {
@@ -74,31 +60,6 @@ describe("constructor", () => {
   });
 });
 
-describe("isBlockedStateDuplicate", () => {
-  it("returns true when blockedBy and contextHash match", () => {
-    expect(
-      isBlockedStateDuplicate(
-        { taskId: "FN-1", blockedBy: "FN-0", recordedAt: "2026-01-01T00:00:00.000Z", contextHash: "abc" },
-        { taskId: "FN-1", blockedBy: "FN-0", recordedAt: "2026-01-02T00:00:00.000Z", contextHash: "abc" },
-      ),
-    ).toBe(true);
-  });
-
-  it("returns false when blockedBy differs or contextHash differs", () => {
-    expect(
-      isBlockedStateDuplicate(
-        { taskId: "FN-1", blockedBy: "FN-0", recordedAt: "2026-01-01T00:00:00.000Z", contextHash: "abc" },
-        { taskId: "FN-1", blockedBy: "FN-2", recordedAt: "2026-01-02T00:00:00.000Z", contextHash: "abc" },
-      ),
-    ).toBe(false);
-    expect(
-      isBlockedStateDuplicate(
-        { taskId: "FN-1", blockedBy: "FN-0", recordedAt: "2026-01-01T00:00:00.000Z", contextHash: "abc" },
-        { taskId: "FN-1", blockedBy: "FN-0", recordedAt: "2026-01-02T00:00:00.000Z", contextHash: "xyz" },
-      ),
-    ).toBe(false);
-  });
-});
 
 describe("start", () => {
   it("initiates polling interval", () => {
@@ -253,6 +214,160 @@ describe("wake-on-message", () => {
     customMonitor.start();
     messageHook?.(createMessage({ toId: "agent-1", toType: "agent", id: "msg-paused" }));
     messageHook?.(createMessage({ toId: "agent-1", toType: "agent", id: "msg-error" }));
+
+    expect(executeHeartbeatSpy).not.toHaveBeenCalled();
+
+    customMonitor.stop();
+  });
+
+  it("forces a wake when metadata.wakeRecipient overrides on-heartbeat mode", () => {
+    let messageHook: ((message: Message) => void) | undefined;
+    const messageStore = createMockMessageStore((hook) => {
+      messageHook = hook;
+    });
+    const configStore = createMockStore({
+      getCachedAgent: vi.fn().mockReturnValue({
+        id: "agent-1",
+        state: "active",
+        runtimeConfig: { messageResponseMode: "on-heartbeat" },
+      }),
+    });
+
+    const customMonitor = new HeartbeatMonitor({
+      store,
+      agentStore: configStore,
+      messageStore,
+    });
+    const executeHeartbeatSpy = vi
+      .spyOn(customMonitor, "executeHeartbeat")
+      .mockResolvedValue({ id: "run-1" } as AgentHeartbeatRun);
+
+    customMonitor.start();
+    messageHook?.(
+      createMessage({
+        toId: "agent-1",
+        toType: "agent",
+        metadata: { wakeRecipient: true },
+      }),
+    );
+
+    expect(executeHeartbeatSpy).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      source: "on_demand",
+      triggerDetail: "wake-on-message-forced",
+    });
+
+    customMonitor.stop();
+  });
+
+  it("forces a wake even when messageResponseMode is unset", () => {
+    let messageHook: ((message: Message) => void) | undefined;
+    const messageStore = createMockMessageStore((hook) => {
+      messageHook = hook;
+    });
+    const configStore = createMockStore({
+      getCachedAgent: vi.fn().mockReturnValue({
+        id: "agent-1",
+        state: "idle",
+        runtimeConfig: {},
+      }),
+    });
+
+    const customMonitor = new HeartbeatMonitor({
+      store,
+      agentStore: configStore,
+      messageStore,
+    });
+    const executeHeartbeatSpy = vi
+      .spyOn(customMonitor, "executeHeartbeat")
+      .mockResolvedValue({ id: "run-1" } as AgentHeartbeatRun);
+
+    customMonitor.start();
+    messageHook?.(
+      createMessage({
+        toId: "agent-1",
+        toType: "agent",
+        metadata: { wakeRecipient: true },
+      }),
+    );
+
+    expect(executeHeartbeatSpy).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      source: "on_demand",
+      triggerDetail: "wake-on-message-forced",
+    });
+
+    customMonitor.stop();
+  });
+
+  it("ignores wakeRecipient metadata when sender is an agent (only humans may force wakes)", () => {
+    let messageHook: ((message: Message) => void) | undefined;
+    const messageStore = createMockMessageStore((hook) => {
+      messageHook = hook;
+    });
+    const configStore = createMockStore({
+      getCachedAgent: vi.fn().mockReturnValue({
+        id: "agent-1",
+        state: "active",
+        runtimeConfig: { messageResponseMode: "on-heartbeat" },
+      }),
+    });
+
+    const customMonitor = new HeartbeatMonitor({
+      store,
+      agentStore: configStore,
+      messageStore,
+    });
+    const executeHeartbeatSpy = vi
+      .spyOn(customMonitor, "executeHeartbeat")
+      .mockResolvedValue({ id: "run-1" } as AgentHeartbeatRun);
+
+    customMonitor.start();
+    messageHook?.(
+      createMessage({
+        toId: "agent-1",
+        toType: "agent",
+        fromId: "agent-2",
+        fromType: "agent",
+        metadata: { wakeRecipient: true },
+      }),
+    );
+
+    expect(executeHeartbeatSpy).not.toHaveBeenCalled();
+
+    customMonitor.stop();
+  });
+
+  it("still respects state gating when wakeRecipient is set (paused agent stays paused)", () => {
+    let messageHook: ((message: Message) => void) | undefined;
+    const messageStore = createMockMessageStore((hook) => {
+      messageHook = hook;
+    });
+    const configStore = createMockStore({
+      getCachedAgent: vi.fn().mockReturnValue({
+        id: "agent-1",
+        state: "paused",
+        runtimeConfig: {},
+      }),
+    });
+
+    const customMonitor = new HeartbeatMonitor({
+      store,
+      agentStore: configStore,
+      messageStore,
+    });
+    const executeHeartbeatSpy = vi
+      .spyOn(customMonitor, "executeHeartbeat")
+      .mockResolvedValue({ id: "run-1" } as AgentHeartbeatRun);
+
+    customMonitor.start();
+    messageHook?.(
+      createMessage({
+        toId: "agent-1",
+        toType: "agent",
+        metadata: { wakeRecipient: true },
+      }),
+    );
 
     expect(executeHeartbeatSpy).not.toHaveBeenCalled();
 
@@ -603,12 +718,17 @@ describe("missed heartbeat detection", () => {
   });
 });
 
-describe("unresponsive agent termination", () => {
-  it("disposes session and terminates agent after 2x timeout", async () => {
+describe("unresponsive agent recovery", () => {
+  it("recovers only tracked stale sessions via pause/resume restart", async () => {
     const onTerminated = vi.fn();
     const session = createMockSession();
+    const localStore = createMockStore({
+      getAgent: vi.fn().mockResolvedValue({ id: "agent-001", state: "running", runtimeConfig: { enabled: false } }),
+      updateAgentState: vi.fn().mockResolvedValue(undefined),
+      updateAgent: vi.fn().mockResolvedValue(undefined),
+    });
     const customMonitor = new HeartbeatMonitor({
-      store,
+      store: localStore,
       heartbeatTimeoutMs: 5000,
       pollIntervalMs: 1000,
       onTerminated,
@@ -618,113 +738,48 @@ describe("unresponsive agent termination", () => {
     customMonitor.start();
     customMonitor.trackAgent("agent-001", session, "run-001");
 
-    // Wait for missed heartbeat (1x timeout)
-    vi.advanceTimersByTime(6000);
-    await vi.advanceTimersByTimeAsync(100);
-
-    // Wait for termination (2x timeout = 10 seconds total from start)
-    vi.advanceTimersByTime(6000);
-    await vi.advanceTimersByTimeAsync(100);
-
-    expect(session.dispose).toHaveBeenCalled();
-    expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "terminated");
-    expect(onTerminated).toHaveBeenCalledWith("agent-001", expect.any(String));
-
-    customMonitor.stop();
-    vi.useRealTimers();
-  });
-
-  it("removes agent from tracking after termination", async () => {
-    const session = createMockSession();
-    const customMonitor = new HeartbeatMonitor({
-      store,
-      heartbeatTimeoutMs: 5000,
-      pollIntervalMs: 1000,
-    });
-
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    customMonitor.start();
-    customMonitor.trackAgent("agent-001", session, "run-001");
-
-    expect(customMonitor.getTrackedAgents()).toContain("agent-001");
-
-    // Wait for termination
     vi.advanceTimersByTime(12000);
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(customMonitor.getTrackedAgents()).not.toContain("agent-001");
-
-    customMonitor.stop();
-    vi.useRealTimers();
-  });
-
-  it("logs warning when session dispose throws during termination", async () => {
-    const warnSpy = vi.mocked(heartbeatLog.warn);
-    warnSpy.mockClear();
-    const session: AgentSession = {
-      dispose: vi.fn(() => {
-        throw new Error("dispose exploded");
-      }),
-    };
-    const updateAgentState = vi.fn().mockResolvedValue(undefined);
-    const localStore = createMockStore({ updateAgentState });
-    const onTerminated = vi.fn();
-    const customMonitor = new HeartbeatMonitor({
-      store: localStore,
-      heartbeatTimeoutMs: 5000,
-      pollIntervalMs: 1000,
-      onTerminated,
-    });
-
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    customMonitor.start();
-    customMonitor.trackAgent("agent-001", session, "run-001");
-
-    vi.advanceTimersByTime(10100);
-    await vi.advanceTimersByTimeAsync(100);
-
-    const warnMessages = warnSpy.mock.calls.map(([message]) => String(message));
-    expect(warnMessages.some((message) => message.includes("Error disposing session for agent-001") && message.includes("dispose exploded"))).toBe(true);
-    expect(updateAgentState).toHaveBeenCalledWith("agent-001", "terminated");
-    expect(onTerminated).toHaveBeenCalledWith("agent-001", expect.any(String));
+    expect(session.dispose).toHaveBeenCalled();
+    expect(localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
+    expect(localStore.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
+    expect(onTerminated).not.toHaveBeenCalled();
     expect(customMonitor.getTrackedAgents()).toHaveLength(0);
 
     customMonitor.stop();
     vi.useRealTimers();
   });
 
-  it("logs warning when updateAgentState throws during termination", async () => {
-    const warnSpy = vi.mocked(heartbeatLog.warn);
-    warnSpy.mockClear();
-    const session = createMockSession();
+  it("does not attempt stale recovery for untracked agents", async () => {
     const localStore = createMockStore({
-      updateAgentState: vi.fn().mockRejectedValue(new Error("db connection lost")),
+      getAgent: vi.fn().mockResolvedValue({
+        id: "agent-001",
+        state: "active",
+        lastHeartbeatAt: new Date(Date.now() - 60_000).toISOString(),
+        runtimeConfig: { enabled: true },
+      }),
+      updateAgentState: vi.fn().mockResolvedValue(undefined),
+      updateAgent: vi.fn().mockResolvedValue(undefined),
     });
-    const onTerminated = vi.fn();
     const customMonitor = new HeartbeatMonitor({
       store: localStore,
-      heartbeatTimeoutMs: 5000,
-      pollIntervalMs: 1000,
-      onTerminated,
+      heartbeatTimeoutMs: 5_000,
+      pollIntervalMs: 1_000,
     });
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
     customMonitor.start();
-    customMonitor.trackAgent("agent-001", session, "run-001");
+    await vi.advanceTimersByTimeAsync(12_000);
 
-    vi.advanceTimersByTime(10100);
-    await vi.advanceTimersByTimeAsync(100);
-
-    const warnMessages = warnSpy.mock.calls.map(([message]) => String(message));
-    expect(warnMessages.some((message) => message.includes("Error terminating agent agent-001") && message.includes("db connection lost"))).toBe(true);
-    expect(onTerminated).toHaveBeenCalledWith("agent-001", expect.any(String));
-    expect(customMonitor.getTrackedAgents()).toHaveLength(0);
+    expect(localStore.updateAgentState).not.toHaveBeenCalledWith("agent-001", "paused");
+    expect(localStore.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
 
     customMonitor.stop();
     vi.useRealTimers();
   });
 
-  it("logs warnings from both dispose and state update when both fail", async () => {
+  it("logs recovery warnings when dispose and pause fail", async () => {
     const warnSpy = vi.mocked(heartbeatLog.warn);
     warnSpy.mockClear();
     const session: AgentSession = {
@@ -733,14 +788,13 @@ describe("unresponsive agent termination", () => {
       }),
     };
     const localStore = createMockStore({
+      getAgent: vi.fn().mockResolvedValue({ id: "agent-001", state: "running", runtimeConfig: { enabled: false } }),
       updateAgentState: vi.fn().mockRejectedValue(new Error("db connection lost")),
     });
-    const onTerminated = vi.fn();
     const customMonitor = new HeartbeatMonitor({
       store: localStore,
       heartbeatTimeoutMs: 5000,
       pollIntervalMs: 1000,
-      onTerminated,
     });
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -751,12 +805,9 @@ describe("unresponsive agent termination", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     const warnMessages = warnSpy.mock.calls.map(([message]) => String(message));
-    expect(warnMessages).toHaveLength(3);
-    expect(warnMessages.some((message) => message.includes("Terminating unresponsive agent agent-001"))).toBe(true);
+    expect(warnMessages.some((message) => message.includes("Recovering unresponsive agent agent-001"))).toBe(true);
     expect(warnMessages.some((message) => message.includes("Error disposing session for agent-001") && message.includes("dispose exploded"))).toBe(true);
-    expect(warnMessages.some((message) => message.includes("Error terminating agent agent-001") && message.includes("db connection lost"))).toBe(true);
-    expect(onTerminated).toHaveBeenCalledWith("agent-001", expect.any(String));
-    expect(customMonitor.getTrackedAgents()).toHaveLength(0);
+    expect(warnMessages.some((message) => message.includes("Error pausing unresponsive agent agent-001") && message.includes("db connection lost"))).toBe(true);
 
     customMonitor.stop();
     vi.useRealTimers();

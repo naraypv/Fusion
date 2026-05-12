@@ -206,6 +206,15 @@ const { stats: diffStats } = useTaskDiffStats(
 
 ## Cache Implementation Details
 
+## Startup slim `listTasks` memoization (FN-4027)
+
+A short-lived startup memo now collapses duplicate `listTasks({ slim: true })` reads that happen during boot choreography (watch cache warmup, scheduler PR hydration, worktree pool scan, and dashboard badge priming).
+
+- Scope: startup-only slim reads keyed by `includeArchived` + `column`
+- Safety: memo entries expire quickly (2.5s TTL) and are explicitly cleared when `watch()` handoff completes
+- Freshness: steady-state polling/watch reads bypass the memo, so normal runtime updates are not served from stale startup data
+- Mutation safety: memoized responses are cloned before return so callers cannot poison shared cached objects
+
 ### useTaskDiffStats Cache
 
 ```typescript

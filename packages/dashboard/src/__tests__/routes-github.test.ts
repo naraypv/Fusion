@@ -307,8 +307,8 @@ function getSharedGitTestRepo(): GitTestRepo {
   const repoDir = join(root, "repo");
 
   mkdirSync(repoDir, { recursive: true });
-  execFileSync("git", ["init", "--bare", remoteDir], { stdio: "pipe" });
-  execFileSync("git", ["init", repoDir], { stdio: "pipe" });
+  execFileSync("git", ["init", "--bare", "--initial-branch=main", remoteDir], { stdio: "pipe" });
+  execFileSync("git", ["init", "--initial-branch=main", repoDir], { stdio: "pipe" });
   execFileSync("git", ["-C", repoDir, "config", "user.email", "kb-tests@example.com"], { stdio: "pipe" });
   execFileSync("git", ["-C", repoDir, "config", "user.name", "KB Tests"], { stdio: "pipe" });
   writeFileSync(join(repoDir, "README.md"), "# Test Repo\n");
@@ -2027,6 +2027,183 @@ describe("GET /tasks/:id/file-diffs", () => {
   });
 });
 
+describe("GET /tasks/:id/review", () => {
+  let store: ReturnType<typeof createMockStore>;
+
+  beforeEach(() => {
+    store = createMockStore();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("returns normalized reviewer-agent payload in direct mode", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      reviewState: { source: "reviewer-agent", items: [], addressing: [] },
+      log: [{ timestamp: "2026-05-01T10:00:00.000Z", action: "code review Step 2: REVISE" }],
+    });
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        timestamp: "2026-05-01T10:00:01.000Z",
+        taskId: "FN-001",
+        type: "text",
+        text: "## Code Review:\n\n### Verdict: REVISE\n\n### Summary\nNeeds null guard\n",
+        agent: "reviewer",
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/tasks/FN-001/review");
+    expect(res.status).toBe(200);
+    expect(res.body.mode).toBe("reviewer-agent");
+    expect(res.body.items[0].sourceMode).toBe("reviewer-agent");
+    expect(res.body.items[0].reviewState).toBe("REVISE");
+  });
+
+  it("returns exact empty payload/message when no reviewer feedback exists", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      reviewState: { source: "reviewer-agent", items: [], addressing: [] },
+      log: [],
+    });
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/tasks/FN-001/review");
+    expect(res.status).toBe(200);
+    expect(res.body.mode).toBe("reviewer-agent");
+    expect(res.body.summary).toBeNull();
+    expect(res.body.items).toEqual([]);
+  });
+
+  it("falls back to task log summary when reviewer output is incomplete", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      reviewState: { source: "reviewer-agent", items: [], addressing: [] },
+      log: [{ timestamp: "2026-05-01T10:00:00.000Z", action: "plan review Step 1: APPROVE" }],
+    });
+    (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        timestamp: "2026-05-01T10:00:01.000Z",
+        taskId: "FN-001",
+        type: "text",
+        text: "partial stream",
+        agent: "reviewer",
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/api/tasks/FN-001/review");
+    expect(res.status).toBe(200);
+    expect(res.body.items[0].title).toContain("plan review APPROVE");
+    expect(res.body.items[0].itemId).toContain("step-1");
+  });
+
+  it("returns 404 when task is missing", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockRejectedValue(Object.assign(new Error("not found"), { code: "ENOENT" }));
+    const res = await REQUEST(buildApp(), "GET", "/api/tasks/FN-404/review");
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /tasks/:id/review/refresh", () => {
+  let store: TaskStore;
+
+  beforeEach(() => {
+    store = createMockStore();
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store));
+    return app;
+  }
+
+  it("refreshes PR-backed review payload", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      prInfo: {
+        url: "https://github.com/owner/repo/pull/42",
+        number: 42,
+        status: "open",
+        title: "PR",
+        headBranch: "fusion/fn-1",
+        baseBranch: "main",
+        commentCount: 0,
+      },
+    });
+    vi.spyOn(GitHubClient.prototype, "getPrReviewDetails").mockResolvedValue({
+      mode: "pull-request",
+      refreshable: true,
+      fetchedAt: "2026-05-01T10:00:00.000Z",
+      summary: { reviewDecision: "CHANGES_REQUESTED", reviewers: [], blockingReasons: ["needs work"], checks: [] },
+      items: [],
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.mode).toBe("pull-request");
+  });
+
+  it("returns scoped refresh error payload in PR mode when GitHub refresh fails", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      prInfo: {
+        url: "https://github.com/owner/repo/pull/42",
+        number: 42,
+        status: "open",
+        title: "PR",
+        headBranch: "fusion/fn-1",
+        baseBranch: "main",
+        commentCount: 0,
+      },
+      reviewState: { source: "pull-request", items: [], addressing: [] },
+    });
+    vi.spyOn(GitHubClient.prototype, "getPrReviewDetails").mockRejectedValue(new Error("GitHub outage"));
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("GitHub outage");
+  });
+
+  it("refreshes direct-mode review payload without PR", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FAKE_TASK_DETAIL,
+      reviewState: {
+        source: "reviewer-agent",
+        items: [],
+        addressing: [],
+      },
+    });
+
+    const getDetailsSpy = vi.spyOn(GitHubClient.prototype, "getPrReviewDetails");
+
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.mode).toBe("reviewer-agent");
+    expect(getDetailsSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 when task is missing", async () => {
+    (store.getTask as ReturnType<typeof vi.fn>).mockRejectedValue(Object.assign(new Error("not found"), { code: "ENOENT" }));
+    const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-404/review/refresh", JSON.stringify({}), {
+      "content-type": "application/json",
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
 // --- Git Management route tests ---
 // These are integration tests that run against the actual git repository
-

@@ -8,6 +8,8 @@ export interface NtfyNotifierOptions {
   ntfyBaseUrl?: string;
   /** Project identifier for deep links in notifications */
   projectId?: string;
+  /** Resolve human-readable agent names for message notifications */
+  agentNameResolver?: (agentId: string) => Promise<string | null> | string | null;
 }
 
 export type NtfyNotificationPriority = "low" | "default" | "high" | "urgent";
@@ -24,6 +26,8 @@ export const DEFAULT_NTFY_EVENTS: readonly NtfyNotificationEvent[] = [
   "planning-awaiting-input",
   "gridlock",
   "fallback-used",
+  "message:agent-to-user",
+  "message:agent-to-agent",
 ] as const;
 
 export interface NtfyNotificationConfigInput {
@@ -99,8 +103,10 @@ export function buildNtfyClickUrl(options: {
   dashboardHost?: string;
   projectId?: string;
   taskId?: string;
+  messageId?: string;
+  view?: string;
 }): string | undefined {
-  const { dashboardHost, projectId, taskId } = options;
+  const { dashboardHost, projectId, taskId, messageId, view } = options;
   if (!dashboardHost) {
     return undefined;
   }
@@ -113,17 +119,26 @@ export function buildNtfyClickUrl(options: {
   }
   if (taskId) {
     queryParts.push(`task=${encodeURIComponent(taskId)}`);
+  } else if (messageId) {
+    queryParts.push(`view=${encodeURIComponent(view ?? "mailbox")}`);
+    queryParts.push(`mailbox-message=${encodeURIComponent(messageId)}`);
   }
 
   const query = queryParts.join("&");
-  return query ? `${normalizedHost}/?${query}` : `${normalizedHost}/`;
+  const baseUrl = query ? `${normalizedHost}/?${query}` : `${normalizedHost}/`;
+
+  if (messageId) {
+    return `${baseUrl}#message-${encodeURIComponent(messageId)}`;
+  }
+
+  return baseUrl;
 }
 
 /**
  * Send a notification to ntfy.
  * Errors are logged and swallowed so callers can treat delivery as best-effort.
  */
-export async function sendNtfyNotification({
+export async function sendNtfyNotificationWithResult({
   ntfyBaseUrl,
   topic,
   title,
@@ -131,7 +146,7 @@ export async function sendNtfyNotification({
   priority = "default",
   clickUrl,
   signal,
-}: SendNtfyNotificationInput): Promise<void> {
+}: SendNtfyNotificationInput): Promise<{ ok: boolean; status: number; statusText: string } | null> {
   try {
     const headers: Record<string, string> = {
       Title: title,
@@ -154,12 +169,23 @@ export async function sendNtfyNotification({
     if (!response.ok) {
       schedulerLog.log(`Ntfy notification failed: ${response.status} ${response.statusText}`);
     }
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+    };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
-      return;
+      return null;
     }
     schedulerLog.log(`Failed to send ntfy notification: ${err}`);
+    return null;
   }
+}
+
+export async function sendNtfyNotification(input: SendNtfyNotificationInput): Promise<void> {
+  await sendNtfyNotificationWithResult(input);
 }
 
 /**
@@ -168,6 +194,10 @@ export async function sendNtfyNotification({
  * notifications to the pluggable provider-based notification module.
  */
 let activeNotificationService: NotificationService | undefined;
+
+export function getActiveNotificationService(): NotificationService | undefined {
+  return activeNotificationService;
+}
 
 export interface FallbackNotificationInput {
   primaryModel: string;
@@ -221,6 +251,7 @@ export class NtfyNotifier {
     this.notificationService = notificationService ?? new NotificationService(store, {
       projectId: this.projectId,
       ntfyBaseUrl: options.ntfyBaseUrl,
+      agentNameResolver: options.agentNameResolver,
     });
     activeNotificationService = this.notificationService;
   }

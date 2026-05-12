@@ -1188,28 +1188,42 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
       expect(doneEvent.message.content).toBeDefined();
     });
 
-    it("logs stderr at warn level on close even with exit code 0", async () => {
-      const model = mockModels[0] as any;
-      const context = {
-        messages: [{ role: "user", content: "Hello" }],
-      };
+    it.each([
+      { code: 0, shouldWarn: false },
+      { code: 42, shouldWarn: true },
+    ])(
+      "FN-3815: routes close stderr logging by exit code=$code",
+      async ({ code, shouldWarn }) => {
+        const model = mockModels[0] as any;
+        const context = {
+          messages: [{ role: "user", content: "Hello" }],
+        };
 
-      const warnSpy = vi.spyOn(console, "warn");
+        const warnSpy = vi.spyOn(console, "warn");
 
-      streamViaCli(model, context);
-      await vi.advanceTimersByTimeAsync(0);
+        streamViaCli(model, context);
+        await vi.advanceTimersByTimeAsync(0);
 
-      const proc = (spawn as any).mock.results[0].value;
+        const proc = (spawn as any).mock.results[0].value;
 
-      proc.stderr.emit("data", Buffer.from("minor warning from cli"));
-      proc.emit("close", 0, null);
-      proc.stdout.end();
-      await vi.advanceTimersByTimeAsync(100);
+        proc.stderr.emit("data", Buffer.from("minor warning from cli"));
+        proc.emit("close", code, null);
+        proc.stdout.end();
+        await vi.advanceTimersByTimeAsync(100);
 
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("minor warning from cli"),
-      );
-    });
+        const stderrWarnCalls = warnSpy.mock.calls.filter(([message]) =>
+          typeof message === "string" &&
+          message.includes("[pi-claude-cli] Claude CLI stderr on close:"),
+        );
+
+        if (shouldWarn) {
+          expect(stderrWarnCalls).toHaveLength(1);
+          expect(stderrWarnCalls[0]?.[0]).toContain("minor warning from cli");
+        } else {
+          expect(stderrWarnCalls).toHaveLength(0);
+        }
+      },
+    );
 
     it("warns when subprocess closes successfully with no content events", async () => {
       const model = mockModels[0] as any;

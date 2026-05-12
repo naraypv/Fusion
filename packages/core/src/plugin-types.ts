@@ -73,6 +73,8 @@ export interface PluginSettingSchema {
   enumValues?: string[];
   /** Only when type is "string" - renders as textarea when true */
   multiline?: boolean;
+  /** Optional UI grouping label used by settings forms */
+  group?: string;
   /** Only when type is "array" - type of items in the array */
   itemType?: "string" | "number";
 }
@@ -135,6 +137,8 @@ export interface PluginContext {
   emitEvent: (event: string, data: unknown) => void;
   /** Engine-injected AI session factory (undefined when engine is not loaded) */
   createAiSession?: CreateAiSessionFactory;
+  /** Optional host capability to resolve a project-scoped TaskStore by projectId. */
+  resolveProjectTaskStore?: (projectId: string) => Promise<TaskStore>;
 }
 
 /**
@@ -150,7 +154,7 @@ export interface PluginLogger {
 /** Lifecycle hook: called when plugin is loaded */
 export type PluginOnLoad = (ctx: PluginContext) => Promise<void> | void;
 /** Lifecycle hook: called when plugin is unloaded */
-export type PluginOnUnload = () => Promise<void> | void;
+export type PluginOnUnload = (ctx: PluginContext) => Promise<void> | void;
 /** Lifecycle hook: called during database schema initialization */
 export type PluginOnSchemaInit = (db: Database) => Promise<void> | void;
 /** Lifecycle hook: called when a task is created */
@@ -189,16 +193,27 @@ export interface PluginToolResult {
 
 // ── Plugin Routes ────────────────────────────────────────────────────
 
-export type PluginRouteMethod = "GET" | "POST" | "PUT" | "DELETE";
+export type PluginRouteMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 /**
  * Custom dashboard API route definition.
  */
+export interface PluginRouteResponse {
+  status: number;
+  body?: unknown;
+  /** Optional response headers to set on the outgoing HTTP response. */
+  headers?: Record<string, string>;
+  /** Optional explicit content type; when set, body is sent without JSON serialization. */
+  contentType?: string;
+}
+
+export type PluginRouteResult = unknown | PluginRouteResponse;
+
 export interface PluginRouteDefinition {
   method: PluginRouteMethod;
   /** Relative path under /api/plugins/:pluginId/ */
   path: string;
-  handler: (req: unknown, ctx: PluginContext) => Promise<unknown>;
+  handler: (req: unknown, ctx: PluginContext) => Promise<PluginRouteResult>;
   description?: string;
 }
 
@@ -252,6 +267,128 @@ export interface PluginUiSlotDefinition {
  * Top-level dashboard view definition for plugin-provided navigation destinations.
  * This is separate from embedded uiSlots and is rendered via host-managed registry.
  */
+export type PluginUiContributionSurface =
+  | "settings-provider-card"
+  | "settings-config-section"
+  | "onboarding-provider-card"
+  | "onboarding-setup-help"
+  | "onboarding-provider-recommendation"
+  | "post-onboarding-recommendation";
+
+export interface PluginUiContributionWhen {
+  providerIds?: string[];
+  runtimeIds?: string[];
+  authState?: "required" | "authenticated" | "unauthenticated";
+  onboardingState?: "required" | "in-progress" | "complete";
+}
+
+export interface PluginUiActionDescriptor {
+  kind:
+    | "open-settings-section"
+    | "open-onboarding"
+    | "refresh-auth-status"
+    | "save-api-key"
+    | "toggle-cli-provider"
+    | "open-external-url";
+  target?: string;
+  label?: string;
+}
+
+interface PluginUiContributionBase {
+  surface: PluginUiContributionSurface;
+  contributionId: string;
+  title: string;
+  description?: string;
+  order?: number;
+  when?: PluginUiContributionWhen;
+}
+
+interface PluginUiProviderCardBase extends PluginUiContributionBase {
+  providerId: string;
+  providerType: "cli" | "oauth" | "api_key" | "custom";
+  settingsSectionId?: string;
+  statusSource?: { kind: string; providerId: string; route?: string };
+  actions?: PluginUiActionDescriptor[];
+}
+
+export interface SettingsProviderCardContribution extends PluginUiProviderCardBase {
+  surface: "settings-provider-card";
+}
+
+export interface SettingsConfigSectionContribution extends PluginUiContributionBase {
+  surface: "settings-config-section";
+  sectionId: string;
+  pluginSettingKeys: string[];
+  layout?: "section" | "card" | "disclosure";
+}
+
+export interface OnboardingProviderCardContribution extends PluginUiProviderCardBase {
+  surface: "onboarding-provider-card";
+  quickStart?: string;
+  recommended?: boolean;
+}
+
+export interface OnboardingSetupHelpContribution extends PluginUiContributionBase {
+  surface: "onboarding-setup-help";
+  providerId?: string;
+  body: string;
+  bodyFormat: "text" | "markdown";
+  actions?: PluginUiActionDescriptor[];
+}
+
+export interface OnboardingProviderRecommendationContribution extends PluginUiContributionBase {
+  surface: "onboarding-provider-recommendation";
+  providerId: string;
+  reason: string;
+  actions?: PluginUiActionDescriptor[];
+  priority?: number;
+}
+
+export interface PostOnboardingRecommendationContribution extends PluginUiContributionBase {
+  surface: "post-onboarding-recommendation";
+  description: string;
+  actions?: PluginUiActionDescriptor[];
+  priority?: number;
+  dismissible?: boolean;
+}
+
+export type PluginUiContributionDefinition =
+  | SettingsProviderCardContribution
+  | SettingsConfigSectionContribution
+  | OnboardingProviderCardContribution
+  | OnboardingSetupHelpContribution
+  | OnboardingProviderRecommendationContribution
+  | PostOnboardingRecommendationContribution;
+
+type LegacyPluginUiContributionSurface =
+  | "settings-integration-card"
+  | "onboarding-recommendation-card";
+
+export type PluginUiContributionInputDefinition = Omit<PluginUiContributionDefinition, "surface"> & {
+  surface: PluginUiContributionSurface | LegacyPluginUiContributionSurface;
+};
+
+export function normalizePluginUiContributionSurface(
+  surface: PluginUiContributionSurface | LegacyPluginUiContributionSurface,
+): PluginUiContributionSurface {
+  if (surface === "settings-integration-card") {
+    return "settings-config-section";
+  }
+  if (surface === "onboarding-recommendation-card") {
+    return "onboarding-provider-recommendation";
+  }
+  return surface;
+}
+
+export function normalizePluginUiContributionDefinition(
+  contribution: PluginUiContributionInputDefinition,
+): PluginUiContributionDefinition {
+  return {
+    ...contribution,
+    surface: normalizePluginUiContributionSurface(contribution.surface),
+  } as PluginUiContributionDefinition;
+}
+
 export interface PluginDashboardViewDefinition {
   /** Unique view identifier within a plugin namespace. */
   viewId: string;
@@ -310,6 +447,60 @@ export interface PluginRuntimeRegistration {
   metadata: PluginRuntimeManifestMetadata;
   /** Factory function that creates the runtime instance */
   factory: PluginRuntimeFactory;
+}
+
+export type CliProviderType = "cli" | "oauth" | "api_key" | "custom";
+
+export interface CliProviderActionMetadata {
+  actionId: string;
+  label: string;
+  actionType: "enable" | "disable" | "test" | "open-url" | "custom";
+  route?: string;
+  method?: "GET" | "POST";
+}
+
+export interface CliProviderProbeResult {
+  available: boolean;
+  authenticated?: boolean;
+  binaryPath?: string;
+  binaryName?: string;
+  version?: string;
+  reason?: string;
+  hostReady?: boolean;
+  pluginReady?: boolean;
+}
+
+export interface CliProviderModelDiscoveryResult {
+  models: Array<{ id: string; label?: string; metadata?: Record<string, unknown> }>;
+  source: string;
+  fallbackUsed: boolean;
+  reason?: string;
+}
+
+export interface CliProviderRuntimeRegistration {
+  runtimeId?: string;
+  createAdapter?: PluginRuntimeFactory;
+}
+
+export interface CliProviderContribution {
+  providerId: string;
+  displayName: string;
+  binaryName: string;
+  providerType: CliProviderType;
+  statusRoute: string;
+  authRoute: string;
+  onboarding?: {
+    title?: string;
+    description?: string;
+  };
+  settings?: {
+    sectionId?: string;
+    pluginSettingKeys?: string[];
+  };
+  actions?: CliProviderActionMetadata[];
+  probe?: (ctx: PluginContext) => Promise<CliProviderProbeResult>;
+  discoverModels?: (ctx: PluginContext) => Promise<CliProviderModelDiscoveryResult>;
+  runtime?: CliProviderRuntimeRegistration;
 }
 
 // ── Plugin Contribution Types ───────────────────────────────────────
@@ -390,6 +581,24 @@ export interface PluginPromptContributions {
   enabledByDefault?: boolean;
 }
 
+export interface ExecutorRuntimeTaskContext {
+  taskId: string;
+  worktreePath: string;
+  rootDir: string;
+  branch?: string;
+}
+
+export interface ExecutorRuntimeEnvContribution {
+  pathPrepend?: string[];
+  env?: Record<string, string>;
+  description?: string;
+}
+
+export type PluginExecutorRuntimeEnvHook = (
+  taskCtx: ExecutorRuntimeTaskContext,
+  ctx: PluginContext,
+) => Promise<ExecutorRuntimeEnvContribution> | ExecutorRuntimeEnvContribution;
+
 export type PluginSetupStatus = "not-installed" | "installing" | "installed" | "error";
 
 export interface PluginSetupCheckResult {
@@ -432,6 +641,25 @@ export interface PluginSetupManifest {
 
 export type PluginState = "installed" | "started" | "stopped" | "error";
 
+export interface PluginSecurityFinding {
+  category: string;
+  severity: "low" | "medium" | "high" | "critical";
+  file: string;
+  excerpt: string;
+  reason: string;
+}
+
+export interface PluginSecurityScanResult {
+  verdict: "clean" | "warning" | "blocked" | "error" | "unavailable";
+  summary: string;
+  findings: PluginSecurityFinding[];
+  scannedAt: string;
+  scannedFiles: string[];
+  scanDurationMs?: number;
+  modelProvider?: string;
+  modelId?: string;
+}
+
 /**
  * Loaded plugin instance with all hooks, tools, routes, and runtimes.
  */
@@ -450,10 +678,13 @@ export interface FusionPlugin {
   tools?: PluginToolDefinition[];
   routes?: PluginRouteDefinition[];
   uiSlots?: PluginUiSlotDefinition[];
+  uiContributions?: PluginUiContributionInputDefinition[];
   /** Plugin-contributed top-level dashboard views. */
   dashboardViews?: PluginDashboardViewDefinition[];
   /** Agent runtime registration for providing custom runtime implementations */
   runtime?: PluginRuntimeRegistration;
+  /** CLI-backed provider metadata and integration hooks. */
+  cliProviders?: CliProviderContribution[];
   /** Plugin-contributed skills surfaced by the skill resolver. */
   skills?: PluginSkillContribution[];
   /** Plugin-contributed workflow step templates. */
@@ -465,6 +696,8 @@ export interface FusionPlugin {
     manifest: PluginSetupManifest;
     hooks: PluginSetupHooks;
   };
+  /** Plugin-contributed executor runtime env for task-scoped subprocesses. */
+  executorRuntimeEnv?: PluginExecutorRuntimeEnvHook;
 }
 
 // ── Plugin Installation ───────────────────────────────────────────────
@@ -489,6 +722,8 @@ export interface PluginInstallation {
   /** Last error message (if state is "error") */
   error?: string;
   dependencies?: string[];
+  aiScanOnLoad?: boolean;
+  lastSecurityScan?: PluginSecurityScanResult;
   createdAt: string;
   updatedAt: string;
 }
@@ -657,6 +892,47 @@ export function validatePluginManifest(manifest: unknown): { valid: boolean; err
       for (const [index, surface] of m.promptSurfaces.entries()) {
         if (typeof surface !== "string" || !PROMPT_CONTRIBUTION_SURFACES.includes(surface as PluginPromptSurface)) {
           errors.push(`promptSurfaces[${index}] must be one of: ${PROMPT_CONTRIBUTION_SURFACES.join(", ")}`);
+        }
+      }
+    }
+  }
+
+  // Optional: top-level dashboard view metadata
+  if (m.dashboardViews !== undefined) {
+    if (!Array.isArray(m.dashboardViews)) {
+      errors.push("dashboardViews must be an array");
+    } else {
+      for (const [index, view] of m.dashboardViews.entries()) {
+        if (!view || typeof view !== "object") {
+          errors.push(`dashboardViews[${index}] must be an object`);
+          continue;
+        }
+
+        const dashboardView = view as Record<string, unknown>;
+
+        if (!dashboardView.viewId || typeof dashboardView.viewId !== "string" || dashboardView.viewId.trim() === "") {
+          errors.push(`dashboardViews[${index}].viewId is required and must be a non-empty string`);
+        } else if (!SLUG_PATTERN.test(dashboardView.viewId)) {
+          errors.push(`dashboardViews[${index}].viewId must be a valid slug (lowercase, alphanumeric, hyphens only, cannot start or end with hyphen)`);
+        }
+
+        if (!dashboardView.label || typeof dashboardView.label !== "string" || dashboardView.label.trim() === "") {
+          errors.push(`dashboardViews[${index}].label is required and must be a non-empty string`);
+        }
+
+        if (
+          !dashboardView.componentPath
+          || typeof dashboardView.componentPath !== "string"
+          || dashboardView.componentPath.trim() === ""
+        ) {
+          errors.push(`dashboardViews[${index}].componentPath is required and must be a non-empty string`);
+        }
+
+        if (
+          dashboardView.placement !== undefined
+          && (typeof dashboardView.placement !== "string" || !["primary", "overflow", "more"].includes(dashboardView.placement))
+        ) {
+          errors.push(`dashboardViews[${index}].placement must be one of: primary, overflow, more`);
         }
       }
     }

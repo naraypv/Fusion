@@ -3,7 +3,7 @@
  * search/filter, and pagination.
  */
 
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, fireEvent, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChat } from "../useChat";
 import * as apiModule from "../../api";
@@ -17,6 +17,7 @@ vi.mock("../../api", () => ({
   updateChatSession: vi.fn(),
   deleteChatSession: vi.fn(),
   streamChatResponse: vi.fn(),
+  attachChatStream: vi.fn(),
   cancelChatResponse: vi.fn(),
   fetchAgents: vi.fn().mockResolvedValue([
     { id: "agent-001", name: "Alpha", role: "executor", state: "idle", icon: undefined, createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z", metadata: {} },
@@ -50,6 +51,7 @@ const mockFetchChatMessages = vi.mocked(apiModule.fetchChatMessages);
 const mockUpdateChatSession = vi.mocked(apiModule.updateChatSession);
 const mockDeleteChatSession = vi.mocked(apiModule.deleteChatSession);
 const mockStreamChatResponse = vi.mocked(apiModule.streamChatResponse);
+const mockAttachChatStream = vi.mocked(apiModule.attachChatStream);
 const mockCancelChatResponse = vi.mocked(apiModule.cancelChatResponse);
 const mockFetchAgents = vi.mocked(apiModule.fetchAgents);
 
@@ -79,6 +81,14 @@ function makeMessage(overrides: Partial<ChatMessage> & Pick<ChatMessage, "id" | 
   };
 }
 
+const setDocumentVisibilityState = (state: DocumentVisibilityState) => {
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    get: () => state,
+  });
+  fireEvent(document, new Event("visibilitychange"));
+};
+
 describe("useChat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -92,11 +102,13 @@ describe("useChat", () => {
     });
     mockDeleteChatSession.mockResolvedValue({ success: true });
     mockStreamChatResponse.mockReturnValue({ close: vi.fn(), isConnected: () => true });
+    mockAttachChatStream.mockReturnValue({ close: vi.fn(), isConnected: () => true });
     mockCancelChatResponse.mockResolvedValue({ success: true });
   });
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("loads sessions on mount", async () => {
@@ -456,6 +468,144 @@ describe("useChat", () => {
     });
   });
 
+  it("sets isStreaming true during first send and clears on delayed done", async () => {
+    const session = makeSession({
+      id: "session-001",
+      agentId: "agent-001",
+      title: "Test Session",
+    });
+
+    mockFetchChatSessions.mockResolvedValue({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useChat(undefined, "project-123"));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      setTimeout(() => {
+        handlers.onDone?.({ messageId: "msg-001" });
+      }, 200);
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    act(() => {
+      void result.current.sendMessage("Hello");
+    });
+
+    await waitFor(() => {
+      expect(result.current.isStreaming).toBe(true);
+    });
+
+    await waitFor(() => {
+      expect(result.current.isStreaming).toBe(false);
+    });
+  });
+
+  it("uses done payload assistant snapshot when no text chunks were streamed", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+
+    let doneHandler: ((data: { messageId: string; message?: ChatMessage }) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      doneHandler = handlers.onDone as typeof doneHandler;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    const { result } = renderHook(() => useChat());
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    await act(async () => {
+      result.current.sendMessage("Hello!");
+    });
+
+    act(() => {
+      doneHandler?.({
+        messageId: "msg-002",
+        message: {
+          id: "msg-002",
+          sessionId: "session-001",
+          role: "assistant",
+          content: "Snapshot reply",
+          thinkingOutput: null,
+          metadata: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        } as ChatMessage,
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.messages.at(-1)).toEqual(expect.objectContaining({
+        id: "msg-002",
+        role: "assistant",
+        content: "Snapshot reply",
+      }));
+      expect(result.current.isStreaming).toBe(false);
+    });
+  });
+
+  it("prefers done payload assistant snapshot over streamed text", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+
+    let textHandler: ((data: string) => void) | undefined;
+    let doneHandler: ((data: { messageId: string; message?: ChatMessage }) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      textHandler = handlers.onText;
+      doneHandler = handlers.onDone as typeof doneHandler;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    const { result } = renderHook(() => useChat());
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      textHandler?.("streamed text");
+      doneHandler?.({
+        messageId: "msg-003",
+        message: {
+          id: "msg-003",
+          sessionId: "session-001",
+          role: "assistant",
+          content: "snapshot wins",
+          thinkingOutput: null,
+          metadata: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        } as ChatMessage,
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.messages.at(-1)).toEqual(expect.objectContaining({
+        id: "msg-003",
+        content: "snapshot wins",
+      }));
+    });
+  });
+
   it("handles stream errors and surfaces them to the user", async () => {
     const session = makeSession({ id: "session-001", agentId: "agent-001" });
     mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
@@ -495,6 +645,214 @@ describe("useChat", () => {
       expect(result.current.isStreaming).toBe(false);
       expect(result.current.messages).toHaveLength(0);
       expect(addToast).toHaveBeenCalledWith("Stream connection failed", "error");
+    });
+  });
+
+  it("suppresses Load failed toast when tab is hidden and reconciles messages", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    const addToast = vi.fn();
+
+    let errorHandler: ((data: string) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      errorHandler = handlers.onError;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    setDocumentVisibilityState("hidden");
+    const { result } = renderHook(() => useChat(undefined, addToast));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    await waitFor(() => {
+      expect(result.current.activeSession?.id).toBe("session-001");
+    });
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      errorHandler?.("Load failed");
+    });
+
+    await waitFor(() => {
+      expect(result.current.isStreaming).toBe(false);
+      expect(addToast).not.toHaveBeenCalledWith("Load failed", "error");
+      expect(mockFetchChatMessages).toHaveBeenCalledWith("session-001", { limit: 50 }, undefined);
+    });
+  });
+
+  it("re-attaches suspended stream when session is still generating", async () => {
+    const session = {
+      ...makeSession({ id: "session-001", agentId: "agent-001" }),
+      isGenerating: true,
+      inFlightGeneration: {
+        status: "generating" as const,
+        streamingText: "partial",
+        streamingThinking: "thinking",
+        toolCalls: [],
+        replayFromEventId: 42,
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+    };
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    const addToast = vi.fn();
+
+    let errorHandler: ((data: string) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      errorHandler = handlers.onError;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    setDocumentVisibilityState("hidden");
+    const { result } = renderHook(() => useChat(undefined, addToast));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    await waitFor(() => {
+      expect(result.current.activeSession?.id).toBe("session-001");
+    });
+
+    const messageLoadCountBeforeError = mockFetchChatMessages.mock.calls.length;
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      errorHandler?.("Load failed");
+    });
+
+    await waitFor(() => {
+      expect(addToast).not.toHaveBeenCalledWith("Load failed", "error");
+      expect(mockAttachChatStream).toHaveBeenCalledWith(
+        "session-001",
+        expect.any(Object),
+        undefined,
+        { lastEventId: 42 },
+      );
+      expect(mockFetchChatMessages.mock.calls.length).toBe(messageLoadCountBeforeError);
+    });
+  });
+
+  it("shows Load failed toast when tab stays visible", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    const addToast = vi.fn();
+
+    let errorHandler: ((data: string) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      errorHandler = handlers.onError;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    setDocumentVisibilityState("visible");
+    const { result } = renderHook(() => useChat(undefined, addToast));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    await waitFor(() => {
+      expect(result.current.activeSession?.id).toBe("session-001");
+    });
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      errorHandler?.("Load failed");
+    });
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith("Load failed", "error");
+    });
+  });
+
+  it("suppresses Failed to fetch shortly after hidden to visible transition", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    const addToast = vi.fn();
+
+    let errorHandler: ((data: string) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      errorHandler = handlers.onError;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    setDocumentVisibilityState("hidden");
+    const { result } = renderHook(() => useChat(undefined, addToast));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      setDocumentVisibilityState("visible");
+      result.current.selectSession("session-001");
+    });
+
+    await waitFor(() => {
+      expect(result.current.activeSession?.id).toBe("session-001");
+    });
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      errorHandler?.("Failed to fetch");
+    });
+
+    await waitFor(() => {
+      expect(addToast).not.toHaveBeenCalledWith("Failed to fetch", "error");
+    });
+  });
+
+  it("still shows toast for non-suspension errors regardless of visibility", async () => {
+    const session = makeSession({ id: "session-001", agentId: "agent-001" });
+    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+    mockFetchChatMessages.mockResolvedValue({ messages: [] });
+    const addToast = vi.fn();
+
+    let errorHandler: ((data: string) => void) | undefined;
+    mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+      errorHandler = handlers.onError;
+      return { close: vi.fn(), isConnected: () => true };
+    });
+
+    setDocumentVisibilityState("hidden");
+    const { result } = renderHook(() => useChat(undefined, addToast));
+
+    await waitFor(() => {
+      expect(result.current.sessions).toHaveLength(1);
+    });
+
+    act(() => {
+      result.current.selectSession("session-001");
+    });
+
+    await waitFor(() => {
+      expect(result.current.activeSession?.id).toBe("session-001");
+    });
+
+    act(() => {
+      result.current.sendMessage("Hello!");
+      errorHandler?.("Request failed: 500");
+    });
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith("Request failed: 500", "error");
     });
   });
 
@@ -608,14 +966,15 @@ describe("useChat", () => {
     });
   });
 
-  it("sending during streaming queues pendingMessage", async () => {
+  it("sending during streaming queues pendingMessage without warning toast", async () => {
     const session = makeSession({ id: "session-001", agentId: "agent-001" });
     mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
     mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+    const addToast = vi.fn();
 
     mockStreamChatResponse.mockReturnValue({ close: vi.fn(), isConnected: () => true });
 
-    const { result } = renderHook(() => useChat("proj-123"));
+    const { result } = renderHook(() => useChat("proj-123", addToast));
 
     await waitFor(() => {
       expect(result.current.sessions).toHaveLength(1);
@@ -643,57 +1002,165 @@ describe("useChat", () => {
 
     expect(result.current.pendingMessage).toBe("Queued message");
     expect(mockStreamChatResponse).toHaveBeenCalledTimes(1);
+    expect(addToast).not.toHaveBeenCalledWith("Still waiting for previous response — message queued", "warning");
   });
 
-  it("queued message auto-sends after onDone", async () => {
-    const session = makeSession({ id: "session-001", agentId: "agent-001" });
-    mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
-    mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+  describe("queued message closure behavior", () => {
+    it("queued message auto-sends after onDone with the active session and completes second stream", async () => {
+      const session = makeSession({ id: "session-001", agentId: "agent-001" });
+      mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+      mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
 
-    const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
-    mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
-      handlers.push(nextHandlers);
-      return { close: vi.fn(), isConnected: () => true };
+      const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
+        handlers.push(nextHandlers);
+        return { close: vi.fn(), isConnected: () => true };
+      });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
+
+      act(() => {
+        result.current.sendMessage("First");
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+      });
+
+      act(() => {
+        result.current.sendMessage("Queued follow-up");
+      });
+
+      await waitFor(() => {
+        expect(result.current.pendingMessage).toBe("Queued follow-up");
+      });
+
+      act(() => {
+        handlers[0]?.onDone?.({ messageId: "msg-001" });
+      });
+
+      await waitFor(() => {
+        expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
+        expect(mockStreamChatResponse.mock.calls[1]?.[0]).toBe("session-001");
+        expect(mockStreamChatResponse.mock.calls[1]?.[1]).toBe("Queued follow-up");
+        expect(result.current.pendingMessage).toBe("");
+        expect(result.current.isStreaming).toBe(true);
+      });
+
+      act(() => {
+        handlers[1]?.onDone?.({ messageId: "msg-002" });
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(false);
+        expect(result.current.streamingText).toBe("");
+      });
     });
 
-    const { result } = renderHook(() => useChat("proj-123"));
+    it("keeps only the latest queued message while streaming", async () => {
+      const session = makeSession({ id: "session-001", agentId: "agent-001" });
+      mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+      mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
 
-    await waitFor(() => {
-      expect(result.current.sessions).toHaveLength(1);
+      const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
+        handlers.push(nextHandlers);
+        return { close: vi.fn(), isConnected: () => true };
+      });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
+
+      act(() => {
+        result.current.sendMessage("First");
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+      });
+
+      act(() => {
+        result.current.sendMessage("Queued B");
+        result.current.sendMessage("Queued C");
+      });
+
+      expect(result.current.pendingMessage).toBe("Queued C");
+
+      act(() => {
+        handlers[0]?.onDone?.({ messageId: "msg-001" });
+      });
+
+      await waitFor(() => {
+        expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
+        expect(mockStreamChatResponse.mock.calls[1]?.[1]).toBe("Queued C");
+      });
     });
 
-    act(() => {
-      result.current.selectSession("session-001");
-    });
+    it("flushes queued message after stream error when not cancelled", async () => {
+      const session = makeSession({ id: "session-001", agentId: "agent-001" });
+      mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+      mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
 
-    await waitFor(() => {
-      expect(result.current.activeSession?.id).toBe("session-001");
-    });
+      const handlers: Array<Parameters<typeof mockStreamChatResponse>[2]> = [];
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, nextHandlers) => {
+        handlers.push(nextHandlers);
+        return { close: vi.fn(), isConnected: () => true };
+      });
 
-    act(() => {
-      result.current.sendMessage("First");
-    });
+      const { result } = renderHook(() => useChat("proj-123"));
 
-    await waitFor(() => {
-      expect(result.current.isStreaming).toBe(true);
-    });
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
 
-    act(() => {
-      result.current.sendMessage("Queued follow-up");
-    });
+      act(() => {
+        result.current.selectSession("session-001");
+      });
 
-    await waitFor(() => {
-      expect(result.current.pendingMessage).toBe("Queued follow-up");
-    });
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
 
-    act(() => {
-      handlers[0]?.onDone?.({ messageId: "msg-001" });
-    });
+      act(() => {
+        result.current.sendMessage("First");
+      });
 
-    await waitFor(() => {
-      expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
-      expect(mockStreamChatResponse.mock.calls[1]?.[1]).toBe("Queued follow-up");
-      expect(result.current.pendingMessage).toBe("");
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+      });
+
+      act(() => {
+        result.current.sendMessage("Queued follow-up");
+        handlers[0]?.onError?.("network");
+      });
+
+      await waitFor(() => {
+        expect(mockStreamChatResponse).toHaveBeenCalledTimes(2);
+        expect(mockStreamChatResponse.mock.calls[1]?.[1]).toBe("Queued follow-up");
+      });
     });
   });
 
@@ -1256,11 +1723,8 @@ describe("useChat", () => {
       });
       mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
 
-      // Track stream handlers separately from SSE handlers
-      let streamDoneHandler: ((data: { messageId: string }) => void) | undefined;
       mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
-        // Capture the onDone handler for stream completion
-        streamDoneHandler = handlers.onDone;
+        void handlers.onDone;
         return { close: vi.fn(), isConnected: () => true };
       });
 
@@ -1278,7 +1742,6 @@ describe("useChat", () => {
         expect(result.current.messages).toHaveLength(0);
       });
 
-      // Start streaming
       await act(async () => {
         await result.current.sendMessage("Hello!");
       });
@@ -1287,8 +1750,6 @@ describe("useChat", () => {
         expect(result.current.isStreaming).toBe(true);
       });
 
-      // Simulate SSE event - should not add message during streaming
-      // because isStreaming is true
       const newMessage = makeMessage({ id: "msg-002", sessionId: "session-001", role: "assistant", content: "Hi" });
       act(() => {
         subscribeHandler["chat:message:added"]?.({
@@ -1296,10 +1757,69 @@ describe("useChat", () => {
         } as MessageEvent);
       });
 
-      // Message should not be added during streaming
-      // (the SSE handler checks isStreaming and skips adding)
       await waitFor(() => {
-        expect(result.current.messages).toHaveLength(1); // Only the optimistic user message
+        expect(result.current.messages).toHaveLength(1);
+      });
+    });
+
+    it("dedupes optimistic user message when persisted user echo arrives after done", async () => {
+      mockFetchChatSessions.mockResolvedValueOnce({
+        sessions: [makeSession({ id: "session-001", agentId: "agent-001" })],
+      });
+      mockFetchChatMessages.mockResolvedValueOnce({ messages: [] });
+
+      let doneHandler: ((data: { messageId: string }) => void) | undefined;
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+        doneHandler = handlers.onDone;
+        return { close: vi.fn(), isConnected: () => true };
+      });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
+
+      act(() => {
+        result.current.sendMessage("Hello!");
+      });
+
+      await waitFor(() => {
+        expect(result.current.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      });
+
+      act(() => {
+        doneHandler?.({ messageId: "msg-assistant-001" });
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(false);
+        expect(result.current.messages).toHaveLength(2);
+      });
+
+      const persistedEcho = makeMessage({
+        id: "msg-user-001",
+        sessionId: "session-001",
+        role: "user",
+        content: "Hello!",
+      });
+      act(() => {
+        subscribeHandler["chat:message:added"]?.({
+          data: JSON.stringify(persistedEcho),
+        } as MessageEvent);
+      });
+
+      await waitFor(() => {
+        const userMessages = result.current.messages.filter((message) => message.role === "user");
+        expect(userMessages).toHaveLength(1);
       });
     });
 
@@ -1485,6 +2005,129 @@ describe("useChat", () => {
   });
 
   describe("FN-3336: streaming state recovery on reload", () => {
+    it("does not re-select and reset active session on subsequent session refreshes", async () => {
+      const session = { ...makeSession({ id: "session-001", agentId: "agent-001" }), isGenerating: true };
+      mockGetScopedItem.mockReturnValue("session-001");
+      mockFetchChatSessions
+        .mockResolvedValueOnce({ sessions: [session] })
+        .mockResolvedValueOnce({ sessions: [{ ...session, updatedAt: "2026-04-08T00:05:00.000Z" }] });
+      mockFetchChatMessages.mockResolvedValue({ messages: [] });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.activeSession?.id).toBe("session-001");
+      });
+
+      expect(mockFetchChatMessages).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await result.current.refreshSessions();
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+      });
+
+      // A sessions refresh should not auto-reselect/reset the active thread.
+      expect(mockFetchChatMessages).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves streaming text/thinking/tool state across sessions refresh", async () => {
+      const session = makeSession({ id: "session-001", agentId: "agent-001" });
+      mockFetchChatSessions
+        .mockResolvedValueOnce({ sessions: [session] })
+        .mockResolvedValueOnce({ sessions: [{ ...session, updatedAt: "2026-04-08T00:06:00.000Z" }] });
+      mockFetchChatMessages.mockResolvedValue({ messages: [] });
+
+      let textHandler: ((data: string) => void) | undefined;
+      let thinkingHandler: ((data: string) => void) | undefined;
+      let toolStartHandler: ((data: { toolName: string; args?: Record<string, unknown> }) => void) | undefined;
+      mockStreamChatResponse.mockImplementation((_sessionId, _content, handlers) => {
+        textHandler = handlers.onText;
+        thinkingHandler = handlers.onThinking;
+        toolStartHandler = handlers.onToolStart;
+        return { close: vi.fn(), isConnected: () => true };
+      });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await act(async () => {
+        result.current.sendMessage("Hello");
+      });
+
+      await act(async () => {
+        textHandler?.("Hi");
+        thinkingHandler?.("plan");
+        toolStartHandler?.({ toolName: "read", args: { path: "a.ts" } });
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+        expect(result.current.streamingText).toBe("Hi");
+        expect(result.current.streamingThinking).toBe("plan");
+        expect(result.current.streamingToolCalls).toHaveLength(1);
+      });
+
+      await act(async () => {
+        await result.current.refreshSessions();
+      });
+
+      expect(result.current.isStreaming).toBe(true);
+      expect(result.current.streamingText).toBe("Hi");
+      expect(result.current.streamingThinking).toBe("plan");
+      expect(result.current.streamingToolCalls).toHaveLength(1);
+    });
+
+    it("hydrates durable in-flight snapshot and resumes from replay point", async () => {
+      const session = {
+        ...makeSession({ id: "session-001", agentId: "agent-001" }),
+        isGenerating: true,
+        inFlightGeneration: {
+          status: "generating" as const,
+          streamingText: "partial text",
+          streamingThinking: "partial thinking",
+          toolCalls: [{ toolName: "read", status: "running" as const, isError: false }],
+          replayFromEventId: 41,
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+      };
+      mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
+      mockFetchChatMessages.mockResolvedValue({ messages: [] });
+
+      const { result } = renderHook(() => useChat("proj-123"));
+
+      await waitFor(() => {
+        expect(result.current.sessions).toHaveLength(1);
+      });
+
+      act(() => {
+        result.current.selectSession("session-001");
+      });
+
+      await waitFor(() => {
+        expect(result.current.isStreaming).toBe(true);
+        expect(result.current.streamingText).toBe("partial text");
+        expect(result.current.streamingThinking).toBe("partial thinking");
+        expect(result.current.streamingToolCalls).toHaveLength(1);
+      });
+
+      expect(mockAttachChatStream).toHaveBeenCalledWith(
+        "session-001",
+        expect.any(Object),
+        "proj-123",
+        { lastEventId: 41 },
+      );
+    });
+
     it("sets isStreaming=true when selecting a session with isGenerating=true", async () => {
       const session = { ...makeSession({ id: "session-001", agentId: "agent-001" }), isGenerating: true };
       mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
@@ -1526,18 +2169,23 @@ describe("useChat", () => {
       });
     });
 
-    it("clears recovery streaming state when SSE delivers assistant message", async () => {
-      let subscribeHandler: Record<string, (event: MessageEvent) => void> = {};
-      mockSubscribeSse.mockImplementation((_url, options) => {
-        if (options?.events) {
-          subscribeHandler = options.events as typeof subscribeHandler;
-        }
-        return () => {};
-      });
-
+    it("clears recovery streaming state when attach stream completes", async () => {
       const session = { ...makeSession({ id: "session-001", agentId: "agent-001" }), isGenerating: true };
       mockFetchChatSessions.mockResolvedValueOnce({ sessions: [session] });
-      mockFetchChatMessages.mockResolvedValue({ messages: [] });
+      mockFetchChatMessages.mockResolvedValue({
+        messages: [
+          makeMessage({
+            id: "msg-assistant-001",
+            sessionId: "session-001",
+            role: "assistant",
+            content: "Generated response",
+          }),
+        ],
+      });
+      mockAttachChatStream.mockImplementation((_sessionId, handlers) => {
+        setTimeout(() => handlers.onDone?.({ messageId: "msg-assistant-001" }), 0);
+        return { close: vi.fn(), isConnected: () => true };
+      });
 
       const { result } = renderHook(() => useChat("proj-123"));
 
@@ -1547,24 +2195,6 @@ describe("useChat", () => {
 
       act(() => {
         result.current.selectSession("session-001");
-      });
-
-      await waitFor(() => {
-        expect(result.current.isStreaming).toBe(true);
-      });
-
-      // Simulate SSE delivering the completed assistant message
-      const assistantMessage = makeMessage({
-        id: "msg-assistant-001",
-        sessionId: "session-001",
-        role: "assistant",
-        content: "Generated response",
-      });
-
-      act(() => {
-        subscribeHandler["chat:message:added"](
-          new MessageEvent("chat:message:added", { data: JSON.stringify(assistantMessage) }),
-        );
       });
 
       await waitFor(() => {

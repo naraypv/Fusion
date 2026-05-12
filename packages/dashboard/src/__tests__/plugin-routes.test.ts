@@ -13,10 +13,16 @@
 
 // @vitest-environment node
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import express from "express";
-import type { TaskStore, PluginStore, PluginLoader, PluginInstallation } from "@fusion/core";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Database, CentralDatabase, type TaskStore, type PluginStore, type PluginLoader, type PluginInstallation } from "@fusion/core";
+import * as fusionCore from "@fusion/core";
 import { createApiRoutes } from "../routes.js";
+import { createPluginRouter } from "../plugin-routes.js";
 import { get as performGet, request as performRequest } from "../test-request.js";
 import * as projectStoreResolver from "../project-store-resolver.js";
 
@@ -92,8 +98,23 @@ function createMockPluginLoader(overrides: Partial<PluginLoader> = {}): PluginLo
     getPluginTools: vi.fn().mockReturnValue([]),
     getPluginRoutes: vi.fn().mockReturnValue([]),
     getPluginUiSlots: vi.fn().mockReturnValue([]),
+    getPluginUiContributions: vi.fn().mockReturnValue([]),
     getPluginRuntimes: vi.fn().mockReturnValue([]),
     getPluginDashboardViews: vi.fn().mockReturnValue([]),
+    createRouteContext: vi.fn(async (pluginId: string, overrides?: { taskStore?: TaskStore; settings?: Record<string, unknown>; resolveProjectTaskStore?: (projectId: string) => Promise<TaskStore> }) => ({
+      pluginId,
+      taskStore: overrides?.taskStore ?? createMockTaskStore(),
+      settings: overrides?.settings ?? {},
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      emitEvent: vi.fn(),
+      createAiSession: await fusionCore.getCreateAiSessionFactory(),
+      resolveProjectTaskStore: overrides?.resolveProjectTaskStore,
+    })),
     loadAllPlugins: vi.fn().mockResolvedValue({ loaded: 0, errors: 0 }),
     stopAllPlugins: vi.fn().mockResolvedValue(undefined),
     invokeHook: vi.fn().mockResolvedValue(undefined),
@@ -200,6 +221,58 @@ async function REQUEST(
 }
 
 // ══════════════════════════════════════════════════════════════════
+describe("PATCH/POST plugin scan config routes", () => {
+  let pluginStore: PluginStore;
+  let pluginLoader: PluginLoader;
+  let store: TaskStore;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    pluginStore = createMockPluginStore({
+      getPlugin: vi.fn().mockResolvedValue({ ...INSTALLED_PLUGIN, id: "my-plugin", enabled: true, state: "started" }),
+      updatePlugin: vi.fn().mockResolvedValue({ ...INSTALLED_PLUGIN, id: "my-plugin", aiScanOnLoad: true }),
+    });
+    pluginLoader = createMockPluginLoader({ loadPlugin: vi.fn().mockResolvedValue(undefined) });
+    store = createMockTaskStore({ getPluginStore: vi.fn().mockReturnValue(pluginStore) });
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    return app;
+  }
+
+  it("PATCH /api/plugins/:id updates aiScanOnLoad", async () => {
+    const res = await REQUEST(buildApp(), "PATCH", "/api/plugins/my-plugin", { aiScanOnLoad: true });
+    expect(res.status).toBe(200);
+    expect(pluginStore.updatePlugin).toHaveBeenCalledWith("my-plugin", { aiScanOnLoad: true });
+  });
+
+  it("PATCH /api/plugins/:id returns 400 for invalid body", async () => {
+    const res = await REQUEST(buildApp(), "PATCH", "/api/plugins/my-plugin", { aiScanOnLoad: "yes" });
+    expect(res.status).toBe(400);
+  });
+
+  it("PATCH /api/plugins/:id returns 404 for unknown plugin", async () => {
+    (pluginStore.updatePlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("not found"));
+    const res = await REQUEST(buildApp(), "PATCH", "/api/plugins/unknown", { aiScanOnLoad: true });
+    expect(res.status).toBe(404);
+  });
+
+  it("POST /api/plugins/:id/rescan returns plugin payload", async () => {
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/my-plugin/rescan", {});
+    expect(res.status).toBe(200);
+    expect(pluginLoader.loadPlugin).toHaveBeenCalledWith("my-plugin");
+  });
+
+  it("POST /api/plugins/:id/rescan returns 404 for unknown plugin", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("not found"));
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins/unknown/rescan", {});
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("POST /api/plugins mode:install — package root path", () => {
   let pluginStore: PluginStore;
   let pluginLoader: PluginLoader;
@@ -288,6 +361,225 @@ describe("POST /api/plugins mode:install — package root path", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════
+describe("POST /api/plugins central persistence integration", () => {
+  let projectDir: string;
+  let centralDir: string;
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), "plugin-route-project-"));
+    centralDir = mkdtempSync(join(tmpdir(), "plugin-route-central-"));
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+    await rm(centralDir, { recursive: true, force: true });
+  });
+
+  function buildRealApp(pluginStore: PluginStore) {
+    const pluginLoader = createMockPluginLoader();
+    const store = createMockTaskStore({
+      getRootDir: vi.fn().mockReturnValue(projectDir),
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+    });
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    return app;
+  }
+
+  it("writes register mode installs to central tables and not project-local plugins", async () => {
+    const pluginStore = new fusionCore.PluginStore(projectDir, { centralGlobalDir: centralDir });
+    await pluginStore.init();
+
+    const app = buildRealApp(pluginStore);
+    const res = await REQUEST(app, "POST", "/api/plugins", {
+      mode: "register",
+      id: "central-register",
+      name: "Central Register",
+      version: "1.0.0",
+      path: "/tmp/central-register.js",
+    });
+
+    expect(res.status).toBe(201);
+
+    const centralDb = new CentralDatabase(centralDir);
+    centralDb.init();
+    const installCount = centralDb
+      .prepare("SELECT COUNT(*) as count FROM plugin_installs WHERE id = ?")
+      .get("central-register") as { count: number };
+    const stateCount = centralDb
+      .prepare("SELECT COUNT(*) as count FROM project_plugin_states WHERE pluginId = ?")
+      .get("central-register") as { count: number };
+
+    const localDb = new Database(join(projectDir, ".fusion"));
+    localDb.init();
+    const legacyCount = localDb
+      .prepare("SELECT COUNT(*) as count FROM plugins WHERE id = ?")
+      .get("central-register") as { count: number };
+
+    expect(installCount.count).toBe(1);
+    expect(stateCount.count).toBe(1);
+    expect(legacyCount.count).toBe(0);
+
+    centralDb.close();
+    localDb.close();
+  });
+
+  it("writes install mode installs to central tables and not project-local plugins", async () => {
+    const pluginStore = new fusionCore.PluginStore(projectDir, { centralGlobalDir: centralDir });
+    await pluginStore.init();
+
+    const pluginPath = "/tmp/my-plugin";
+    mockAccess.mockImplementation((p: string) => {
+      if (p === pluginPath || p === `${pluginPath}/manifest.json`) return Promise.resolve();
+      return Promise.reject(new Error("not found"));
+    });
+    mockReadFile.mockResolvedValueOnce(JSON.stringify(VALID_MANIFEST));
+
+    const app = buildRealApp(pluginStore);
+    const res = await REQUEST(app, "POST", "/api/plugins", {
+      mode: "install",
+      path: pluginPath,
+    });
+
+    expect(res.status).toBe(201);
+
+    const centralDb = new CentralDatabase(centralDir);
+    centralDb.init();
+    const installCount = centralDb
+      .prepare("SELECT COUNT(*) as count FROM plugin_installs WHERE id = ?")
+      .get("my-plugin") as { count: number };
+
+    const localDb = new Database(join(projectDir, ".fusion"));
+    localDb.init();
+    const legacyCount = localDb
+      .prepare("SELECT COUNT(*) as count FROM plugins WHERE id = ?")
+      .get("my-plugin") as { count: number };
+
+    expect(installCount.count).toBe(1);
+    expect(legacyCount.count).toBe(0);
+
+    centralDb.close();
+    localDb.close();
+  });
+});
+
+describe("POST /api/plugins mode:install — bundled plugin path fallback", () => {
+  let pluginStore: PluginStore;
+  let pluginLoader: PluginLoader;
+  let store: TaskStore;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    pluginStore = createMockPluginStore();
+    pluginLoader = createMockPluginLoader();
+    store = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+    });
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    return app;
+  }
+
+  it("installs bundled dependency graph plugin when relative path misses cwd", async () => {
+    const bundledManifest = {
+      ...VALID_MANIFEST,
+      id: "fusion-plugin-dependency-graph",
+      name: "Dependency Graph",
+    };
+    mockExistsSync.mockImplementation((p: string) => p.includes("fusion-plugin-dependency-graph/manifest.json"));
+    mockAccess.mockImplementation((p: string) => {
+      if (p.includes("fusion-plugin-dependency-graph")) return Promise.resolve();
+      return Promise.reject(new Error("not found"));
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(bundledManifest));
+    (pluginStore.registerPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...INSTALLED_PLUGIN,
+      id: "fusion-plugin-dependency-graph",
+      name: "Dependency Graph",
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins", {
+      mode: "install",
+      path: "./plugins/fusion-plugin-dependency-graph",
+    });
+
+    expect(res.status).toBe(201);
+    expect(pluginStore.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifest: expect.objectContaining({ id: "fusion-plugin-dependency-graph" }),
+        path: expect.stringContaining("fusion-plugin-dependency-graph"),
+      }),
+    );
+  });
+
+  it("installs bundled reports plugin when relative path misses cwd", async () => {
+    const bundledManifest = {
+      ...VALID_MANIFEST,
+      id: "fusion-plugin-reports",
+      name: "Reports",
+    };
+    mockExistsSync.mockImplementation((p: string) => p.includes("fusion-plugin-reports/manifest.json"));
+    mockAccess.mockImplementation((p: string) => {
+      if (p.includes("fusion-plugin-reports")) return Promise.resolve();
+      return Promise.reject(new Error("not found"));
+    });
+    mockReadFile.mockResolvedValue(JSON.stringify(bundledManifest));
+    (pluginStore.registerPlugin as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...INSTALLED_PLUGIN,
+      id: "fusion-plugin-reports",
+      name: "Reports",
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins", {
+      mode: "install",
+      path: "./plugins/fusion-plugin-reports",
+    });
+
+    expect(res.status).toBe(201);
+    expect(pluginStore.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manifest: expect.objectContaining({ id: "fusion-plugin-reports" }),
+        path: expect.stringContaining("fusion-plugin-reports"),
+      }),
+    );
+  });
+
+  it("returns 404 with helpful message when local and bundled paths are unresolved", async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockAccess.mockRejectedValue(new Error("not found"));
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins", {
+      mode: "install",
+      path: "./plugins/fusion-plugin-dependency-graph",
+    });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toContain("Checked resolved local path and bundled plugin locations");
+  });
+
+  it("keeps register mode behavior unchanged", async () => {
+    (pluginStore.registerPlugin as ReturnType<typeof vi.fn>).mockResolvedValue(INSTALLED_PLUGIN);
+
+    const res = await REQUEST(buildApp(), "POST", "/api/plugins", {
+      mode: "register",
+      id: "my-plugin",
+      name: "My Plugin",
+      version: "1.0.0",
+      path: "./plugins/fusion-plugin-dependency-graph",
+    });
+
+    expect(res.status).toBe(201);
+    expect(pluginStore.registerPlugin).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "./plugins/fusion-plugin-dependency-graph" }),
+    );
+  });
+});
+
 describe("POST /api/plugins mode:install — negative paths", () => {
   let pluginStore: PluginStore;
   let pluginLoader: PluginLoader;
@@ -703,6 +995,16 @@ describe("GET /api/plugins/dashboard-views", () => {
     return app;
   }
 
+  it("returns empty array when pluginLoader is not available", async () => {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore }));
+
+    const res = await performGet(app, "/api/plugins/dashboard-views");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+
   it("returns 200 with empty array when no plugins have dashboard views", async () => {
     (pluginLoader.getPluginDashboardViews as ReturnType<typeof vi.fn>).mockReturnValue([]);
     const res = await performGet(buildApp(), "/api/plugins/dashboard-views");
@@ -720,6 +1022,8 @@ describe("GET /api/plugins/dashboard-views", () => {
           componentPath: "./views/Graph.js",
           icon: "Network",
           placement: "more",
+          order: 40,
+          description: "Dependency graph",
         },
       },
     ];
@@ -729,6 +1033,61 @@ describe("GET /api/plugins/dashboard-views", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(mockViews);
+  });
+
+  it("returns exactly pluginLoader dashboard-view entries (no synthesized plugin rows)", async () => {
+    (pluginLoader.getPluginDashboardViews as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        pluginId: "with-view",
+        view: {
+          viewId: "graph",
+          label: "Graph",
+          componentPath: "./Graph.js",
+        },
+      },
+    ]);
+
+    const res = await performGet(buildApp(), "/api/plugins/dashboard-views");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0]).toMatchObject({
+      pluginId: "with-view",
+      view: { viewId: "graph", label: "Graph", componentPath: "./Graph.js" },
+    });
+  });
+
+  it("keeps dashboard-views payload separate from ui-slots payload", async () => {
+    (pluginLoader.getPluginDashboardViews as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        pluginId: "fusion-plugin-roadmap",
+        view: {
+          viewId: "roadmaps",
+          label: "Roadmaps",
+          componentPath: "./dashboard-view",
+        },
+      },
+    ]);
+    (pluginLoader.getPluginUiSlots as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        pluginId: "fusion-plugin-roadmap",
+        slot: {
+          slotId: "task-detail-tab",
+          label: "Roadmap Details",
+          componentPath: "./task-detail.js",
+        },
+      },
+    ]);
+
+    const viewsRes = await performGet(buildApp(), "/api/plugins/dashboard-views");
+    const slotsRes = await performGet(buildApp(), "/api/plugins/ui-slots");
+
+    expect(viewsRes.status).toBe(200);
+    expect(slotsRes.status).toBe(200);
+    expect(viewsRes.body[0]).toHaveProperty("view");
+    expect(viewsRes.body[0]).not.toHaveProperty("slot");
+    expect(slotsRes.body[0]).toHaveProperty("slot");
+    expect(slotsRes.body[0]).not.toHaveProperty("view");
   });
 });
 
@@ -898,6 +1257,513 @@ describe("GET /api/plugins/ui-slots", () => {
         },
       },
     ]);
+  });
+});
+
+describe("GET /api/plugins/ui-contributions", () => {
+  let pluginStore: PluginStore;
+  let pluginLoader: PluginLoader;
+  let store: TaskStore;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    pluginStore = createMockPluginStore();
+    pluginLoader = createMockPluginLoader();
+    store = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+    });
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    return app;
+  }
+
+  it("returns normalized and sorted structured contributions", async () => {
+    (pluginLoader.getPluginUiContributions as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        pluginId: "b-plugin",
+        contribution: {
+          surface: "onboarding-provider-recommendation",
+          contributionId: "rec-b",
+          providerId: "openai",
+          title: "OpenAI",
+          reason: "default",
+          order: 10,
+        },
+      },
+      {
+        pluginId: "a-plugin",
+        contribution: {
+          surface: "settings-config-section",
+          contributionId: "cfg-a",
+          sectionId: "openai",
+          title: "OpenAI settings",
+          pluginSettingKeys: ["openai.apiKey"],
+          order: 1,
+        },
+      },
+    ]);
+
+    const res = await performGet(buildApp(), "/api/plugins/ui-contributions");
+
+    expect(res.status).toBe(200);
+    expect(res.body.map((entry: { pluginId: string }) => entry.pluginId)).toEqual(["a-plugin", "b-plugin"]);
+    expect(res.body[0].contribution.surface).toBe("settings-config-section");
+  });
+
+  it("returns empty array when pluginLoader is missing", async () => {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { pluginStore }));
+
+    const res = await performGet(app, "/api/plugins/ui-contributions");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+});
+
+describe("createPluginRouter plugin setup routes", () => {
+  let pluginStore: PluginStore;
+  let pluginLoader: PluginLoader;
+  let pluginRunner: {
+    getPluginRoutes: ReturnType<typeof vi.fn>;
+    checkPluginSetup: ReturnType<typeof vi.fn>;
+    installPluginSetup: ReturnType<typeof vi.fn>;
+    getPluginSetupInfo: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    pluginStore = createMockPluginStore();
+    pluginLoader = createMockPluginLoader();
+    pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([]),
+      checkPluginSetup: vi.fn().mockResolvedValue({ status: "installed", version: "1.0.0" }),
+      installPluginSetup: vi.fn().mockResolvedValue({ success: true }),
+      getPluginSetupInfo: vi.fn().mockReturnValue([]),
+    };
+  });
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+    return app;
+  }
+
+  it("returns 404 for missing plugin setup status", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("Plugin \"missing\" not found"));
+
+    const res = await REQUEST(buildApp(), "GET", "/plugins/missing/setup-status");
+
+    expect(res.status).toBe(404);
+  });
+
+  it("returns hasSetup false when plugin has no setup metadata", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...INSTALLED_PLUGIN, state: "started" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([]);
+
+    const res = await REQUEST(buildApp(), "GET", "/plugins/my-plugin/setup-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasSetup: false });
+  });
+
+  it("returns deferred setup status when setup metadata exists but plugin is not started", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...INSTALLED_PLUGIN, state: "installed" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "my-plugin",
+        manifest: { binaryName: "tool", description: "desc" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/plugins/my-plugin/setup-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      hasSetup: true,
+      setupCheckDeferred: true,
+      deferredReason: "plugin-not-started",
+      pluginState: "installed",
+    });
+    expect(pluginRunner.checkPluginSetup).not.toHaveBeenCalled();
+  });
+
+  it("returns setup status when setup metadata exists and plugin is started", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...INSTALLED_PLUGIN, state: "started" });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "my-plugin",
+        manifest: { binaryName: "tool", description: "desc" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "GET", "/plugins/my-plugin/setup-status");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasSetup: true, status: "installed", version: "1.0.0" });
+  });
+
+  it("rejects setup install when plugin has no install hook", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...INSTALLED_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "my-plugin",
+        manifest: { binaryName: "tool", description: "desc" },
+        hooks: { checkSetup: vi.fn() },
+      },
+    ]);
+
+    const res = await REQUEST(buildApp(), "POST", "/plugins/my-plugin/setup/install", {});
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("no install hook");
+  });
+
+  it("returns setup install result payload", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...INSTALLED_PLUGIN, enabled: true });
+    pluginRunner.getPluginSetupInfo.mockReturnValueOnce([
+      {
+        pluginId: "my-plugin",
+        manifest: { binaryName: "tool", description: "desc" },
+        hooks: { checkSetup: vi.fn(), install: vi.fn() },
+      },
+    ]);
+    pluginRunner.installPluginSetup.mockResolvedValueOnce({ success: false, error: "install failed" });
+
+    const res = await REQUEST(buildApp(), "POST", "/plugins/my-plugin/setup/install", {});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: false, error: "install failed" });
+  });
+});
+
+describe("createPluginRouter plugin-defined route responses", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(fusionCore, "getCreateAiSessionFactory").mockResolvedValue(undefined);
+  });
+
+  it("injects request-scoped taskStore and scoped plugin settings", async () => {
+    const defaultTaskStore = createMockTaskStore();
+    const scopedPluginStore = createMockPluginStore({
+      getPlugin: vi.fn().mockResolvedValue({ ...INSTALLED_PLUGIN, id: "demo", settings: { mode: "scoped" } }),
+    });
+    const scopedTaskStore = createMockTaskStore({
+      getRootDir: vi.fn().mockReturnValue("/scoped"),
+      getPluginStore: vi.fn().mockReturnValue(scopedPluginStore),
+    });
+    mockGetOrCreateProjectStore.mockResolvedValue(scopedTaskStore);
+
+    const pluginStore = createMockPluginStore({
+      getPlugin: vi.fn().mockResolvedValue({ ...INSTALLED_PLUGIN, id: "demo", settings: { mode: "global" } }),
+    });
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "POST",
+            path: "/status",
+            handler: vi.fn(async (_req: unknown, ctx: import("@fusion/core").PluginContext) => ({
+              status: 201,
+              body: { scoped: ctx.taskStore.getRootDir(), mode: ctx.settings.mode },
+            })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner, defaultTaskStore));
+
+    const res = await REQUEST(app, "POST", "/plugins/demo/status?projectId=p1", { projectId: "p1" });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ scoped: "/scoped", mode: "scoped" });
+  });
+
+  it("falls back to global plugin settings when scoped plugin record is unavailable", async () => {
+    const scopedPluginStore = createMockPluginStore({
+      getPlugin: vi.fn().mockRejectedValue(new Error("missing")),
+    });
+    const scopedTaskStore = createMockTaskStore({
+      getPluginStore: vi.fn().mockReturnValue(scopedPluginStore),
+    });
+    mockGetOrCreateProjectStore.mockResolvedValue(scopedTaskStore);
+
+    const pluginStore = createMockPluginStore({
+      getPlugin: vi.fn().mockResolvedValue({ ...INSTALLED_PLUGIN, id: "demo", settings: { mode: "global" } }),
+    });
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/settings",
+            handler: vi.fn(async (_req: unknown, ctx: import("@fusion/core").PluginContext) => ({ mode: ctx.settings.mode })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "GET", "/plugins/demo/settings?projectId=p1");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ mode: "global" });
+  });
+
+  it("includes createAiSession in plugin route context when engine has registered a factory", async () => {
+    const createAiSession = vi.fn();
+    vi.spyOn(fusionCore, "getCreateAiSessionFactory").mockResolvedValue(createAiSession as unknown as import("@fusion/core").CreateAiSessionFactory);
+
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/ai",
+            handler: vi.fn(async (_req: unknown, ctx: import("@fusion/core").PluginContext) => ({ hasFactory: Boolean(ctx.createAiSession) })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "GET", "/plugins/demo/ai");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasFactory: true });
+  });
+
+  it("leaves createAiSession undefined when engine factory is unavailable", async () => {
+    vi.spyOn(fusionCore, "getCreateAiSessionFactory").mockResolvedValue(undefined);
+
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/ai-none",
+            handler: vi.fn(async (_req: unknown, ctx: import("@fusion/core").PluginContext) => ({ hasFactory: Boolean(ctx.createAiSession) })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "GET", "/plugins/demo/ai-none");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ hasFactory: false });
+  });
+
+  it("maps plugin-defined non-2xx status responses", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/error",
+            handler: vi.fn(async () => ({ status: 422, body: { error: "invalid" } })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "GET", "/plugins/demo/error");
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "invalid" });
+  });
+
+  it("propagates thrown handler errors via catchHandler", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/throws",
+            handler: vi.fn(async () => {
+              throw new Error("boom");
+            }),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "GET", "/plugins/demo/throws");
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("boom");
+  });
+
+  it("supports 204 empty responses for plugin routes", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "DELETE",
+            path: "/resource",
+            handler: vi.fn(async () => ({ status: 204 })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await REQUEST(app, "DELETE", "/plugins/demo/resource");
+    expect(res.status).toBe(204);
+  });
+
+  it("returns JSON by default for object bodies", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/json",
+            handler: vi.fn(async () => ({ status: 200, body: { ok: true } })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await performGet(app, "/plugins/demo/json");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it("sends raw html body when contentType is provided", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/html",
+            handler: vi.fn(async () => ({
+              status: 200,
+              body: "<html><body>Hello</body></html>",
+              contentType: "text/html; charset=utf-8",
+            })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await performGet(app, "/plugins/demo/html");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    const html = typeof res.text === "string" ? res.text : String(res.body ?? "");
+    expect(html).toContain("<html><body>Hello</body></html>");
+  });
+
+  it("propagates custom response headers", async () => {
+    const pluginStore = createMockPluginStore();
+    const pluginLoader = createMockPluginLoader({
+      getPlugin: vi.fn().mockReturnValue({ manifest: { id: "demo" } }),
+    });
+    const pluginRunner = {
+      getPluginRoutes: vi.fn().mockReturnValue([
+        {
+          pluginId: "demo",
+          route: {
+            method: "GET",
+            path: "/download",
+            handler: vi.fn(async () => ({
+              status: 200,
+              body: "<html></html>",
+              contentType: "text/html",
+              headers: {
+                "Content-Disposition": "attachment; filename=\"x.html\"",
+              },
+            })),
+          },
+        },
+      ]),
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use("/plugins", createPluginRouter(pluginStore, pluginLoader, pluginRunner));
+
+    const res = await performGet(app, "/plugins/demo/download");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe("attachment; filename=\"x.html\"");
   });
 });
 

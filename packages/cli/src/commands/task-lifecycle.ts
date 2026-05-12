@@ -17,6 +17,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 const execAsync = promisify(exec);
 import type { TaskStore } from "@fusion/core";
+import { resolveTaskMergeTarget } from "@fusion/core";
 import type { Settings, TaskDetail, PrInfo } from "@fusion/core";
 
 /**
@@ -25,7 +26,7 @@ import type { Settings, TaskDetail, PrInfo } from "@fusion/core";
  */
 interface GitHubOperations {
   findPrForBranch(params: { head: string; state?: "open" | "closed" | "all" }): Promise<PrInfo | null>;
-  createPr(params: { title: string; body: string; head: string }): Promise<PrInfo>;
+  createPr(params: { title: string; body: string; head: string; base?: string }): Promise<PrInfo>;
   getPrMergeStatus(base?: string, head?: string, number?: number): Promise<{
     prInfo: PrInfo;
     reviewDecision: string | null;
@@ -58,7 +59,48 @@ export function getTaskBranchName(taskId: string): string {
  * fast-forwards thereafter. Required because the GitHub PR-create flow
  * does not implicitly publish the local branch.
  */
+function commandExitCode(err: unknown): number | undefined {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "number" ? code : undefined;
+  }
+  return undefined;
+}
+
+async function gitCommandSucceeds(cwd: string, command: string, missingExitCode: number): Promise<boolean> {
+  try {
+    await execAsync(command, { cwd, timeout: 30_000 });
+    return true;
+  } catch (err: unknown) {
+    if (commandExitCode(err) === missingExitCode) return false;
+    throw err;
+  }
+}
+
 async function pushTaskBranchToOrigin(cwd: string, branch: string): Promise<void> {
+  const localRef = `refs/heads/${branch}`;
+  const localBranchExists = await gitCommandSucceeds(
+    cwd,
+    `git show-ref --verify --quiet "${localRef}"`,
+    1,
+  );
+
+  if (!localBranchExists) {
+    const remoteBranchExists = await gitCommandSucceeds(
+      cwd,
+      `git ls-remote --exit-code --heads origin "${branch}"`,
+      2,
+    );
+
+    if (remoteBranchExists) {
+      return;
+    }
+
+    throw new Error(
+      `Cannot create PR for missing task branch "${branch}": no local ref "${localRef}" and no origin branch "${branch}". Re-run the task or recreate the branch before retrying PR creation.`,
+    );
+  }
+
   try {
     await execAsync(`git push -u origin "${branch}"`, {
       cwd,
@@ -133,11 +175,12 @@ async function finalizePullRequestMerge(
   cwd: string,
   task: TaskDetail,
   prInfo: PrInfo,
+  message = "Pull request merged",
 ): Promise<void> {
   await cleanupMergedTaskArtifacts(cwd, task);
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
   await store.moveTask(task.id, "done");
-  await store.logEntry(task.id, "Pull request merged", `PR #${prInfo.number}: ${prInfo.url}`);
+  await store.logEntry(task.id, message, `PR #${prInfo.number}: ${prInfo.url}`);
 }
 
 /**
@@ -187,6 +230,11 @@ export async function processPullRequestMergeTask(
   }
 
   const branch = getTaskBranchName(task.id);
+  const settings = await store.getSettings();
+  const projectDefaultBranch = typeof settings.baseBranch === "string" ? settings.baseBranch : undefined;
+  const mergeTarget = resolveTaskMergeTarget(task, {
+    projectDefaultBranch,
+  });
   let prInfo: PrInfo | undefined = task.prInfo;
 
   if (!prInfo) {
@@ -199,11 +247,23 @@ export async function processPullRequestMergeTask(
       // branch, so we push it here right before creating the PR.
       await pushTaskBranchToOrigin(cwd, branch);
     }
-    prInfo = existingPr ?? await github.createPr({
-      title: buildPullRequestTitle(task),
-      body: buildPullRequestBody(task),
-      head: branch,
-    });
+    try {
+      prInfo = existingPr ?? await github.createPr({
+        title: buildPullRequestTitle(task),
+        body: buildPullRequestBody(task),
+        head: branch,
+        base: mergeTarget.branch,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("No commits between")) {
+        const error = `No pull request created for ${branch}: the branch has no commits relative to the base branch.`;
+        await store.updateTask(task.id, { status: "failed", error });
+        await store.logEntry(task.id, error, message);
+        return "skipped";
+      }
+      throw err;
+    }
 
     await store.updatePrInfo(task.id, prInfo);
     await store.logEntry(
@@ -217,7 +277,7 @@ export async function processPullRequestMergeTask(
     throw new Error(`Failed to create or resolve pull request for ${task.id}`);
   }
 
-  const mergeStatus = await github.getPrMergeStatus(undefined, undefined, prInfo.number);
+  const mergeStatus = await github.getPrMergeStatus(mergeTarget.branch, branch, prInfo.number);
   const refreshedPrInfo: PrInfo = {
     ...prInfo,
     ...mergeStatus.prInfo,
@@ -236,7 +296,6 @@ export async function processPullRequestMergeTask(
   // immediately. `requirePrApproval` lets users keep PR mode as "open the
   // PR, wait for me to approve and merge it" by holding the merge until
   // reviewDecision === "APPROVED".
-  const settings = await store.getSettings();
   if (settings.requirePrApproval && mergeStatus.reviewDecision !== "APPROVED") {
     await store.updateTask(task.id, { status: "awaiting-pr-checks" });
     return "waiting";
@@ -258,7 +317,36 @@ export async function processPullRequestMergeTask(
     return "waiting";
   }
   await store.updateTask(task.id, { status: "merging-pr" });
-  const mergedPr = await github.mergePr({ number: prInfo.number, method: "squash" });
+  let mergedPr: PrInfo;
+  try {
+    mergedPr = await github.mergePr({ number: prInfo.number, method: "squash" });
+  } catch (err: unknown) {
+    let refreshedStatus: Awaited<ReturnType<GitHubOperations["getPrMergeStatus"]>>;
+    try {
+      refreshedStatus = await github.getPrMergeStatus(mergeTarget.branch, branch, prInfo.number);
+    } catch {
+      throw err;
+    }
+    const refreshedAfterFailure: PrInfo = {
+      ...prInfo,
+      ...refreshedStatus.prInfo,
+      lastCheckedAt: new Date().toISOString(),
+    };
+    await store.updatePrInfo(task.id, refreshedAfterFailure);
+
+    if (refreshedAfterFailure.status === "merged") {
+      await finalizePullRequestMerge(
+        store,
+        cwd,
+        task,
+        refreshedAfterFailure,
+        "Pull request already merged after merge command failed; reconciled task state from GitHub",
+      );
+      return "merged";
+    }
+
+    throw err;
+  }
   await store.updatePrInfo(task.id, { ...mergedPr, lastCheckedAt: new Date().toISOString() });
   await finalizePullRequestMerge(store, cwd, task, mergedPr);
   return "merged";

@@ -1,6 +1,7 @@
 import type {
   Task,
   TaskDetail,
+  TaskReviewData,
   TaskAttachment,
   TaskComment,
   TaskCreateInput,
@@ -18,7 +19,9 @@ import type {
   WorkflowStepInput,
   WorkflowStepResult,
   PluginInstallation,
+  PluginSetupCheckResult,
   PluginUiSlotDefinition,
+  PluginUiContributionDefinition,
   PluginDashboardViewDefinition,
   TaskDocument,
   TaskDocumentRevision,
@@ -30,7 +33,7 @@ import type {
   ParticipantType,
   NodeConfig,
   NodeStatus,
-  NodeMeshState,
+  MeshClusterSnapshot,
   SystemMetrics,
   DiscoveryConfig,
   MissionEvent,
@@ -39,21 +42,12 @@ import type {
   AgentRating,
   AgentRatingSummary,
   AgentRatingInput,
+  ChatAttachment,
   ChatMessage,
+  ChatRoom,
+  ChatRoomMember,
+  ChatRoomMessage,
   EnrichedChatSession,
-  Roadmap,
-  RoadmapMilestone,
-  RoadmapFeature,
-  RoadmapCreateInput,
-  RoadmapUpdateInput,
-  RoadmapMilestoneCreateInput,
-  RoadmapMilestoneUpdateInput,
-  RoadmapFeatureCreateInput,
-  RoadmapFeatureUpdateInput,
-  RoadmapWithHierarchy,
-  RoadmapExportBundle,
-  RoadmapMissionPlanningHandoff,
-  RoadmapFeatureTaskPlanningHandoff,
   TodoList,
   TodoItem,
   TodoListWithItems,
@@ -66,6 +60,8 @@ import type {
   InsightStatus,
   InsightRun,
   InsightRunTrigger,
+  EvalRun,
+  EvalTaskResult,
   ResearchRunStatus,
   TaskPriority,
   TaskSourceIssue,
@@ -76,6 +72,8 @@ import type {
   DockerVolumeMount,
   DockerExtraCli,
   DockerNodeStatus,
+  ProjectNodePathMapping,
+  ApprovalRequestStatus,
 } from "@fusion/core";
 import type { PlanningQuestion, PlanningSummary } from "@fusion/core";
 import type { ScheduledTask, ScheduledTaskCreateInput, ScheduledTaskUpdateInput, AutomationRunResult, Routine, RoutineCreateInput, RoutineUpdateInput, RoutineExecutionResult } from "@fusion/core";
@@ -245,7 +243,50 @@ export async function fetchTaskDetail(id: string, projectId?: string): Promise<T
   throw new Error("Request failed");
 }
 
-export function createTask(input: TaskCreateInput, projectId?: string): Promise<Task> {
+export interface UpdateTaskReviewRequest {
+  reviewState: TaskDetail["reviewState"] | null;
+}
+
+export interface TaskReviewResponse {
+  reviewState: NonNullable<TaskDetail["reviewState"]>;
+  automationStatus: string | null;
+  emptyMessage?: string | null;
+  prInfo?: TaskDetail["prInfo"];
+}
+
+export interface RefreshTaskReviewResponse {
+  reviewState: NonNullable<TaskDetail["reviewState"]>;
+  automationStatus: string | null;
+  prInfo?: TaskDetail["prInfo"];
+}
+
+export interface SelectedReviewItem {
+  id: string;
+  source: "pr-review" | "reviewer-agent";
+  threadId?: string;
+  filePath?: string;
+  lineNumber?: number;
+  author?: string;
+  summary: string;
+  body: string;
+  url?: string;
+}
+
+export interface ReviseTaskReviewResponse {
+  task: Task;
+  reviewState: NonNullable<TaskDetail["reviewState"]>;
+}
+
+export interface CreateTaskRequestOptions {
+  transportNodeId?: string;
+  localNodeId?: string;
+}
+
+export function createTask(
+  input: TaskCreateInput,
+  projectId?: string,
+  options?: CreateTaskRequestOptions,
+): Promise<Task> {
   const {
     title,
     description,
@@ -267,10 +308,16 @@ export function createTask(input: TaskCreateInput, projectId?: string): Promise<
     executionMode,
     priority,
     source,
+    nodeId,
+    branch,
+    baseBranch,
+    githubTracking,
   } = input;
 
-  return api<Task>(withProjectId("/tasks", projectId), {
+  return proxyApi<Task>(withProjectId("/tasks", projectId), {
     method: "POST",
+    nodeId: options?.transportNodeId,
+    localNodeId: options?.localNodeId,
     body: JSON.stringify({
       title,
       description,
@@ -292,6 +339,10 @@ export function createTask(input: TaskCreateInput, projectId?: string): Promise<
       executionMode,
       priority,
       source,
+      nodeId,
+      branch,
+      baseBranch,
+      githubTracking,
     }),
   });
 }
@@ -316,6 +367,13 @@ export function updateTask(
     priority?: TaskPriority | null;
     sourceIssue?: TaskSourceIssue | null;
     nodeId?: string | null;
+    branch?: string | null;
+    baseBranch?: string | null;
+    githubTracking?: {
+      enabled?: boolean;
+      repoOverride?: string | null;
+      issue?: null;
+    } | null;
   },
   projectId?: string,
 ): Promise<Task> {
@@ -1359,6 +1417,19 @@ export interface DroidCliStatus {
   ready: boolean;
 }
 
+export interface CursorCliStatus {
+  binary: {
+    available: boolean;
+    version?: string;
+    binaryPath?: string;
+    reason?: string;
+    probeDurationMs: number;
+  };
+  enabled: boolean;
+  extension: null;
+  ready: boolean;
+}
+
 export interface LlamaCppStatus {
   enabled: boolean;
   extension: {
@@ -1430,6 +1501,10 @@ export function installFnBinary(): Promise<FnBinaryInstallResponse> {
 /** Probe the local Droid CLI binary + setting + extension state. */
 export function fetchDroidCliStatus(): Promise<DroidCliStatus> {
   return api<DroidCliStatus>("/providers/droid-cli/status");
+}
+
+export function fetchCursorCliStatus(): Promise<CursorCliStatus> {
+  return api<CursorCliStatus>("/providers/cursor-cli/status");
 }
 
 /** Probe llama.cpp server + setting + extension state. */
@@ -1708,6 +1783,15 @@ export function setDroidCliEnabled(
   enabled: boolean,
 ): Promise<{ enabled: boolean; restartRequired: boolean }> {
   return api<{ enabled: boolean; restartRequired: boolean }>("/auth/droid-cli", {
+    method: "POST",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function setCursorCliEnabled(
+  enabled: boolean,
+): Promise<{ enabled: boolean; restartRequired: boolean }> {
+  return api<{ enabled: boolean; restartRequired: boolean }>("/auth/cursor-cli", {
     method: "POST",
     body: JSON.stringify({ enabled }),
   });
@@ -2239,6 +2323,7 @@ export interface GitCommit {
   hash: string;
   shortHash: string;
   message: string;
+  body?: string;
   author: string;
   date: string;
   parents: string[];
@@ -2358,9 +2443,18 @@ export function fetchRemote(remote?: string, projectId?: string): Promise<GitFet
 }
 
 /** Pull current branch */
-export function pullBranch(projectId?: string): Promise<GitPullResult> {
-  return api<GitPullResult>(withProjectId("/git/pull", projectId), {
+export function pullBranch(options?: { rebase?: boolean }, projectId?: string): Promise<GitPullResult>;
+export function pullBranch(projectId?: string): Promise<GitPullResult>;
+export function pullBranch(
+  optionsOrProjectId?: { rebase?: boolean } | string,
+  projectId?: string,
+): Promise<GitPullResult> {
+  const options = typeof optionsOrProjectId === "string" ? undefined : optionsOrProjectId;
+  const resolvedProjectId = typeof optionsOrProjectId === "string" ? optionsOrProjectId : projectId;
+
+  return api<GitPullResult>(withProjectId("/git/pull", resolvedProjectId), {
     method: "POST",
+    body: JSON.stringify({ rebase: options?.rebase ?? false }),
   });
 }
 
@@ -2413,6 +2507,11 @@ export function dropStash(index: number, projectId?: string): Promise<{ message:
   return api<{ message: string }>(withProjectId(`/git/stashes/${index}`, projectId), {
     method: "DELETE",
   });
+}
+
+/** Fetch stash diff (stat + patch) */
+export function fetchStashDiff(index: number, projectId?: string): Promise<{ stat: string; patch: string }> {
+  return api<{ stat: string; patch: string }>(withProjectId(`/git/stashes/${index}/diff`, projectId));
 }
 
 /** Fetch unstaged diff (working directory changes) */
@@ -2669,6 +2768,7 @@ export interface SubtaskItem {
   title: string;
   description: string;
   suggestedSize: "S" | "M" | "L";
+  priority?: TaskPriority;
   dependsOn: string[];
 }
 
@@ -2695,6 +2795,35 @@ export interface AgentOnboardingSummary {
   templateId?: string;
   patternAgentId?: string;
   rationale?: string;
+  model?: string;
+  /** Draft-only AI suggestion for eventual runtimeConfig.model selection. */
+  modelHint?: string;
+  /** Draft-only AI suggestion for eventual runtimeConfig.runtimeHint plugin runtime selection. */
+  runtimeHint?: string;
+  heartbeatProcedurePath?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatEnabled?: boolean;
+}
+
+export type OnboardingMode = "create" | "edit";
+
+export interface ExistingAgentOnboardingConfig {
+  name?: string;
+  role?: AgentCapability | "custom";
+  title?: string;
+  instructionsText?: string;
+  soul?: string;
+  memory?: string;
+  reportsTo?: string;
+  skills?: string[];
+  model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+  maxTurns?: number;
+  runtimeHint?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  maxConcurrentRuns?: number;
+  messageResponseMode?: "immediate" | "on-heartbeat";
 }
 
 export type AgentOnboardingStreamEvent =
@@ -2827,6 +2956,8 @@ export function startAgentOnboardingStreaming(
   context: {
     existingAgents: Array<{ id: string; name: string; role: string }>;
     templates: Array<{ id: string; label: string; description?: string }>;
+    mode?: OnboardingMode;
+    existingAgentConfig?: ExistingAgentOnboardingConfig;
   },
   projectId?: string,
   modelOverride?: { planningModelProvider?: string; planningModelId?: string },
@@ -2836,6 +2967,8 @@ export function startAgentOnboardingStreaming(
     body: JSON.stringify({
       intent,
       context,
+      mode: context.mode,
+      existingAgentConfig: context.existingAgentConfig,
       planningModelProvider: modelOverride?.planningModelProvider,
       planningModelId: modelOverride?.planningModelId,
     }),
@@ -2907,6 +3040,7 @@ export function createTasksFromPlanning(
     title: string;
     description: string;
     suggestedSize: "S" | "M" | "L";
+    priority?: TaskPriority;
     dependsOn: string[];
   }>,
   projectId?: string,
@@ -4317,7 +4451,16 @@ export function fetchWorkflowStepTemplates(): Promise<{ templates: import("@fusi
   return api<{ templates: import("@fusion/core").WorkflowStepTemplate[] }>("/workflow-step-templates");
 }
 
-/** Create a workflow step from a built-in template */
+/** Fetch plugin-contributed workflow step templates */
+export function fetchPluginWorkflowStepTemplates(): Promise<{
+  templates: Array<{ pluginId: string; template: import("@fusion/core").WorkflowStepTemplate }>;
+}> {
+  return api<{
+    templates: Array<{ pluginId: string; template: import("@fusion/core").WorkflowStepTemplate }>;
+  }>("/plugin-workflow-step-templates");
+}
+
+/** Create a workflow step from a built-in or plugin template */
 export function createWorkflowStepFromTemplate(templateId: string, projectId?: string): Promise<WorkflowStep> {
   return api<WorkflowStep>(withProjectId(`/workflow-step-templates/${encodeURIComponent(templateId)}/create`, projectId), {
     method: "POST",
@@ -4547,12 +4690,26 @@ export function createTasksFromBreakdown(
   subtasks: SubtaskItem[],
   parentTaskId?: string,
   projectId?: string,
+  options?: {
+    branch?: string;
+    baseBranch?: string;
+    branchSelection?: {
+      mode: "project-default" | "auto-new" | "existing" | "custom-new";
+      branchName?: string;
+      baseBranch?: string;
+    };
+    branchAssignment?: { mode: "shared" | "per-task-derived" };
+  },
 ): Promise<{ tasks: Task[]; parentTaskClosed?: boolean }> {
   return api<{ tasks: Task[]; parentTaskClosed?: boolean }>(withProjectId("/subtasks/create-tasks", projectId), {
     method: "POST",
     body: JSON.stringify({
       sessionId,
       parentTaskId,
+      ...(options?.branch !== undefined ? { branch: options.branch } : {}),
+      ...(options?.baseBranch !== undefined ? { baseBranch: options.baseBranch } : {}),
+      ...(options?.branchSelection ? { branchSelection: options.branchSelection } : {}),
+      ...(options?.branchAssignment ? { branchAssignment: options.branchAssignment } : {}),
       subtasks: subtasks.map((subtask) => ({
         tempId: subtask.id,
         title: subtask.title,
@@ -4658,6 +4815,29 @@ export function updateAgent(agentId: string, updates: AgentUpdateInput, projectI
   return api<Agent>(withProjectId(`/agents/${encodeURIComponent(agentId)}`, projectId), {
     method: "PATCH",
     body: JSON.stringify(updates),
+  });
+}
+
+/** Upload an agent avatar image. */
+export async function uploadAgentAvatar(agentId: string, file: File, projectId?: string): Promise<Agent> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await fetch(buildApiUrl(withProjectId(`/agents/${encodeURIComponent(agentId)}/avatar`, projectId)), {
+    method: "POST",
+    headers: withTokenHeader(),
+    body: formData,
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error((data as { error?: string }).error || "Avatar upload failed");
+  }
+  return data as Agent;
+}
+
+/** Delete an agent avatar image. */
+export function deleteAgentAvatar(agentId: string, projectId?: string): Promise<Agent> {
+  return api<Agent>(withProjectId(`/agents/${encodeURIComponent(agentId)}/avatar`, projectId), {
+    method: "DELETE",
   });
 }
 
@@ -5023,6 +5203,66 @@ export function assignTaskToUser(taskId: string, userId: string | null, projectI
 export function acceptTaskReview(taskId: string, projectId?: string): Promise<Task> {
   return api<Task>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/accept-review`, projectId), {
     method: "POST",
+  });
+}
+
+function mapTaskReviewDataToLegacy(data: TaskReviewData): TaskReviewResponse {
+  return {
+    reviewState: {
+      source: data.mode,
+      summary: data.summary ?? undefined,
+      items: data.items.map((item) => ({
+        id: item.itemId,
+        body: item.body,
+        author: { login: item.author },
+        createdAt: item.createdAt ?? new Date(0).toISOString(),
+        updatedAt: item.updatedAt ?? undefined,
+        path: item.filePath,
+        threadId: item.threadId,
+        htmlUrl: item.url,
+        state: item.reviewState ?? undefined,
+        isResolved: item.isResolved,
+      })),
+      addressing: [],
+      lastRefreshedAt: data.fetchedAt ?? undefined,
+      refreshStatus: "ready",
+      refreshSource: "initial-load",
+    },
+    automationStatus: null,
+  };
+}
+
+/** Fetch normalized task review data (PR mode or direct mode) */
+export async function fetchTaskReview(taskId: string, projectId?: string): Promise<TaskReviewResponse> {
+  const data = await api<TaskReviewData>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review`, projectId));
+  return mapTaskReviewDataToLegacy(data);
+}
+
+/** Fetch canonical review payload for future review-tab rendering. */
+export function fetchTaskReviewData(taskId: string, projectId?: string): Promise<TaskReviewData> {
+  return api<TaskReviewData>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review`, projectId));
+}
+
+/** Refresh normalized task review data (PR mode or direct mode) */
+export async function refreshTaskReview(taskId: string, projectId?: string): Promise<RefreshTaskReviewResponse> {
+  const data = await api<TaskReviewData>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review/refresh`, projectId), {
+    method: "POST",
+  });
+  return mapTaskReviewDataToLegacy(data);
+}
+
+/** Refresh canonical review payload for future review-tab rendering. */
+export function refreshTaskReviewData(taskId: string, projectId?: string): Promise<TaskReviewData> {
+  return api<TaskReviewData>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review/refresh`, projectId), {
+    method: "POST",
+  });
+}
+
+/** Request an in-place revision pass for selected review items */
+export function reviseTaskReviewItems(taskId: string, selectedItems: SelectedReviewItem[], projectId?: string): Promise<ReviseTaskReviewResponse> {
+  return api<ReviseTaskReviewResponse>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/review/address`, projectId), {
+    method: "POST",
+    body: JSON.stringify({ selectedItems, tab: "review" }),
   });
 }
 
@@ -5484,6 +5724,34 @@ export interface NodeCreateInput {
   dockerConfig?: DockerNodeConfigInfo;
 }
 
+/** Input for assigning a project path for a specific node during onboarding. */
+export interface NodeProjectMappingInput {
+  projectId: string;
+  path: string;
+}
+
+export interface RemoteNodeDiscoveredProject {
+  id: string;
+  name: string;
+  path: string;
+  status: "active" | "paused" | "errored" | "initializing";
+  isolationMode: "in-process" | "child-process";
+}
+
+export interface RemoteNodeProjectDiscoveryResult {
+  projects: RemoteNodeDiscoveredProject[];
+}
+
+/**
+ * Node onboarding payload used by dashboard UI.
+ *
+ * `projectMappings` is intentionally separate from `ProjectInfo.path` and `projects.nodeId`.
+ * It captures node-specific filesystem paths for selected existing projects.
+ */
+export interface NodeOnboardingInput extends NodeCreateInput {
+  projectMappings: NodeProjectMappingInput[];
+}
+
 /** Input for updating an existing node */
 export type NodeUpdateInput = Partial<Pick<NodeCreateInput, "name" | "type" | "url" | "apiKey" | "maxConcurrent" | "dockerConfig">> & {
   status?: NodeStatus;
@@ -5571,28 +5839,34 @@ export function fetchProjects(): Promise<ProjectInfo[]> {
   return api<ProjectInfo[]>("/projects");
 }
 
-/** Project info with source node metadata (added by server for remote projects) */
+/** Dashboard-facing mapping contract for project availability on nodes. */
+export interface ProjectNodeAvailability {
+  nodeId: string;
+  nodeName?: string;
+  path: string;
+  available: boolean;
+}
+
+/** Project info with source node metadata (added by server for remote projects). */
 export interface ProjectInfoWithSource extends ProjectInfo {
-  /** Name of the source node (added by server for remote projects) */
+  /** Name of the source node (added by server for remote projects). */
   _sourceNodeName?: string;
+  /** Normalized per-node project mappings for dashboard UI. */
+  nodeMappings?: ProjectNodeAvailability[];
+  /** Compatibility fields accepted from in-flight server rollouts. */
+  projectNodeMappings?: ProjectNodeAvailability[];
+  pathMappings?: ProjectNodeAvailability[];
+}
+
+export function hasNodeMappingsSupport(project: ProjectInfoWithSource): boolean {
+  return Array.isArray(project.nodeMappings)
+    || Array.isArray(project.projectNodeMappings)
+    || Array.isArray(project.pathMappings);
 }
 
 /** Fetch all registered projects from all nodes (local + remote) */
 export function fetchProjectsAcrossNodes(): Promise<ProjectInfoWithSource[]> {
   return api<ProjectInfoWithSource[]>("/projects/across-nodes");
-}
-
-/**
- * Append a client-side perf measurement to the shared dashboard-perf log on disk.
- * Used when browser devtools aren't available (e.g. mobile). Best-effort.
- */
-export function reportDashboardPerf(source: string, message: string): void {
-  void api("/_perf/dashboard-load", {
-    method: "POST",
-    body: JSON.stringify({ source, message }),
-  }).catch(() => {
-    // best-effort only
-  });
 }
 
 /** Fetch all registered nodes */
@@ -5685,9 +5959,22 @@ export function registerNode(input: NodeCreateInput): Promise<NodeInfo> {
   });
 }
 
+/** Discover projects from a remote node before registering it. */
+export function discoverRemoteNodeProjects(input: { url: string; apiKey?: string }): Promise<RemoteNodeProjectDiscoveryResult> {
+  return api<RemoteNodeProjectDiscoveryResult>("/nodes/discover-projects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /** Fetch a single node by ID */
 export function fetchNode(id: string): Promise<NodeInfo> {
   return api<NodeInfo>(`/nodes/${encodeURIComponent(id)}`);
+}
+
+/** Fetch all project path mappings for a node */
+export function fetchNodePathMappings(nodeId: string): Promise<ProjectNodePathMapping[]> {
+  return api<ProjectNodePathMapping[]>(`/nodes/${encodeURIComponent(nodeId)}/path-mappings`);
 }
 
 /** Update an existing node */
@@ -5758,8 +6045,8 @@ export async function fetchNodeMetrics(id: string): Promise<SystemMetrics | null
 }
 
 /** Fetch full mesh topology state (all nodes with their metrics and known peers) */
-export async function fetchMeshState(): Promise<NodeMeshState[]> {
-  return api<NodeMeshState[]>("/mesh/state");
+export async function fetchMeshState(): Promise<MeshClusterSnapshot> {
+  return api<MeshClusterSnapshot>("/mesh/state");
 }
 
 /** Browse directory entries for the directory picker */
@@ -5802,6 +6089,43 @@ export function unregisterProject(id: string): Promise<void> {
   return api<void>(`/projects/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+/** Fetch all per-node path mappings for a project */
+export function fetchProjectPathMappings(projectId: string): Promise<ProjectNodePathMapping[]> {
+  return api<ProjectNodePathMapping[]>(`/projects/${encodeURIComponent(projectId)}/path-mappings`);
+}
+
+/** Fetch a single project-node path mapping */
+export function fetchProjectPathMapping(projectId: string, nodeId: string): Promise<ProjectNodePathMapping> {
+  return api<ProjectNodePathMapping>(
+    `/projects/${encodeURIComponent(projectId)}/path-mappings/${encodeURIComponent(nodeId)}`,
+  );
+}
+
+/** Create or update a project-node path mapping */
+export function upsertProjectPathMapping(
+  projectId: string,
+  nodeId: string,
+  path: string,
+): Promise<ProjectNodePathMapping> {
+  return api<ProjectNodePathMapping>(
+    `/projects/${encodeURIComponent(projectId)}/path-mappings/${encodeURIComponent(nodeId)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ path }),
+    },
+  );
+}
+
+/** Remove a project-node path mapping */
+export function removeProjectPathMapping(projectId: string, nodeId: string): Promise<void> {
+  return api<void>(
+    `/projects/${encodeURIComponent(projectId)}/path-mappings/${encodeURIComponent(nodeId)}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 /** Fetch health metrics for a specific project */
@@ -6008,6 +6332,27 @@ export function fetchTaskDiff(taskId: string, worktree?: string, projectId?: str
   return api<TaskDiff>(`/tasks/${encodeURIComponent(taskId)}/diff${query}`);
 }
 
+export interface TaskCommitAssociationRow {
+  commitSha: string;
+  commitSubject: string;
+  authoredAt: string;
+  matchedBy: "canonical-lineage-trailer" | "legacy-task-id-trailer" | "legacy-subject" | "manual-reconciliation";
+  confidence: "canonical" | "legacy" | "ambiguous";
+  taskIdSnapshot: string;
+  note?: string;
+}
+
+export interface TaskCommitAssociationsResponse {
+  taskId: string;
+  lineageId: string | null;
+  associations: TaskCommitAssociationRow[];
+}
+
+/** Fetch lineage commit associations for a task */
+export function fetchTaskCommitAssociations(taskId: string, projectId?: string): Promise<TaskCommitAssociationsResponse> {
+  return api<TaskCommitAssociationsResponse>(withProjectId(`/tasks/${encodeURIComponent(taskId)}/commit-associations`, projectId));
+}
+
 /** Individual file diff */
 export interface TaskFileDiff {
   path: string;
@@ -6033,7 +6378,7 @@ export type MilestoneStatus = "planning" | "active" | "blocked" | "complete";
 export type SliceStatus = "pending" | "active" | "complete";
 
 /** Feature status values */
-export type FeatureStatus = "defined" | "triaged" | "in-progress" | "done";
+export type FeatureStatus = "defined" | "triaged" | "in-progress" | "done" | "blocked";
 
 /** Autopilot state values for mission autonomous progression */
 export type AutopilotState = "inactive" | "watching" | "activating" | "completing";
@@ -6332,17 +6677,42 @@ export function unlinkFeatureFromTask(featureId: string, projectId?: string): Pr
 }
 
 /** Triage a feature — create a task from the feature and link it */
-export function triageFeature(featureId: string, taskTitle?: string, taskDescription?: string, projectId?: string): Promise<MissionFeature> {
+export function triageFeature(
+  featureId: string,
+  taskTitle?: string,
+  taskDescription?: string,
+  projectId?: string,
+  branchOptions?: {
+    branchSelection?: {
+      mode: "project-default" | "auto-new" | "existing" | "custom-new";
+      branchName?: string;
+      baseBranch?: string;
+    };
+    branchAssignment?: { mode: "shared" | "per-task-derived" };
+  },
+): Promise<MissionFeature> {
   return api<MissionFeature>(withProjectId(`/missions/features/${encodeURIComponent(featureId)}/triage`, projectId), {
     method: "POST",
-    body: JSON.stringify({ taskTitle, taskDescription }),
+    body: JSON.stringify({ taskTitle, taskDescription, ...branchOptions }),
   });
 }
 
 /** Triage all "defined" features in a slice */
-export function triageAllSliceFeatures(sliceId: string, projectId?: string): Promise<{ triaged: MissionFeature[]; count: number }> {
+export function triageAllSliceFeatures(
+  sliceId: string,
+  projectId?: string,
+  branchOptions?: {
+    branchSelection?: {
+      mode: "project-default" | "auto-new" | "existing" | "custom-new";
+      branchName?: string;
+      baseBranch?: string;
+    };
+    branchAssignment?: { mode: "shared" | "per-task-derived" };
+  },
+): Promise<{ triaged: MissionFeature[]; count: number }> {
   return api<{ triaged: MissionFeature[]; count: number }>(withProjectId(`/missions/slices/${encodeURIComponent(sliceId)}/triage-all`, projectId), {
     method: "POST",
+    body: JSON.stringify(branchOptions ?? {}),
   });
 }
 
@@ -6679,11 +7049,28 @@ export function cancelMissionInterview(sessionId: string, projectId?: string, ta
 export function createMissionFromInterview(
   sessionId: string,
   summary?: MissionPlanSummary,
-  projectId?: string
+  projectId?: string,
+  options?: {
+    branch?: string;
+    baseBranch?: string;
+    branchSelection?: {
+      mode: "project-default" | "auto-new" | "existing" | "custom-new";
+      branchName?: string;
+      baseBranch?: string;
+    };
+    branchAssignment?: { mode: "shared" | "per-task-derived" };
+  },
 ): Promise<MissionWithHierarchy> {
   return api<MissionWithHierarchy>(withProjectId("/missions/interview/create-mission", projectId), {
     method: "POST",
-    body: JSON.stringify({ sessionId, summary }),
+    body: JSON.stringify({
+      sessionId,
+      summary,
+      ...(options?.branch !== undefined ? { branch: options.branch } : {}),
+      ...(options?.baseBranch !== undefined ? { baseBranch: options.baseBranch } : {}),
+      ...(options?.branchSelection ? { branchSelection: options.branchSelection } : {}),
+      ...(options?.branchAssignment ? { branchAssignment: options.branchAssignment } : {}),
+    }),
   });
 }
 
@@ -7098,223 +7485,6 @@ export async function previewEnrichedDescription(
   }
 }
 
-// ── Roadmap API ─────────────────────────────────────────────────────────────────
-
-/** Fetch all roadmaps */
-export function fetchRoadmaps(projectId?: string): Promise<Roadmap[]> {
-  return api<Roadmap[]>(withProjectId("/roadmaps", projectId));
-}
-
-/** Create a new roadmap */
-export function createRoadmap(input: RoadmapCreateInput, projectId?: string): Promise<Roadmap> {
-  return api<Roadmap>(withProjectId("/roadmaps", projectId), {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Fetch a single roadmap with full hierarchy (milestones and features) */
-export function fetchRoadmap(roadmapId: string, projectId?: string): Promise<RoadmapWithHierarchy> {
-  return api<RoadmapWithHierarchy>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}`, projectId));
-}
-
-/** Update roadmap metadata */
-export function updateRoadmap(roadmapId: string, updates: RoadmapUpdateInput, projectId?: string): Promise<Roadmap> {
-  return api<Roadmap>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}`, projectId), {
-    method: "PATCH",
-    body: JSON.stringify(updates),
-  });
-}
-
-/** Delete a roadmap */
-export function deleteRoadmap(roadmapId: string, projectId?: string): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}`, projectId), {
-    method: "DELETE",
-  });
-}
-
-/** Fetch milestones for a roadmap */
-export function fetchRoadmapMilestones(roadmapId: string, projectId?: string): Promise<RoadmapMilestone[]> {
-  return api<RoadmapMilestone[]>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/milestones`, projectId));
-}
-
-/** Create a milestone in a roadmap */
-export function createRoadmapMilestone(roadmapId: string, input: RoadmapMilestoneCreateInput, projectId?: string): Promise<RoadmapMilestone> {
-  return api<RoadmapMilestone>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/milestones`, projectId), {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Update milestone metadata */
-export function updateRoadmapMilestone(milestoneId: string, updates: RoadmapMilestoneUpdateInput, projectId?: string): Promise<RoadmapMilestone> {
-  return api<RoadmapMilestone>(withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}`, projectId), {
-    method: "PATCH",
-    body: JSON.stringify(updates),
-  });
-}
-
-/** Delete a milestone */
-export function deleteRoadmapMilestone(milestoneId: string, projectId?: string): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}`, projectId), {
-    method: "DELETE",
-  });
-}
-
-/** Fetch features for a milestone */
-export function fetchRoadmapFeatures(milestoneId: string, projectId?: string): Promise<RoadmapFeature[]> {
-  return api<RoadmapFeature[]>(withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}/features`, projectId));
-}
-
-/** Create a feature in a milestone */
-export function createRoadmapFeature(milestoneId: string, input: RoadmapFeatureCreateInput, projectId?: string): Promise<RoadmapFeature> {
-  return api<RoadmapFeature>(withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}/features`, projectId), {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Update feature metadata */
-export function updateRoadmapFeature(featureId: string, updates: RoadmapFeatureUpdateInput, projectId?: string): Promise<RoadmapFeature> {
-  return api<RoadmapFeature>(withProjectId(`/roadmaps/features/${encodeURIComponent(featureId)}`, projectId), {
-    method: "PATCH",
-    body: JSON.stringify(updates),
-  });
-}
-
-/** Delete a feature */
-export function deleteRoadmapFeature(featureId: string, projectId?: string): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/features/${encodeURIComponent(featureId)}`, projectId), {
-    method: "DELETE",
-  });
-}
-
-/** Reorder milestones within a roadmap */
-export function reorderRoadmapMilestones(roadmapId: string, orderedMilestoneIds: string[], projectId?: string): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/milestones/reorder`, projectId), {
-    method: "POST",
-    body: JSON.stringify({ orderedMilestoneIds }),
-  });
-}
-
-/** Reorder features within a milestone */
-export function reorderRoadmapFeatures(milestoneId: string, orderedFeatureIds: string[], projectId?: string): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}/features/reorder`, projectId), {
-    method: "POST",
-    body: JSON.stringify({ orderedFeatureIds }),
-  });
-}
-
-/** Move a feature to a different milestone or position */
-export function moveRoadmapFeature(
-  featureId: string,
-  targetMilestoneId: string,
-  targetIndex: number,
-  projectId?: string
-): Promise<void> {
-  return api<void>(withProjectId(`/roadmaps/features/${encodeURIComponent(featureId)}/move`, projectId), {
-    method: "POST",
-    body: JSON.stringify({ targetMilestoneId, targetIndex }),
-  });
-}
-
-/** Export a roadmap as a flat bundle for persistence/import/export */
-export function exportRoadmap(roadmapId: string, projectId?: string): Promise<RoadmapExportBundle> {
-  return api<RoadmapExportBundle>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/export`, projectId));
-}
-
-/** Get mission planning handoff payload for a roadmap */
-export function getRoadmapMissionHandoff(roadmapId: string, projectId?: string): Promise<RoadmapMissionPlanningHandoff> {
-  return api<RoadmapMissionPlanningHandoff>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/handoff/mission`, projectId));
-}
-
-/** Get task planning handoff payload for a single roadmap feature */
-export function getRoadmapFeatureHandoff(
-  roadmapId: string,
-  milestoneId: string,
-  featureId: string,
-  projectId?: string
-): Promise<RoadmapFeatureTaskPlanningHandoff> {
-  return api<RoadmapFeatureTaskPlanningHandoff>(
-    withProjectId(
-      `/roadmaps/${encodeURIComponent(roadmapId)}/milestones/${encodeURIComponent(milestoneId)}/features/${encodeURIComponent(featureId)}/handoff/task`,
-      projectId
-    )
-  );
-}
-
-/** Combined handoff response type for roadmap handoff endpoint */
-export interface RoadmapHandoffResponse {
-  mission: RoadmapMissionPlanningHandoff;
-  features: RoadmapFeatureTaskPlanningHandoff[];
-}
-
-/** Get both mission and feature handoff payloads for a roadmap */
-export function fetchRoadmapHandoff(roadmapId: string, projectId?: string): Promise<RoadmapHandoffResponse> {
-  return api<RoadmapHandoffResponse>(withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/handoff`, projectId));
-}
-
-/** Response from milestone suggestion generation */
-export interface MilestoneSuggestionsResponse {
-  suggestions: Array<{
-    title: string;
-    description?: string;
-  }>;
-}
-
-/** Generate milestone suggestions from a goal prompt */
-export function generateMilestoneSuggestions(
-  roadmapId: string,
-  goalPrompt: string,
-  count?: number,
-  projectId?: string
-): Promise<MilestoneSuggestionsResponse> {
-  return api<MilestoneSuggestionsResponse>(
-    withProjectId(`/roadmaps/${encodeURIComponent(roadmapId)}/suggestions/milestones`, projectId),
-    {
-      method: "POST",
-      body: JSON.stringify({
-        goalPrompt: goalPrompt.trim(),
-        ...(count !== undefined ? { count } : {}),
-      }),
-    }
-  );
-}
-
-/** Response type for feature suggestions */
-export interface FeatureSuggestionsResponse {
-  suggestions: Array<{
-    title: string;
-    description?: string;
-  }>;
-}
-
-/** Input for generating feature suggestions */
-export interface GenerateFeatureSuggestionsInput {
-  /** Optional prompt to guide feature generation */
-  prompt?: string;
-  /** Number of features to generate (default 5, max 10) */
-  count?: number;
-}
-
-/** Generate feature suggestions for a milestone */
-export function generateFeatureSuggestions(
-  milestoneId: string,
-  input?: GenerateFeatureSuggestionsInput,
-  projectId?: string
-): Promise<FeatureSuggestionsResponse> {
-  return api<FeatureSuggestionsResponse>(
-    withProjectId(`/roadmaps/milestones/${encodeURIComponent(milestoneId)}/suggestions/features`, projectId),
-    {
-      method: "POST",
-      body: JSON.stringify({
-        ...(input?.prompt !== undefined ? { prompt: input.prompt.trim() } : {}),
-        ...(input?.count !== undefined ? { count: input.count } : {}),
-      }),
-    }
-  );
-}
-
 // ── Todo API ─────────────────────────────────────────────────────────────────
 
 /** Fetch all todo lists with their items */
@@ -7554,6 +7724,7 @@ export interface OutboxResponse {
 /** Response shape for GET /messages/unread-count */
 export interface UnreadCountResponse {
   unreadCount: number;
+  pendingApprovalCount?: number;
 }
 
 /** Response shape for POST /messages/read-all */
@@ -7572,6 +7743,13 @@ export interface AgentMailboxResponse {
   outbox: Message[];
 }
 
+/** Response shape for GET /agents/mailbox/all */
+export interface AllAgentsMailboxResponse {
+  messages: Message[];
+  total: number;
+  unreadCount: number;
+}
+
 /** Input for sending a message via the dashboard */
 export interface SendMessageInput {
   toId: string;
@@ -7579,6 +7757,56 @@ export interface SendMessageInput {
   content: string;
   type: MessageType;
   metadata?: MessageMetadata;
+  wakeImmediately?: boolean;
+}
+
+export interface ApprovalRequestSummary {
+  id: string;
+  status: ApprovalRequestStatus;
+  actionCategory: string;
+  actionSummary: string;
+  agentId: string;
+  taskId?: string;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt?: string;
+  decidedBy?: string;
+}
+
+export interface ApprovalRequestDetail extends ApprovalRequestSummary {
+  requester: {
+    actorId: string;
+    actorType: "agent" | "user" | "system";
+    actorName: string;
+  };
+  runId?: string;
+  requestedAt: string;
+  completedAt?: string;
+  targetAction: {
+    category: string;
+    action: string;
+    summary: string;
+    resourceType: string;
+    resourceId: string;
+    context?: Record<string, unknown>;
+  };
+  history: Array<{
+    id: string;
+    eventType: string;
+    actor: {
+      actorId: string;
+      actorType: "agent" | "user" | "system";
+      actorName: string;
+    };
+    note?: string;
+    createdAt: string;
+  }>;
+}
+
+export interface ApprovalListResponse {
+  requests: ApprovalRequestSummary[];
+  total: number;
+  pendingCount: number;
 }
 
 /** Fetch inbox messages for the current user. */
@@ -7662,6 +7890,39 @@ export function fetchConversation(
 /** Fetch an agent's mailbox (admin read-only view). */
 export function fetchAgentMailbox(agentId: string, projectId?: string): Promise<AgentMailboxResponse> {
   return api<AgentMailboxResponse>(withProjectId(`/agents/${encodeURIComponent(agentId)}/mailbox`, projectId));
+}
+
+/** Fetch aggregate mailbox across all agent-to-agent messages (admin read-only view). */
+export function fetchAllAgentMailbox(projectId?: string): Promise<AllAgentsMailboxResponse> {
+  return api<AllAgentsMailboxResponse>(withProjectId("/agents/mailbox/all", projectId));
+}
+
+export function fetchApprovals(
+  options?: { status?: ApprovalRequestStatus; limit?: number; offset?: number },
+  projectId?: string,
+): Promise<ApprovalListResponse> {
+  const params = new URLSearchParams();
+  if (options?.status) params.set("status", options.status);
+  if (options?.limit !== undefined) params.set("limit", String(options.limit));
+  if (options?.offset !== undefined) params.set("offset", String(options.offset));
+  if (projectId) params.set("projectId", projectId);
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  return api<ApprovalListResponse>(`/approvals${query}`);
+}
+
+export function fetchApprovalDetail(id: string, projectId?: string): Promise<ApprovalRequestDetail> {
+  return api<ApprovalRequestDetail>(withProjectId(`/approvals/${encodeURIComponent(id)}`, projectId));
+}
+
+export function decideApproval(
+  id: string,
+  input: { decision: "approve" | "deny"; comment?: string },
+  projectId?: string,
+): Promise<ApprovalRequestDetail> {
+  return api<ApprovalRequestDetail>(withProjectId(`/approvals/${encodeURIComponent(id)}/decision`, projectId), {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 /** Fetch reflection history for an agent. */
@@ -7760,7 +8021,7 @@ export async function fetchPluginDetail(id: string, projectId?: string): Promise
 
 /** Install a plugin from local path or npm package */
 export async function installPlugin(
-  source: { path: string } | { package: string },
+  source: { path: string; aiScanOnLoad?: boolean } | { package: string; aiScanOnLoad?: boolean },
   projectId?: string,
 ): Promise<PluginInstallation> {
   return api<PluginInstallation>(withProjectId("/plugins", projectId), {
@@ -7807,9 +8068,46 @@ export async function updatePluginSettings(
   });
 }
 
+export type PluginSetupStatusResponse =
+  | { hasSetup: false }
+  | ({ hasSetup: true } & PluginSetupCheckResult)
+  | {
+    hasSetup: true;
+    setupCheckDeferred: true;
+    deferredReason: "plugin-not-started";
+    pluginState: PluginInstallation["state"];
+  };
+
+/** Fetch plugin setup status */
+export async function fetchPluginSetupStatus(id: string, projectId?: string): Promise<PluginSetupStatusResponse> {
+  return api<PluginSetupStatusResponse>(withProjectId(`/plugins/${encodeURIComponent(id)}/setup-status`, projectId));
+}
+
+/** Trigger plugin setup install hook */
+export async function installPluginSetup(id: string, projectId?: string): Promise<{ success: boolean; error?: string }> {
+  return api<{ success: boolean; error?: string }>(withProjectId(`/plugins/${encodeURIComponent(id)}/setup/install`, projectId), {
+    method: "POST",
+  });
+}
+
 /** Reload a running plugin with updated code */
 export async function reloadPlugin(id: string, projectId?: string): Promise<PluginInstallation> {
   return api<PluginInstallation>(withProjectId(`/plugins/${encodeURIComponent(id)}/reload`, projectId), {
+    method: "POST",
+  });
+}
+
+/** Update plugin security-scan configuration */
+export async function updatePlugin(id: string, updates: { aiScanOnLoad: boolean }, projectId?: string): Promise<PluginInstallation> {
+  return api<PluginInstallation>(withProjectId(`/plugins/${encodeURIComponent(id)}`, projectId), {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+}
+
+/** Trigger plugin rescan + reload flow */
+export async function rescanPlugin(id: string, projectId?: string): Promise<PluginInstallation> {
+  return api<PluginInstallation>(withProjectId(`/plugins/${encodeURIComponent(id)}/rescan`, projectId), {
     method: "POST",
   });
 }
@@ -7818,6 +8116,12 @@ export async function reloadPlugin(id: string, projectId?: string): Promise<Plug
 export interface PluginUiSlotEntry {
   pluginId: string;
   slot: PluginUiSlotDefinition;
+}
+
+/** A structured UI contribution entry returned by GET /api/plugins/ui-contributions */
+export interface PluginUiContributionEntry {
+  pluginId: string;
+  contribution: PluginUiContributionDefinition;
 }
 
 /** A dashboard view entry returned by GET /api/plugins/dashboard-views */
@@ -7840,6 +8144,11 @@ export async function fetchPluginUiSlots(projectId?: string): Promise<PluginUiSl
   return api<PluginUiSlotEntry[]>(withProjectId("/plugins/ui-slots", projectId));
 }
 
+
+/** Fetch all structured UI contributions from active plugins */
+export async function fetchPluginUiContributions(projectId?: string): Promise<PluginUiContributionEntry[]> {
+  return api<PluginUiContributionEntry[]>(withProjectId("/plugins/ui-contributions", projectId));
+}
 
 /** Fetch all top-level dashboard view definitions from active plugins */
 export async function fetchPluginDashboardViews(projectId?: string): Promise<PluginDashboardViewEntry[]> {
@@ -7906,6 +8215,27 @@ export interface ChatSessionResponse {
 
 export interface ChatMessageListResponse {
   messages: ChatMessage[];
+}
+
+export interface ChatRoomListResponse {
+  rooms: ChatRoom[];
+}
+
+export interface ChatRoomResponse {
+  room: ChatRoom;
+  members?: ChatRoomMember[];
+}
+
+export interface ChatRoomMembersResponse {
+  members: ChatRoomMember[];
+}
+
+export interface ChatRoomMessageListResponse {
+  messages: ChatRoomMessage[];
+}
+
+export interface ChatRoomMessageResponse {
+  message: ChatRoomMessage;
 }
 
 /** Fetch all chat sessions for a project */
@@ -8021,6 +8351,114 @@ export function deleteChatMessage(
   );
 }
 
+export function fetchChatRooms(
+  options: { status?: string; agentId?: string } = {},
+  projectId?: string,
+): Promise<ChatRoomListResponse> {
+  const search = new URLSearchParams();
+  if (projectId) search.set("projectId", projectId);
+  if (options.status) search.set("status", options.status);
+  if (options.agentId) search.set("agentId", options.agentId);
+  const qs = search.toString();
+  return api<ChatRoomListResponse>(`/chat/rooms${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchChatRoom(id: string, projectId?: string): Promise<ChatRoomResponse> {
+  return api<ChatRoomResponse>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}`, projectId));
+}
+
+export function createChatRoom(
+  input: { name: string; description?: string | null; createdBy?: string | null; memberAgentIds?: string[] },
+  projectId?: string,
+): Promise<ChatRoomResponse> {
+  const body = { ...input, ...(projectId ? { projectId } : {}) };
+  return api<ChatRoomResponse>(withProjectId("/chat/rooms", projectId), {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateChatRoom(
+  id: string,
+  updates: { name?: string; description?: string | null; status?: "active" | "archived" },
+  projectId?: string,
+): Promise<{ room: ChatRoom }> {
+  return api<{ room: ChatRoom }>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}`, projectId), {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+}
+
+export function deleteChatRoom(id: string, projectId?: string): Promise<{ success: boolean }> {
+  return api<{ success: boolean }>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}`, projectId), {
+    method: "DELETE",
+  });
+}
+
+export function fetchChatRoomMembers(id: string, projectId?: string): Promise<ChatRoomMembersResponse> {
+  return api<ChatRoomMembersResponse>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}/members`, projectId));
+}
+
+export function addChatRoomMember(
+  id: string,
+  input: { agentId: string; role?: "owner" | "member" },
+  projectId?: string,
+): Promise<{ member: ChatRoomMember }> {
+  return api<{ member: ChatRoomMember }>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}/members`, projectId), {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function removeChatRoomMember(id: string, agentId: string, projectId?: string): Promise<{ success: boolean }> {
+  return api<{ success: boolean }>(
+    withProjectId(`/chat/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(agentId)}`, projectId),
+    { method: "DELETE" },
+  );
+}
+
+export function fetchChatRoomMessages(
+  id: string,
+  opts?: { limit?: number; offset?: number; before?: string },
+  projectId?: string,
+): Promise<ChatRoomMessageListResponse> {
+  const search = new URLSearchParams();
+  if (opts?.limit !== undefined) search.set("limit", String(opts.limit));
+  if (opts?.offset !== undefined) search.set("offset", String(opts.offset));
+  if (opts?.before) search.set("before", opts.before);
+  const qs = search.toString();
+  return api<ChatRoomMessageListResponse>(
+    withProjectId(`/chat/rooms/${encodeURIComponent(id)}/messages${qs ? `?${qs}` : ""}`, projectId),
+  );
+}
+
+export function postChatRoomMessage(
+  id: string,
+  input: { content: string; senderAgentId?: null; mentions?: string[]; attachments?: File[] | ChatAttachment[] },
+  projectId?: string,
+): Promise<ChatRoomMessageResponse> {
+  return api<ChatRoomMessageResponse>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}/messages`, projectId), {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteChatRoomMessage(
+  id: string,
+  messageId: string,
+  projectId?: string,
+): Promise<{ success: boolean }> {
+  return api<{ success: boolean }>(
+    withProjectId(`/chat/rooms/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}`, projectId),
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Room POST /messages in FN-3808 is persist-only (201 JSON response).
+ * Do not add streamChatRoomResponse until FN-3810 introduces AI invocation/streaming.
+ */
+
 /** Cancel an in-flight chat generation. */
 export function cancelChatResponse(
   sessionId: string,
@@ -8044,34 +8482,55 @@ export function cancelChatResponse(
  *  When attachments are provided, the request body is sent as multipart form data;
  *  otherwise it uses the existing JSON payload path.
  */
+export interface ChatStreamHandlers {
+  onThinking?: (data: string) => void;
+  onText?: (data: string) => void;
+  onToolStart?: (data: { toolName: string; args?: Record<string, unknown> }) => void;
+  onToolEnd?: (data: { toolName: string; isError: boolean; result?: unknown }) => void;
+  onFallback?: (data: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }) => void;
+  onDone?: (data: { messageId: string; message?: ChatMessage }) => void;
+  onError?: (data: string) => void;
+  onConnectionStateChange?: (state: StreamConnectionState) => void;
+}
+
 export function streamChatResponse(
   sessionId: string,
   content: string,
-  handlers: {
-    onThinking?: (data: string) => void;
-    onText?: (data: string) => void;
-    onToolStart?: (data: { toolName: string; args?: Record<string, unknown> }) => void;
-    onToolEnd?: (data: { toolName: string; isError: boolean; result?: unknown }) => void;
-    onFallback?: (data: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }) => void;
-    onDone?: (data: { messageId: string }) => void;
-    onError?: (data: string) => void;
-    onConnectionStateChange?: (state: StreamConnectionState) => void;
-  },
+  handlers: ChatStreamHandlers,
   attachments?: File[],
   projectId?: string,
-  options?: { maxReconnectAttempts?: number },
+  options?: { maxReconnectAttempts?: number; firstEventTimeoutMs?: number },
 ): { close: () => void; isConnected: () => boolean } {
   const url = buildApiUrl(withProjectId(`/chat/sessions/${encodeURIComponent(sessionId)}/messages`, projectId));
 
-  void options;
-
   const abortController = new AbortController();
   let closedByUser = false;
+  let terminated = false;
+  let receivedStreamEvent = false;
+  const firstEventTimeoutMs = Math.max(1_000, options?.firstEventTimeoutMs ?? 60_000);
+  let firstEventTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearFirstEventTimer = (): void => {
+    if (firstEventTimer) {
+      clearTimeout(firstEventTimer);
+      firstEventTimer = null;
+    }
+  };
+
+  const markFirstEventReceived = (): void => {
+    if (receivedStreamEvent) {
+      return;
+    }
+    receivedStreamEvent = true;
+    clearFirstEventTimer();
+  };
 
   const dispatchEvent = (eventName: string, rawData: string): void => {
     if (!eventName) {
       return;
     }
+
+    markFirstEventReceived();
 
     switch (eventName) {
       case "thinking":
@@ -8110,13 +8569,19 @@ export function streamChatResponse(
         }
         break;
       case "done":
+        terminated = true;
         try {
-          handlers.onDone?.(JSON.parse(rawData));
+          const parsed = JSON.parse(rawData) as { messageId?: unknown; message?: unknown };
+          handlers.onDone?.({
+            messageId: typeof parsed.messageId === "string" ? parsed.messageId : "",
+            ...(parsed.message && typeof parsed.message === "object" ? { message: parsed.message as ChatMessage } : {}),
+          });
         } catch {
           handlers.onDone?.({ messageId: "" });
         }
         break;
       case "error":
+        terminated = true;
         try {
           const parsed = JSON.parse(rawData);
           handlers.onError?.(parsed.message || parsed);
@@ -8164,6 +8629,14 @@ export function streamChatResponse(
       }
 
       handlers.onConnectionStateChange?.("connected");
+      firstEventTimer = setTimeout(() => {
+        if (terminated || closedByUser || receivedStreamEvent) {
+          return;
+        }
+        terminated = true;
+        handlers.onError?.("Timed out waiting for first response event");
+        abortController.abort();
+      }, firstEventTimeoutMs);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -8193,6 +8666,8 @@ export function streamChatResponse(
             currentEvent = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
             const value = line.slice(5);
+            // Strip only the optional SSE protocol delimiter-space after `data:`.
+            // Payload whitespace (including JSON-string leading spaces) must stay verbatim.
             currentDataLines.push(value.startsWith(" ") ? value.slice(1) : value);
           } else if (line === "") {
             const currentData = currentDataLines.join("\n");
@@ -8221,14 +8696,223 @@ export function streamChatResponse(
 
         processLines(decoder.decode(value, { stream: true }));
       }
+
+      const hasUndispatchedTrailingFragment =
+        buffer.length > 0 || currentEvent.length > 0 || currentDataLines.length > 0;
+
+      // Server closed the stream without emitting a terminal `done` or `error`
+      // SSE event (common on flaky mobile networks, proxy idle-kill, or
+      // backgrounded tabs). Surface as an error so the client unwinds
+      // streaming state instead of getting stuck with isStreaming=true.
+      // Ignore dangling partial fragments at EOF: those indicate a truncated
+      // trailing event that should be dropped rather than surfaced as transport
+      // failure.
+      if (!terminated && !closedByUser && !hasUndispatchedTrailingFragment) {
+        handlers.onError?.("Connection closed unexpectedly");
+      }
+      clearFirstEventTimer();
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        if (!closedByUser) {
+        if (!closedByUser && !terminated) {
+          handlers.onError?.("Connection aborted");
+        }
+        clearFirstEventTimer();
+        return;
+      }
+      if (closedByUser) {
+        clearFirstEventTimer();
+        return;
+      }
+      clearFirstEventTimer();
+      handlers.onError?.(err instanceof Error ? err.message : "Connection error");
+    }
+  })();
+
+  return {
+    close: () => {
+      closedByUser = true;
+      clearFirstEventTimer();
+      abortController.abort();
+    },
+    isConnected: () => !closedByUser,
+  };
+}
+
+export function attachChatStream(
+  sessionId: string,
+  handlers: ChatStreamHandlers,
+  projectId?: string,
+  options?: { lastEventId?: number },
+): { close: () => void; isConnected: () => boolean } {
+  const url = buildApiUrl(withProjectId(`/chat/sessions/${encodeURIComponent(sessionId)}/stream`, projectId));
+  const abortController = new AbortController();
+  let closedByUser = false;
+  let terminated = false;
+
+  const dispatchEvent = (eventName: string, rawData: string): void => {
+    if (!eventName) {
+      return;
+    }
+
+    switch (eventName) {
+      case "thinking":
+        try {
+          handlers.onThinking?.(JSON.parse(rawData));
+        } catch {
+          handlers.onThinking?.(rawData);
+        }
+        break;
+      case "text":
+        try {
+          handlers.onText?.(JSON.parse(rawData));
+        } catch {
+          handlers.onText?.(rawData);
+        }
+        break;
+      case "tool_start":
+        try {
+          handlers.onToolStart?.(JSON.parse(rawData));
+        } catch {
+          // skip malformed event
+        }
+        break;
+      case "tool_end":
+        try {
+          handlers.onToolEnd?.(JSON.parse(rawData));
+        } catch {
+          // skip malformed event
+        }
+        break;
+      case "fallback":
+        try {
+          handlers.onFallback?.(JSON.parse(rawData));
+        } catch {
+          // skip malformed event
+        }
+        break;
+      case "done":
+        terminated = true;
+        try {
+          const parsed = JSON.parse(rawData) as { messageId?: unknown; message?: unknown };
+          handlers.onDone?.({
+            messageId: typeof parsed.messageId === "string" ? parsed.messageId : "",
+            ...(parsed.message && typeof parsed.message === "object" ? { message: parsed.message as ChatMessage } : {}),
+          });
+        } catch {
+          handlers.onDone?.({ messageId: "" });
+        }
+        break;
+      case "error":
+        terminated = true;
+        try {
+          const parsed = JSON.parse(rawData);
+          handlers.onError?.(parsed.message || parsed);
+        } catch {
+          handlers.onError?.(rawData || "Stream error");
+        }
+        break;
+    }
+  };
+
+  (async () => {
+    try {
+      const requestHeaders = new Headers(withTokenHeader() as HeadersInit);
+      if (typeof options?.lastEventId === "number") {
+        requestHeaders.set("Last-Event-ID", String(options.lastEventId));
+      }
+
+      const res = await fetch(url, {
+        method: "GET",
+        headers: requestHeaders,
+        signal: abortController.signal,
+      });
+
+      if (!res.ok) {
+        const errorBody = await res.text();
+        let errorMsg = `Request failed: ${res.status}`;
+        try {
+          const parsed = JSON.parse(errorBody);
+          errorMsg = parsed.error || errorMsg;
+        } catch { /* use default */ }
+        handlers.onError?.(errorMsg);
+        return;
+      }
+
+      if (!res.body) {
+        handlers.onError?.("No response body");
+        return;
+      }
+
+      handlers.onConnectionStateChange?.("connected");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let currentEvent = "";
+      let currentDataLines: string[] = [];
+
+      const processLines = (chunk: string, flushPendingEvent = false): void => {
+        buffer += chunk;
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        if (flushPendingEvent && buffer.length > 0) {
+          lines.push(buffer);
+          buffer = "";
+        }
+
+        for (const rawLine of lines) {
+          const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+
+          if (line.startsWith("event:")) {
+            currentEvent = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            const value = line.slice(5);
+            // Strip only the optional SSE protocol delimiter-space after `data:`.
+            // Payload whitespace (including JSON-string leading spaces) must stay verbatim.
+            currentDataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+          } else if (line === "") {
+            const currentData = currentDataLines.join("\n");
+            dispatchEvent(currentEvent, currentData);
+            currentEvent = "";
+            currentDataLines = [];
+          }
+        }
+
+        if (flushPendingEvent && currentEvent && currentDataLines.length > 0) {
+          const trailingData = currentDataLines.join("\n");
+          dispatchEvent(currentEvent, trailingData);
+          currentEvent = "";
+          currentDataLines = [];
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          processLines(decoder.decode(), true);
+          break;
+        }
+
+        processLines(decoder.decode(value, { stream: true }));
+      }
+
+      const hasUndispatchedTrailingFragment =
+        buffer.length > 0 || currentEvent.length > 0 || currentDataLines.length > 0;
+
+      if (!terminated && !closedByUser && !hasUndispatchedTrailingFragment) {
+        return;
+      }
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        if (!closedByUser && !terminated) {
           handlers.onError?.("Connection aborted");
         }
         return;
       }
-      if (closedByUser) return;
+      if (closedByUser) {
+        return;
+      }
       handlers.onError?.(err instanceof Error ? err.message : "Connection error");
     }
   })();
@@ -8322,16 +9006,39 @@ export function dismissInsight(id: string, projectId?: string): Promise<Insight>
 }
 
 /**
+ * Archive an insight (set status to archived).
+ */
+export function archiveInsight(id: string, projectId?: string): Promise<Insight> {
+  return api<Insight>(withProjectId(`/insights/${encodeURIComponent(id)}/archive`, projectId), {
+    method: "POST",
+  });
+}
+
+/**
+ * Unarchive an insight (set status back to confirmed).
+ */
+export function unarchiveInsight(id: string, projectId?: string): Promise<Insight> {
+  return api<Insight>(withProjectId(`/insights/${encodeURIComponent(id)}/unarchive`, projectId), {
+    method: "POST",
+  });
+}
+
+/**
  * Trigger a manual insight generation run.
  */
 export function triggerInsightRun(
   trigger: InsightRunTrigger = "manual",
   inputMetadata?: InsightRun["inputMetadata"],
   projectId?: string,
+  modelProvider?: string,
+  modelId?: string,
 ): Promise<InsightRun> {
+  const body: Record<string, unknown> = { trigger, inputMetadata };
+  if (modelProvider) body.modelProvider = modelProvider;
+  if (modelId) body.modelId = modelId;
   return api<InsightRun>(withProjectId("/insights/run", projectId), {
     method: "POST",
-    body: JSON.stringify({ trigger, inputMetadata }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -8367,6 +9074,35 @@ export function getInsightCreateTaskData(
 }
 
 // ── Research API ────────────────────────────────────────────────────────────
+
+export interface EvalsListOptions {
+  q?: string;
+  runId?: string;
+  scoreMin?: number;
+  scoreMax?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export function listEvals(options: EvalsListOptions = {}, projectId?: string): Promise<{ results: EvalTaskResult[]; count: number }> {
+  const params = new URLSearchParams();
+  if (options.q) params.set("q", options.q);
+  if (options.runId) params.set("runId", options.runId);
+  if (options.scoreMin !== undefined) params.set("scoreMin", String(options.scoreMin));
+  if (options.scoreMax !== undefined) params.set("scoreMax", String(options.scoreMax));
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  if (options.offset !== undefined) params.set("offset", String(options.offset));
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return api<{ results: EvalTaskResult[]; count: number }>(withProjectId(`/evals${suffix}`, projectId));
+}
+
+export function getEval(id: string, projectId?: string): Promise<{ result: EvalTaskResult }> {
+  return api<{ result: EvalTaskResult }>(withProjectId(`/evals/${encodeURIComponent(id)}`, projectId));
+}
+
+export function listEvalRuns(projectId?: string): Promise<{ runs: EvalRun[] }> {
+  return api<{ runs: EvalRun[] }>(withProjectId("/evals/runs", projectId));
+}
 
 export interface CreateResearchRunInput {
   query: string;

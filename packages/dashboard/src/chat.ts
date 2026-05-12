@@ -17,12 +17,14 @@ import type {
   AgentStore,
   ChatMention,
   ChatAttachment,
+  ChatInFlightGenerationState,
   ChatStore,
   ChatSession,
   ChatSessionCreateInput,
+  MessageStore,
   Settings,
 } from "@fusion/core";
-import { resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy, summarizeTitle } from "@fusion/core";
+import { summarizeTitle } from "@fusion/core";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
@@ -35,6 +37,8 @@ import {
   promptWithFallback as enginePromptWithFallback,
   extractRuntimeHint,
   extractRuntimeModel,
+  createSendMessageTool,
+  createReadMessagesTool,
 } from "@fusion/engine";
 import * as engineModule from "@fusion/engine";
 
@@ -122,6 +126,8 @@ async function ensureEngineReady(): Promise<void> {
 /** Chat system prompt for the AI agent */
 const CHAT_SYSTEM_PROMPT = `You are a helpful AI assistant integrated into the fn task board system. You help users with questions about their project, code, architecture, and tasks. You have access to project files and can read them to provide informed responses. Be concise, accurate, and helpful. When referencing files or code, provide specific paths and line numbers when possible.`;
 
+const CHAT_AGENT_MESSAGE_ROUTING_GUIDANCE = `## Messaging Semantics\n\nYour chat reply is the primary response to the user. Do not also call \`fn_send_message\` with the same content just to mirror your chat response into mailbox.\n\nOnly use \`fn_send_message\` when the user explicitly asks for mailbox/inbox/notification delivery (for example: "send me this in mail", "ntfy me when…", or "leave me a note in my inbox"). In that explicit-request case, send with \`type: "agent-to-user"\` and target the dashboard user alias (\`to_id: "dashboard"\` is preferred). Never route that as a user/CLI → agent message.`;
+
 /** Rate limiting window in milliseconds (1 minute) */
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
@@ -130,6 +136,11 @@ const MAX_MESSAGES_PER_IP_PER_MINUTE = 30;
 
 /** Maximum file size for # mentions (50KB). Files larger than this are skipped. */
 const MAX_REFERENCED_FILE_SIZE = 50 * 1024;
+const ROOM_AMBIENT_MAX_RESPONDERS = 5;
+const ROOM_THREAD_CONTEXT_MAX_MESSAGES = 16;
+const ROOM_THREAD_CONTEXT_MAX_CHARS = 8_000;
+const ROOM_THREAD_MESSAGE_CONTENT_MAX_CHARS = 1_200;
+const IN_FLIGHT_PERSIST_DEBOUNCE_MS = 200;
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size}B`;
@@ -146,11 +157,33 @@ export type ChatStreamEvent =
   | { type: "tool_start"; data: { toolName: string; args?: Record<string, unknown> } }
   | { type: "tool_end"; data: { toolName: string; isError: boolean; result?: unknown } }
   | { type: "fallback"; data: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" } }
-  | { type: "done"; data: { messageId: string; attachments?: ChatAttachment[] } }
+  | {
+      type: "done";
+      data: {
+        messageId: string;
+        message?: {
+          id: string;
+          sessionId: string;
+          role: "assistant";
+          content: string;
+          thinkingOutput: string | null;
+          metadata: Record<string, unknown> | null;
+          attachments?: ChatAttachment[];
+          createdAt: string;
+        };
+        attachments?: ChatAttachment[];
+      };
+    }
   | { type: "error"; data: string };
 
 /** Callback function for streaming events */
 export type ChatStreamCallback = (event: ChatStreamEvent, eventId?: number) => void;
+
+/** Per-subscription record. `generationId` (if set) filters which broadcasts are delivered. */
+interface ChatStreamSubscription {
+  callback: ChatStreamCallback;
+  generationId?: number;
+}
 
 interface RateLimitEntry {
   count: number;
@@ -269,7 +302,7 @@ export async function resolveFileReferences(content: string, rootDir: string): P
  * Follows the PlanningStreamManager pattern.
  */
 export class ChatStreamManager extends EventEmitter {
-  private readonly sessions = new Map<string, Set<ChatStreamCallback>>();
+  private readonly sessions = new Map<string, Set<ChatStreamSubscription>>();
   private readonly buffers = new Map<string, SessionEventBuffer>();
 
   constructor(private readonly bufferSize = 100) {
@@ -279,18 +312,29 @@ export class ChatStreamManager extends EventEmitter {
   /**
    * Register a client callback for a chat session.
    * Returns a function to unsubscribe.
+   *
+   * If `options.generationId` is provided, this subscriber only receives broadcasts
+   * tagged with the same generationId (or untagged broadcasts). This isolates each
+   * client SSE connection to events from its own `chatManager.sendMessage` call so
+   * that a previous generation's late "Generation cancelled" event cannot leak into
+   * a new request that has just subscribed for the same session.
    */
-  subscribe(sessionId: string, callback: ChatStreamCallback): () => void {
+  subscribe(
+    sessionId: string,
+    callback: ChatStreamCallback,
+    options?: { generationId?: number },
+  ): () => void {
     if (!this.sessions.has(sessionId)) {
       this.sessions.set(sessionId, new Set());
     }
 
-    const callbacks = this.sessions.get(sessionId)!;
-    callbacks.add(callback);
+    const subscriptions = this.sessions.get(sessionId)!;
+    const subscription: ChatStreamSubscription = { callback, generationId: options?.generationId };
+    subscriptions.add(subscription);
 
     return () => {
-      callbacks.delete(callback);
-      if (callbacks.size === 0) {
+      subscriptions.delete(subscription);
+      if (subscriptions.size === 0) {
         this.sessions.delete(sessionId);
       }
     };
@@ -308,18 +352,36 @@ export class ChatStreamManager extends EventEmitter {
   /**
    * Broadcast an event to all clients subscribed to a session.
    * Every event is buffered and assigned a monotonically increasing id.
+   *
+   * When `options.generationId` is set, the event is delivered only to subscribers
+   * that registered without a generation filter or whose generation matches.
+   * Subscribers tied to a different generation will not receive it. Untagged
+   * broadcasts (no generationId) reach every subscriber for backward compatibility.
    */
-  broadcast(sessionId: string, event: ChatStreamEvent): number {
+  broadcast(
+    sessionId: string,
+    event: ChatStreamEvent,
+    options?: { generationId?: number },
+  ): number {
     const serialized = JSON.stringify((event as { data?: unknown }).data ?? {});
     const eventData = typeof serialized === "string" ? serialized : "{}";
     const eventId = this.getBuffer(sessionId).push(event.type, eventData);
 
-    const callbacks = this.sessions.get(sessionId);
-    if (!callbacks) return eventId;
+    const subscriptions = this.sessions.get(sessionId);
+    if (!subscriptions) return eventId;
 
-    for (const callback of callbacks) {
+    const broadcastGenerationId = options?.generationId;
+
+    for (const subscription of subscriptions) {
+      if (
+        broadcastGenerationId !== undefined &&
+        subscription.generationId !== undefined &&
+        subscription.generationId !== broadcastGenerationId
+      ) {
+        continue;
+      }
       try {
-        callback(event, eventId);
+        subscription.callback(event, eventId);
       } catch (err) {
         diagnostics.error(`Error broadcasting to client for session ${sessionId}:`, err);
       }
@@ -341,8 +403,8 @@ export class ChatStreamManager extends EventEmitter {
    * Check if a session has active subscribers.
    */
   hasSubscribers(sessionId: string): boolean {
-    const callbacks = this.sessions.get(sessionId);
-    return callbacks !== undefined && callbacks.size > 0;
+    const subscriptions = this.sessions.get(sessionId);
+    return subscriptions !== undefined && subscriptions.size > 0;
   }
 
   /**
@@ -429,11 +491,24 @@ export function getRateLimitResetTime(ip: string): Date | null {
  * Manages AI agent chat sessions.
  * Creates sessions, sends messages, and streams AI responses via SSE.
  */
+export class RoomReplyGenerationError extends Error {
+  readonly roomId: string;
+
+  constructor(message: string, roomId: string) {
+    super(message);
+    this.name = "RoomReplyGenerationError";
+    this.roomId = roomId;
+  }
+}
+
 export class ChatManager {
   private agentStoreReady?: Promise<void>;
+  private generationCounter = 0;
+  private inFlightPersistTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private activeGenerations = new Map<string, {
     abortController: AbortController;
     agentResult?: AgentResult;
+    generationId: number;
   }>();
 
   constructor(
@@ -444,16 +519,37 @@ export class ChatManager {
       getRuntimeById?(runtimeId: string): unknown;
       createRuntimeContext?(pluginId: string): Promise<unknown>;
     },
-    private getSettings?: () => Promise<Partial<Settings> | undefined> | Partial<Settings> | undefined,
+    private getSettings?: () => Promise<Pick<Settings, "fallbackProvider" | "fallbackModelId" | "defaultProvider" | "defaultModelId"> | undefined> | Pick<Settings, "fallbackProvider" | "fallbackModelId" | "defaultProvider" | "defaultModelId"> | undefined,
+    private messageStore?: MessageStore,
   ) {}
+
+  private queueInFlightGenerationPersist(sessionId: string, snapshot: ChatInFlightGenerationState | null): void {
+    const existingTimer = this.inFlightPersistTimers.get(sessionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+      this.inFlightPersistTimers.delete(sessionId);
+      this.chatStore.setInFlightGeneration(sessionId, snapshot);
+    }, IN_FLIGHT_PERSIST_DEBOUNCE_MS);
+    this.inFlightPersistTimers.set(sessionId, timer);
+  }
+
+  private flushInFlightGenerationPersist(sessionId: string, snapshot: ChatInFlightGenerationState | null): void {
+    const existingTimer = this.inFlightPersistTimers.get(sessionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.inFlightPersistTimers.delete(sessionId);
+    }
+    this.chatStore.setInFlightGeneration(sessionId, snapshot);
+  }
 
   private async getChatModelSettings(): Promise<{
     fallbackProvider?: string;
     fallbackModelId?: string;
     defaultProvider?: string;
     defaultModelId?: string;
-    modelFallbackChain?: Array<{ provider?: string; modelId?: string }>;
-    routeViaDspy?: boolean;
   }> {
     if (!this.getSettings) {
       return {};
@@ -466,8 +562,6 @@ export class ChatManager {
         fallbackModelId: settings?.fallbackModelId ?? undefined,
         defaultProvider: settings?.defaultProvider ?? undefined,
         defaultModelId: settings?.defaultModelId ?? undefined,
-        modelFallbackChain: resolveModelFallbackChain(settings),
-        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -478,6 +572,7 @@ export class ChatManager {
 
   private handleFallbackModelUsed(
     sessionId: string,
+    generationId: number,
     payload: {
       primaryModel: string;
       fallbackModel: string;
@@ -498,7 +593,40 @@ export class ChatManager {
     chatStreamManager.broadcast(sessionId, {
       type: "fallback",
       data: payload,
-    });
+    }, { generationId });
+  }
+
+  /**
+   * Allocate a fresh generation slot for a session before subscribing/streaming.
+   *
+   * Returns a monotonically increasing `generationId` plus an `AbortController` that
+   * later steps (the SSE route, `sendMessage`, `cancelGeneration`) use to drive and
+   * tear down this specific generation. Any in-flight generation for the same
+   * session is pre-emptively aborted; its lingering broadcasts will carry the old
+   * generationId, which `ChatStreamManager` filters out for new subscribers.
+   *
+   * Routes that subscribe to SSE before invoking `sendMessage` should call this
+   * first so subscription and broadcast generationIds are tied together.
+   */
+  beginGeneration(sessionId: string): { generationId: number; abortController: AbortController } {
+    // If a previous generation is still tracked (e.g. its browser disconnected
+    // mid-stream and its agent loop hasn't reached `finally` yet), abort its
+    // controller so it stops issuing further prompts/tool calls that would
+    // race against the new generation for the same CLI session file.
+    //
+    // We deliberately do NOT dispose its agent here — the previous generation
+    // owns its own dispose in its `finally`. Calling dispose pre-emptively can
+    // yank the underlying CLI process out from under the new generation's
+    // freshly-opened SessionManager pointing at the same session file.
+    const existing = this.activeGenerations.get(sessionId);
+    if (existing) {
+      existing.abortController.abort();
+    }
+    this.generationCounter += 1;
+    const generationId = this.generationCounter;
+    const abortController = new AbortController();
+    this.activeGenerations.set(sessionId, { abortController, generationId });
+    return { generationId, abortController };
   }
 
   /**
@@ -558,6 +686,23 @@ export class ChatManager {
       const message = agentListError instanceof Error ? agentListError.message : String(agentListError);
       diagnostics.warn(`Failed to list agents for mention parsing: ${message}`);
       return [];
+    }
+  }
+
+  private async getAgentById(agentId: string): Promise<Agent | null> {
+    if (!this.agentStore) {
+      return null;
+    }
+
+    try {
+      this.agentStoreReady ??= this.agentStore.init();
+      await this.agentStoreReady;
+      const agent = await this.agentStore.getAgent(agentId);
+      return agent ?? null;
+    } catch (agentLookupError) {
+      const message = agentLookupError instanceof Error ? agentLookupError.message : String(agentLookupError);
+      diagnostics.warn(`Failed to resolve room member agent ${agentId}: ${message}`);
+      return null;
     }
   }
 
@@ -645,11 +790,311 @@ export class ChatManager {
     ].join("\n");
   }
 
+  private resolveRoomResponders(
+    session: ChatSession,
+    mentions: ChatMention[],
+    availableAgents: Agent[],
+  ): { direct: Agent[]; ambient: Agent[]; nonMemberMentions: ChatMention[] } {
+    if (session.kind !== "room" || !session.roomId) {
+      return { direct: [], ambient: [], nonMemberMentions: [] };
+    }
+
+    const roomMembers = this.chatStore.listRoomMembers(session.roomId);
+    const memberIds = new Set(roomMembers.map((member) => member.agentId));
+    const agentsById = new Map(availableAgents.map((agent) => [agent.id, agent]));
+
+    const direct: Agent[] = [];
+    const seenDirect = new Set<string>();
+    const nonMemberMentions: ChatMention[] = [];
+
+    for (const mention of mentions) {
+      if (!memberIds.has(mention.agentId)) {
+        nonMemberMentions.push(mention);
+        continue;
+      }
+      if (seenDirect.has(mention.agentId)) {
+        continue;
+      }
+      const agent = agentsById.get(mention.agentId);
+      if (!agent) {
+        continue;
+      }
+      direct.push(agent);
+      seenDirect.add(mention.agentId);
+    }
+
+    const ambientCandidates = roomMembers
+      .map((member) => agentsById.get(member.agentId))
+      .filter((agent): agent is Agent => agent !== undefined)
+      .filter((agent) => !seenDirect.has(agent.id));
+
+    const ambient = ambientCandidates.slice(0, ROOM_AMBIENT_MAX_RESPONDERS);
+    if (ambientCandidates.length > ROOM_AMBIENT_MAX_RESPONDERS) {
+      diagnostics.warn(
+        `Room ${session.roomId} ambient responders capped at ${ROOM_AMBIENT_MAX_RESPONDERS} (from ${ambientCandidates.length})`,
+      );
+    }
+
+    return { direct, ambient, nonMemberMentions };
+  }
+
   /**
    * Create a new chat session.
    */
   createSession(input: ChatSessionCreateInput): ChatSession {
     return this.chatStore.createSession(input);
+  }
+
+  async sendRoomMessage(
+    roomId: string,
+    content: string,
+    attachments?: ChatAttachment[],
+    modelProvider?: string,
+    modelId?: string,
+  ) {
+    const room = this.chatStore.getRoom(roomId);
+    if (!room) {
+      throw new Error(`Chat room ${roomId} not found`);
+    }
+
+    const trimmedContent = content.trim();
+    const hasMentionCandidates = /@[\w-]+/.test(trimmedContent);
+    const availableAgents = await this.listAgentsForMentions();
+    const availableAgentsById = new Map(availableAgents.map((agent) => [agent.id, agent]));
+
+    for (const member of this.chatStore.listRoomMembers(roomId)) {
+      if (availableAgentsById.has(member.agentId)) {
+        continue;
+      }
+      const memberAgent = await this.getAgentById(member.agentId);
+      if (!memberAgent) {
+        continue;
+      }
+      availableAgentsById.set(memberAgent.id, memberAgent);
+      availableAgents.push(memberAgent);
+    }
+
+    const mentions = hasMentionCandidates ? await this.parseMentions(trimmedContent, availableAgents) : [];
+
+    const responderPlan = this.resolveRoomResponders(
+      { id: `room-${roomId}`, kind: "room", roomId, agentId: "room", status: "active" } as ChatSession,
+      mentions,
+      availableAgents,
+    );
+
+    const userMessage = this.chatStore.addRoomMessage(roomId, {
+      role: "user",
+      content: trimmedContent,
+      senderAgentId: null,
+      mentions: mentions.map((mention) => mention.agentId),
+      metadata: responderPlan.nonMemberMentions.length > 0
+        ? {
+            nonMemberMentions: responderPlan.nonMemberMentions,
+          }
+        : undefined,
+      ...(Array.isArray(attachments) ? { attachments } : {}),
+    });
+
+    const roomMembers = this.chatStore.listRoomMembers(roomId);
+    const responders = [...responderPlan.direct, ...responderPlan.ambient];
+    if (responders.length === 0) {
+      if (responderPlan.nonMemberMentions.length > 0) {
+        const labels = responderPlan.nonMemberMentions
+          .map((mention) => `@${mention.agentName.replace(/\s+/g, "_")}`)
+          .join(", ");
+        this.chatStore.addRoomMessage(roomId, {
+          role: "assistant",
+          senderAgentId: null,
+          content: `I couldn't route ${labels} because they are not members of this room.`,
+        });
+      }
+
+      if (roomMembers.length > 0) {
+        throw new RoomReplyGenerationError(`No active room responders available for room ${roomId}`, roomId);
+      }
+
+      return { userMessage, responders: [] };
+    }
+
+    const successfulResponderIds: string[] = [];
+    const responderFailures: string[] = [];
+
+    for (const responder of responders) {
+      try {
+        const response = await this.generateRoomResponderReply({
+          roomId,
+          roomName: room.name,
+          content: trimmedContent,
+          latestUserMessageId: userMessage.id,
+          mentions,
+          responder,
+          modelProvider,
+          modelId,
+        });
+
+        this.chatStore.addRoomMessage(roomId, {
+          role: "assistant",
+          content: response.content,
+          thinkingOutput: response.thinkingOutput,
+          metadata: response.metadata,
+          senderAgentId: responder.id,
+          mentions: mentions.map((mention) => mention.agentId),
+        });
+        successfulResponderIds.push(responder.id);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        diagnostics.error(`Room responder ${responder.id} failed in room ${roomId}: ${reason}`);
+        responderFailures.push(`${responder.id}: ${reason}`);
+      }
+    }
+
+    if (successfulResponderIds.length === 0) {
+      throw new RoomReplyGenerationError(
+        `Failed to generate room replies for room ${roomId}: ${responderFailures.join("; ")}`,
+        roomId,
+      );
+    }
+
+    if (responderPlan.nonMemberMentions.length > 0) {
+      const labels = responderPlan.nonMemberMentions
+        .map((mention) => `@${mention.agentName.replace(/\s+/g, "_")}`)
+        .join(", ");
+      this.chatStore.addRoomMessage(roomId, {
+        role: "assistant",
+        senderAgentId: null,
+        content: `Note: ${labels} are not members of this room, so they did not respond.`,
+      });
+    }
+
+    return {
+      userMessage,
+      responders: successfulResponderIds,
+    };
+  }
+
+  private async generateRoomResponderReply(input: {
+    roomId: string;
+    roomName: string;
+    content: string;
+    latestUserMessageId: string;
+    mentions: ChatMention[];
+    responder: Agent;
+    modelProvider?: string;
+    modelId?: string;
+  }): Promise<{ content: string; thinkingOutput: string | null; metadata?: Record<string, unknown> }> {
+    await ensureEngineReady();
+
+    let systemPrompt = CHAT_SYSTEM_PROMPT;
+    if (buildAgentChatPromptFn) {
+      try {
+        systemPrompt = await buildAgentChatPromptFn({
+          agent: input.responder,
+          rootDir: this.rootDir,
+          agentStore: this.agentStore,
+          basePrompt: CHAT_SYSTEM_PROMPT,
+          includeProjectMemory: true,
+        });
+      } catch (error) {
+        diagnostics.warn(`Failed to build chat prompt for room responder ${input.responder.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    const mentionContext = await this.buildMentionContext(input.mentions);
+    if (mentionContext) {
+      systemPrompt = `${systemPrompt}\n\n${mentionContext}`;
+    }
+    systemPrompt = `${systemPrompt}\n\n${CHAT_AGENT_MESSAGE_ROUTING_GUIDANCE}`;
+
+    const roomMessages = this.chatStore.getRoomMessages(input.roomId, { limit: ROOM_THREAD_CONTEXT_MAX_MESSAGES });
+    const roomPrompt = [
+      `You are replying as ${input.responder.name} in room #${input.roomName}.`,
+      "Reply to the latest user room message in the context of this shared room thread.",
+      "Room transcript (oldest to newest, bounded):",
+      this.formatRoomThreadContext(roomMessages, input.latestUserMessageId),
+      "Latest user message to answer:",
+      input.content,
+    ].join("\n\n");
+
+    const resolvedSession = await createResolvedAgentSession({
+      createFnAgent,
+      resolvedProvider: input.modelProvider,
+      resolvedModel: input.modelId,
+      defaultModelProvider: input.modelProvider,
+      defaultModelId: input.modelId,
+      createFnAgentArgs: {
+        rootDir: this.rootDir,
+        modelProvider: input.modelProvider,
+        modelId: input.modelId,
+        systemPrompt,
+      },
+    });
+
+    try {
+      await enginePromptWithFallback(resolvedSession.session, roomPrompt);
+
+      type AgentMessage = { role?: string; type?: string; content?: string | Array<{ type?: string; text?: string }> };
+      const messages = (resolvedSession.session.state.messages as AgentMessage[]) ?? [];
+      const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant" || message.type === "assistant");
+      let content = "";
+      if (typeof lastAssistant?.content === "string") {
+        content = lastAssistant.content;
+      } else if (Array.isArray(lastAssistant?.content)) {
+        content = lastAssistant.content
+          .map((part) => (part?.type === "text" ? part.text ?? "" : ""))
+          .join("");
+      }
+
+      const stateError = (resolvedSession.session.state as { errorMessage?: string } | undefined)?.errorMessage;
+      if (stateError?.trim()) {
+        throw new Error(stateError.trim());
+      }
+
+      const finalContent = content.trim();
+      if (!finalContent) {
+        throw new Error("Room responder returned an empty reply");
+      }
+
+      return {
+        content: finalContent,
+        thinkingOutput: null,
+        metadata: {
+          roomId: input.roomId,
+        },
+      };
+    } finally {
+      resolvedSession.session.dispose?.();
+    }
+  }
+
+  private formatRoomThreadContext(
+    messages: Array<{ id: string; role: "user" | "assistant" | "system"; content: string; createdAt: string; senderAgentId?: string | null }>,
+    latestUserMessageId: string,
+  ): string {
+    const trimmedFromTail: string[] = [];
+    let totalChars = 0;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      const senderLabel = message.role === "user"
+        ? "User"
+        : message.role === "system"
+          ? "System"
+          : (message.senderAgentId ? `Agent ${message.senderAgentId}` : "Assistant");
+      const content = message.content.length > ROOM_THREAD_MESSAGE_CONTENT_MAX_CHARS
+        ? `${message.content.slice(0, ROOM_THREAD_MESSAGE_CONTENT_MAX_CHARS - 1)}…`
+        : message.content;
+      const marker = message.id === latestUserMessageId ? " [LATEST USER MESSAGE — ANSWER THIS]" : "";
+      const line = `- [${message.createdAt}] (${message.role}) ${senderLabel}: ${content}${marker}`;
+
+      if (trimmedFromTail.length > 0 && totalChars + line.length > ROOM_THREAD_CONTEXT_MAX_CHARS) {
+        break;
+      }
+
+      trimmedFromTail.push(line);
+      totalChars += line.length;
+    }
+
+    return trimmedFromTail.reverse().join("\n");
   }
 
   /**
@@ -674,14 +1119,31 @@ export class ChatManager {
     modelProvider?: string,
     modelId?: string,
     attachments?: ChatAttachment[],
+    options?: { generationId?: number },
   ): Promise<void> {
-    const abortController = new AbortController();
-    this.activeGenerations.set(sessionId, { abortController });
+    // The SSE route allocates a generation via `beginGeneration` so it can subscribe
+    // with a matching filter before this method runs. Direct callers (tests, internal
+    // code) pass nothing and we allocate a generation here.
+    const preallocated = options?.generationId !== undefined
+      ? this.activeGenerations.get(sessionId)
+      : undefined;
+    let generationId: number;
+    let abortController: AbortController;
+    if (preallocated && preallocated.generationId === options?.generationId) {
+      generationId = preallocated.generationId;
+      abortController = preallocated.abortController;
+    } else {
+      const allocated = this.beginGeneration(sessionId);
+      generationId = allocated.generationId;
+      abortController = allocated.abortController;
+    }
+    const broadcastOptions = { generationId };
 
     const session = this.chatStore.getSession(sessionId);
     let agentResult: AgentResult | undefined;
     let accumulatedThinking = "";
     let accumulatedText = "";
+    let lastStreamEventId = 0;
     type ToolCallRecord = {
       toolName: string;
       args?: Record<string, unknown>;
@@ -694,15 +1156,54 @@ export class ChatManager {
       | { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }
       | undefined;
 
+    const persistInFlightSnapshot = (): void => {
+      const runningToolCalls = [...pendingToolStarts.entries()].flatMap(([toolName, starts]) =>
+        starts.map((start) => ({
+          toolName,
+          args: start.args,
+          isError: false,
+          result: undefined,
+          status: "running" as const,
+        })),
+      );
+
+      this.queueInFlightGenerationPersist(sessionId, {
+        status: "generating",
+        streamingText: accumulatedText,
+        streamingThinking: accumulatedThinking,
+        toolCalls: [
+          ...toolCallsAccum.map((toolCall) => ({
+            toolName: toolCall.toolName,
+            args: toolCall.args,
+            isError: toolCall.isError,
+            result: toolCall.result,
+            status: "completed" as const,
+          })),
+          ...runningToolCalls,
+        ],
+        replayFromEventId: lastStreamEventId,
+        updatedAt: new Date().toISOString(),
+      });
+    };
+
     try {
       // Validate session exists
       if (!session) {
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: `Chat session ${sessionId} not found`,
-        });
+        }, broadcastOptions);
         return;
       }
+
+      this.flushInFlightGenerationPersist(sessionId, {
+        status: "generating",
+        streamingText: "",
+        streamingThinking: "",
+        toolCalls: [],
+        replayFromEventId: 0,
+        updatedAt: new Date().toISOString(),
+      });
 
       const hasMentionCandidates = /@[\w-]+/.test(content);
       const mentionAgents = hasMentionCandidates ? await this.listAgentsForMentions() : [];
@@ -717,10 +1218,11 @@ export class ChatManager {
           attachments,
         });
       } catch (err) {
+        this.flushInFlightGenerationPersist(sessionId, null);
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: `Failed to save message: ${err instanceof Error ? err.message : "Unknown error"}`,
-        });
+        }, broadcastOptions);
         return;
       }
 
@@ -763,6 +1265,7 @@ export class ChatManager {
             basePrompt: CHAT_SYSTEM_PROMPT,
             includeProjectMemory: true,
           });
+          systemPrompt = `${systemPrompt}\n\n${CHAT_AGENT_MESSAGE_ROUTING_GUIDANCE}`;
         } catch (promptBuildError) {
           const message = promptBuildError instanceof Error ? promptBuildError.message : String(promptBuildError);
           diagnostics.warn(`Failed to build enriched system prompt for ${agent.id}: ${message}`);
@@ -844,10 +1347,18 @@ export class ChatManager {
           || usesConfiguredDefaultModel
         );
 
+      const messagingTools = agent?.id && this.messageStore
+        ? [
+            createSendMessageTool(this.messageStore, agent.id),
+            createReadMessagesTool(this.messageStore, agent.id),
+          ]
+        : undefined;
+
       const sessionOptions = {
         cwd: this.rootDir,
         systemPrompt,
         tools: "coding" as const,
+        ...(messagingTools ? { customTools: messagingTools } : {}),
         sessionManager,
         ...(effectiveModelProvider && effectiveModelId
           ? {
@@ -861,41 +1372,40 @@ export class ChatManager {
               fallbackModelId: chatModelSettings.fallbackModelId,
             }
           : {}),
-        ...(allowFallback && chatModelSettings.modelFallbackChain && chatModelSettings.modelFallbackChain.length > 0
-          ? { modelFallbackChain: chatModelSettings.modelFallbackChain }
-          : {}),
-        routeViaDspy: chatModelSettings.routeViaDspy,
         onFallbackModelUsed: (payload: {
           primaryModel: string;
           fallbackModel: string;
           triggerPoint: "session-creation" | "prompt-time";
         }) => {
           fallbackInfo = payload;
-          this.handleFallbackModelUsed(sessionId, payload);
+          this.handleFallbackModelUsed(sessionId, generationId, payload);
         },
         onThinking: (delta: string) => {
           accumulatedThinking += delta;
-          chatStreamManager.broadcast(sessionId, {
+          lastStreamEventId = chatStreamManager.broadcast(sessionId, {
             type: "thinking",
             data: delta,
-          });
+          }, broadcastOptions);
+          persistInFlightSnapshot();
         },
         onText: (delta: string) => {
           accumulatedText += delta;
-          chatStreamManager.broadcast(sessionId, {
+          lastStreamEventId = chatStreamManager.broadcast(sessionId, {
             type: "text",
             data: delta,
-          });
+          }, broadcastOptions);
+          persistInFlightSnapshot();
         },
         onToolStart: (name: string, args?: Record<string, unknown>) => {
           const pendingForTool = pendingToolStarts.get(name) ?? [];
           pendingForTool.push({ toolName: name, args });
           pendingToolStarts.set(name, pendingForTool);
 
-          chatStreamManager.broadcast(sessionId, {
+          lastStreamEventId = chatStreamManager.broadcast(sessionId, {
             type: "tool_start",
             data: { toolName: name, args },
-          });
+          }, broadcastOptions);
+          persistInFlightSnapshot();
         },
         onToolEnd: (name: string, isError: boolean, result?: unknown) => {
           const pendingForTool = pendingToolStarts.get(name);
@@ -911,25 +1421,30 @@ export class ChatManager {
             result,
           });
 
-          chatStreamManager.broadcast(sessionId, {
+          lastStreamEventId = chatStreamManager.broadcast(sessionId, {
             type: "tool_end",
             data: { toolName: name, isError, result },
-          });
+          }, broadcastOptions);
+          persistInFlightSnapshot();
         },
       };
 
+      // Single agent-creation path for both regular chat and QuickChat. When
+      // the chat is bound to an agent that declares a runtime hint we pass it
+      // through; when there's no agent (e.g. QuickChat's model-only mode) or
+      // no hint, `createResolvedAgentSession` falls back to the default
+      // runtime via `resolveRuntime`. This avoids the previous divergence
+      // where QuickChat went through `createFnAgent` and hit pi-ai's shared
+      // `cleanupSessionResources(sessionId)` tear-down across overlapping
+      // sessions opened from the same CLI session file.
       const agentRuntimeHint = agent ? extractRuntimeHint(agent.runtimeConfig) : undefined;
-      if (agentRuntimeHint) {
-        agentResult = await createResolvedAgentSession({
-          sessionPurpose: "executor",
-          runtimeHint: agentRuntimeHint,
-          pluginRunner: this.pluginRunner,
-          ...sessionOptions,
-        });
-      } else {
-        agentResult = await createFnAgent(sessionOptions);
-      }
-      this.activeGenerations.set(sessionId, { abortController, agentResult });
+      agentResult = await createResolvedAgentSession({
+        sessionPurpose: "executor",
+        ...(agentRuntimeHint ? { runtimeHint: agentRuntimeHint } : {}),
+        pluginRunner: this.pluginRunner,
+        ...sessionOptions,
+      });
+      this.activeGenerations.set(sessionId, { abortController, agentResult, generationId });
 
       if (abortController.signal.aborted) {
         agentResult.session.dispose?.();
@@ -952,7 +1467,7 @@ export class ChatManager {
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: sessionErrorMessage,
-        });
+        }, broadcastOptions);
         return;
       }
 
@@ -995,17 +1510,34 @@ export class ChatManager {
         metadata: Object.keys(assistantMetadata).length > 0 ? assistantMetadata : undefined,
       });
 
-      // Broadcast done event
+      this.flushInFlightGenerationPersist(sessionId, null);
+
+      // Broadcast done event with persisted assistant snapshot so clients can
+      // render completion even when incremental text deltas were absent.
       chatStreamManager.broadcast(sessionId, {
         type: "done",
-        data: { messageId: assistantMessage.id, attachments },
-      });
+        data: {
+          messageId: assistantMessage.id,
+          message: {
+            id: assistantMessage.id,
+            sessionId: assistantMessage.sessionId,
+            role: "assistant",
+            content: assistantMessage.content,
+            thinkingOutput: assistantMessage.thinkingOutput,
+            metadata: assistantMessage.metadata,
+            attachments: assistantMessage.attachments,
+            createdAt: assistantMessage.createdAt,
+          },
+          attachments,
+        },
+      }, broadcastOptions);
     } catch (err) {
       if (abortController.signal.aborted) {
+        this.flushInFlightGenerationPersist(sessionId, null);
         chatStreamManager.broadcast(sessionId, {
           type: "error",
           data: "Generation cancelled",
-        });
+        }, broadcastOptions);
         return;
       }
 
@@ -1029,15 +1561,36 @@ export class ChatManager {
         }
       }
 
+      this.flushInFlightGenerationPersist(sessionId, null);
+
       chatStreamManager.broadcast(sessionId, {
         type: "error",
         data: errorMessage,
-      });
+      }, broadcastOptions);
     } finally {
-      this.activeGenerations.delete(sessionId);
+      // Only clear the active-generation slot if it still belongs to us. If a
+      // newer sendMessage pre-empted us via beginGeneration, the slot now holds
+      // that newer generation's controller and must not be deleted by us.
+      const current = this.activeGenerations.get(sessionId);
+      const stillOwnsSlot = current?.generationId === generationId;
+      if (stillOwnsSlot) {
+        this.activeGenerations.delete(sessionId);
+      }
 
-      // Always dispose agent session
-      if (agentResult) {
+      // Dispose the agent session — but ONLY when we still own the slot.
+      //
+      // pi-ai's `cleanupSessionResources(sessionId)` fires globally-registered
+      // cleanup callbacks keyed by sessionId, and two agents opened from the
+      // same CLI session file share that sessionId. If a newer generation has
+      // taken over for the same chat session, disposing this (older) agent
+      // tears down resources the newer agent is actively using — the model
+      // produces no output and the next turn looks like a silent failure.
+      //
+      // The newer generation will dispose its own agent in its own finally.
+      // The older agent's resources are largely garbage-collectible without
+      // an explicit dispose; the small leak per pre-empted generation is
+      // worth avoiding the cross-generation tear-down.
+      if (stillOwnsSlot && agentResult) {
         try {
           agentResult.session.dispose?.();
         } catch (err) {
@@ -1063,10 +1616,12 @@ export class ChatManager {
       }
     }
 
+    this.flushInFlightGenerationPersist(sessionId, null);
+
     chatStreamManager.broadcast(sessionId, {
       type: "error",
       data: "Generation cancelled",
-    });
+    }, { generationId: entry.generationId });
 
     return true;
   }
@@ -1076,6 +1631,13 @@ export class ChatManager {
    */
   isGenerating(sessionId: string): boolean {
     return this.activeGenerations.has(sessionId);
+  }
+
+  /**
+   * Return the active generation ID for a session, if any.
+   */
+  getActiveGenerationId(sessionId: string): number | undefined {
+    return this.activeGenerations.get(sessionId)?.generationId;
   }
 
   /**
@@ -1094,6 +1656,13 @@ export class ChatManager {
  */
 export function __setCreateFnAgent(mock: typeof createFnAgent): void {
   createFnAgent = mock;
+  // chat.ts now routes both regular chat and QuickChat through
+  // `createResolvedAgentSession`, which would normally bypass this mock and
+  // hit the real engine. Mirror the same fake into the resolved-session slot
+  // so existing test setups that only call `__setCreateFnAgent` continue to
+  // work.
+  createResolvedAgentSession = (async (options: Parameters<typeof createResolvedAgentSession>[0]) =>
+    mock(options)) as typeof createResolvedAgentSession;
 }
 
 /**

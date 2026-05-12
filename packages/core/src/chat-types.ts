@@ -19,8 +19,31 @@ export type ChatMessageRole = "user" | "assistant" | "system";
  * A chat session between a user and an agent.
  * Contains metadata about the conversation and references to the model used.
  */
+export interface ChatInFlightToolCall {
+  toolName: string;
+  args?: Record<string, unknown>;
+  isError: boolean;
+  result?: unknown;
+  status: "running" | "completed";
+}
+
+export interface ChatInFlightGenerationState {
+  status: "generating";
+  streamingText: string;
+  streamingThinking: string;
+  toolCalls: ChatInFlightToolCall[];
+  replayFromEventId: number;
+  updatedAt: string;
+}
+
 export interface ChatSession {
   id: string;
+  /** Session routing kind; legacy sessions default to direct */
+  kind?: "direct" | "room";
+  /** Room ID when kind is room */
+  roomId?: string | null;
+  /** Optional room name for prompt context */
+  roomName?: string | null;
   /** ID of the agent participating in this session */
   agentId: string;
   /** Human-readable title for the session (optional, can be auto-generated) */
@@ -45,6 +68,8 @@ export interface ChatSession {
    * for sessions that have never produced an assistant reply.
    */
   cliSessionFile: string | null;
+  /** Durable in-flight assistant snapshot used to recover streaming UI after refresh. */
+  inFlightGeneration: ChatInFlightGenerationState | null;
 }
 
 /**
@@ -165,5 +190,77 @@ export interface ChatMessagesFilter {
    * Cursor for pagination: only return messages created before this timestamp.
    * Used for loading older messages in a conversation.
    */
+  before?: string;
+}
+
+// ── Room Chat Types ──────────────────────────────────────────────────
+
+export type ChatRoomStatus = "active" | "archived";
+
+export type RoomMemberRole = "owner" | "member";
+
+export interface ChatRoom {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  projectId: string | null;
+  createdBy: string | null;
+  status: ChatRoomStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatRoomMember {
+  roomId: string;
+  agentId: string;
+  role: RoomMemberRole;
+  addedAt: string;
+}
+
+export interface ChatRoomMessage {
+  id: string;
+  roomId: string;
+  role: ChatMessageRole;
+  content: string;
+  thinkingOutput: string | null;
+  metadata: Record<string, unknown> | null;
+  attachments?: ChatAttachment[];
+  senderAgentId: string | null;
+  mentions: string[];
+  createdAt: string;
+}
+
+/**
+ * Alias retained for callers that explicitly reason about parsed mention payloads.
+ */
+export type ChatRoomMessageWithMentions = ChatRoomMessage;
+
+export interface ChatRoomCreateInput {
+  name: string;
+  description?: string | null;
+  projectId?: string | null;
+  createdBy?: string | null;
+}
+
+export interface ChatRoomUpdateInput {
+  name?: string;
+  description?: string | null;
+  status?: ChatRoomStatus;
+}
+
+export interface ChatRoomMessageCreateInput {
+  role: ChatMessageRole;
+  content: string;
+  thinkingOutput?: string | null;
+  metadata?: Record<string, unknown> | null;
+  attachments?: ChatAttachment[];
+  senderAgentId?: string | null;
+  mentions?: string[];
+}
+
+export interface ChatRoomMessagesFilter {
+  limit?: number;
+  offset?: number;
   before?: string;
 }

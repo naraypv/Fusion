@@ -724,6 +724,26 @@ describe("QuickEntryBox", () => {
       });
     });
 
+    it("does not render branch fields and does not include branch payload keys", async () => {
+      const { props } = renderQuickEntryBox({});
+      expandQuickEntry();
+      const textarea = screen.getByTestId("quick-entry-input");
+
+      expect(screen.queryByTestId("quick-entry-working-branch")).toBeNull();
+      expect(screen.queryByTestId("quick-entry-base-branch")).toBeNull();
+
+      fireEvent.change(textarea, { target: { value: "Task without quick-entry branch controls" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+
+      await waitFor(() => {
+        expect(props.onCreate).toHaveBeenCalled();
+      });
+
+      const payload = props.onCreate.mock.calls[0]?.[0];
+      expect(payload).not.toHaveProperty("branch");
+      expect(payload).not.toHaveProperty("baseBranch");
+    });
+
     it("toggles Fast pressed state", () => {
       renderQuickEntryBox({});
       expandQuickEntry();

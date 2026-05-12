@@ -90,6 +90,24 @@ const showAllColumnsByDefault = () => {
   );
 };
 
+const getSectionTaskIds = (sectionName: string): string[] => {
+  const allRows = screen.getAllByRole("row");
+  const sectionStart = allRows.findIndex(
+    (row) => row.className.includes("list-section-header") && row.textContent?.includes(sectionName),
+  );
+  if (sectionStart < 0) return [];
+
+  const ids: string[] = [];
+  for (let index = sectionStart + 1; index < allRows.length; index += 1) {
+    const row = allRows[index];
+    if (row.className.includes("list-section-header")) break;
+    const id = row.getAttribute("data-id");
+    if (id) ids.push(id);
+  }
+
+  return ids;
+};
+
 function ensureMatchMedia() {
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {
@@ -155,6 +173,21 @@ describe("ListView", () => {
     renderListView();
     // The search/filter is now in the header, not in the list view toolbar
     expect(screen.getByText("View options")).toBeDefined();
+  });
+
+  it("falls back malformed task columns to Planning group instead of crashing", () => {
+    const malformedTask = {
+      ...createMockTask({ id: "FN-404" }),
+      column: "impossible-column",
+    } as unknown as Task;
+
+    expect(() => renderListView({ tasks: [malformedTask] })).not.toThrow();
+    expect(screen.getByText("FN-404")).toBeInTheDocument();
+
+    const planningSection = screen
+      .getAllByRole("row")
+      .find((row) => row.className.includes("list-section-header") && row.textContent?.includes("Planning"));
+    expect(planningSection?.textContent).toContain("1");
   });
 
   it("keeps view options collapsed by default on desktop", () => {
@@ -881,6 +914,25 @@ describe("ListView", () => {
     expect(mockOnNewTask).toHaveBeenCalled();
   });
 
+  it("renders + New Task as the trailing desktop sidebar control", () => {
+    renderListView({}, { openViewOptions: false });
+
+    const actions = document.querySelector(".list-sidebar-controls__actions");
+    const actionButtons = Array.from(actions?.querySelectorAll("button") ?? []);
+    expect(actionButtons.at(-1)?.textContent).toContain("+ New Task");
+  });
+
+  it("renders + New Task as the trailing mobile toolbar control", () => {
+    const viewportSpy = mockMobileViewport();
+    renderListView({}, { openViewOptions: false });
+
+    const toolbar = document.querySelector(".list-toolbar");
+    const toolbarButtons = Array.from(toolbar?.querySelectorAll("button") ?? []);
+    expect(toolbarButtons.at(-1)?.textContent).toContain("+ New Task");
+
+    viewportSpy.mockRestore();
+  });
+
   it("+ New Task button uses theme-driven btn-task-create class", () => {
     const mockOnNewTask = vi.fn();
     renderListView({ onNewTask: mockOnNewTask });
@@ -1152,6 +1204,40 @@ describe("ListView", () => {
     expect(screen.queryByText("FN-002")).toBeNull();
   });
 
+  it("defaults todo section to board-consistent priority then oldest ordering", () => {
+    const tasks = [
+      createMockTask({ id: "FN-100", column: "todo", priority: "low", createdAt: "2024-01-01T08:00:00.000Z" }),
+      createMockTask({ id: "FN-101", column: "todo", priority: "urgent", createdAt: "2024-01-01T10:00:00.000Z" }),
+      createMockTask({ id: "FN-102", column: "todo", priority: "high", createdAt: "2024-01-01T07:00:00.000Z" }),
+    ];
+
+    renderListView({ tasks });
+
+    expect(getSectionTaskIds("Todo")).toEqual(["FN-101", "FN-102", "FN-100"]);
+  });
+
+  it("defaults done section to board-consistent completion recency", () => {
+    const tasks = [
+      createMockTask({ id: "FN-200", column: "done", priority: "urgent", columnMovedAt: "2024-01-01T08:00:00.000Z" }),
+      createMockTask({ id: "FN-201", column: "done", priority: "low", columnMovedAt: "2024-01-01T10:00:00.000Z" }),
+    ];
+
+    renderListView({ tasks });
+
+    expect(getSectionTaskIds("Done")).toEqual(["FN-201", "FN-200"]);
+  });
+
+  it("defaults in-review section to board-consistent merge-active pinning", () => {
+    const tasks = [
+      createMockTask({ id: "FN-300", column: "in-review", status: "review-ready", priority: "urgent" }),
+      createMockTask({ id: "FN-301", column: "in-review", status: "merging-fix", priority: "normal" }),
+    ];
+
+    renderListView({ tasks });
+
+    expect(getSectionTaskIds("In Review")).toEqual(["FN-301", "FN-300"]);
+  });
+
   it("maintains sort order within each section", () => {
     const tasks = [
       createMockTask({ id: "FN-003", title: "Charlie", column: "triage" }),
@@ -1161,20 +1247,10 @@ describe("ListView", () => {
 
     renderListView({ tasks });
 
-    // Sort by title
     const titleHeader = screen.getByRole("columnheader", { name: /title/i });
     fireEvent.click(titleHeader);
 
-    // Get only data rows within the triage section
-    const allRows = screen.getAllByRole("row");
-    const triageSectionStart = allRows.findIndex(r => r.className.includes("list-section-header") && r.textContent?.includes("Planning"));
-    
-    // The next 3 rows after the section header should be the sorted tasks
-    const dataRows = allRows.slice(triageSectionStart + 1, triageSectionStart + 4).filter(r => r.getAttribute("data-id"));
-    
-    expect(dataRows[0].textContent).toContain("FN-001"); // Alpha
-    expect(dataRows[1].textContent).toContain("FN-002"); // Bravo
-    expect(dataRows[2].textContent).toContain("FN-003"); // Charlie
+    expect(getSectionTaskIds("Planning")).toEqual(["FN-001", "FN-002", "FN-003"]);
   });
 });
 
@@ -2315,7 +2391,7 @@ describe("ListView - Bulk Selection", () => {
     fireEvent.click(checkbox);
     expect(screen.getByText("1 selected")).toBeDefined();
 
-    const clearButton = screen.getByRole("button", { name: /selected/i });
+    const clearButton = screen.getByRole("button", { name: /^1 selected$/i });
     fireEvent.click(clearButton);
 
     expect(screen.queryByText("1 selected")).toBeNull();
@@ -2332,7 +2408,7 @@ describe("ListView - Bulk Selection", () => {
     const selectAllCheckbox = screen.getByLabelText("Select all visible tasks");
     fireEvent.click(selectAllCheckbox);
 
-    expect(screen.getByRole("button", { name: /selected/i })).toBeDefined();
+    expect(screen.getByRole("button", { name: /^2 selected$/i })).toBeDefined();
   });
 
   it("accepts favoriteProviders and favoriteModels props", () => {
@@ -2410,6 +2486,112 @@ describe("ListView - Bulk Selection", () => {
 
     const applyButton = screen.getByText("Apply");
     expect(applyButton).toBeDisabled();
+  });
+
+  describe("bulk delete", () => {
+    it("deletes selected tasks and clears selection on success", async () => {
+      const user = userEvent.setup();
+      const tasks = [createMockTask({ id: "FN-001" }), createMockTask({ id: "FN-002" })];
+      const onDeleteTask = vi.fn(async () => createMockTask());
+      mockConfirm.mockResolvedValueOnce(true);
+
+      renderListView({ tasks, onDeleteTask });
+      enterBulkEditMode();
+      await user.click(screen.getByLabelText("Select FN-001"));
+      await user.click(screen.getByLabelText("Select FN-002"));
+      await user.click(screen.getByRole("button", { name: /delete selected/i }));
+
+      await waitFor(() => {
+        expect(onDeleteTask).toHaveBeenCalledTimes(2);
+        expect(onDeleteTask).toHaveBeenNthCalledWith(1, "FN-001");
+        expect(onDeleteTask).toHaveBeenNthCalledWith(2, "FN-002");
+      });
+      expect(mockAddToast).toHaveBeenCalledWith("Deleted 2 tasks · 0 archived skipped · 0 failed", "success");
+      expect(screen.queryByText("2 selected")).toBeNull();
+    });
+
+    it("skips archived tasks and reports summary", async () => {
+      const user = userEvent.setup();
+      const tasks = [createMockTask({ id: "FN-001", column: "todo" }), createMockTask({ id: "FN-002", column: "archived" })];
+      const onDeleteTask = vi.fn(async () => createMockTask());
+      mockConfirm.mockResolvedValueOnce(true);
+      localStorage.setItem(scopedStorageKey("kb-dashboard-selected-tasks"), JSON.stringify(["FN-001", "FN-002"]));
+
+      renderListView({ tasks, onDeleteTask });
+      enterBulkEditMode();
+      await user.click(screen.getByRole("button", { name: /delete selected/i }));
+
+      await waitFor(() => {
+        expect(onDeleteTask).toHaveBeenCalledTimes(1);
+        expect(onDeleteTask).toHaveBeenCalledWith("FN-001");
+      });
+      expect(mockAddToast).toHaveBeenCalledWith("Deleted 1 task · 1 archived skipped · 0 failed", "success");
+      expect(screen.getByText("1 selected")).toBeInTheDocument();
+    });
+
+    it("does nothing when delete confirm is cancelled", async () => {
+      const user = userEvent.setup();
+      const tasks = [createMockTask({ id: "FN-001" })];
+      const onDeleteTask = vi.fn(async () => createMockTask());
+      mockConfirm.mockResolvedValueOnce(false);
+
+      renderListView({ tasks, onDeleteTask });
+      enterBulkEditMode();
+      await user.click(screen.getByLabelText("Select FN-001"));
+      await user.click(screen.getByRole("button", { name: /delete selected/i }));
+
+      await waitFor(() => {
+        expect(mockConfirm).toHaveBeenCalledTimes(1);
+      });
+      expect(onDeleteTask).not.toHaveBeenCalled();
+    });
+
+    it("force deletes when dependency conflict is confirmed", async () => {
+      const user = userEvent.setup();
+      const tasks = [createMockTask({ id: "FN-001" })];
+      const conflictError = Object.assign(new Error("dependency conflict"), {
+        details: { code: "TASK_HAS_DEPENDENTS", dependentIds: ["FN-100"] },
+      });
+      const onDeleteTask = vi
+        .fn<(...args: [string, { removeDependencyReferences?: boolean }?]) => Promise<Task>>()
+        .mockRejectedValueOnce(conflictError)
+        .mockResolvedValueOnce(createMockTask());
+      mockConfirm.mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+
+      renderListView({ tasks, onDeleteTask });
+      enterBulkEditMode();
+      await user.click(screen.getByLabelText("Select FN-001"));
+      await user.click(screen.getByRole("button", { name: /delete selected/i }));
+
+      await waitFor(() => {
+        expect(onDeleteTask).toHaveBeenCalledTimes(2);
+      });
+      expect(onDeleteTask).toHaveBeenNthCalledWith(1, "FN-001");
+      expect(onDeleteTask).toHaveBeenNthCalledWith(2, "FN-001", { removeDependencyReferences: true });
+      expect(mockAddToast).toHaveBeenCalledWith("Deleted 1 task · 0 archived skipped · 0 failed", "success");
+    });
+
+    it("marks failure when force delete is declined", async () => {
+      const user = userEvent.setup();
+      const tasks = [createMockTask({ id: "FN-001" })];
+      const conflictError = Object.assign(new Error("dependency conflict"), {
+        details: { code: "TASK_HAS_DEPENDENTS", dependentIds: ["FN-100"] },
+      });
+      const onDeleteTask = vi.fn(async () => {
+        throw conflictError;
+      });
+      mockConfirm.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+
+      renderListView({ tasks, onDeleteTask });
+      enterBulkEditMode();
+      await user.click(screen.getByLabelText("Select FN-001"));
+      await user.click(screen.getByRole("button", { name: /delete selected/i }));
+
+      await waitFor(() => {
+        expect(onDeleteTask).toHaveBeenCalledTimes(1);
+      });
+      expect(mockAddToast).toHaveBeenCalledWith("Deleted 0 tasks · 0 archived skipped · 1 failed", "error");
+    });
   });
 
   it("persists selection to localStorage", () => {

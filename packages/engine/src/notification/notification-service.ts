@@ -1,6 +1,7 @@
 import type {
   Column,
   MergeResult,
+  Message,
   NotificationEvent,
   NotificationPayload,
   NotificationProvider,
@@ -18,12 +19,21 @@ export interface NotificationServiceOptions {
   projectId?: string;
   /** Base URL for ntfy.sh (backward compat with NtfyNotifierOptions) */
   ntfyBaseUrl?: string;
+  /** Optional message store for mailbox message notifications */
+  messageStore?: NotificationMessageStore;
+  /** Resolve human-readable name for an agent ID used in message notifications */
+  agentNameResolver?: (agentId: string) => Promise<string | null> | string | null;
 }
 
 interface NotificationServiceStore {
   getSettings(): Promise<Settings> | Settings;
   on(event: string, listener: (...args: any[]) => void): void;
   off(event: string, listener: (...args: any[]) => void): void;
+}
+
+interface NotificationMessageStore {
+  on(event: "message:sent", listener: (message: Message) => void): void;
+  off?(event: "message:sent", listener: (message: Message) => void): void;
 }
 
 export class NotificationService {
@@ -33,6 +43,7 @@ export class NotificationService {
   private notificationsEnabled = false;
   private ntfyProvider?: NtfyNotificationProvider;
   private webhookProvider?: WebhookNotificationProvider;
+  private refreshInFlight: Promise<void> | null = null;
 
   constructor(
     private readonly store: NotificationServiceStore,
@@ -59,6 +70,7 @@ export class NotificationService {
     this.store.on("task:updated", this.handleTaskUpdated);
     this.store.on("task:merged", this.handleTaskMerged);
     this.store.on("settings:updated", this.handleSettingsUpdated);
+    this.options.messageStore?.on("message:sent", this.handleMessageSent);
 
     this.started = true;
     schedulerLog.log("NotificationService started");
@@ -74,6 +86,9 @@ export class NotificationService {
       this.store.off("task:updated", this.handleTaskUpdated);
       this.store.off("task:merged", this.handleTaskMerged);
       this.store.off("settings:updated", this.handleSettingsUpdated);
+      if (typeof this.options.messageStore?.off === "function") {
+        this.options.messageStore.off("message:sent", this.handleMessageSent);
+      }
     }
 
     await this.dispatcher.shutdownAll();
@@ -218,7 +233,93 @@ export class NotificationService {
       webhookUrl: settings.webhookUrl,
       webhookFormat: settings.webhookFormat ?? "generic",
       events: settings.webhookEvents ?? [],
+      dashboardHost: settings.ntfyDashboardHost,
+      projectId: this.options.projectId,
     });
+  }
+
+  private handleMessageSent = (message: Message): void => {
+    void this.handleMessageSentAsync(message);
+  };
+
+  private async handleMessageSentAsync(message: Message): Promise<void> {
+    schedulerLog.log(
+      `NotificationService.handleMessageSent messageId=${message.id} type=${message.type} notificationsEnabled=${String(this.notificationsEnabled)} hasNtfyProvider=${String(Boolean(this.ntfyProvider))}`,
+    );
+
+    if (!this.notificationsEnabled) {
+      await this.refreshNotificationState("message:sent");
+      if (!this.notificationsEnabled) {
+        return;
+      }
+    }
+
+    let eventType: NotificationEvent;
+    if (message.type === "agent-to-user") {
+      eventType = "message:agent-to-user";
+    } else if (message.type === "agent-to-agent") {
+      eventType = "message:agent-to-agent";
+    } else {
+      return;
+    }
+
+    const preview = message.content.length > 100
+      ? `${message.content.slice(0, 100)}…`
+      : message.content;
+
+    const taskId = typeof message.metadata?.taskId === "string" ? message.metadata.taskId : undefined;
+
+    const fromName = await this.resolveAgentName(message.fromType, message.fromId, "from");
+    const toName = await this.resolveAgentName(message.toType, message.toId, "to");
+
+    this.maybeNotify(message.id, eventType, {
+      taskId,
+      taskTitle: undefined,
+      event: eventType,
+      metadata: {
+        messageId: message.id,
+        fromId: message.fromId,
+        fromType: message.fromType,
+        ...(fromName ? { fromName } : {}),
+        toId: message.toId,
+        toType: message.toType,
+        ...(toName ? { toName } : {}),
+        type: message.type,
+        replyToMessageId: message.metadata?.replyTo?.messageId,
+        preview,
+      },
+    });
+
+    schedulerLog.log(
+      `NotificationService.handleMessageSent scheduled eventType=${eventType} messageId=${message.id}`,
+    );
+  }
+
+  private async resolveAgentName(
+    participantType: Message["fromType"],
+    participantId: string,
+    direction: "from" | "to",
+  ): Promise<string | null> {
+    if (participantType !== "agent") {
+      return null;
+    }
+
+    const resolver = this.options.agentNameResolver;
+    if (!resolver) {
+      return null;
+    }
+
+    try {
+      const resolved = await resolver(participantId);
+      const trimmed = typeof resolved === "string" ? resolved.trim() : "";
+      return trimmed.length > 0 ? trimmed : null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      schedulerLog.log(
+        `NotificationService.handleMessageSent failed to resolve ${direction} agent name agentId=${participantId} error=${message}`,
+      );
+      return null;
+    }
   }
 
   private setNotificationsEnabledFromSettings(settings: Settings): void {
@@ -230,11 +331,35 @@ export class NotificationService {
 
   async dispatch(eventType: NotificationEvent, payload: NotificationPayload): Promise<void> {
     if (!this.notificationsEnabled) {
-      return;
+      await this.refreshNotificationState("manual-dispatch");
+      if (!this.notificationsEnabled) {
+        return;
+      }
     }
 
     const dedupTaskId = payload.taskId ?? "global";
     this.maybeNotify(dedupTaskId, eventType, payload);
+  }
+
+  private async refreshNotificationState(reason: string): Promise<void> {
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
+
+    this.refreshInFlight = (async () => {
+      const settings = await this.store.getSettings();
+      this.setNotificationsEnabledFromSettings(settings);
+      await this.syncNtfyProvider(settings);
+      await this.syncWebhookProvider(settings);
+      schedulerLog.log(`NotificationService refreshed notification state reason=${reason} enabled=${String(this.notificationsEnabled)}`);
+    })();
+
+    try {
+      await this.refreshInFlight;
+    } finally {
+      this.refreshInFlight = null;
+    }
   }
 
   private createTaskPayload(task: Task, event: NotificationEvent): NotificationPayload {
@@ -249,10 +374,12 @@ export class NotificationService {
   private maybeNotify(taskId: string, eventType: NotificationEvent, payload: NotificationPayload): void {
     const key = `${taskId}:${eventType}`;
     if (this.notifiedEvents.has(key)) {
+      schedulerLog.log(`NotificationService.maybeNotify suppressed duplicate key=${key}`);
       return;
     }
 
     this.notifiedEvents.add(key);
+    schedulerLog.log(`NotificationService.maybeNotify dispatching key=${key}`);
     this.dispatcher.dispatch(eventType, payload).catch(() => {
       // best effort dispatch
     });

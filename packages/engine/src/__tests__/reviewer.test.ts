@@ -146,6 +146,47 @@ describe("reviewStep — spec review type", () => {
     expect(opts.systemPrompt).toContain("Mission clarity");
   });
 
+  it("appends reviewer plugin prompt contributions when provided", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
+    );
+
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([
+        { pluginId: "plugin-review", contribution: { content: "Follow plugin reviewer rubric." } },
+      ]),
+    };
+
+    await reviewStep(
+      "/tmp/worktree", "FN-050", 0, "Spec Review", "spec", "# Task: KB-050",
+      undefined,
+      { pluginRunner: pluginRunner as any },
+    );
+
+    const opts = mockedCreateFnAgent.mock.calls[0][0];
+    expect(opts.systemPrompt).toContain("## Plugin: plugin-review");
+    expect(opts.systemPrompt).toContain("Follow plugin reviewer rubric.");
+  });
+
+  it("keeps reviewer system prompt unchanged when no reviewer plugin contributions exist", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
+    );
+
+    const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn().mockReturnValue([]),
+    };
+
+    await reviewStep(
+      "/tmp/worktree", "FN-050", 0, "Spec Review", "spec", "# Task: KB-050",
+      undefined,
+      { pluginRunner: pluginRunner as any },
+    );
+
+    const opts = mockedCreateFnAgent.mock.calls[0][0];
+    expect(opts.systemPrompt).not.toContain("## Plugin:");
+  });
+
   it("injects read-only memory instructions and tools when project memory is enabled", async () => {
     mockedCreateFnAgent.mockResolvedValue(
       createMockSession("### Verdict: APPROVE\n### Summary\nGood spec."),
@@ -160,7 +201,7 @@ describe("reviewStep — spec review type", () => {
     const opts = mockedCreateFnAgent.mock.calls[0][0];
     expect(opts.systemPrompt).toContain("## Project Memory");
     expect(opts.systemPrompt).toContain("Do not update memory during review");
-    expect(opts.customTools?.map((tool: any) => tool.name)).toEqual(["fn_memory_search", "fn_memory_get"]);
+    expect(opts.customTools?.map((tool: any) => tool.name)).toEqual(["fn_web_fetch", "fn_memory_search", "fn_memory_get"]);
   });
 
   it("omits reviewer memory tools and instructions when memory is disabled", async () => {
@@ -176,7 +217,7 @@ describe("reviewStep — spec review type", () => {
 
     const opts = mockedCreateFnAgent.mock.calls[0][0];
     expect(opts.systemPrompt).not.toContain("## Project Memory");
-    expect(opts.customTools).toBeUndefined();
+    expect(opts.customTools?.map((tool: any) => tool.name)).toEqual(["fn_web_fetch"]);
   });
 
   it("builds review request with spec-specific instructions", async () => {

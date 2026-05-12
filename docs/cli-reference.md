@@ -93,13 +93,32 @@ fn research retry RR-001 --json
 | `fn research cancel <run-id> [--json]` | Request cancellation for an active run. |
 | `fn research retry <run-id> [--json]` | Create a new retry run from a `failed`/`timed_out` run when lifecycle marks it retryable. |
 
-Disabled/setup behavior mirrors dashboard and agent surfaces:
-- Feature disabled → `FEATURE_DISABLED` (enable project/global research settings)
-- Missing credentials → `MISSING_CREDENTIALS` (configure provider auth)
-- Provider unavailable or cooldown/rate limit → `PROVIDER_UNAVAILABLE` / `RATE_LIMITED` with retry metadata
-- Invalid cancel/retry transitions are reported explicitly (`INVALID_TRANSITION`) with current status context
-- Retry budget exhaustion and non-retryable failures are reported explicitly (`RETRY_EXHAUSTED`, `NON_RETRYABLE_PROVIDER_ERROR`)
-- Non-retryable failures and invalid state transitions are surfaced as structured errors instead of generic failures
+### Research error behavior (`fn research`)
+
+`fn research` returns structured failures with machine-readable codes. The extension/tool-side equivalents are lowercase aliases in payload metadata (`feature-disabled`, `missing-credentials`, `provider-unavailable`, `invalid-transition`, `retry-exhausted`, `non-retryable-provider-error`).
+
+- Feature disabled → `FEATURE_DISABLED` / `feature-disabled`
+- Missing credentials → `MISSING_CREDENTIALS` / `missing-credentials`
+- Provider unavailable/cooldown → `PROVIDER_UNAVAILABLE` / `provider-unavailable`
+- Invalid cancel/retry transition → `INVALID_TRANSITION` / `invalid-transition`
+- Retry budget exhausted → `RETRY_EXHAUSTED` / `retry-exhausted`
+- Non-retryable provider failure → `NON_RETRYABLE_PROVIDER_ERROR` / `non-retryable-provider-error`
+
+Examples:
+
+```bash
+# Feature disabled / setup guard
+fn research create --query "compare x y" --json
+
+# Missing credentials / provider unavailable
+fn research create --query "latest node lts" --json
+
+# Invalid transition (run already terminal)
+fn research cancel RR-001 --json
+
+# Retry exhausted / non-retryable provider error
+fn research retry RR-001 --json
+```
 
 ---
 
@@ -167,6 +186,10 @@ QR hand-off behavior in TUI:
 
 On startup, the TUI opens on the **System** section by default so you can
 immediately see host/port and access-token details.
+
+Mouse reporting auto-toggles with focus on the main screen: selecting
+**Logs** enables wheel scrolling, while selecting **System** turns mouse
+reporting back off so native click-drag text selection works.
 
 **Keyboard Navigation:**
 
@@ -269,9 +292,11 @@ To revoke/reset access, choose the behavior you want:
 When the published CLI bundle includes the vendored `@fusion/droid-cli` extension, users can enable **Factory AI — via Droid CLI** in **Settings → Authentication**.
 
 Requirements:
-- `droid` binary installed and available on `PATH`
+- a working Droid CLI binary (`droid` on `PATH` by default, or a custom plugin `droidBinaryPath`)
 - successful local login (`droid auth login`)
 - Fusion restart after toggling the provider on (to reload extensions)
+
+Authentication status checks in **Settings → Authentication** use the same effective Droid binary path as the Droid runtime plugin, so custom binary-path installs are detected correctly.
 
 ---
 
@@ -368,6 +393,44 @@ fn task create "Fix bug" --attach screenshot.png --depends FN-010
 fn task create "Investigate flaky runner" --node edge-runner
 fn task plan "Design a new authentication flow"
 ```
+
+For AI-guided task specification, see [Planning mode](#planning-mode).
+
+### Planning mode
+
+Use planning mode to turn a rough idea into a triage task through an interactive AI-guided Q&A flow.
+
+When supported by your configured runtime/model provider, planning sessions can also use builtin `WebSearch` and `WebFetch` tools for live context gathering.
+
+```bash
+fn task plan [description]
+```
+
+`description` is optional. If you omit it, the CLI prompts for an initial idea (`Describe your idea:`) before creating the planning session.
+
+Planning questions are interactive and use these types:
+- `text` (multi-line; finish with `DONE` on its own line)
+- `single_select` (pick one option)
+- `multi_select` (pick one or more comma-separated options)
+- `confirm` (`[Y/n]`, Enter defaults to yes)
+
+Planning flow:
+1. Create planning session from your description/idea.
+2. Answer the current question.
+3. Receive either a follow-up question or completion summary.
+4. Review summary (title, description, suggested size, dependencies, key deliverables).
+5. Confirm creation (or skip confirmation with `--yes`).
+6. Task is created in `triage` when confirmed.
+
+- With `--yes`, final confirmation is skipped and the task is created immediately.
+- Without `--yes`, the CLI asks `Create this task? [Y/n]:`; answering no cancels creation.
+
+| Option | Description |
+|---|---|
+| `--yes` | Skip final confirmation before creating the planned task. |
+| `--project <name>`, `-P <name>` | Run planning mode against a specific registered project. |
+
+Planning session limit: maximum **1000 planning sessions per hour**.
 
 ### Query and logs
 
@@ -515,6 +578,98 @@ fn agent export ./output-dir --company-name "My Company" --company-slug my-compa
 
 Subcommands: `stop`, `start`, `mailbox`, `import`, `export`.
 
+### `fn agent stop`
+
+Pause a running/active agent by transitioning its state to `paused`.
+
+**Options:**
+| Option | Description |
+|---|---|
+| `--project <name>`, `-P <name>` | Target a specific registered project before resolving the agent. |
+
+**Behavior notes:**
+- Usage: `fn agent stop <id>`.
+- If the agent does not exist, the command exits with `Agent <id> not found`.
+- If the agent is already paused, this is a no-op and prints `Agent <id> is already paused`.
+- Invalid state transitions are rejected with `Cannot stop agent <id> — current state '<state>' cannot transition to 'paused'`.
+- On success, prints `✓ Agent <id> stopped`.
+
+**Examples:**
+```bash
+fn agent stop AGENT-001
+fn agent stop AGENT-001 --project my-project
+```
+
+### `fn agent start`
+
+Resume a paused agent by transitioning its state to `active`.
+
+**Options:**
+| Option | Description |
+|---|---|
+| `--project <name>`, `-P <name>` | Target a specific registered project before resolving the agent. |
+
+**Behavior notes:**
+- Usage: `fn agent start <id>`.
+- If the agent does not exist, the command exits with `Agent <id> not found`.
+- If the agent is already `active` or `running`, this is a no-op and prints `Agent <id> is already running (<state>)`.
+- Invalid state transitions are rejected with `Cannot start agent <id> — current state '<state>' cannot transition to 'active'`.
+- On success, prints `✓ Agent <id> started`.
+
+**Examples:**
+```bash
+fn agent start AGENT-001
+fn agent start AGENT-001 --project my-project
+```
+
+### `fn agent mailbox`
+
+Inspect an agent-owned inbox (different from `fn message inbox`, which shows the CLI user's inbox).
+
+**Options:**
+| Option | Description |
+|---|---|
+| `--project <name>`, `-P <name>` | Target a specific registered project before reading mailbox data. |
+
+**Behavior notes:**
+- Usage: `fn agent mailbox <id>`.
+- Header format: `🤖 Agent Mailbox: <id> (<unreadCount> unread)`.
+- Displays up to 20 most recent inbox messages for the agent.
+- Unread messages are prefixed with `●`; read messages are unprefixed.
+- Message previews are truncated to 80 characters with a trailing ellipsis (`…`).
+- If no messages are present, prints `No messages`.
+
+**Examples:**
+```bash
+fn agent mailbox AGENT-001
+fn agent mailbox AGENT-001 --project my-project
+```
+
+### `fn agent export`
+
+Export Fusion agents to an Agent Companies package directory.
+
+**Options:**
+| Option | Description |
+|---|---|
+| `--company-name <name>` | Override the exported company display name. |
+| `--company-slug <slug>` | Override the exported company slug used in package metadata/paths. |
+| `--project <name>`, `-P <name>` | Target a specific registered project before collecting agents. |
+
+**Behavior notes:**
+- Usage: `fn agent export <dir> [--company-name <name>] [--company-slug <slug>]`.
+- If no agents exist in the selected project, the command exits with `No agents found to export`.
+- Exported `AGENTS.md` manifests include inline `memory` for each agent so memory round-trips across package export/import.
+- Successful runs print a summary including output directory, agents exported, skills exported, files written, and per-agent errors (if any).
+- Output directory paths are resolved to absolute paths before export.
+
+**Examples:**
+```bash
+fn agent export ./output-dir
+fn agent export ./output-dir --company-name "My Company" --company-slug my-company
+fn agent export ./output-dir --project my-project
+```
+
 ### `fn agent import`
 
 Import agents from [companies.sh](https://companies.sh) packages. Supports single manifest files, team packages, and archives.
@@ -532,6 +687,9 @@ Import agents from [companies.sh](https://companies.sh) packages. Supports singl
 
 **Team hierarchy:**
 When importing a companies.sh package with team structure, the importer preserves manager/report relationships for both fresh and partial imports. Manifest-style manager references such as `ceo`, `../ceo/AGENTS.md`, and already-valid Fusion agent IDs are resolved to actual Fusion `reportsTo` agent IDs before agents are created, and `--skip-existing` reuses matching existing managers when available instead of flattening the org tree.
+
+**Memory import/export parity:**
+Manifest-provided inline `memory` is preserved during `fn agent import` (including `--dry-run` previews) and restored onto created agents, matching export behavior so operator-authored memory is not dropped.
 
 **Skill imports:**
 When importing from a package directory or archive, the importer also imports any package skill manifests (`skills/*/SKILL.md`). Skills are written to `{project}/skills/imported/{company-slug}/{skill-slug}/SKILL.md`. Existing skill files at the target path are skipped (not overwritten). Single `AGENTS.md` file imports do not include package skills.
@@ -563,7 +721,7 @@ fn agent import ./package/ --skip-existing
 
 ## `fn message`
 
-Inter-agent/user message mailbox.
+User mailbox operations for sending and managing direct messages with agents.
 
 ```bash
 fn message inbox
@@ -572,6 +730,36 @@ fn message send AGENT-001 "Please prioritize FN-222"
 fn message read MSG-123
 fn message delete MSG-123
 ```
+
+| Subcommand | Description |
+|---|---|
+| `fn message inbox` | List your inbox messages (newest first, up to 20). |
+| `fn message outbox` | List messages you sent (newest first, up to 20). |
+| `fn message send <agent-id> <content>` | Send a user→agent message and print the created message ID. |
+| `fn message read <id>` | Show one full message by ID and auto-mark it as read if unread. |
+| `fn message delete <id>` | Permanently delete one message by ID. |
+
+### Mailbox behavior
+
+- `inbox` header shows unread totals as `Inbox (<count> unread)`.
+- Unread inbox rows are prefixed with `●`; read rows have no dot.
+- Inbox sender labels use `Agent <id>` for agent senders and raw user IDs for user senders.
+- Outbox recipient labels use `Agent <id>` for agent recipients.
+- Inbox/outbox previews are truncated to 80 characters with a trailing ellipsis (`…`).
+- `send` success output includes `✓ Message sent: <message-id>` plus the destination agent.
+- `read` prints full metadata (`Message`, `Type`, `From`, `To`, `Time`) and the complete message body.
+- `read` exits with code `1` when the message ID is not found.
+- `delete` removes the message immediately and prints `✓ Message <id> deleted`.
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--project <name>` | Route mailbox operations to a specific registered project (resolved via project context). Supported by all `fn message` subcommands. |
+
+### Related command
+
+`fn agent mailbox <agent-id>` is separate from `fn message`: it inspects an **agent-owned mailbox** (agent inbox view), while `fn message ...` manages the **CLI user mailbox**.
 
 ---
 
@@ -630,14 +818,25 @@ Plugin lifecycle management.
 
 ```bash
 fn plugin list
-fn plugin install <path>
+fn plugin install <path> [--ai-scan]
+fn plugin rescan <id>
+fn plugin trust <id>
+fn plugin untrust <id>
+fn plugin verify <id>
 fn plugin uninstall <id> --force
 fn plugin enable <id>
 fn plugin disable <id>
 fn plugin create <name>
 ```
 
-Subcommands: `list|ls`, `install`, `uninstall`, `enable`, `disable`, `create`.
+Subcommands: `list|ls`, `install`, `rescan`, `trust`, `untrust`, `verify`, `uninstall`, `enable`, `disable`, `create`.
+
+Scope semantics:
+- `fn plugin install` / `fn plugin uninstall` are **global** operations
+- `fn plugin enable` / `fn plugin disable` are **project-scoped** operations (`--project` selects the project context)
+- `fn plugin list` shows globally installed plugins plus enabled/disabled state for the current project context
+
+`fn plugin install --ai-scan` enables AI security scanning on plugin load. `fn plugin rescan <id>` runs a fresh scan/reload cycle and prints plugin name, verdict, summary, and finding count. It exits non-zero for `blocked`, `error`, or `unavailable` verdicts.
 
 ---
 
@@ -663,6 +862,7 @@ Subcommands: `search`, `install`.
 
 | Option | Used by |
 |---|---|
+| `--project`, `-P` | Most project-scoped commands (for example: `fn task ...`, `fn message ...`, `fn agent mailbox`, `fn settings`, `fn research`, `fn mission`, `fn node`, `fn plugin`, `fn skills`) |
 | `--port`, `-p` | `fn dashboard`, `fn serve`, `fn daemon` |
 | `--host` | `fn serve`, `fn daemon` |
 | `--interactive` | `fn dashboard`, `fn serve`, `fn daemon`, `fn desktop`, `fn task import`, `fn project add` |
@@ -676,5 +876,9 @@ Subcommands: `search`, `install`.
 | `--limit`, `-l` | `fn task import` (default: 30, max: 100), `fn skills search` (default: 10, max: 50) |
 | `--labels`, `-L` | `fn task import` |
 | `--skill` | `fn skills install` |
+| `--dry-run` | `fn agent import` |
+| `--skip-existing` | `fn agent import` |
+| `--company-name` | `fn agent export` |
+| `--company-slug` | `fn agent export` |
 
 For configuration details used by these commands, see [Settings Reference](./settings-reference.md).

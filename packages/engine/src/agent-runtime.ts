@@ -15,18 +15,39 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { PermanentAgentGatingContext } from "@fusion/core";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
+import type { AgentActionGateContext } from "./agent-action-gate.js";
+import type { SystemPromptLayers } from "./prompt-layers.js";
 
 /**
  * Options for creating an agent session.
  * Mirrors the options accepted by createFnAgent.
  */
+export interface AgentRuntimeContext {
+  sessionPurpose?: string;
+  toolMode?: "coding" | "readonly";
+  customToolNames?: string[];
+  requestedSkillNames?: string[];
+}
+
 export interface AgentRuntimeOptions {
   /** Working directory for the agent session */
   cwd: string;
   /** System prompt for the agent */
   systemPrompt: string;
+  /**
+   * Optional structured prompt layers for cross-session caching.
+   * When present, runtimes that support prompt caching use the `stable`
+   * layer as a cacheable prefix and the `dynamic` layer as the per-session
+   * suffix. Runtimes that don't support caching ignore this and use
+   * `systemPrompt` (the collapsed string) instead.
+   *
+   * Callers MUST also provide `systemPrompt` as the collapsed equivalent
+   * for backward compatibility.
+   */
+  systemPromptLayers?: SystemPromptLayers;
   /** Tool set to use: "coding" for full tools, "readonly" for read-only access */
   tools?: "coding" | "readonly";
   /** Additional custom tools to merge with the base toolset */
@@ -59,6 +80,10 @@ export interface AgentRuntimeOptions {
   skillSelection?: SkillSelectionContext;
   /** Convenience: skill names to include in the session */
   skills?: string[];
+  /** Runtime-facing context for non-pi runtimes that cannot consume JS ToolDefinition objects directly. */
+  runtimeContext?: AgentRuntimeContext;
+  /** Optional task-scoped environment variables for session-local subprocesses. */
+  taskEnv?: NodeJS.ProcessEnv;
   /**
    * Last-chance abort hook fired by the runtime *immediately before* the
    * underlying LLM session is instantiated — i.e., after all of the runtime's
@@ -79,6 +104,9 @@ export interface AgentRuntimeOptions {
   /** Optional task context for fallback notifications. */
   taskId?: string;
   taskTitle?: string;
+  actionGateContext?: AgentActionGateContext;
+  /** Permanent-agent action gating context for v1 category classification enforcement. */
+  permanentAgentGating?: PermanentAgentGatingContext;
 }
 
 /**

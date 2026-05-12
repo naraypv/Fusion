@@ -20,6 +20,35 @@ export interface AgentOnboardingSummary {
   templateId?: string;
   patternAgentId?: string;
   rationale?: string;
+  model?: string;
+  /** Draft-only AI suggestion for eventual runtimeConfig.model selection. */
+  modelHint?: string;
+  /** Draft-only AI suggestion for eventual runtimeConfig.runtimeHint plugin runtime selection. */
+  runtimeHint?: string;
+  heartbeatProcedurePath?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatEnabled?: boolean;
+}
+
+export type OnboardingMode = "create" | "edit";
+
+export interface ExistingAgentOnboardingConfig {
+  name?: string;
+  role?: AgentCapability | "custom";
+  title?: string;
+  instructionsText?: string;
+  soul?: string;
+  memory?: string;
+  reportsTo?: string;
+  skills?: string[];
+  model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+  maxTurns?: number;
+  runtimeHint?: string;
+  heartbeatIntervalMs?: number;
+  heartbeatTimeoutMs?: number;
+  maxConcurrentRuns?: number;
+  messageResponseMode?: "immediate" | "on-heartbeat";
 }
 
 export type AgentOnboardingStreamEvent =
@@ -45,19 +74,22 @@ Ask targeted questions using this JSON format:
 {"type":"question","data":{"id":"q1","type":"text|single_select|multi_select|confirm","question":"...","description":"...","options":[{"id":"x","label":"X","description":"..."}]}}
 
 When ready, return a final summary JSON in this exact format:
-{"type":"complete","data":{"name":"...","role":"executor","instructionsText":"...","thinkingLevel":"medium","maxTurns":25,"title":"...","icon":"🤖","reportsTo":"...","soul":"...","memory":"...","skills":["..."],"templateId":"...","patternAgentId":"...","rationale":"..."}}
+{"type":"complete","data":{"name":"...","role":"executor","instructionsText":"...","thinkingLevel":"medium","maxTurns":25,"title":"...","icon":"🤖","reportsTo":"...","soul":"...","memory":"...","skills":["..."],"templateId":"...","patternAgentId":"...","rationale":"...","heartbeatProcedurePath":"...","heartbeatIntervalMs":30000,"heartbeatEnabled":true,"modelHint":"...","runtimeHint":"..."}}
 
 Rules:
 - role must be one of triage|executor|reviewer|merger|scheduler|engineer|custom
 - thinkingLevel must be off|minimal|low|medium|high
 - maxTurns must be a positive integer
-- Do not include runtimeMode/model/runtimeHint; those are user review-time choices.`;
+- Use instructionsText for starter operating guidance/playbook content; do not create a separate playbook field
+- modelHint and runtimeHint are optional draft suggestions only (not final runtime selection)
+- heartbeatProcedurePath, heartbeatIntervalMs, and heartbeatEnabled are optional draft hints only.`;
 
 type OnboardingAgent = Awaited<ReturnType<typeof engineCreateFnAgent>>;
 
 interface Session {
   id: string;
   ip: string;
+  mode: OnboardingMode;
   contextPrompt: string;
   currentQuestion?: PlanningQuestion;
   summary?: AgentOnboardingSummary;
@@ -150,42 +182,119 @@ export function parseAgentOnboardingResponse(text: string): { type: "question"; 
   }
 
   if (typed.type === "complete") {
-    const data = (typed.data ?? {}) as { name?: unknown; instructionsText?: unknown; maxTurns?: unknown };
+    const data = (typed.data ?? {}) as AgentOnboardingSummary & {
+      name?: unknown;
+      instructionsText?: unknown;
+      maxTurns?: unknown;
+      heartbeatProcedurePath?: unknown;
+      heartbeatIntervalMs?: unknown;
+      heartbeatEnabled?: unknown;
+      modelHint?: unknown;
+      runtimeHint?: unknown;
+    };
     if (typeof data.name !== "string" || !data.name.trim()) throw new Error("Invalid summary.name");
     if (typeof data.instructionsText !== "string" || !data.instructionsText.trim()) throw new Error("Invalid summary.instructionsText");
     const maxTurns = data.maxTurns;
     if (typeof maxTurns !== "number" || !Number.isInteger(maxTurns) || maxTurns <= 0) {
       throw new Error("Invalid summary.maxTurns");
     }
-    return { type: "complete", data: typed.data as AgentOnboardingSummary };
+
+    if (data.heartbeatProcedurePath !== undefined) {
+      if (typeof data.heartbeatProcedurePath !== "string" || !data.heartbeatProcedurePath.trim()) {
+        throw new Error("Invalid summary.heartbeatProcedurePath");
+      }
+      data.heartbeatProcedurePath = data.heartbeatProcedurePath.trim();
+    }
+
+    if (data.heartbeatIntervalMs !== undefined) {
+      if (typeof data.heartbeatIntervalMs !== "number" || !Number.isInteger(data.heartbeatIntervalMs) || data.heartbeatIntervalMs <= 0) {
+        throw new Error("Invalid summary.heartbeatIntervalMs");
+      }
+    }
+
+    if (data.heartbeatEnabled !== undefined && typeof data.heartbeatEnabled !== "boolean") {
+      throw new Error("Invalid summary.heartbeatEnabled");
+    }
+
+    if (data.modelHint !== undefined && typeof data.modelHint !== "string") {
+      throw new Error("Invalid summary.modelHint");
+    }
+
+    if (data.runtimeHint !== undefined && typeof data.runtimeHint !== "string") {
+      throw new Error("Invalid summary.runtimeHint");
+    }
+
+    return { type: "complete", data: data as AgentOnboardingSummary };
   }
 
   return { type: "question", data: typed.data as PlanningQuestion };
 }
 
 export function createAgentOnboardingSessionPrompt(input: {
+  mode: OnboardingMode;
   intent: string;
   existingAgents: Array<{ id: string; name: string; role: string }>;
   templates: Array<{ id: string; label: string; description?: string }>;
+  existingAgentConfig?: ExistingAgentOnboardingConfig;
 }): string {
   const compactAgents = input.existingAgents.slice(0, 25).map((a) => `${a.id}:${a.name}(${a.role})`).join("\n") || "none";
   const compactTemplates = input.templates.slice(0, 25).map((t) => `${t.id}:${t.label}${t.description ? ` - ${t.description}` : ""}`).join("\n") || "none";
-  return `User intent:\n${input.intent}\n\nExisting agents:\n${compactAgents}\n\nTemplate/preset options:\n${compactTemplates}`;
+  const createContext = `User intent:\n${input.intent}\n\nExisting agents:\n${compactAgents}\n\nTemplate/preset options:\n${compactTemplates}`;
+
+  if (input.mode === "create") {
+    return createContext;
+  }
+
+  const currentConfig = input.existingAgentConfig ?? {};
+  const currentConfigLines = [
+    `name: ${currentConfig.name ?? ""}`,
+    `role: ${currentConfig.role ?? ""}`,
+    `title: ${currentConfig.title ?? ""}`,
+    `instructionsText: ${currentConfig.instructionsText ?? ""}`,
+    `soul: ${currentConfig.soul ?? ""}`,
+    `memory: ${currentConfig.memory ?? ""}`,
+    `reportsTo: ${currentConfig.reportsTo ?? ""}`,
+    `skills: ${(currentConfig.skills ?? []).join(", ")}`,
+    `model: ${currentConfig.model ?? ""}`,
+    `thinkingLevel: ${currentConfig.thinkingLevel ?? ""}`,
+    `maxTurns: ${currentConfig.maxTurns ?? ""}`,
+    `runtimeHint: ${currentConfig.runtimeHint ?? ""}`,
+    `heartbeatIntervalMs: ${currentConfig.heartbeatIntervalMs ?? ""}`,
+    `heartbeatTimeoutMs: ${currentConfig.heartbeatTimeoutMs ?? ""}`,
+    `maxConcurrentRuns: ${currentConfig.maxConcurrentRuns ?? ""}`,
+    `messageResponseMode: ${currentConfig.messageResponseMode ?? ""}`,
+  ].join("\n");
+
+  return `${createContext}\n\nCurrent agent configuration:\n${currentConfigLines}`;
 }
 
 export async function startAgentOnboardingSession(
   ip: string,
-  initialContext: { intent: string; existingAgents: Array<{ id: string; name: string; role: string }>; templates: Array<{ id: string; label: string; description?: string }> },
+  initialContext: {
+    mode?: OnboardingMode;
+    intent: string;
+    existingAgents: Array<{ id: string; name: string; role: string }>;
+    templates: Array<{ id: string; label: string; description?: string }>;
+    existingAgentConfig?: ExistingAgentOnboardingConfig;
+  },
   rootDir: string,
   modelProvider?: string,
   modelId?: string,
   promptOverrides?: PromptOverrideMap,
 ): Promise<string> {
   const id = randomUUID();
+  const mode: OnboardingMode = initialContext.mode ?? "create";
   const session: Session = {
     id,
     ip,
-    contextPrompt: createAgentOnboardingSessionPrompt(initialContext),
+    mode,
+    contextPrompt: createAgentOnboardingSessionPrompt({
+      mode,
+      intent: initialContext.intent,
+      existingAgents: initialContext.existingAgents,
+      templates: initialContext.templates,
+      existingAgentConfig: initialContext.existingAgentConfig,
+    }),
     history: [],
     thinkingOutput: "",
     createdAt: new Date(),

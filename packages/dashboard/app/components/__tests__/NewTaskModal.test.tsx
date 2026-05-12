@@ -28,6 +28,7 @@ vi.mock("../../api", () => ({
     defaultPresetBySize: {},
   }),
   fetchWorkflowSteps: vi.fn().mockResolvedValue([]),
+  fetchGlobalSettings: vi.fn().mockResolvedValue({}),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchAuthStatus: vi.fn().mockResolvedValue({ providers: [] }),
   refineText: vi.fn(),
@@ -210,6 +211,42 @@ describe("NewTaskModal", () => {
       expect(props.onCreateTask).toHaveBeenCalledWith(
         expect.objectContaining({
           description: "Test description",
+        }),
+      );
+    });
+  });
+
+  it("includes branch and baseBranch when provided", async () => {
+    const { props } = renderNewTaskModal();
+
+    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Task with branches" } });
+    fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+    fireEvent.change(screen.getByLabelText("Working branch"), { target: { value: " feature/fn-3422 " } });
+    fireEvent.change(screen.getByLabelText("Merge target / base branch"), { target: { value: " main " } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+
+    await waitFor(() => {
+      expect(props.onCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: "feature/fn-3422",
+          baseBranch: "main",
+        }),
+      );
+    });
+  });
+
+  it("omits branch and baseBranch when left blank", async () => {
+    const { props } = renderNewTaskModal();
+
+    fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Task without branches" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+
+    await waitFor(() => {
+      expect(props.onCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: undefined,
+          baseBranch: undefined,
         }),
       );
     });
@@ -742,7 +779,7 @@ describe("NewTaskModal", () => {
       const select = document.getElementById("review-level") as HTMLSelectElement;
       fireEvent.change(select, { target: { value: "2" } });
 
-      const descTextarea = screen.getByRole('textbox');
+      const descTextarea = screen.getByPlaceholderText("What needs to be done?");
       fireEvent.change(descTextarea, { target: { value: "Task with review level" } });
 
       fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
@@ -770,7 +807,7 @@ describe("NewTaskModal", () => {
       const select = document.getElementById("review-level") as HTMLSelectElement;
       fireEvent.change(select, { target: { value: "3" } });
 
-      const descTextarea = screen.getByRole('textbox');
+      const descTextarea = screen.getByPlaceholderText("What needs to be done?");
       fireEvent.change(descTextarea, { target: { value: "Task with full review" } });
 
       fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
@@ -806,7 +843,7 @@ describe("NewTaskModal", () => {
 
       fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
       fireEvent.change(screen.getByTestId("task-priority-select"), { target: { value: "urgent" } });
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Task with urgent priority" } });
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Task with urgent priority" } });
       fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
 
       await waitFor(() => {
@@ -862,23 +899,6 @@ describe("NewTaskModal", () => {
       await waitFor(() => {
         expect(screen.getByText("Select agent")).toBeTruthy();
         expect(screen.getByText("Executor Bot")).toBeTruthy();
-      });
-    });
-
-    it("excludes terminated agents from picker", async () => {
-      const { fetchAgents } = await import("../../api");
-      vi.mocked(fetchAgents).mockResolvedValueOnce([
-        { id: "agent-1", name: "Active Agent", role: "executor", state: "active" as const, metadata: {}, createdAt: "", updatedAt: "" },
-        { id: "agent-2", name: "Terminated Agent", role: "executor", state: "terminated" as const, metadata: {}, createdAt: "", updatedAt: "" },
-      ]);
-
-      renderNewTaskModal();
-
-      fireEvent.click(screen.getByTestId("new-task-agent-button"));
-
-      await waitFor(() => {
-        expect(screen.getByText("Active Agent")).toBeTruthy();
-        expect(screen.queryByText("Terminated Agent")).toBeNull();
       });
     });
 
@@ -1046,6 +1066,44 @@ describe("NewTaskModal", () => {
 
       await waitFor(() => {
         expect(screen.getByTestId("new-task-agent-button")).toHaveTextContent("Assign agent");
+      });
+    });
+  });
+
+  describe("GitHub tracking", () => {
+    it("renders GitHub tracking after Workflow Steps in more options", async () => {
+      renderNewTaskModal();
+
+      fireEvent.click(screen.getByTestId("task-form-more-options-toggle"));
+
+      const workflowLabel = await screen.findByText("Workflow Steps");
+      const githubTrackingSection = screen.getByTestId("task-form-github-tracking");
+
+      expect(
+        workflowLabel.compareDocumentPosition(githubTrackingSection) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+
+    it("seeds tracking toggle from project settings and submits githubTracking payload", async () => {
+      const { fetchSettings } = await import("../../api");
+      vi.mocked(fetchSettings).mockResolvedValueOnce({
+        modelPresets: [],
+        autoSelectModelPreset: false,
+        defaultPresetBySize: {},
+        githubTrackingEnabledByDefault: true,
+      });
+
+      const { props } = renderNewTaskModal();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Task with tracking" } });
+
+      const toggle = await screen.findByLabelText("Enable GitHub issue tracking for this task");
+      fireEvent.click(toggle);
+
+      fireEvent.change(screen.getByLabelText("Repository (owner/repo)"), { target: { value: "acme/repo" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+
+      await waitFor(() => {
+        expect(props.onCreateTask).toHaveBeenCalledTimes(1);
       });
     });
   });

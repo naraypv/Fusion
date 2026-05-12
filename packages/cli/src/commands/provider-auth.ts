@@ -46,18 +46,7 @@ interface ReadFallbackAuthStorage {
 
 type StoredCredential = StoredAuthCredential;
 
-/**
- * Provider IDs that should be treated as OAuth-backed by the upstream
- * pi-coding-agent AuthStorage but which Fusion reclassifies as API-key
- * providers.  These IDs are stripped from getOAuthProviders() results so
- * the dashboard never offers a browser-based OAuth login for them.
- */
-const OAUTH_TO_API_KEY_RECLASSIFICATIONS: ReadonlySet<string> = new Set([
-  "anthropic",
-]);
-
 const BUILT_IN_API_KEY_PROVIDERS: Array<{ id: string; name: string }> = [
-  { id: "anthropic", name: "Anthropic" },
   { id: "brave", name: "Brave Search" },
   { id: "kimi-coding", name: "Kimi" },
   { id: "minimax", name: "Minimax" },
@@ -98,7 +87,6 @@ export function wrapAuthStorageWithApiKeyProviders(
     getOAuthProviders: () =>
       mergedAuthStorage
         .getOAuthProviders()
-        .filter((provider) => !OAUTH_TO_API_KEY_RECLASSIFICATIONS.has(provider.id))
         .map((provider) => ({ id: provider.id, name: provider.name })),
     hasAuth: (provider) => accountStore.list(provider).length > 0 || mergedAuthStorage.hasAuth(provider),
     login: async (providerId, callbacks) => {
@@ -114,12 +102,9 @@ export function wrapAuthStorageWithApiKeyProviders(
     },
     logout: (provider) => mergedAuthStorage.logout(provider),
     getApiKeyProviders: () => {
-      // Use the reclassified (filtered) OAuth provider list so that providers
-      // moved to API-key (e.g. anthropic) are not skipped by the OAuth dedup.
       const oauthProviderIds = new Set(
         mergedAuthStorage
           .getOAuthProviders()
-          .filter((provider) => !OAUTH_TO_API_KEY_RECLASSIFICATIONS.has(provider.id))
           .map((provider) => provider.id),
       );
       const providers = new Map<string, string>();
@@ -174,6 +159,12 @@ export function mergeAuthStorageReads(
   readFallbackAuthStorages: ReadFallbackAuthStorage[] = [],
 ): AuthStorage {
   const readAuthStorages = [authStorage, ...readFallbackAuthStorages];
+
+  // Providers the user has explicitly logged out from. These should not be
+  // "resurrected" from supplemental credential files (e.g. ~/.claude/.credentials.json).
+  // Cleared when the user re-authenticates via set().
+  const loggedOutProviders = new Set<string>();
+
   const selectCredential = (
     providerId: string,
     storages: Array<Pick<ReadFallbackAuthStorage, "get">>,
@@ -185,11 +176,19 @@ export function mergeAuthStorageReads(
     return best;
   };
 
-  const getCredential = (providerId: string) => selectCredential(providerId, readAuthStorages);
+  const getCredential = (providerId: string) => {
+    if (loggedOutProviders.has(providerId)) {
+      return undefined;
+    }
+    return selectCredential(providerId, readAuthStorages);
+  };
 
   const syncFallbackOauthCredentials = () => {
     const providerIds = new Set(readFallbackAuthStorages.flatMap((storage) => storage.list()));
     for (const providerId of providerIds) {
+      if (loggedOutProviders.has(providerId)) {
+        continue;
+      }
       const current = authStorage.get(providerId) as StoredCredential | undefined;
       const candidate = selectCredential(providerId, readFallbackAuthStorages);
       if (!shouldHydrateStoredCredential(current, candidate)) {
@@ -205,6 +204,27 @@ export function mergeAuthStorageReads(
 
   return new Proxy(authStorage, {
     get(target, prop, receiver) {
+      if (prop === "logout") {
+        return (provider: string) => {
+          target.logout(provider);
+          loggedOutProviders.add(provider);
+        };
+      }
+
+      if (prop === "remove") {
+        return (provider: string) => {
+          target.remove(provider);
+          loggedOutProviders.add(provider);
+        };
+      }
+
+      if (prop === "set") {
+        return (provider: string, credential: AuthCredential) => {
+          target.set(provider, credential);
+          loggedOutProviders.delete(provider);
+        };
+      }
+
       if (prop === "reload") {
         return () => {
           for (const storage of readAuthStorages) {
@@ -219,11 +239,21 @@ export function mergeAuthStorageReads(
       }
 
       if (prop === "has") {
-        return (provider: string) => readAuthStorages.some((storage) => Boolean(storage.get(provider)));
+        return (provider: string) => {
+          if (loggedOutProviders.has(provider)) {
+            return false;
+          }
+          return readAuthStorages.some((storage) => Boolean(storage.get(provider)));
+        };
       }
 
       if (prop === "hasAuth") {
-        return (provider: string) => readAuthStorages.some((storage) => storage.hasAuth(provider));
+        return (provider: string) => {
+          if (loggedOutProviders.has(provider)) {
+            return false;
+          }
+          return readAuthStorages.some((storage) => storage.hasAuth(provider));
+        };
       }
 
       if (prop === "getAll") {
@@ -231,6 +261,9 @@ export function mergeAuthStorageReads(
           const providerIds = new Set(readAuthStorages.flatMap((storage) => storage.list()));
           const merged: Record<string, StoredCredential> = {};
           for (const providerId of providerIds) {
+            if (loggedOutProviders.has(providerId)) {
+              continue;
+            }
             const credential = getCredential(providerId);
             if (credential) {
               merged[providerId] = credential;
@@ -241,11 +274,17 @@ export function mergeAuthStorageReads(
       }
 
       if (prop === "list") {
-        return () => Array.from(new Set(readAuthStorages.flatMap((storage) => storage.list())));
+        return () => {
+          const providers = readAuthStorages.flatMap((storage) => storage.list());
+          return Array.from(new Set(providers.filter((p) => !loggedOutProviders.has(p))));
+        };
       }
 
       if (prop === "getApiKey") {
         return async (providerId: string) => {
+          if (loggedOutProviders.has(providerId)) {
+            return undefined;
+          }
           for (const storage of readAuthStorages) {
             const apiKey = await storage.getApiKey(providerId);
             if (apiKey) return apiKey;

@@ -1,6 +1,6 @@
 import "./AgentsView.css";
 import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense, type CSSProperties } from "react";
-import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, ChevronDown, ChevronUp, Filter, Upload, Network, SlidersHorizontal, Copy, Check, ZoomIn, ZoomOut, Minimize2 } from "lucide-react";
+import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Info } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
 import { updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings } from "../api";
 
@@ -11,7 +11,6 @@ import { AgentEmptyState } from "./AgentEmptyState";
 import { useAgents } from "../hooks/useAgents";
 import { useConfirm } from "../hooks/useConfirm";
 import { NewAgentDialog } from "./NewAgentDialog";
-import { ExperimentalAgentOnboardingModal } from "./ExperimentalAgentOnboardingModal";
 import { AgentImportModal } from "./AgentImportModal";
 import { getScopedItem, setScopedItem } from "../utils/projectStorage";
 import { useViewportMode } from "../hooks/useViewportMode";
@@ -25,8 +24,10 @@ import {
   HEARTBEAT_INTERVAL_PRESETS,
 } from "../utils/heartbeatIntervals";
 import { isEphemeralAgent, getErrorMessage } from "@fusion/core";
-import { relativeTime } from "./AgentDetailView";
 import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
+import { resolveOrgChartLayoutMode, type OrgChartLayoutMode } from "./agentsOrgChartLayout";
+import { AgentAvatar } from "./AgentAvatar";
+import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
 
 export interface AgentsViewProps {
   addToast: (message: string, type?: "success" | "error") => void;
@@ -59,8 +60,6 @@ function getStateBadgeClass(state: AgentState): string {
       return "agent-badge--paused";
     case "error":
       return "agent-badge--error";
-    case "terminated":
-      return "agent-badge--terminated";
     case "idle":
     default:
       return "agent-badge--idle";
@@ -80,66 +79,12 @@ function getStateCardClass(
       return `${prefix}--paused`;
     case "error":
       return `${prefix}--error`;
-    case "terminated":
-      return `${prefix}--terminated`;
     case "idle":
     default:
       return `${prefix}--idle`;
   }
 }
 
-export function CollapsibleErrorDisplay({
-  errorText,
-  className,
-}: {
-  errorText: string;
-  className?: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(errorText);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Ignore clipboard errors
-    }
-  }, [errorText]);
-
-  return (
-    <div className={`agent-card-error${className ? ` ${className}` : ""}`}>
-      <div className="agent-card-error-header">
-        <span className="agent-card-error-preview" title={errorText}>
-          {errorText}
-        </span>
-        <div className="agent-card-error-actions">
-          <button
-            type="button"
-            className="btn-icon touch-target agent-card-error-copy-btn"
-            onClick={() => void handleCopy()}
-            title={copied ? "Copied" : "Copy error"}
-            aria-label={copied ? "Copied error to clipboard" : "Copy error to clipboard"}
-          >
-            {copied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
-          <button
-            type="button"
-            className="btn-icon touch-target agent-card-error-toggle"
-            onClick={() => setExpanded((value) => !value)}
-            title={expanded ? "Collapse error" : "Expand error"}
-            aria-label={expanded ? "Collapse error" : "Expand error"}
-            aria-expanded={expanded}
-          >
-            {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-          </button>
-        </div>
-      </div>
-      {expanded ? <pre className="agent-card-error-full">{errorText}</pre> : null}
-    </div>
-  );
-}
 
 function getOrgChartLeafCount(node: OrgTreeNode): number {
   if (node.children.length === 0) {
@@ -147,6 +92,17 @@ function getOrgChartLeafCount(node: OrgTreeNode): number {
   }
 
   return node.children.reduce((sum, child) => sum + getOrgChartLeafCount(child), 0);
+}
+
+function getHealthSummary(agent: Agent, health: AgentHealthStatus): { title: string | undefined; label: string | null } {
+  if (agent.state === "error") {
+    return { title: undefined, label: "Error" };
+  }
+
+  return {
+    title: health.reason ?? health.label,
+    label: health.stateDerived ? null : health.label,
+  };
 }
 
 function OrgChartNode({
@@ -164,10 +120,17 @@ function OrgChartNode({
 }) {
   const { agent, children } = node;
   const health = getHealthStatus(agent);
+  const healthSummary = getHealthSummary(agent, health);
   const stateBadgeClass = getStateBadgeClass(agent.state);
   const stateNodeClass = getStateCardClass("org-chart-node-card", agent.state);
   const subtreeLeafCount = getOrgChartLeafCount(node);
   const nodeStyle = { "--org-chart-subtree-leaves": String(subtreeLeafCount) } as CSSProperties;
+  const firstChildLeafCount = children.length > 0 ? getOrgChartLeafCount(children[0]) : 1;
+  const lastChildLeafCount = children.length > 0 ? getOrgChartLeafCount(children[children.length - 1]) : 1;
+  const childrenStyle = {
+    "--org-chart-first-child-leaves": String(firstChildLeafCount),
+    "--org-chart-last-child-leaves": String(lastChildLeafCount),
+  } as CSSProperties;
 
   return (
     <div
@@ -189,7 +152,7 @@ function OrgChartNode({
         }}
       >
         <div className="org-chart-node__header">
-          <span className="org-chart-node__icon">{getRoleIcon(agent.role)}</span>
+          <span className="org-chart-node__icon"><AgentAvatar agent={agent} size={20} /></span>
           <span className="org-chart-node__name">{agent.name}</span>
         </div>
         <div className="org-chart-node__meta">
@@ -198,14 +161,14 @@ function OrgChartNode({
           >
             {agent.state}
           </span>
-          <span className="org-chart-node__health" style={{ color: health.color }} title={health.reason ?? health.label}>
+          <span className="org-chart-node__health" style={{ color: health.color }} title={healthSummary.title}>
             {health.icon}
-            {!health.stateDerived && <span className="text-secondary">{health.label}</span>}
+            {healthSummary.label && <span className="text-secondary">{healthSummary.label}</span>}
           </span>
         </div>
       </div>
       {children.length > 0 && (
-        <div className="org-chart-children" role="group" aria-label={`${agent.name} employees`}>
+        <div className="org-chart-children" style={childrenStyle} role="group" aria-label={`${agent.name} employees`}>
           {children.map((child) => (
             <OrgChartNode
               key={child.agent.id}
@@ -227,15 +190,15 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const viewportMode = useViewportMode();
   const isMobileViewport = viewportMode === "mobile";
   const [filterState, setFilterState] = useState<AgentState | "all">("all");
-  const { agents, stats, isLoading, loadAgents } = useAgents(projectId, {
+  const { agents, stats, isLoading, loadAgents, refreshAgents } = useAgents(projectId, {
     filterState,
     showSystemAgents,
   });
   const [isCreating, setIsCreating] = useState(false);
-  const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
   const [onboardingDraft, setOnboardingDraft] = useState<AgentOnboardingSummary | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedOrgChartAgentId, setSelectedOrgChartAgentId] = useState<string | null>(null);
   const isMobileDetailOpen = isMobileViewport && !!selectedAgentId;
   const [selectedAgentInitialTab, setSelectedAgentInitialTab] = useState<"dashboard" | "runs">("dashboard");
   const [selectedAgentInitialRunId, setSelectedAgentInitialRunId] = useState<string | null>(null);
@@ -247,10 +210,12 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   });
   const [orgTree, setOrgTree] = useState<OrgTreeNode[]>([]);
   const [isOrgTreeLoading, setIsOrgTreeLoading] = useState(false);
+  const [orgChartViewportWidth, setOrgChartViewportWidth] = useState(0);
   const [isControlsPanelOpen, setIsControlsPanelOpen] = useState(false);
   const [isOverviewOpen, setIsOverviewOpen] = useState(false);
   const [orgChartZoomIndex, setOrgChartZoomIndex] = useState(1);
   const controlsPanelRef = useRef<HTMLDivElement>(null);
+  const orgChartViewportRef = useRef<HTMLDivElement>(null);
   const { confirm } = useConfirm();
   const controlsTriggerRef = useRef<HTMLButtonElement>(null);
   const controlsPanelId = useId();
@@ -335,7 +300,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
 
   // Filter agents for display. "All States" means all non-ephemeral agents,
-  // including disabled/terminated agents that still carry configuration.
+  // including paused/error agents and heartbeat-disabled agents that still carry configuration.
   // When "Show system agents" is enabled, include ephemeral/internal agents.
   const displayAgents = useMemo(() => {
     return optimisticAgents.filter((agent) => showSystemAgents || !isEphemeralAgent(agent));
@@ -371,6 +336,26 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
       .filter((n): n is OrgTreeNode => n !== null);
   }, [orgTree, showSystemAgents]);
 
+  useEffect(() => {
+    if (agentView !== "org") return;
+
+    const viewport = orgChartViewportRef.current;
+    if (!viewport) return;
+
+    const updateWidth = () => {
+      setOrgChartViewportWidth(viewport.clientWidth);
+    };
+
+    updateWidth();
+    const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(updateWidth) : null;
+    resizeObserver?.observe(viewport);
+    window.addEventListener("resize", updateWidth);
+
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateWidth);
+    };
+  }, [agentView, displayOrgTree.length]);
 
   useEffect(() => {
     if (agentView !== "org") return;
@@ -486,7 +471,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     try {
       await deleteAgent(agentId, projectId);
       addToast(`Agent "${agentName}" deleted`, "success");
-      void loadAgents();
+      await loadAgents();
     } catch (err) {
       addToast(`Failed to delete agent: ${getErrorMessage(err)}`, "error");
     }
@@ -670,6 +655,18 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     openAgentDetail(childId);
   }, [openAgentDetail]);
 
+  const handleOrgChartNodeSelect = useCallback((agentId: string) => {
+    setSelectedOrgChartAgentId(agentId);
+    openAgentDetail(agentId);
+  }, [openAgentDetail]);
+
+  const handleDetailMutationSuccess = useCallback(async ({ agentId, deleted }: { agentId: string; deleted?: boolean }) => {
+    await refreshAgents();
+    if (deleted && selectedAgentId === agentId) {
+      handleCloseDetail();
+    }
+  }, [refreshAgents, selectedAgentId, handleCloseDetail]);
+
   const handleOverviewAgentSelect = useCallback((agentId: string) => {
     openAgentDetail(agentId);
     if (isMobileViewport) {
@@ -678,11 +675,31 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   }, [isMobileViewport, openAgentDetail]);
 
   const handleRunHeartbeat = async (agentId: string, agentName: string) => {
+    // Optimistic state flip: the API call can take several seconds before the
+    // backend transitions the agent to running, and the user clicking "Run
+    // Now" reasonably expects the card to react immediately. We mirror the
+    // pattern handleStateChange uses: stamp the override, await the API,
+    // refetch on success, roll back on failure.
+    setOptimisticStateOverrides((prev) => {
+      const next = new Map(prev);
+      next.set(agentId, "running");
+      return next;
+    });
     try {
       await startAgentRun(agentId, projectId, { source: "on_demand", triggerDetail: "Triggered from dashboard" });
       addToast(`Heartbeat run started for ${agentName}`, "success");
-      void loadAgents();
+      await loadAgents();
+      setOptimisticStateOverrides((prev) => {
+        const next = new Map(prev);
+        next.delete(agentId);
+        return next;
+      });
     } catch (err) {
+      setOptimisticStateOverrides((prev) => {
+        const next = new Map(prev);
+        next.delete(agentId);
+        return next;
+      });
       addToast(`Failed to start heartbeat run: ${getErrorMessage(err)}`, "error");
     }
   };
@@ -699,8 +716,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
   const getRoleLabel = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.label ?? role;
   const getRoleIcon = (role: AgentCapability) => AGENT_ROLES.find(r => r.value === role)?.icon ?? "◆";
-  const selectedAgent = selectedAgentId ? displayAgents.find((agent) => agent.id === selectedAgentId) ?? null : null;
   const orgChartZoom = ORG_CHART_ZOOM_LEVELS[orgChartZoomIndex];
+  const orgChartLayoutMode: OrgChartLayoutMode = useMemo(() => resolveOrgChartLayoutMode({
+    tree: displayOrgTree,
+    availableWidth: orgChartViewportWidth,
+  }), [displayOrgTree, orgChartViewportWidth]);
 
   /** Get skill badges from agent metadata */
   const getSkillBadges = (agent: Agent): string[] => {
@@ -718,12 +738,8 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const showInitialAgentsLoading = isLoading && agents.length === 0;
 
   const handleOpenNewAgent = useCallback(() => {
-    if (agentOnboardingEnabled) {
-      setIsOnboardingOpen(true);
-      return;
-    }
     setIsCreating(true);
-  }, [agentOnboardingEnabled]);
+  }, []);
 
   return (
     <div className="agents-view">
@@ -784,11 +800,25 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               <RefreshCw size={16} className={isLoading ? "spin" : undefined} />
             </button>
             <button
+              className="btn btn-sm agent-import-trigger"
+              onClick={() => {
+                setIsImporting(true);
+                setIsControlsPanelOpen(false);
+              }}
+              aria-label="Import"
+              title="Import"
+            >
+              <Upload size={16} />
+              Import
+            </button>
+            <button
               className="btn btn-task-create btn-sm"
               onClick={() => {
                 handleOpenNewAgent();
                 setIsControlsPanelOpen(false);
               }}
+              aria-label="New Agent"
+              title="New Agent"
             >
               <Plus size={16} />
               New Agent
@@ -822,7 +852,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                   <option value="running">Running</option>
                   <option value="paused">Paused</option>
                   <option value="error">Error</option>
-                  <option value="terminated">Terminated</option>
                 </select>
               </div>
 
@@ -837,21 +866,9 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               </label>
             </div>
 
-            <div className="agent-controls-actions">
-              <button
-                className="btn"
-                onClick={() => {
-                  setIsImporting(true);
-                  setIsControlsPanelOpen(false);
-                }}
-              >
-                <Upload size={16} />
-                Import
-              </button>
-            </div>
           </div>
 
-          <div className="agent-global-controls">
+          <div className="agent-global-controls agent-controls-actions">
             <div className="heartbeat-multiplier-group">
               <div className="heartbeat-multiplier-controls">
                 <label htmlFor="globalHeartbeatMultiplier" className="heartbeat-multiplier-label">
@@ -903,6 +920,27 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         </div>
       )}
 
+      <NewAgentDialog
+        isOpen={isCreating}
+        onClose={() => {
+          setIsCreating(false);
+          setOnboardingDraft(null);
+        }}
+        onCreated={() => { setIsCreating(false); setOnboardingDraft(null); void loadAgents(); }}
+        projectId={projectId}
+        prefillDraft={onboardingDraft}
+        agentOnboardingEnabled={agentOnboardingEnabled}
+        existingAgents={agents}
+        onPrefillDraft={setOnboardingDraft}
+      />
+
+      <AgentImportModal
+        isOpen={isImporting}
+        onClose={() => setIsImporting(false)}
+        onImported={() => void loadAgents()}
+        projectId={projectId}
+      />
+
       <AgentsOverviewBar
         stats={stats}
         activeAgents={displayActiveAgents}
@@ -913,107 +951,123 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         onOpenTaskLogs={onOpenTaskLogs}
       />
 
+      {agentView === "org" ? (
+        <div className="agents-org-full-view">
+          <div className="agents-view-content agents-view-content--org-full">
+            {selectedAgentId ? (
+              <div className="agents-org-detail-view" data-testid="agents-org-detail-view">
+                <button
+                  type="button"
+                  className="btn btn-sm agents-org-detail-back"
+                  onClick={handleCloseDetail}
+                  aria-label="Back to org chart"
+                >
+                  Back to org chart
+                </button>
+                <Suspense fallback={null}>
+                  <AgentDetailView
+                    key={selectedAgentId}
+                    inline
+                    showInlineBackButton={false}
+                    agentId={selectedAgentId}
+                    projectId={projectId}
+                    onClose={handleCloseDetail}
+                    addToast={addToast}
+                    onChildClick={handleChildClick}
+                    initialTab={selectedAgentInitialTab}
+                    initialRunId={selectedAgentInitialRunId}
+                    preferActiveRun={selectedAgentPreferActiveRun}
+                  />
+                </Suspense>
+              </div>
+            ) : showInitialAgentsLoading ? (
+              <div className="agents-view-loading" role="status" aria-live="polite">
+                <RefreshCw size={18} className="spin" />
+                <span>Loading agents...</span>
+              </div>
+            ) : (
+              <div className="agent-org-chart-shell" data-testid="agent-org-chart-shell">
+                {isMobileViewport ? (
+                  <div className="agent-org-chart-controls" data-testid="agent-org-chart-controls">
+                    <button
+                      type="button"
+                      className="btn-icon touch-target"
+                      onClick={() => setOrgChartZoomIndex((value) => Math.max(0, value - 1))}
+                      disabled={orgChartZoomIndex === 0}
+                      aria-label="Zoom out org chart"
+                      title="Zoom out"
+                    >
+                      <ZoomOut size={16} />
+                    </button>
+                    <span className="agent-org-chart-controls__zoom-label" aria-live="polite">{Math.round(orgChartZoom * 100)}%</span>
+                    <button
+                      type="button"
+                      className="btn-icon touch-target"
+                      onClick={() => setOrgChartZoomIndex((value) => Math.min(ORG_CHART_ZOOM_LEVELS.length - 1, value + 1))}
+                      disabled={orgChartZoomIndex === ORG_CHART_ZOOM_LEVELS.length - 1}
+                      aria-label="Zoom in org chart"
+                      title="Zoom in"
+                    >
+                      <ZoomIn size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      className="btn touch-target btn-sm agent-org-chart-controls__fit-btn"
+                      onClick={() => setOrgChartZoomIndex(1)}
+                      aria-label="Fit org chart"
+                      title="Fit org chart"
+                    >
+                      <Minimize2 size={16} />
+                      Fit
+                    </button>
+                  </div>
+                ) : null}
+                <div
+                  ref={orgChartViewportRef}
+                  className="agent-org-chart-viewport"
+                  data-testid="agent-org-chart-viewport"
+                >
+                  <div className={`agent-org-chart-canvas agent-org-chart-canvas--zoom-${Math.round(orgChartZoom * 100)}`}>
+                    <div
+                      className={`agent-org-chart${orgChartLayoutMode === "vertical" ? " agent-org-chart--vertical" : ""}`}
+                      data-testid="agent-org-chart"
+                      data-layout-mode={orgChartLayoutMode}
+                    >
+                      {isOrgTreeLoading ? (
+                        <div className="agent-org-chart__loading" role="status" aria-live="polite">
+                          <RefreshCw size={18} className="spin" />
+                          <span>Loading org chart...</span>
+                        </div>
+                      ) : displayOrgTree.length === 0 ? (
+                        <AgentEmptyState onCtaClick={handleOpenNewAgent} />
+                      ) : (
+                        displayOrgTree.map((node) => (
+                          <OrgChartNode
+                            key={node.agent.id}
+                            node={node}
+                            onSelect={handleOrgChartNodeSelect}
+                            getHealthStatus={getHealthStatus}
+                            getRoleIcon={getRoleIcon}
+                            selectedAgentId={selectedOrgChartAgentId}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
       <div className="agents-split-layout">
         <div className={`agents-split-sidebar${isMobileDetailOpen ? " agents-split-sidebar--hidden-mobile" : ""}`}>
           <div className="agents-view-content">
-        <NewAgentDialog
-          isOpen={isCreating}
-          onClose={() => {
-            setIsCreating(false);
-            setOnboardingDraft(null);
-          }}
-          onCreated={() => { setIsCreating(false); setOnboardingDraft(null); void loadAgents(); }}
-          projectId={projectId}
-          prefillDraft={onboardingDraft}
-        />
-
-        <ExperimentalAgentOnboardingModal
-          isOpen={isOnboardingOpen}
-          onClose={() => setIsOnboardingOpen(false)}
-          onUseDraft={(draft) => {
-            setOnboardingDraft(draft);
-            setIsOnboardingOpen(false);
-            setIsCreating(true);
-          }}
-          projectId={projectId}
-          existingAgents={agents}
-        />
-
-        <AgentImportModal
-          isOpen={isImporting}
-          onClose={() => setIsImporting(false)}
-          onImported={() => void loadAgents()}
-          projectId={projectId}
-        />
-
         {/* Agent Collection */}
         {showInitialAgentsLoading ? (
           <div className="agents-view-loading" role="status" aria-live="polite">
             <RefreshCw size={18} className="spin" />
             <span>Loading agents...</span>
-          </div>
-        ) : agentView === "org" ? (
-          <div className="agent-org-chart-shell" data-testid="agent-org-chart-shell">
-            {isMobileViewport ? (
-              <div className="agent-org-chart-controls" data-testid="agent-org-chart-controls">
-                <button
-                  type="button"
-                  className="btn-icon touch-target"
-                  onClick={() => setOrgChartZoomIndex((value) => Math.max(0, value - 1))}
-                  disabled={orgChartZoomIndex === 0}
-                  aria-label="Zoom out org chart"
-                  title="Zoom out"
-                >
-                  <ZoomOut size={16} />
-                </button>
-                <span className="agent-org-chart-controls__zoom-label" aria-live="polite">{Math.round(orgChartZoom * 100)}%</span>
-                <button
-                  type="button"
-                  className="btn-icon touch-target"
-                  onClick={() => setOrgChartZoomIndex((value) => Math.min(ORG_CHART_ZOOM_LEVELS.length - 1, value + 1))}
-                  disabled={orgChartZoomIndex === ORG_CHART_ZOOM_LEVELS.length - 1}
-                  aria-label="Zoom in org chart"
-                  title="Zoom in"
-                >
-                  <ZoomIn size={16} />
-                </button>
-                <button
-                  type="button"
-                  className="btn touch-target btn-sm agent-org-chart-controls__fit-btn"
-                  onClick={() => setOrgChartZoomIndex(1)}
-                  aria-label="Fit org chart"
-                  title="Fit org chart"
-                >
-                  <Minimize2 size={16} />
-                  Fit
-                </button>
-              </div>
-            ) : null}
-            <div className="agent-org-chart-viewport" data-testid="agent-org-chart-viewport">
-              <div className={`agent-org-chart-canvas agent-org-chart-canvas--zoom-${Math.round(orgChartZoom * 100)}`}>
-                <div className="agent-org-chart" data-testid="agent-org-chart">
-                  {isOrgTreeLoading ? (
-                    <div className="agent-org-chart__loading" role="status" aria-live="polite">
-                      <RefreshCw size={18} className="spin" />
-                      <span>Loading org chart...</span>
-                    </div>
-                  ) : displayOrgTree.length === 0 ? (
-                    <AgentEmptyState onCtaClick={handleOpenNewAgent} />
-                  ) : (
-                    displayOrgTree.map((node) => (
-                      <OrgChartNode
-                        key={node.agent.id}
-                        node={node}
-                        onSelect={openAgentDetail}
-                        getHealthStatus={getHealthStatus}
-                        getRoleIcon={getRoleIcon}
-                        selectedAgentId={selectedAgentId}
-                      />
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
           </div>
         ) : agentView === "board" ? (
           <div className="agent-board">
@@ -1022,6 +1076,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             ) : (
               displayAgents.map((agent) => {
                 const health = getHealthStatus(agent);
+                const healthSummary = getHealthSummary(agent, health);
                 const stateBadgeClass = getStateBadgeClass(agent.state);
                 const stateCardClass = getStateCardClass("agent-board-card", agent.state);
                 return (
@@ -1041,14 +1096,20 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                       }}
                     >
                       <div className="agent-board-header">
-                        <span className="agent-board-icon">{getRoleIcon(agent.role)}</span>
+                        <span className="agent-board-icon"><AgentAvatar agent={agent} size={20} /></span>
                         <span className="agent-board-badge badge text-secondary">{getRoleLabel(agent.role)}</span>
                         <span className={`agent-board-badge badge ${stateBadgeClass}`}>{agent.state}</span>
+                        {(agent.pendingApprovalCount ?? 0) > 0 ? (
+                          <span className="agent-board-badge badge agent-approval-badge" title="Pending approvals">
+                            <span className="status-dot status-dot--pending" />
+                            {agent.pendingApprovalCount}
+                          </span>
+                        ) : null}
                       </div>
                       <div className="agent-board-name">{agent.name}</div>
                       <div className="agent-board-id">{agent.id}</div>
-                      <div className="agent-board-health" style={{ color: health.color }} title={health.reason ?? health.label}>
-                        {health.icon}{!health.stateDerived && ` ${health.label}`}
+                      <div className="agent-board-health" style={{ color: health.color }} title={healthSummary.title}>
+                        {health.icon}{healthSummary.label ? ` ${healthSummary.label}` : ""}
                       </div>
                     </div>
                   </div>
@@ -1064,28 +1125,46 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             // List view: detailed card layout
             displayAgents.map(agent => {
               const health = getHealthStatus(agent);
+              const healthSummary = getHealthSummary(agent, health);
               const stateBadgeClass = getStateBadgeClass(agent.state);
               const stateCardClass = getStateCardClass("agent-card", agent.state);
               const configuredIntervalMs = resolveHeartbeatIntervalMs(agent.runtimeConfig?.heartbeatIntervalMs);
               const heartbeatOptions = getHeartbeatIntervalOptions(configuredIntervalMs);
               const isUpdatingHeartbeat = updatingHeartbeatAgentId === agent.id;
               return (
-                <div key={agent.id} className={`agent-card ${stateCardClass}${selectedAgentId === agent.id ? " agent-card--selected" : ""}`}>
+                <div
+                  key={agent.id}
+                  className={`agent-card agent-card--clickable ${stateCardClass}${selectedAgentId === agent.id ? " agent-card--selected" : ""}`}
+                  onClick={(e) => {
+                    // Open detail when the user clicks the card body, but
+                    // bail when the click landed on an interactive
+                    // descendant (action buttons, the role-edit select,
+                    // the role-icon button) so those keep their dedicated
+                    // behaviors instead of double-firing. Use currentTarget
+                    // as the boundary so the card's own role="button" is
+                    // not treated as an interactive descendant.
+                    const target = e.target as HTMLElement;
+                    if (target === e.currentTarget) {
+                      openAgentDetail(agent.id);
+                      return;
+                    }
+                    const interactive = target.closest('button, select, input, [role="button"]');
+                    if (interactive && interactive !== e.currentTarget) return;
+                    openAgentDetail(agent.id);
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      if (e.key === " ") e.preventDefault();
+                      openAgentDetail(agent.id);
+                    }
+                  }}
+                  aria-label={`Open details for ${agent.name}`}
+                >
                   <div className="agent-card-header">
-                    <div
-                      className="agent-info agent-info--clickable"
-                      onClick={() => openAgentDetail(agent.id)}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          if (e.key === " ") {
-                            e.preventDefault();
-                          }
-                          openAgentDetail(agent.id);
-                        }
-                      }}
-                    >
+                    <div className="agent-info">
                       {editingRoleForAgent === agent.id ? (
                         <select
                           ref={roleSelectRef}
@@ -1119,7 +1198,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                             }
                           }}
                         >
-                          {getRoleIcon(agent.role)}
+                          <AgentAvatar agent={agent} size={20} />
                         </span>
                       )}
                       <div className="agent-meta">
@@ -1134,12 +1213,18 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                       >
                         {agent.state}
                       </span>
-                      <span className="badge" style={{ color: health.color }} title={health.reason ?? health.label}>
-                        {health.icon}{!health.stateDerived && ` ${health.label}`}
+                      <span className="badge" style={{ color: health.color }} title={healthSummary.title}>
+                        {health.icon}{healthSummary.label ? ` ${healthSummary.label}` : ""}
                       </span>
                       <span className="badge text-secondary">
                         {getRoleLabel(agent.role)}
                       </span>
+                      {(agent.pendingApprovalCount ?? 0) > 0 ? (
+                        <span className="badge agent-approval-badge" title="Pending approvals">
+                          <span className="status-dot status-dot--pending" />
+                          {agent.pendingApprovalCount}
+                        </span>
+                      ) : null}
                       {/* List view: up to 2 skill badges */}
                       {(() => {
                         const skills = getSkillBadges(agent);
@@ -1160,7 +1245,16 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
 
                   <div className="agent-card-body">
                     {agent.state === "error" && agent.lastError ? (
-                      <CollapsibleErrorDisplay errorText={agent.lastError} />
+                      <AgentErrorIndicator
+                        errorText={agent.lastError}
+                        issueContext={{
+                          surface: "AgentsView list",
+                          agentId: agent.id,
+                          agentName: agent.name,
+                          agentState: agent.state,
+                          taskId: agent.taskId,
+                        }}
+                      />
                     ) : null}
                     {agent.taskId && (
                       <div className="agent-task">
@@ -1200,7 +1294,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                           />
                           <span className="text-secondary">min</span>
                           <button
-                            className="btn btn--sm"
+                            className="btn btn-sm"
                             onClick={() => void handleCustomHeartbeatSave(agent)}
                             disabled={isUpdatingHeartbeat}
                             title="Save custom interval"
@@ -1208,7 +1302,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                             Save
                           </button>
                           <button
-                            className="btn btn--sm"
+                            className="btn btn-sm"
                             onClick={() => {
                               setCustomHeartbeatAgentId(null);
                               setCustomHeartbeatMinutes((prev) => {
@@ -1276,100 +1370,92 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                   <div className="agent-card-actions">
                     {agent.state === "idle" && (
                       <button
-                        className="btn btn--sm"
+                        className="btn btn-sm"
                         onClick={() => void handleStateChange(agent.id, "active")}
                         disabled={transitioningAgentIds.has(agent.id)}
                         title="Activate"
                       >
-                        <Play size={14} /> Start
+                        <Play size={14} /> <span className="agent-card-action-label">Start</span>
                       </button>
                     )}
                     {agent.state === "active" && (
                       <>
                         <button
-                          className="btn btn--sm"
+                          className="btn btn-sm"
                           onClick={() => void handleRunHeartbeat(agent.id, agent.name)}
                           disabled={transitioningAgentIds.has(agent.id)}
                           title="Run Now"
                           aria-label={`Run now for ${agent.name}`}
                         >
-                          <Activity size={14} /> Run Now
+                          <Activity size={14} /> <span className="agent-card-action-label">Run Now</span>
                         </button>
                         <button
-                          className="btn btn--sm"
+                          className="btn btn-sm"
                           onClick={() => void handleStateChange(agent.id, "paused")}
                           disabled={transitioningAgentIds.has(agent.id)}
                           title="Pause"
                         >
-                          <Pause size={14} /> Pause
+                          <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
                         </button>
                       </>
                     )}
                     {agent.state === "paused" && (
                       <button
-                        className="btn btn--sm"
+                        className="btn btn-sm"
                         onClick={() => void handleStateChange(agent.id, "active")}
                         disabled={transitioningAgentIds.has(agent.id)}
                         title="Resume"
                       >
-                        <Play size={14} /> Resume
+                        <Play size={14} /> <span className="agent-card-action-label">Resume</span>
                       </button>
                     )}
                     {agent.state === "running" && (
                       <>
                         <button
-                          className="btn btn--sm"
+                          className="btn btn-sm"
                           onClick={() => openAgentDetail(agent.id, { initialTab: "runs", initialRunId: null, preferActiveRun: true })}
                           title="View live run details"
                           aria-label={`View live run details for ${agent.name}`}
                         >
-                          <Activity size={14} /> Running
+                          <Activity size={14} /> <span className="agent-card-action-label">Running</span>
                         </button>
                         <button
-                          className="btn btn--sm"
+                          className="btn btn-sm"
                           onClick={() => void handleStateChange(agent.id, "paused")}
                           disabled={transitioningAgentIds.has(agent.id)}
                           title="Pause"
                         >
-                          <Pause size={14} /> Pause
+                          <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
                         </button>
                       </>
                     )}
                     {agent.state === "error" && (
                       <button
-                        className="btn btn--sm"
+                        className="btn btn-sm"
                         onClick={() => void handleStateChange(agent.id, "active")}
                         disabled={transitioningAgentIds.has(agent.id)}
                         title="Retry"
                       >
-                        <Play size={14} /> Retry
-                      </button>
-                    )}
-                    {agent.state === "terminated" && (
-                      <button
-                        className="btn btn--sm"
-                        onClick={() => void handleStateChange(agent.id, "active")}
-                        disabled={transitioningAgentIds.has(agent.id)}
-                        title="Start"
-                      >
-                        <Play size={14} /> Start
+                        <Play size={14} /> <span className="agent-card-action-label">Retry</span>
                       </button>
                     )}
                     <button
-                      className="btn btn--sm agent-card-details-btn"
+                      className="btn btn-sm agent-card-details-btn"
                       onClick={() => openAgentDetail(agent.id)}
                       title={`View details for ${agent.name}`}
                       aria-label={`View details for ${agent.name}`}
                     >
-                      View Details
+                      <Info size={14} /> <span className="agent-card-action-label">Details</span>
                     </button>
-                    <button
-                      className="btn btn--sm btn--danger"
-                      onClick={() => void handleDelete(agent.id, agent.name)}
-                      title="Delete"
-                    >
-                      <Trash2 size={14} /> Delete
-                    </button>
+                    {(agent.state === "idle" || agent.state === "paused") && (
+                      <button
+                        className="btn btn-sm btn-danger"
+                        onClick={() => void handleDelete(agent.id, agent.name)}
+                        title="Delete"
+                      >
+                        <Trash2 size={14} /> <span className="agent-card-action-label">Delete</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -1379,60 +1465,6 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
         )}
           </div>
 
-          {!isMobileViewport && selectedAgent && (
-            <div className="agents-sidebar-quick-controls">
-              <div className="agents-sidebar-quick-controls__header">
-                <strong>{selectedAgent.name}</strong>
-                <span className={`badge ${getStateBadgeClass(selectedAgent.state)}`}>{selectedAgent.state}</span>
-              </div>
-              <div className="agents-sidebar-quick-controls__meta">
-                <span>{formatHeartbeatInterval(resolveHeartbeatIntervalMs(selectedAgent.runtimeConfig?.heartbeatIntervalMs))}</span>
-                {selectedAgent.lastHeartbeatAt && <span>Last {relativeTime(selectedAgent.lastHeartbeatAt)}</span>}
-              </div>
-              <div className="agents-sidebar-quick-controls__actions">
-                {selectedAgent.state === "idle" && (
-                  <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "active")}>
-                    <Play size={14} /> Start
-                  </button>
-                )}
-                {selectedAgent.state === "active" && (
-                  <>
-                    <button className="btn btn-sm" onClick={() => void handleRunHeartbeat(selectedAgent.id, selectedAgent.name)}>
-                      <Activity size={14} /> Run Now
-                    </button>
-                    <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "paused")}>
-                      <Pause size={14} /> Pause
-                    </button>
-                  </>
-                )}
-                {selectedAgent.state === "running" && (
-                  <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "paused")}>
-                    <Pause size={14} /> Pause
-                  </button>
-                )}
-                {selectedAgent.state === "paused" && (
-                  <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "active")}>
-                    <Play size={14} /> Resume
-                  </button>
-                )}
-                {selectedAgent.state === "error" && (
-                  <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "active")}>
-                    <Play size={14} /> Retry
-                  </button>
-                )}
-                {selectedAgent.state === "terminated" && (
-                  <>
-                    <button className="btn btn-sm" onClick={() => void handleStateChange(selectedAgent.id, "active")}>
-                      <Play size={14} /> Start
-                    </button>
-                    <button className="btn btn-danger btn-sm" onClick={() => void handleDelete(selectedAgent.id, selectedAgent.name)}>
-                      <Trash2 size={14} /> Delete
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
         </div>
 
         <div className={`agents-split-detail${isMobileViewport && !selectedAgentId ? " agents-split-detail--hidden-mobile" : ""}`}>
@@ -1450,6 +1482,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                 initialTab={selectedAgentInitialTab}
                 initialRunId={selectedAgentInitialRunId}
                 preferActiveRun={selectedAgentPreferActiveRun}
+                onMutationSuccess={handleDetailMutationSuccess}
               />
             </Suspense>
           ) : (
@@ -1461,6 +1494,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

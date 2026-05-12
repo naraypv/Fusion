@@ -8,18 +8,28 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildPackageDirByName,
+  buildReverseDependencyMap,
   shouldForceFullSuite,
   resolveAffectedPackages,
   decideExecutionPlan,
   computePackageHash,
+  expandWithReverseDependents,
+  listWorkspacePackageInfos,
   readCache,
   writeCache,
   applyCacheToPlan,
   recordCachePass,
   cacheFilePath,
+  shouldRunIsolationGuard,
+  defaultTestWorkerBudget,
+  createIsolatedHomeEnv,
+  cleanupIsolatedHomePath,
+  knownIsolatedHomeBasenames,
+  __setCleanupRmSyncForTests,
 } from "../test-changed.mjs";
 
-import { mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -91,6 +101,10 @@ test("shouldForceFullSuite: returns true when scripts/test-changed.mjs changed",
   assert.equal(shouldForceFullSuite(["scripts/test-changed.mjs"]), true);
 });
 
+test("shouldForceFullSuite: returns true when scripts/check-test-isolation.mjs changed", () => {
+  assert.equal(shouldForceFullSuite(["scripts/check-test-isolation.mjs"]), true);
+});
+
 test("shouldForceFullSuite: returns true when a GitHub workflow changed", () => {
   assert.equal(shouldForceFullSuite([".github/workflows/ci.yml"]), true);
 });
@@ -100,7 +114,7 @@ test("shouldForceFullSuite: returns true when a GitHub workflow changed", () => 
 // ---------------------------------------------------------------------------
 
 test("resolveAffectedPackages: maps changed files to package names", () => {
-  const map = pkgMap([["engine", "@fusion/engine"], ["core", "@fusion/core"]]);
+  const map = pkgMap([["packages/engine", "@fusion/engine"], ["packages/core", "@fusion/core"]]);
   const result = resolveAffectedPackages(
     ["packages/engine/src/index.ts", "packages/core/src/utils.ts"],
     map,
@@ -108,23 +122,50 @@ test("resolveAffectedPackages: maps changed files to package names", () => {
   assert.deepEqual(result?.sort(), ["@fusion/core", "@fusion/engine"]);
 });
 
-test("resolveAffectedPackages: ignores non-package files", () => {
-  const map = pkgMap([["engine", "@fusion/engine"]]);
+test("resolveAffectedPackages: ignores non-workspace files", () => {
+  const map = pkgMap([["packages/engine", "@fusion/engine"]]);
   const result = resolveAffectedPackages(["docs/readme.md"], map);
   assert.deepEqual(result, []);
 });
 
 test("resolveAffectedPackages: returns null for unknown package dir", () => {
-  const map = pkgMap([["engine", "@fusion/engine"]]);
+  const map = pkgMap([["packages/engine", "@fusion/engine"]]);
   const result = resolveAffectedPackages(["packages/unknown-pkg/src/foo.ts"], map);
   assert.equal(result, null);
+});
+
+
+test("resolveAffectedPackages: maps plugin workspace changes", () => {
+  const map = pkgMap([
+    ["packages/engine", "@fusion/engine"],
+    ["plugins/fusion-plugin-hermes-runtime", "@fusion-plugin-examples/hermes-runtime"],
+  ]);
+
+  const result = resolveAffectedPackages([
+    "plugins/fusion-plugin-hermes-runtime/src/runtime-adapter.ts",
+  ], map);
+
+  assert.deepEqual(result, ["@fusion-plugin-examples/hermes-runtime"]);
+});
+
+test("buildPackageDirByName: uses canonical workspace dirs instead of package aliases", () => {
+  const result = buildPackageDirByName([
+    { name: "@fusion/engine", dir: "packages/engine" },
+    { name: "@fusion/core", dir: "packages/core" },
+    { name: "@fusion-plugin-examples/cursor-runtime", dir: "plugins/fusion-plugin-cursor-runtime" },
+  ]);
+
+  assert.equal(result.get("@fusion/engine"), "packages/engine");
+  assert.equal(result.get("@fusion/core"), "packages/core");
+  assert.equal(result.get("@fusion-plugin-examples/cursor-runtime"), "plugins/fusion-plugin-cursor-runtime");
+  assert.notEqual(result.get("@fusion/engine"), "engine");
 });
 
 // ---------------------------------------------------------------------------
 // decideExecutionPlan
 // ---------------------------------------------------------------------------
 
-const basePackageMap = pkgMap([["engine", "@fusion/engine"], ["core", "@fusion/core"]]);
+const basePackageMap = pkgMap([["packages/engine", "@fusion/engine"], ["packages/core", "@fusion/core"]]);
 
 test("decideExecutionPlan: forced full suite", () => {
   const plan = decideExecutionPlan({
@@ -192,6 +233,23 @@ test("decideExecutionPlan: only package files changed → changed mode", () => {
   assert.deepEqual(plan.packages, ["@fusion/engine"]);
 });
 
+test("decideExecutionPlan: expands changed packages with reverse dependents", () => {
+  const plan = decideExecutionPlan({
+    forceFullSuite: false,
+    comparisonBase: "abc123",
+    changedFiles: ["packages/core/src/store.ts"],
+    packageNameByDir: basePackageMap,
+    reverseDependencyMap: new Map([
+      ["@fusion/core", ["@fusion/engine"]],
+      ["@fusion/engine", ["@fusion/dashboard"]],
+      ["@fusion/dashboard", []],
+    ]),
+  });
+
+  assert.equal(plan.mode, "changed");
+  assert.deepEqual(plan.packages, ["@fusion/core", "@fusion/engine", "@fusion/dashboard"]);
+});
+
 test("decideExecutionPlan: no affected package resolved → full", () => {
   const plan = decideExecutionPlan({
     forceFullSuite: false,
@@ -199,6 +257,33 @@ test("decideExecutionPlan: no affected package resolved → full", () => {
     changedFiles: ["packages/nonexistent/src/foo.ts"],
     packageNameByDir: basePackageMap,
   });
+  assert.equal(plan.mode, "full");
+  assert.equal(plan.reason, "no-affected-package");
+});
+
+test("decideExecutionPlan: plugin-only workspace changes stay in changed mode", () => {
+  const plan = decideExecutionPlan({
+    forceFullSuite: false,
+    comparisonBase: "abc123",
+    changedFiles: ["plugins/fusion-plugin-openclaw-runtime/src/runtime-adapter.ts"],
+    packageNameByDir: pkgMap([
+      ["packages/engine", "@fusion/engine"],
+      ["plugins/fusion-plugin-openclaw-runtime", "@fusion-plugin-examples/openclaw-runtime"],
+    ]),
+  });
+
+  assert.equal(plan.mode, "changed");
+  assert.deepEqual(plan.packages, ["@fusion-plugin-examples/openclaw-runtime"]);
+});
+
+test("decideExecutionPlan: plugin changes without mapping fail safe to full", () => {
+  const plan = decideExecutionPlan({
+    forceFullSuite: false,
+    comparisonBase: "abc123",
+    changedFiles: ["plugins/fusion-plugin-openclaw-runtime/src/runtime-adapter.ts"],
+    packageNameByDir: basePackageMap,
+  });
+
   assert.equal(plan.mode, "full");
   assert.equal(plan.reason, "no-affected-package");
 });
@@ -546,7 +631,108 @@ test("recordCachePass: empty package list skips write", () => {
 // cacheFilePath
 // ---------------------------------------------------------------------------
 
-test("cacheFilePath: ends with .fusion/test-cache.json", () => {
+test("cacheFilePath: ends with node_modules/.cache/fusion/test-cache.json", () => {
   const p = cacheFilePath();
-  assert.ok(p.endsWith(path.join(".fusion", "test-cache.json")), `got: ${p}`);
+  assert.ok(p.endsWith(path.join("node_modules", ".cache", "fusion", "test-cache.json")), `got: ${p}`);
+});
+
+test("shouldRunIsolationGuard: enabled by default", () => {
+  assert.equal(shouldRunIsolationGuard({}), true);
+});
+
+test("shouldRunIsolationGuard: disabled when env flag is set", () => {
+  assert.equal(shouldRunIsolationGuard({ FUSION_TEST_DISABLE_ISOLATION_GUARD: "1" }), false);
+});
+
+test("defaultTestWorkerBudget: uses env overrides when provided", () => {
+  const budget = defaultTestWorkerBudget({
+    FUSION_TEST_TOTAL_WORKERS: "9",
+    FUSION_TEST_CONCURRENCY: "3",
+  });
+
+  assert.deepEqual(budget, { totalWorkers: 9, concurrency: 3 });
+});
+
+test("defaultTestWorkerBudget: uses CPU-aware defaults and clamps concurrency", () => {
+  const budget = defaultTestWorkerBudget({
+    FUSION_TEST_TOTAL_WORKERS: "",
+    FUSION_TEST_CONCURRENCY: "999",
+  });
+
+  assert.ok(budget.totalWorkers >= 4);
+  assert.ok(budget.totalWorkers <= 12);
+  assert.equal(budget.concurrency, budget.totalWorkers);
+});
+
+test("createIsolatedHomeEnv: returns temp HOME/USERPROFILE pair without mutating input", () => {
+  const baseEnv = { PATH: process.env.PATH || "" };
+  const { env, isolatedHome } = createIsolatedHomeEnv(baseEnv);
+
+  assert.equal(env.HOME, isolatedHome);
+  assert.equal(env.USERPROFILE, isolatedHome);
+  assert.equal(baseEnv.HOME, undefined);
+  assert.equal(baseEnv.USERPROFILE, undefined);
+  assert.match(isolatedHome, /fusion-test-home-root-/);
+
+  rmSync(isolatedHome, { recursive: true, force: true });
+});
+
+test("cleanupIsolatedHomePath: removes existing isolated HOME directory", () => {
+  const homePath = mkdtempSync(path.join(tmpdir(), "fusion-test-home-root-cleanup-"));
+  assert.equal(path.basename(homePath).startsWith("fusion-test-home-root-cleanup-"), true);
+
+  cleanupIsolatedHomePath(homePath);
+
+  assert.equal(existsSync(homePath), false);
+});
+
+test("cleanupIsolatedHomePath: silently succeeds for ENOENT paths", () => {
+  const missingPath = path.join(tmpdir(), `fusion-test-home-root-missing-${Date.now()}-${Math.random()}`);
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+
+  try {
+    cleanupIsolatedHomePath(missingPath);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.deepEqual(warnings, []);
+});
+
+test("cleanupIsolatedHomePath: warns once after bounded retry failures", () => {
+  const homePath = mkdtempSync(path.join(tmpdir(), "fusion-test-home-root-fail-"));
+  const warnings = [];
+  const originalWarn = console.warn;
+  const error = Object.assign(new Error("simulated EBUSY"), { code: "EBUSY" });
+  let calls = 0;
+
+  __setCleanupRmSyncForTests(() => {
+    calls += 1;
+    throw error;
+  });
+  console.warn = (msg) => warnings.push(String(msg));
+
+  try {
+    cleanupIsolatedHomePath(homePath, 3, 0);
+  } finally {
+    __setCleanupRmSyncForTests(null);
+    console.warn = originalWarn;
+    rmSync(homePath, { recursive: true, force: true });
+  }
+
+  assert.equal(calls, 3);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /failed to remove isolated HOME/);
+});
+
+test("createIsolatedHomeEnv: records raw/realpath basenames in allow-list set", () => {
+  const { isolatedHome } = createIsolatedHomeEnv({ PATH: process.env.PATH || "" });
+  const base = path.basename(isolatedHome);
+
+  assert.equal(knownIsolatedHomeBasenames.has(base), true);
+  assert.ok(knownIsolatedHomeBasenames.size >= 1);
+
+  cleanupIsolatedHomePath(isolatedHome);
 });

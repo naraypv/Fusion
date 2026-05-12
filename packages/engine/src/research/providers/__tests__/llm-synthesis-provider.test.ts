@@ -35,6 +35,9 @@ describe("LLMSynthesisProvider", () => {
     );
 
     expect(promptWithFallbackMock).toHaveBeenCalled();
+    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+      builtinToolsAllowlist: ["WebSearch", "WebFetch"],
+    }));
     expect(result.citations).toEqual(["https://a"]);
     expect(result.confidence).toBe(0.8);
     expect(disposeMock).toHaveBeenCalled();

@@ -1,15 +1,16 @@
 import "./TaskDetailModal.css";
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft } from "lucide-react";
+import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft, Zap } from "lucide-react";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Task, TaskDetail, TaskAttachment, Column, MergeResult, Settings, AgentLogEntry, Agent, TaskPriority, TaskSourceIssue, WorkflowStepResult } from "@fusion/core";
+import type { Task, TaskDetail, TaskAttachment, Column, MergeResult, Settings, GlobalSettings, AgentLogEntry, Agent, TaskPriority, TaskSourceIssue, WorkflowStepResult } from "@fusion/core";
 import {
   COLUMN_LABELS,
   DEFAULT_TASK_PRIORITY,
+  REPO_OVERRIDE_RE,
   TASK_PRIORITIES,
   VALID_TRANSITIONS,
   getErrorMessage,
@@ -17,7 +18,7 @@ import {
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,
 } from "@fusion/core";
-import { uploadAttachment, deleteAttachment, updateTask, pauseTask, unpauseTask, fetchTaskDetail, fetchSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent } from "../api";
+import { uploadAttachment, deleteAttachment, updateTask, pauseTask, unpauseTask, fetchTaskDetail, fetchSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent } from "../api";
 import type { ToastType } from "../hooks/useToast";
 import { useAgentLogs } from "../hooks/useAgentLogs";
 import { useConfirm } from "../hooks/useConfirm";
@@ -25,6 +26,7 @@ import { AgentLogViewer } from "./AgentLogViewer";
 import { ModelSelectorTab } from "./ModelSelectorTab";
 import { PrSection } from "./PrSection";
 import { TaskComments } from "./TaskComments";
+import { TaskReviewTab } from "./TaskReviewTab";
 import { MergeDetails } from "./MergeDetails";
 import { TaskChangesTab } from "./TaskChangesTab";
 import { TaskForm, type PendingImage } from "./TaskForm";
@@ -38,6 +40,9 @@ import { ProviderIcon } from "./ProviderIcon";
 import { subscribeSse } from "../sse-bus";
 import { usePluginUiSlots } from "../hooks/usePluginUiSlots";
 import { appendTokenQuery } from "../auth";
+import { extractDependencyDeleteConflict } from "../utils/taskDelete";
+import { computeBlockerFanoutMap } from "../hooks/useBlockerFanout";
+import { resolveEffectiveGithubRepoDefault } from "./githubTracking";
 
 interface ModelSelection {
   provider?: string;
@@ -53,22 +58,100 @@ const ACTIVE_STATUSES = new Set(["planning", "researching", "executing", "finali
  * 1. Per-task modelProvider/modelId (both must be set)
  * 2. Project/global execution lane fallback
  */
+function extractExecutorModelFromLog(entries: AgentLogEntry[]): { provider: string; modelId: string } | null {
+  let result: { provider: string; modelId: string } | null = null;
+  for (const entry of entries) {
+    if (entry.agent !== "executor" || entry.type !== "text") continue;
+    const match = entry.text.match(/^Executor using model: (.+?)\/(.+)$/);
+    if (match) {
+      result = { provider: match[1], modelId: match[2] };
+    }
+  }
+  return result;
+}
+
+function extractReviewerModelFromLog(entries: AgentLogEntry[]): { provider: string; modelId: string } | null {
+  let result: { provider: string; modelId: string } | null = null;
+  for (const entry of entries) {
+    if (entry.agent !== "reviewer" || entry.type !== "text") continue;
+    const match = entry.text.match(/^Reviewer using model: (.+?)\/(.+)$/);
+    if (match) {
+      result = { provider: match[1], modelId: match[2] };
+    }
+  }
+  return result;
+}
+
+function extractAssignedRuntimeModel(agent: Agent | null | undefined): ModelSelection {
+  const runtimeConfig = (agent?.runtimeConfig ?? undefined) as Record<string, unknown> | undefined;
+  const model = typeof runtimeConfig?.model === "string" ? runtimeConfig.model.trim() : "";
+  if (model) {
+    const slashIdx = model.indexOf("/");
+    if (slashIdx > 0 && slashIdx < model.length - 1) {
+      return {
+        provider: model.slice(0, slashIdx),
+        modelId: model.slice(slashIdx + 1),
+      };
+    }
+  }
+
+  const provider = typeof runtimeConfig?.modelProvider === "string" ? runtimeConfig.modelProvider.trim() : "";
+  const modelId = typeof runtimeConfig?.modelId === "string" ? runtimeConfig.modelId.trim() : "";
+  return {
+    provider: provider || undefined,
+    modelId: modelId || undefined,
+  };
+}
+
+/**
+ * Resolve the effective executor model following the engine's resolution order:
+ * 1. Runtime executor model from agent log marker
+ * 2. Assigned agent runtime model (active runs only)
+ * 3. Per-task modelProvider/modelId override
+ * 4. Project/global execution lane fallback
+ */
 function resolveEffectiveExecutor(
   task: Task | TaskDetail,
+  logEntries: AgentLogEntry[],
+  assignedAgent: Agent | null,
   settings?: Settings,
 ): ModelSelection {
+  const fromLog = extractExecutorModelFromLog(logEntries);
+  if (fromLog) return fromLog;
+
+  if (ACTIVE_STATUSES.has(task.status ?? "") || task.column === "in-progress") {
+    const assignedModel = extractAssignedRuntimeModel(assignedAgent);
+    if (assignedModel.provider && assignedModel.modelId) {
+      return assignedModel;
+    }
+  }
+
   return resolveTaskExecutionModel(task, settings);
 }
 
 /**
  * Resolve the effective validator model following the engine's resolution order:
- * 1. Per-task validatorModelProvider/validatorModelId (both must be set)
- * 2. Project/global validator lane fallback
+ * 1. Runtime reviewer model from agent log marker
+ * 2. Assigned agent runtime model (active runs only)
+ * 3. Per-task validatorModelProvider/validatorModelId override
+ * 4. Project/global validator lane fallback
  */
 function resolveEffectiveValidator(
   task: Task | TaskDetail,
+  logEntries: AgentLogEntry[],
+  assignedAgent: Agent | null,
   settings?: Settings,
 ): ModelSelection {
+  const fromLog = extractReviewerModelFromLog(logEntries);
+  if (fromLog) return fromLog;
+
+  if (ACTIVE_STATUSES.has(task.status ?? "") || task.column === "in-progress") {
+    const assignedModel = extractAssignedRuntimeModel(assignedAgent);
+    if (assignedModel.provider && assignedModel.modelId) {
+      return assignedModel;
+    }
+  }
+
   return resolveTaskValidatorModel(task, settings);
 }
 
@@ -140,7 +223,7 @@ function formatTimestamp(iso: string): string {
   if (diffMin < 60) return `${diffMin}m ago`;
   if (diffHr < 24) return `${diffHr}h ago`;
   if (diffDay < 7) return `${diffDay}d ago`;
-  return date.toLocaleDateString();
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function formatBytes(bytes: number): string {
@@ -149,7 +232,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-type TabId = "definition" | "logs" | "changes" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | `plugin-${string}`;
+type TabId = "definition" | "logs" | "changes" | "review" | "comments" | "model" | "workflow" | "documents" | "stats" | "routing" | `plugin-${string}`;
 
 export interface TaskDetailModalProps {
   task: Task | TaskDetail;
@@ -176,24 +259,6 @@ export type TaskDetailContentProps = Omit<TaskDetailModalProps, "onClose"> & {
   embedded?: boolean;
   onRequestClose?: () => void;
 };
-
-function extractDependencyDeleteConflict(err: unknown): { dependentIds: string[] } | null {
-  if (!(err instanceof Error)) {
-    return null;
-  }
-
-  const details = (err as { details?: { code?: string; dependentIds?: unknown } }).details;
-  if (details?.code === "TASK_HAS_DEPENDENTS" && Array.isArray(details.dependentIds)) {
-    return { dependentIds: details.dependentIds.filter((id): id is string => typeof id === "string") };
-  }
-
-  const idsInMessage = err.message.match(/[A-Z]+-\d+/g) ?? [];
-  if (idsInMessage.length > 1) {
-    return { dependentIds: [...new Set(idsInMessage.slice(1))] };
-  }
-
-  return null;
-}
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
@@ -319,6 +384,7 @@ function getProvenanceLabel(task: Task | TaskDetail, options: ProvenanceLabelOpt
 const DESCRIPTION_TRUNCATE_LENGTH = 200;
 
 const EDITABLE_COLUMNS: Set<Column> = new Set(["triage", "todo"]);
+const GITHUB_TRACKING_EDITABLE_COLUMNS: Set<Column> = new Set(["triage", "todo", "in-progress", "in-review"]);
 
 export function TaskDetailContent({
   task,
@@ -439,6 +505,8 @@ export function TaskDetailContent({
   const [editTitle, setEditTitle] = useState(task.title || "");
   const [editDescription, setEditDescription] = useState(task.description || "");
   const [editDependencies, setEditDependencies] = useState<string[]>(task.dependencies || []);
+  const [editBranch, setEditBranch] = useState(task.branch ?? "");
+  const [editBaseBranch, setEditBaseBranch] = useState(task.baseBranch ?? "");
   const [editExecutorModel, setEditExecutorModel] = useState("");
   const [editValidatorModel, setEditValidatorModel] = useState("");
   const [editPlanningModel, setEditPlanningModel] = useState("");
@@ -458,12 +526,19 @@ export function TaskDetailContent({
   const [isSaving, setIsSaving] = useState(false);
   const [inlinePriority, setInlinePriority] = useState<TaskPriority>(normalizeTaskPriorityValue(task.priority));
   const [isSavingInlinePriority, setIsSavingInlinePriority] = useState(false);
+  const [inlineExecutionMode, setInlineExecutionMode] = useState<"standard" | "fast">(normalizeExecutionModeValue(task.executionMode));
+  const [isSavingInlineExecutionMode, setIsSavingInlineExecutionMode] = useState(false);
   const mountedRef = useRef(false);
 
   // Split-menu dropdown state for footer actions
   const [showMoveMenu, setShowMoveMenu] = useState(false);
   const [showActionsMenu, setShowActionsMenu] = useState(false);
   const [sourceIssueExpanded, setSourceIssueExpanded] = useState(false);
+  const [githubTrackingExpanded, setGithubTrackingExpanded] = useState(false);
+  const [githubRepoOverrideDraft, setGithubRepoOverrideDraft] = useState(task.githubTracking?.repoOverride ?? "");
+  const [githubTrackingEnabledDraft, setGithubTrackingEnabledDraft] = useState<boolean | null>(null);
+  const [githubRepoOverrideError, setGithubRepoOverrideError] = useState<string | null>(null);
+  const [isSavingGithubTracking, setIsSavingGithubTracking] = useState(false);
   const moveMenuRef = useRef<HTMLDivElement>(null);
   const moveButtonRef = useRef<HTMLButtonElement>(null);
   const actionsMenuRef = useRef<HTMLDivElement>(null);
@@ -490,6 +565,7 @@ export function TaskDetailContent({
 
   // Merged project settings for effective model resolution in Agent Log header
   const [settings, setSettings] = useState<Settings | undefined>(undefined);
+  const [globalSettings, setGlobalSettings] = useState<GlobalSettings | null>(null);
 
   // Workflow results state
   const [workflowResults, setWorkflowResults] = useState<WorkflowStepResult[]>([]);
@@ -501,14 +577,20 @@ export function TaskDetailContent({
   useEffect(() => {
     setEditTitle(task.title || "");
     setEditDescription(task.description || "");
+    setEditBranch(task.branch ?? "");
+    setEditBaseBranch(task.baseBranch ?? "");
     setEditSourceIssueProvider(task.sourceIssue?.provider ?? "");
     setEditSourceIssueRepository(task.sourceIssue?.repository ?? "");
     setEditSourceIssueExternalId(task.sourceIssue?.externalIssueId ?? "");
     setEditSourceIssueUrl(task.sourceIssue?.url ?? "");
     setEditExecutionMode(normalizeExecutionModeValue(task.executionMode));
     setSourceIssueExpanded(false);
+    setGithubTrackingExpanded(false);
+    setGithubRepoOverrideDraft(task.githubTracking?.repoOverride ?? "");
+    setGithubTrackingEnabledDraft(null);
+    setGithubRepoOverrideError(null);
     setIsEditing(false);
-  }, [task.id, task.title, task.description, task.sourceIssue, task.executionMode]);
+  }, [task.id, task.title, task.description, task.branch, task.baseBranch, task.sourceIssue, task.executionMode, task.githubTracking]);
 
   useEffect(() => {
     setWorkflowEnabledSteps(task.enabledWorkflowSteps || []);
@@ -517,6 +599,17 @@ export function TaskDetailContent({
   useEffect(() => {
     setInlinePriority(normalizeTaskPriorityValue(task.priority));
   }, [task.id, task.priority]);
+
+  useEffect(() => {
+    setInlineExecutionMode(normalizeExecutionModeValue(task.executionMode));
+  }, [task.id, task.executionMode]);
+
+  useEffect(() => {
+    if (githubTrackingEnabledDraft === null) return;
+    if ((task.githubTracking?.enabled === true) === githubTrackingEnabledDraft) {
+      setGithubTrackingEnabledDraft(null);
+    }
+  }, [githubTrackingEnabledDraft, task.githubTracking?.enabled]);
 
   // Load merged settings for effective model resolution
   useEffect(() => {
@@ -527,6 +620,13 @@ export function TaskDetailContent({
       })
       .catch(() => {
         // Settings fetch failure is non-blocking; fallback to "Using default"
+      });
+    fetchGlobalSettings()
+      .then((nextGlobalSettings) => {
+        if (!cancelled) setGlobalSettings(nextGlobalSettings);
+      })
+      .catch(() => {
+        if (!cancelled) setGlobalSettings(null);
       });
     return () => { cancelled = true; };
   }, [projectId]);
@@ -687,6 +787,73 @@ export function TaskDetailContent({
 
   // Check if task can be edited
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isSaving;
+  const canEditGithubTracking = GITHUB_TRACKING_EDITABLE_COLUMNS.has(task.column) && !isSaving;
+  const githubTrackingEnabled = githubTrackingEnabledDraft ?? (task.githubTracking?.enabled === true);
+  const githubTrackedIssue = task.githubTracking?.issue;
+  const showGithubTrackingSection = canEditGithubTracking || githubTrackingEnabled || Boolean(githubTrackedIssue);
+  const githubTrackingStatus = githubTrackedIssue ? "Linked" : githubTrackingEnabled ? "Enabled" : "Disabled";
+  const effectiveGithubRepoDefault = resolveEffectiveGithubRepoDefault(settings ?? null, globalSettings);
+  const githubRepoOverrideTrimmed = githubRepoOverrideDraft.trim();
+
+  const handleToggleGithubTracking = useCallback(async () => {
+    if (!canEditGithubTracking || isSavingGithubTracking) return;
+    const nextEnabled = !githubTrackingEnabled;
+    setGithubTrackingEnabledDraft(nextEnabled);
+    setIsSavingGithubTracking(true);
+    try {
+      const updatedTask = await updateTask(task.id, {
+        githubTracking: {
+          enabled: nextEnabled,
+        },
+      }, projectId);
+      onTaskUpdated?.(updatedTask);
+    } catch (err) {
+      setGithubTrackingEnabledDraft(task.githubTracking?.enabled === true);
+      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+    } finally {
+      if (mountedRef.current) setIsSavingGithubTracking(false);
+    }
+  }, [addToast, canEditGithubTracking, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, task.githubTracking?.enabled, task.id]);
+
+  const handleSaveGithubRepoOverride = useCallback(async () => {
+    if (!canEditGithubTracking || isSavingGithubTracking) return;
+    if (githubRepoOverrideTrimmed.length > 0 && !REPO_OVERRIDE_RE.test(githubRepoOverrideTrimmed)) {
+      setGithubRepoOverrideError("Repository override must be in owner/repo format");
+      return;
+    }
+    setGithubRepoOverrideError(null);
+    setIsSavingGithubTracking(true);
+    try {
+      const updatedTask = await updateTask(task.id, {
+        githubTracking: {
+          repoOverride: githubRepoOverrideTrimmed.length > 0 ? githubRepoOverrideTrimmed : null,
+        },
+      }, projectId);
+      onTaskUpdated?.(updatedTask);
+    } catch (err) {
+      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+    } finally {
+      if (mountedRef.current) setIsSavingGithubTracking(false);
+    }
+  }, [addToast, canEditGithubTracking, githubRepoOverrideTrimmed, isSavingGithubTracking, onTaskUpdated, projectId, task.id]);
+
+  const handleRetryGithubTrackingIssueCreate = useCallback(async () => {
+    if (!githubTrackingEnabled || githubTrackedIssue || isSavingGithubTracking) return;
+    setIsSavingGithubTracking(true);
+    try {
+      const updatedTask = await updateTask(task.id, {
+        githubTracking: {
+          enabled: true,
+        },
+      }, projectId);
+      onTaskUpdated?.(updatedTask);
+      addToast("Requested GitHub tracking issue creation", "info");
+    } catch (err) {
+      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+    } finally {
+      if (mountedRef.current) setIsSavingGithubTracking(false);
+    }
+  }, [addToast, githubTrackedIssue, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, task.id]);
 
   const enterEditMode = useCallback(() => {
     if (!canEdit) return;
@@ -694,6 +861,8 @@ export function TaskDetailContent({
     setEditTitle(task.title || "");
     setEditDescription(task.description || "");
     setEditDependencies(task.dependencies || []);
+    setEditBranch(task.branch ?? "");
+    setEditBaseBranch(task.baseBranch ?? "");
     // Populate model overrides from task
     const execModel = task.modelProvider && task.modelId ? `${task.modelProvider}/${task.modelId}` : "";
     const valModel = task.validatorModelProvider && task.validatorModelId ? `${task.validatorModelProvider}/${task.validatorModelId}` : "";
@@ -721,6 +890,8 @@ export function TaskDetailContent({
     setEditTitle(task.title || "");
     setEditDescription(task.description || "");
     setEditDependencies(task.dependencies || []);
+    setEditBranch(task.branch ?? "");
+    setEditBaseBranch(task.baseBranch ?? "");
     setEditNodeId(task.nodeId);
     setEditSourceIssueProvider(task.sourceIssue?.provider ?? "");
     setEditSourceIssueRepository(task.sourceIssue?.repository ?? "");
@@ -732,166 +903,178 @@ export function TaskDetailContent({
     setEditPendingImages([]);
   }, [task.title, task.description, task.dependencies, task.nodeId, task.priority, task.executionMode, editPendingImages]);
 
-  const handleSave = useCallback(async () => {
+  const [editAutoSaveStatus, setEditAutoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const editAutoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const editAutoSaveRevisionRef = useRef(0);
+
+  const buildEditUpdates = useCallback((includeDescription: boolean) => {
+    const updates: Record<string, unknown> = {};
+    const trimmedTitle = editTitle.trim();
+    const trimmedDescription = editDescription.trim();
+
+    if (trimmedTitle && trimmedTitle !== (task.title ?? "")) updates.title = trimmedTitle;
+    if (includeDescription && trimmedDescription && trimmedDescription !== (task.description ?? "")) updates.description = trimmedDescription;
+    if (!sameStringArray(editDependencies, task.dependencies ?? [])) updates.dependencies = editDependencies;
+    if (!sameStringArray(editSelectedWorkflowSteps, task.enabledWorkflowSteps ?? [])) updates.enabledWorkflowSteps = editSelectedWorkflowSteps;
+
+    const normalizedBranch = editBranch.trim() || null;
+    const currentBranch = task.branch ?? null;
+    if (normalizedBranch !== currentBranch) updates.branch = normalizedBranch;
+
+    const normalizedBaseBranch = editBaseBranch.trim() || null;
+    const currentBaseBranch = task.baseBranch ?? null;
+    if (normalizedBaseBranch !== currentBaseBranch) updates.baseBranch = normalizedBaseBranch;
+
+    const executorSelection = splitModelSelection(editExecutorModel);
+    const currentExecutorModel = task.modelProvider && task.modelId ? `${task.modelProvider}/${task.modelId}` : "";
+    if (editExecutorModel !== currentExecutorModel) {
+      updates.modelProvider = executorSelection?.provider ?? null;
+      updates.modelId = executorSelection?.modelId ?? null;
+    }
+
+    const validatorSelection = splitModelSelection(editValidatorModel);
+    const currentValidatorModel = task.validatorModelProvider && task.validatorModelId ? `${task.validatorModelProvider}/${task.validatorModelId}` : "";
+    if (editValidatorModel !== currentValidatorModel) {
+      updates.validatorModelProvider = validatorSelection?.provider ?? null;
+      updates.validatorModelId = validatorSelection?.modelId ?? null;
+    }
+
+    const planningSelection = splitModelSelection(editPlanningModel);
+    const currentPlanningModel = task.planningModelProvider && task.planningModelId ? `${task.planningModelProvider}/${task.planningModelId}` : "";
+    if (editPlanningModel !== currentPlanningModel) {
+      updates.planningModelProvider = planningSelection?.provider ?? null;
+      updates.planningModelId = planningSelection?.modelId ?? null;
+    }
+
+    const currentThinkingLevel = task.thinkingLevel ?? "";
+    if (editThinkingLevel !== currentThinkingLevel) updates.thinkingLevel = editThinkingLevel !== "" ? (editThinkingLevel as "minimal" | "low" | "medium" | "high") : null;
+    if ((task.nodeId ?? undefined) !== editNodeId) updates.nodeId = editNodeId ?? null;
+    if (editReviewLevel !== task.reviewLevel) updates.reviewLevel = editReviewLevel;
+    if (editPriority !== normalizeTaskPriorityValue(task.priority)) updates.priority = editPriority;
+    if (editExecutionMode !== normalizeExecutionModeValue(task.executionMode)) updates.executionMode = editExecutionMode === "fast" ? "fast" : null;
+
+    const normalizedProvider = normalizeSourceIssueText(editSourceIssueProvider);
+    const normalizedRepository = normalizeSourceIssueText(editSourceIssueRepository);
+    const normalizedExternalId = normalizeSourceIssueText(editSourceIssueExternalId);
+    const normalizedUrl = normalizeSourceIssueUrl(editSourceIssueUrl);
+    const allSourceFieldsEmpty = normalizedProvider.length === 0 && normalizedRepository.length === 0 && normalizedExternalId.length === 0 && !normalizedUrl;
+
+    if (allSourceFieldsEmpty) {
+      if (task.sourceIssue) updates.sourceIssue = null;
+    } else {
+      if (!normalizedProvider || !normalizedRepository || !normalizedExternalId) {
+        return { updates: null, error: "Source issue provider, repository, and issue identifier are required" };
+      }
+      const fallbackIssueNumber = Number.parseInt(normalizedExternalId, 10);
+      const issueNumber = task.sourceIssue?.issueNumber ?? fallbackIssueNumber;
+      if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
+        return { updates: null, error: "Source issue identifier must be numeric for new metadata" };
+      }
+      const nextSourceIssue: TaskSourceIssue = {
+        provider: normalizedProvider,
+        repository: normalizedRepository,
+        externalIssueId: normalizedExternalId,
+        issueNumber,
+        ...(normalizedUrl ? { url: normalizedUrl } : {}),
+      };
+      const previousSourceIssue = task.sourceIssue;
+      const sourceIssueChanged = !previousSourceIssue
+        || previousSourceIssue.provider !== nextSourceIssue.provider
+        || previousSourceIssue.repository !== nextSourceIssue.repository
+        || previousSourceIssue.externalIssueId !== nextSourceIssue.externalIssueId
+        || previousSourceIssue.issueNumber !== nextSourceIssue.issueNumber
+        || (previousSourceIssue.url ?? undefined) !== nextSourceIssue.url;
+      if (sourceIssueChanged) updates.sourceIssue = nextSourceIssue;
+    }
+
+    return { updates, error: null as string | null };
+  }, [editBaseBranch, editBranch, editDependencies, editDescription, editExecutionMode, editExecutorModel, editNodeId, editPlanningModel, editPriority, editReviewLevel, editSelectedWorkflowSteps, editSourceIssueExternalId, editSourceIssueProvider, editSourceIssueRepository, editSourceIssueUrl, editThinkingLevel, editTitle, editValidatorModel, task]);
+
+  const persistEditChanges = useCallback(async (includeDescription: boolean) => {
+    const { updates, error } = buildEditUpdates(includeDescription);
+    if (!updates) {
+      setEditAutoSaveStatus("error");
+      if (error) {
+        addToast(`Failed to update ${task.id}: ${error}`, "error");
+      }
+      return false;
+    }
+    if (Object.keys(updates).length === 0) {
+      return true;
+    }
+    const revision = ++editAutoSaveRevisionRef.current;
     setIsSaving(true);
+    setEditAutoSaveStatus("saving");
     try {
-      const updates: Record<string, unknown> = {};
-      const trimmedTitle = editTitle.trim();
-      const trimmedDescription = editDescription.trim();
-
-      if (trimmedTitle && trimmedTitle !== (task.title ?? "")) {
-        updates.title = trimmedTitle;
-      }
-      if (trimmedDescription && trimmedDescription !== (task.description ?? "")) {
-        updates.description = trimmedDescription;
-      }
-      if (!sameStringArray(editDependencies, task.dependencies ?? [])) {
-        updates.dependencies = editDependencies;
-      }
-      if (!sameStringArray(editSelectedWorkflowSteps, task.enabledWorkflowSteps ?? [])) {
-        updates.enabledWorkflowSteps = editSelectedWorkflowSteps;
-      }
-
-      const executorSelection = splitModelSelection(editExecutorModel);
-      const currentExecutorModel = task.modelProvider && task.modelId ? `${task.modelProvider}/${task.modelId}` : "";
-      if (editExecutorModel !== currentExecutorModel) {
-        updates.modelProvider = executorSelection?.provider ?? null;
-        updates.modelId = executorSelection?.modelId ?? null;
-      }
-
-      const validatorSelection = splitModelSelection(editValidatorModel);
-      const currentValidatorModel = task.validatorModelProvider && task.validatorModelId ? `${task.validatorModelProvider}/${task.validatorModelId}` : "";
-      if (editValidatorModel !== currentValidatorModel) {
-        updates.validatorModelProvider = validatorSelection?.provider ?? null;
-        updates.validatorModelId = validatorSelection?.modelId ?? null;
-      }
-
-      const planningSelection = splitModelSelection(editPlanningModel);
-      const currentPlanningModel = task.planningModelProvider && task.planningModelId ? `${task.planningModelProvider}/${task.planningModelId}` : "";
-      if (editPlanningModel !== currentPlanningModel) {
-        updates.planningModelProvider = planningSelection?.provider ?? null;
-        updates.planningModelId = planningSelection?.modelId ?? null;
-      }
-
-      const currentThinkingLevel = task.thinkingLevel ?? "";
-      if (editThinkingLevel !== currentThinkingLevel) {
-        updates.thinkingLevel = editThinkingLevel !== "" ? (editThinkingLevel as "minimal" | "low" | "medium" | "high") : null;
-      }
-      if ((task.nodeId ?? undefined) !== editNodeId) {
-        updates.nodeId = editNodeId ?? null;
-      }
-
-      const currentReviewLevel = task.reviewLevel;
-      if (editReviewLevel !== currentReviewLevel) {
-        updates.reviewLevel = editReviewLevel;
-      }
-
-      const currentPriority = normalizeTaskPriorityValue(task.priority);
-      if (editPriority !== currentPriority) {
-        updates.priority = editPriority;
-      }
-
-      const currentExecutionMode = normalizeExecutionModeValue(task.executionMode);
-      if (editExecutionMode !== currentExecutionMode) {
-        updates.executionMode = editExecutionMode === "fast" ? "fast" : null;
-      }
-
-      const normalizedProvider = normalizeSourceIssueText(editSourceIssueProvider);
-      const normalizedRepository = normalizeSourceIssueText(editSourceIssueRepository);
-      const normalizedExternalId = normalizeSourceIssueText(editSourceIssueExternalId);
-      const normalizedUrl = normalizeSourceIssueUrl(editSourceIssueUrl);
-      const allSourceFieldsEmpty =
-        normalizedProvider.length === 0
-        && normalizedRepository.length === 0
-        && normalizedExternalId.length === 0
-        && !normalizedUrl;
-
-      if (allSourceFieldsEmpty) {
-        if (task.sourceIssue) {
-          updates.sourceIssue = null;
-        }
-      } else {
-        if (!normalizedProvider || !normalizedRepository || !normalizedExternalId) {
-          addToast("Source issue provider, repository, and issue identifier are required", "error");
-          setIsSaving(false);
-          return;
-        }
-
-        const fallbackIssueNumber = Number.parseInt(normalizedExternalId, 10);
-        const issueNumber = task.sourceIssue?.issueNumber ?? fallbackIssueNumber;
-        if (!Number.isFinite(issueNumber) || issueNumber <= 0) {
-          addToast("Source issue identifier must be numeric for new metadata", "error");
-          setIsSaving(false);
-          return;
-        }
-
-        const nextSourceIssue: TaskSourceIssue = {
-          provider: normalizedProvider,
-          repository: normalizedRepository,
-          externalIssueId: normalizedExternalId,
-          issueNumber,
-          ...(normalizedUrl ? { url: normalizedUrl } : {}),
-        };
-
-        const previousSourceIssue = task.sourceIssue;
-        const sourceIssueChanged =
-          !previousSourceIssue
-          || previousSourceIssue.provider !== nextSourceIssue.provider
-          || previousSourceIssue.repository !== nextSourceIssue.repository
-          || previousSourceIssue.externalIssueId !== nextSourceIssue.externalIssueId
-          || previousSourceIssue.issueNumber !== nextSourceIssue.issueNumber
-          || (previousSourceIssue.url ?? undefined) !== nextSourceIssue.url;
-
-        if (sourceIssueChanged) {
-          updates.sourceIssue = nextSourceIssue;
-        }
-      }
-
-      const hasTaskUpdates = Object.keys(updates).length > 0;
-      if (hasTaskUpdates) {
-        const updatedTask = await updateTask(task.id, updates as never, projectId);
-        onTaskUpdated?.(updatedTask);
-      }
-
-      // Upload pending images as attachments
-      if (editPendingImages.length > 0) {
-        const failures: string[] = [];
-        for (const img of editPendingImages) {
-          try {
-            const attachment = await uploadAttachment(task.id, img.file, projectId);
-            setAttachments((prev) => [...prev, attachment]);
-          } catch {
-            failures.push(img.file.name);
-          }
-        }
-        if (failures.length > 0) {
-          addToast(`Failed to upload: ${failures.join(", ")}`, "error");
-        }
-      }
-
-      // Clean up
-      editPendingImages.forEach((img) => URL.revokeObjectURL(img.previewUrl));
-      setEditPendingImages([]);
-      addToast(`Updated ${task.id}`, "success");
-      setIsEditing(false);
+      const updatedTask = await updateTask(task.id, updates as never, projectId);
+      if (revision !== editAutoSaveRevisionRef.current) return;
+      onTaskUpdated?.(updatedTask);
+      setEditAutoSaveStatus("saved");
+      return true;
     } catch (err) {
-      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+      if (revision === editAutoSaveRevisionRef.current) {
+        setEditAutoSaveStatus("error");
+        addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+      }
+      return false;
     } finally {
-      if (mountedRef.current) {
+      if (mountedRef.current && revision === editAutoSaveRevisionRef.current) {
         setIsSaving(false);
       }
     }
-  }, [task, editTitle, editDescription, editDependencies, editExecutorModel, editValidatorModel, editPlanningModel, editThinkingLevel, editNodeId, editReviewLevel, editPriority, editExecutionMode, editSelectedWorkflowSteps, editSourceIssueProvider, editSourceIssueRepository, editSourceIssueExternalId, editSourceIssueUrl, editPendingImages, addToast, projectId, onTaskUpdated]);
+  }, [addToast, buildEditUpdates, onTaskUpdated, projectId, task.id]);
 
-  const handleAutoSaveDescription = useCallback(async (description: string) => {
-    try {
-      const updatedTask = await updateTask(task.id, { description }, projectId);
-      onTaskUpdated?.(updatedTask);
-      addToast("Description saved", "success");
-    } catch (err) {
-      addToast(`Failed to save: ${getErrorMessage(err)}`, "error");
+  const handleAutoSaveDescription = useCallback(async (_description: string) => {
+    await persistEditChanges(true);
+  }, [persistEditChanges]);
+
+  const handleSave = useCallback(async () => {
+    const didSave = await persistEditChanges(true);
+    if (!didSave) {
+      return;
     }
-  }, [task.id, addToast, projectId, onTaskUpdated]);
+    addToast(`Updated ${task.id}`, "success");
+    if (mountedRef.current) {
+      setIsEditing(false);
+    }
+  }, [addToast, persistEditChanges, task.id]);
+
+  useEffect(() => {
+    if (!isEditing) return;
+    if (editAutoSaveTimeoutRef.current) {
+      clearTimeout(editAutoSaveTimeoutRef.current);
+    }
+    editAutoSaveTimeoutRef.current = setTimeout(() => {
+      void persistEditChanges(false);
+    }, 700);
+
+    return () => {
+      if (editAutoSaveTimeoutRef.current) {
+        clearTimeout(editAutoSaveTimeoutRef.current);
+        editAutoSaveTimeoutRef.current = null;
+      }
+    };
+  }, [
+    isEditing,
+    editTitle,
+    editDependencies,
+    editBranch,
+    editBaseBranch,
+    editExecutorModel,
+    editValidatorModel,
+    editPlanningModel,
+    editThinkingLevel,
+    editNodeId,
+    editReviewLevel,
+    editPriority,
+    editExecutionMode,
+    editSelectedWorkflowSteps,
+    editSourceIssueProvider,
+    editSourceIssueRepository,
+    editSourceIssueExternalId,
+    editSourceIssueUrl,
+    persistEditChanges,
+  ]);
 
   const handleInlinePriorityChange = useCallback(async (nextValue: string) => {
     const normalizedNextPriority = normalizeTaskPriorityValue(nextValue as Task["priority"]);
@@ -921,6 +1104,30 @@ export function TaskDetailContent({
     }
   }, [task.id, task.priority, projectId, inlinePriority, onTaskUpdated, addToast]);
 
+  const handleInlineExecutionModeToggle = useCallback(async () => {
+    const currentMode = normalizeExecutionModeValue(task.executionMode);
+    const nextMode = currentMode === "fast" ? "standard" : "fast";
+    const previousMode = inlineExecutionMode;
+
+    setInlineExecutionMode(nextMode);
+    setIsSavingInlineExecutionMode(true);
+
+    try {
+      const updatedTask = await updateTask(task.id, { executionMode: nextMode === "fast" ? "fast" : null }, projectId);
+      const normalizedUpdatedMode = normalizeExecutionModeValue(updatedTask.executionMode);
+      setInlineExecutionMode(normalizedUpdatedMode);
+      onTaskUpdated?.(updatedTask);
+      addToast(`Execution mode updated to ${normalizedUpdatedMode}`, "success");
+    } catch (err) {
+      setInlineExecutionMode(previousMode);
+      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+    } finally {
+      if (mountedRef.current) {
+        setIsSavingInlineExecutionMode(false);
+      }
+    }
+  }, [task.id, task.executionMode, projectId, inlineExecutionMode, onTaskUpdated, addToast]);
+
   // Handle keyboard shortcuts for edit mode
   const handleEditKeyDown = useCallback((e: KeyboardEvent) => {
     if (!isEditing) return;
@@ -929,7 +1136,7 @@ export function TaskDetailContent({
       exitEditMode();
     } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      handleSave();
+      void handleSave();
     }
   }, [isEditing, exitEditMode, handleSave]);
 
@@ -942,6 +1149,29 @@ export function TaskDetailContent({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { nodes } = useNodes();
   const { confirm } = useConfirm();
+
+  const handleUnlinkGithubIssue = useCallback(async () => {
+    if (!canEdit || !githubTrackedIssue || isSavingGithubTracking) return;
+    const confirmed = await confirm({
+      title: "Unlink GitHub issue?",
+      message: "This stops Fusion from syncing with the linked GitHub issue. The issue itself will not be modified.",
+      confirmLabel: "Unlink",
+      danger: true,
+    });
+    if (!confirmed) return;
+
+    setIsSavingGithubTracking(true);
+    try {
+      const updatedTask = await updateTask(task.id, { githubTracking: { issue: null } }, projectId);
+      onTaskUpdated?.(updatedTask);
+      addToast("GitHub issue unlinked", "success");
+    } catch (err) {
+      addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
+    } finally {
+      if (mountedRef.current) setIsSavingGithubTracking(false);
+    }
+  }, [addToast, canEdit, confirm, githubTrackedIssue, isSavingGithubTracking, onTaskUpdated, projectId, task.id]);
+
   const {
     entries: agentLogEntries,
     loading: agentLogLoading,
@@ -1467,6 +1697,21 @@ export function TaskDetailContent({
       return bNum - aNum;
     });
 
+  const blockerFanoutMap = useMemo(() => computeBlockerFanoutMap(tasks), [tasks]);
+  const blockingEntry = blockerFanoutMap.get(task.id);
+  const blockingDependents = useMemo(() => {
+    if (!blockingEntry) return [] as Array<{ id: string; label: string; stale: boolean }>;
+    const staleSet = new Set(blockingEntry.staleBlockedByDependentIds);
+    return blockingEntry.dependentIds.map((dependentId) => {
+      const dependentTask = tasks.find((candidate) => candidate.id === dependentId);
+      return {
+        id: dependentId,
+        label: dependentTask?.title || dependentTask?.description || dependentId,
+        stale: staleSet.has(dependentId),
+      };
+    });
+  }, [blockingEntry, tasks]);
+
   const assignedAgentLabel = assignedAgent?.name ?? task.assignedAgentId ?? null;
   const detailProviders = useMemo(() => {
     const providers: string[] = [];
@@ -1626,6 +1871,10 @@ export function TaskDetailContent({
                 onDescriptionChange={setEditDescription}
                 dependencies={editDependencies}
                 onDependenciesChange={setEditDependencies}
+                branch={editBranch}
+                onBranchChange={setEditBranch}
+                baseBranch={editBaseBranch}
+                onBaseBranchChange={setEditBaseBranch}
                 executorModel={editExecutorModel}
                 onExecutorModelChange={setEditExecutorModel}
                 validatorModel={editValidatorModel}
@@ -1727,28 +1976,41 @@ export function TaskDetailContent({
                 );
               })()}
               <div className="detail-meta">
-                Created {new Date(task.createdAt).toLocaleDateString()} · Updated{" "}
-                {new Date(task.updatedAt).toLocaleDateString()} ·
-                <label
-                  className={`card-priority-badge card-priority-badge--${inlinePriority} detail-priority-chip ${isSavingInlinePriority ? "detail-priority-chip--saving" : ""}`}
-                >
-                  <span>Priority:</span>
-                  <select
-                    className="detail-priority-select"
-                    value={inlinePriority}
-                    onChange={(event) => {
-                      void handleInlinePriorityChange(event.target.value);
-                    }}
-                    disabled={isSavingInlinePriority}
-                    aria-label="Task priority"
+                <div className="detail-meta-inline-controls" data-testid="detail-meta-inline-controls">
+                  <label
+                    className={`card-priority-badge card-priority-badge--${inlinePriority} detail-priority-chip ${isSavingInlinePriority ? "detail-priority-chip--saving" : ""}`}
                   >
-                    {TASK_PRIORITIES.map((priorityOption) => (
-                      <option key={priorityOption} value={priorityOption}>
-                        {priorityOption}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    <span>Priority:</span>
+                    <select
+                      className="detail-priority-select"
+                      value={inlinePriority}
+                      onChange={(event) => {
+                        void handleInlinePriorityChange(event.target.value);
+                      }}
+                      disabled={isSavingInlinePriority}
+                      aria-label="Task priority"
+                    >
+                      {TASK_PRIORITIES.map((priorityOption) => (
+                        <option key={priorityOption} value={priorityOption}>
+                          {priorityOption}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className={`btn btn-sm detail-execution-mode-toggle ${inlineExecutionMode === "fast" ? "detail-execution-mode-toggle--fast" : ""} ${isSavingInlineExecutionMode ? "detail-execution-mode-toggle--saving" : ""}`}
+                    onClick={() => {
+                      void handleInlineExecutionModeToggle();
+                    }}
+                    disabled={isSavingInlineExecutionMode}
+                    aria-label={`Execution mode: ${inlineExecutionMode}`}
+                    aria-pressed={inlineExecutionMode === "fast"}
+                  >
+                    <Zap aria-hidden="true" />
+                    <span>{inlineExecutionMode === "fast" ? "Fast" : "Standard"}</span>
+                  </button>
+                </div>
                 {provenanceDisplay && (
                   <div className="detail-provenance">
                     <GitBranch aria-hidden="true" />
@@ -1787,6 +2049,43 @@ export function TaskDetailContent({
                     </span>
                   </div>
                 )}
+                {(task.prInfo?.number || task.mergeDetails?.prNumber) && (
+                  <div className="detail-provenance detail-pr-link-row">
+                    <GitBranch aria-hidden="true" />
+                    <span>
+                      PR{" "}
+                      {task.prInfo?.url ? (
+                        <a
+                          className="detail-provenance-link"
+                          href={task.prInfo.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          #{task.prInfo.number}
+                        </a>
+                      ) : (
+                        <span>#{task.prInfo?.number ?? task.mergeDetails?.prNumber}</span>
+                      )}
+                    </span>
+                  </div>
+                )}
+                <div className="detail-timestamps" aria-label="Task timestamps">
+                  <span className="detail-timestamp-item">
+                    <span className="detail-timestamp-label">Created</span>{" "}
+                    <time dateTime={task.createdAt} title={new Date(task.createdAt).toLocaleString()}>
+                      {formatTimestamp(task.createdAt)}
+                    </time>
+                  </span>
+                  <span className="detail-timestamp-separator" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="detail-timestamp-item">
+                    <span className="detail-timestamp-label">Updated</span>{" "}
+                    <time dateTime={task.updatedAt} title={new Date(task.updatedAt).toLocaleString()}>
+                      {formatTimestamp(task.updatedAt)}
+                    </time>
+                  </span>
+                </div>
               </div>
             </>
           )}
@@ -1822,6 +2121,12 @@ export function TaskDetailContent({
                 Changes
               </button>
             )}
+            <button
+              className={`detail-tab${activeTab === "review" ? " detail-tab-active" : ""}`}
+              onClick={() => setActiveTab("review")}
+            >
+              Review
+            </button>
             <button
               className={`detail-tab${activeTab === "comments" ? " detail-tab-active" : ""}`}
               onClick={() => setActiveTab("comments")}
@@ -1908,8 +2213,8 @@ export function TaskDetailContent({
                 <AgentLogViewer
                   entries={agentLogEntries}
                   loading={agentLogLoading}
-                  executorModel={resolveEffectiveExecutor(task, settings)}
-                  validatorModel={resolveEffectiveValidator(task, settings)}
+                  executorModel={resolveEffectiveExecutor(task, agentLogEntries, assignedAgent, settings)}
+                  validatorModel={resolveEffectiveValidator(task, agentLogEntries, assignedAgent, settings)}
                   planningModel={resolveEffectivePlanning(task, agentLogEntries, settings)}
                   hasMore={agentLogHasMore}
                   onLoadMore={loadMoreAgentLogs}
@@ -1948,6 +2253,8 @@ export function TaskDetailContent({
             </div>
           ) : activeTab === "changes" ? (
             <TaskChangesTab taskId={task.id} worktree={task.worktree} projectId={projectId} column={task.column} mergeDetails={task.mergeDetails} modifiedFiles={task.modifiedFiles} />
+          ) : activeTab === "review" ? (
+            <TaskReviewTab task={task} addToast={addToast} projectId={projectId} onTaskUpdated={onTaskUpdated} />
           ) : activeTab === "comments" ? (
             <TaskComments task={task} addToast={addToast} projectId={projectId} onTaskUpdated={onTaskUpdated} />
           ) : activeTab === "documents" ? (
@@ -2069,6 +2376,105 @@ export function TaskDetailContent({
               )}
             </div>
           )}
+          {showGithubTrackingSection && (
+            <div className="detail-section detail-github-tracking-section">
+              <div className="detail-source-header">
+                <div className="detail-source-summary">
+                  <span className="detail-source-label">GitHub tracking</span>
+                  <span className="detail-source-provider-badge" aria-label="GitHub tracking status">
+                    <GitBranch aria-hidden="true" />
+                    <span>{githubTrackingStatus}</span>
+                  </span>
+                  {!githubTrackedIssue && (
+                    <span className="detail-source-empty">
+                      {githubTrackingEnabled ? "Issue not yet created" : "Tracking is currently disabled"}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="detail-source-toggle"
+                  aria-expanded={githubTrackingExpanded}
+                  aria-label={githubTrackingExpanded ? "Collapse GitHub tracking details" : "Expand GitHub tracking details"}
+                  onClick={() => setGithubTrackingExpanded((expanded) => !expanded)}
+                >
+                  <ChevronRight
+                    size={16}
+                    className={githubTrackingExpanded ? "detail-source-chevron--expanded" : undefined}
+                  />
+                </button>
+              </div>
+              {githubTrackingExpanded && (
+                <div className="detail-github-tracking-content">
+                  {githubTrackedIssue && (
+                    <dl className="detail-source-grid detail-github-tracking-grid">
+                      <div>
+                        <dt>Issue</dt>
+                        <dd>
+                          {githubTrackedIssue.url ? (
+                            <a className="detail-source-link" href={githubTrackedIssue.url} target="_blank" rel="noopener noreferrer">
+                              {`${githubTrackedIssue.owner}/${githubTrackedIssue.repo}#${githubTrackedIssue.number}`}
+                            </a>
+                          ) : (
+                            <span>{`${githubTrackedIssue.owner}/${githubTrackedIssue.repo}#${githubTrackedIssue.number}`}</span>
+                          )}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>State</dt>
+                        <dd>
+                          <span className={`detail-github-issue-state ${task.issueInfo?.state === "closed" ? "detail-github-issue-state--closed" : "detail-github-issue-state--open"}`}>
+                            {task.issueInfo?.state ?? "open"}
+                          </span>
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
+                  <div className="detail-github-tracking-controls">
+                    {!githubTrackedIssue && githubTrackingEnabled && (
+                      <button className="btn btn-sm touch-target" onClick={() => void handleRetryGithubTrackingIssueCreate()} disabled={isSavingGithubTracking}>
+                        Create tracking issue
+                      </button>
+                    )}
+                    {canEditGithubTracking && (
+                      <>
+                        <label className="checkbox-label" htmlFor="detail-github-tracking-toggle">
+                          <input
+                            id="detail-github-tracking-toggle"
+                            type="checkbox"
+                            checked={githubTrackingEnabled}
+                            disabled={isSavingGithubTracking}
+                            onChange={() => void handleToggleGithubTracking()}
+                          />
+                          Enable GitHub tracking
+                        </label>
+                        <div className="detail-github-tracking-repo-row">
+                          <input
+                            className="input"
+                            value={githubRepoOverrideDraft}
+                            onChange={(event) => {
+                              setGithubRepoOverrideDraft(event.target.value);
+                              setGithubRepoOverrideError(null);
+                            }}
+                            placeholder={effectiveGithubRepoDefault || "owner/repo"}
+                          />
+                          <button className="btn btn-sm" onClick={() => void handleSaveGithubRepoOverride()} disabled={isSavingGithubTracking}>
+                            Save
+                          </button>
+                        </div>
+                        {githubRepoOverrideError && <small className="detail-github-tracking-error">{githubRepoOverrideError}</small>}
+                        {githubTrackedIssue && (
+                          <button className="btn btn-sm touch-target" onClick={() => void handleUnlinkGithubIssue()} disabled={isSavingGithubTracking}>
+                            Unlink GitHub issue
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <div className="detail-section detail-agent-section">
             <div className="detail-meta-row">
               <div className="detail-meta-left">
@@ -2114,7 +2520,7 @@ export function TaskDetailContent({
                 {showAgentPicker && (
                   <div className="agent-picker-dropdown">
                     {agentsLoading && <div className="agent-picker-loading">Loading agents...</div>}
-                    {!agentsLoading && agents.filter((a) => a.state !== "terminated").map((a) => (
+                    {!agentsLoading && agents.map((a) => (
                       <button
                         key={a.id}
                         className={`agent-picker-item${task.assignedAgentId === a.id ? " selected" : ""}`}
@@ -2125,7 +2531,7 @@ export function TaskDetailContent({
                         <span className="agent-picker-role">{a.role}</span>
                       </button>
                     ))}
-                    {!agentsLoading && agents.filter((a) => a.state !== "terminated").length === 0 && (
+                    {!agentsLoading && agents.length === 0 && (
                       <div className="agent-picker-empty">No agents available</div>
                     )}
                   </div>
@@ -2379,6 +2785,43 @@ export function TaskDetailContent({
               })()}
             </div>
           </div>
+          <div className="detail-deps detail-blocking">
+            <h4>Blocking</h4>
+            {blockingDependents.length > 0 ? (
+              <ul className="detail-dep-list">
+                {blockingDependents.map((dependent) => (
+                  <li key={dependent.id} className="detail-dep-item">
+                    <span
+                      className="detail-dep-link"
+                      onClick={() => handleDepClick(dependent.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          handleDepClick(dependent.id);
+                        }
+                      }}
+                      role="link"
+                      tabIndex={0}
+                      title={`Click to view ${dependent.id}`}
+                    >
+                      <span className="detail-dep-id">{dependent.id}</span>
+                      <span className="detail-dep-label">{truncate(dependent.label, 40)}</span>
+                    </span>
+                    {dependent.stale && (
+                      <span
+                        className="detail-blocking-item--stale"
+                        title="Stale blockedBy edge: self-healing clearStaleBlockedBy should clear this automatically"
+                      >
+                        (stale)
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="detail-empty-inline">(no downstream tasks blocked)</div>
+            )}
+          </div>
           {/* PR Section - only for in-review tasks */}
           {task.column === "in-review" && (
             <div className="detail-section detail-pr-section">
@@ -2410,7 +2853,7 @@ export function TaskDetailContent({
           {isEditing ? (
             <>
               <span className="modal-edit-hint">
-                <kbd>Ctrl+Enter</kbd> to save · <kbd>Escape</kbd> to cancel
+                {editAutoSaveStatus === "saving" ? "Autosaving…" : editAutoSaveStatus === "saved" ? "Saved" : editAutoSaveStatus === "error" ? "Save failed" : "Changes autosave as you edit"}
               </span>
               <div className="modal-actions-spacer" />
               <button
@@ -2422,7 +2865,7 @@ export function TaskDetailContent({
               </button>
               <button
                 className="btn btn-primary btn-sm"
-                onClick={handleSave}
+                onClick={() => void handleSave()}
                 disabled={isSaving}
               >
                 {isSaving ? "Saving…" : "Save"}

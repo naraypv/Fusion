@@ -64,6 +64,14 @@ class MockStore extends EventEmitter {
     };
   }
 
+  getDatabaseHealth() {
+    return {
+      corruptionDetected: false,
+      integrityCheckPending: false,
+      integrityCheckLastRunAt: null,
+    };
+  }
+
   getMissionStore() {
     return {
       listMissions: vi.fn().mockResolvedValue([]),

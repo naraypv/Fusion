@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { NodesView } from "../NodesView";
-import type { NodeInfo, ProjectInfo } from "../../api";
+import type { NodeInfo, ProjectInfoWithSource } from "../../api";
 import { useNodes } from "../../hooks/useNodes";
 import { useProjects } from "../../hooks/useProjects";
 import { useNodeSettingsSync } from "../../hooks/useNodeSettingsSync";
 import { useManagedDockerNodes } from "../../hooks/useManagedDockerNodes";
+import { useMeshState } from "../../hooks/useMeshState";
 import type { NodeSettingsSyncStatus } from "../../api-node";
 
 vi.mock("../../hooks/useNodes", () => ({
@@ -44,10 +45,15 @@ vi.mock("../../hooks/useManagedDockerNodes", () => ({
   useManagedDockerNodes: vi.fn(),
 }));
 
+vi.mock("../../hooks/useMeshState", () => ({
+  useMeshState: vi.fn(),
+}));
+
 const mockUseNodes = vi.mocked(useNodes);
 const mockUseProjects = vi.mocked(useProjects);
 const mockUseNodeSettingsSync = vi.mocked(useNodeSettingsSync);
 const mockUseManagedDockerNodes = vi.mocked(useManagedDockerNodes);
+const mockUseMeshState = vi.mocked(useMeshState);
 
 function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
   return {
@@ -62,8 +68,8 @@ function makeNode(overrides: Partial<NodeInfo> = {}): NodeInfo {
   };
 }
 
-function makeProject(overrides: Partial<ProjectInfo> = {}): ProjectInfo {
-  return {
+function makeProject(overrides: Partial<ProjectInfoWithSource> = {}): ProjectInfoWithSource {
+  const project: ProjectInfoWithSource = {
     id: "proj-1",
     name: "Project One",
     path: "/workspace/project-one",
@@ -73,6 +79,12 @@ function makeProject(overrides: Partial<ProjectInfo> = {}): ProjectInfo {
     updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,
   };
+
+  if (!project.nodeMappings && project.nodeId) {
+    project.nodeMappings = [{ nodeId: project.nodeId, path: project.path, available: true }];
+  }
+
+  return project;
 }
 
 function makeUseNodesResult(overrides: Partial<ReturnType<typeof useNodes>> = {}): ReturnType<typeof useNodes> {
@@ -85,6 +97,10 @@ function makeUseNodesResult(overrides: Partial<ReturnType<typeof useNodes>> = {}
     update: vi.fn().mockResolvedValue(makeNode()),
     unregister: vi.fn().mockResolvedValue(undefined),
     healthCheck: vi.fn().mockResolvedValue(undefined),
+    fetchDockerConfig: vi.fn().mockResolvedValue(null),
+    patchDockerConfig: vi.fn().mockResolvedValue({}),
+    fetchDockerDiff: vi.fn().mockResolvedValue({ persistedVersion: 0, deployedVersion: null, needsRecreate: false }),
+    discoverRemoteProjects: vi.fn().mockResolvedValue({ projects: [] }),
     ...overrides,
   };
 }
@@ -123,6 +139,13 @@ beforeEach(() => {
     getContainerStatus: vi.fn().mockResolvedValue({ running: true, status: "running" }),
     getLogs: vi.fn().mockResolvedValue(""),
     create: vi.fn().mockResolvedValue(undefined),
+  });
+
+  mockUseMeshState.mockReturnValue({
+    meshState: [],
+    loading: false,
+    error: null,
+    refresh: vi.fn().mockResolvedValue(undefined),
   });
 });
 
@@ -178,6 +201,15 @@ describe("NodesView", () => {
         makeNode({ id: "node-2", name: "Beta", status: "offline", type: "remote", url: "https://beta.node" }),
       ],
     }));
+    mockUseMeshState.mockReturnValue({
+      meshState: [
+        { nodeId: "node-1", nodeName: "Alpha", nodeUrl: undefined, nodeType: "local", status: "online", metrics: null, lastSeen: "2026-01-01T00:00:00.000Z", connectedAt: "2026-01-01T00:00:00.000Z", knownPeers: [] },
+        { nodeId: "node-2", nodeName: "Beta", nodeUrl: "https://beta.node", nodeType: "remote", status: "offline", metrics: null, lastSeen: "2026-01-01T00:00:00.000Z", connectedAt: "2026-01-01T00:00:00.000Z", knownPeers: [] },
+      ],
+      loading: false,
+      error: null,
+      refresh: vi.fn().mockResolvedValue(undefined),
+    });
 
     render(<NodesView addToast={vi.fn()} onClose={vi.fn()} />);
 
@@ -217,6 +249,35 @@ describe("NodesView", () => {
     expect(screen.getByRole("dialog", { name: "Add Node" })).toBeDefined();
   });
 
+  it("refreshes projects after node registration succeeds", async () => {
+    const register = vi.fn().mockResolvedValue(makeNode({ id: "node-new", name: "New Node" }));
+    const refreshProjects = vi.fn().mockResolvedValue(undefined);
+    mockUseNodes.mockReturnValue(makeUseNodesResult({ nodes: [], register }));
+    mockUseProjects.mockReturnValue({
+      projects: [makeProject()],
+      loading: false,
+      error: null,
+      refresh: refreshProjects,
+      register: vi.fn(),
+      update: vi.fn(),
+      unregister: vi.fn(),
+    });
+
+    render(<NodesView addToast={vi.fn()} onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByText("Add Node"));
+    fireEvent.change(screen.getByPlaceholderText("Build Machine"), { target: { value: "New Node" } });
+    fireEvent.click(screen.getByTestId("add-node-submit"));
+
+    await waitFor(() => {
+      expect(register).toHaveBeenCalledWith(expect.objectContaining({
+        name: "New Node",
+        projectMappings: [],
+      }));
+      expect(refreshProjects).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("opens Node Detail modal when a node card is clicked", () => {
     mockUseProjects.mockReturnValue({
       projects: [makeProject({ nodeId: "node-1" })],
@@ -241,11 +302,11 @@ describe("NodesView", () => {
     expect(screen.getByRole("dialog", { name: "Node details for Detail Node" })).toBeDefined();
   });
 
-  it("local node project count includes unassigned projects in detail modal", () => {
+  it("local node detail modal only counts projects with available mappings", () => {
     mockUseProjects.mockReturnValue({
       projects: [
-        makeProject({ id: "proj-1", nodeId: "node-1" }), // explicitly assigned
-        makeProject({ id: "proj-2", nodeId: undefined }), // unassigned - runs on local
+        makeProject({ id: "proj-1", nodeId: "node-1" }),
+        makeProject({ id: "proj-2", nodeMappings: [{ nodeId: "node-1", path: "/workspace/project-two", available: false }] }),
       ],
       loading: false,
       error: null,
@@ -266,8 +327,7 @@ describe("NodesView", () => {
     expect(nodeCard).toBeInTheDocument();
     fireEvent.click(nodeCard!);
 
-    // Modal should show "Projects (2)" - including the unassigned project
-    expect(screen.getByText("Projects (2)")).toBeDefined();
+    expect(screen.getByText("Projects (1)")).toBeDefined();
   });
 
   it("renders close button and calls onClose when clicked", () => {
@@ -296,6 +356,22 @@ describe("NodesView", () => {
       ];
 
       mockUseNodes.mockReturnValue(makeUseNodesResult({ nodes: sampleNodes }));
+      mockUseMeshState.mockReturnValue({
+        meshState: sampleNodes.map((node) => ({
+          nodeId: node.id,
+          nodeName: node.name,
+          nodeUrl: node.url,
+          nodeType: node.type,
+          status: node.status,
+          metrics: null,
+          lastSeen: node.updatedAt,
+          connectedAt: node.createdAt,
+          knownPeers: [],
+        })),
+        loading: false,
+        error: null,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      });
 
       render(<NodesView addToast={vi.fn()} onClose={vi.fn()} />);
 

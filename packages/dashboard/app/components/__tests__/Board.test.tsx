@@ -79,6 +79,26 @@ describe("Board", () => {
     }
   });
 
+  it("falls back malformed task columns to triage instead of crashing", () => {
+    const malformedTask = {
+      id: "FN-404",
+      description: "Malformed",
+      column: "impossible-column",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    } as unknown as Task;
+
+    expect(() => renderBoard({ tasks: [malformedTask] })).not.toThrow();
+
+    const triageTasks = JSON.parse(screen.getByTestId("column-triage").getAttribute("data-tasks") || "[]") as Task[];
+    expect(triageTasks).toHaveLength(1);
+    expect(triageTasks[0]?.id).toBe("FN-404");
+  });
+
   it("forwards board-level workflow name lookup to columns", async () => {
     renderBoard();
 
@@ -291,7 +311,7 @@ describe("Board", () => {
       expect(columnRenderCounts.done).toBeGreaterThanOrEqual(initialDoneRenders);
     });
 
-    describe("sortTasksForColumn priority ordering", () => {
+    describe("column default ordering priority semantics", () => {
       it("orders done tasks by most recent completion regardless of priority", () => {
         const tasks: Task[] = [
           createTask({
@@ -471,7 +491,7 @@ describe("Board", () => {
       });
     });
 
-    describe("sortTasksForColumn merging pinning", () => {
+    describe("column default ordering merging pinning", () => {
       it("pins merging tasks to top of in-review even when newer non-merging tasks exist", () => {
         const tasks: Task[] = [
           createTask({
@@ -642,6 +662,27 @@ describe("Board", () => {
       // Should have both matching tasks
       expect(todoTasks).toHaveLength(2);
       expect(todoTasks.map((t: Task) => t.id).sort()).toEqual(["FN-999", "SEARCH-123"]);
+    });
+
+    it("renders server-filtered branch-target results without additional client filtering", () => {
+      const branchFilteredTasks: Task[] = [
+        createTask({
+          id: "FN-3428",
+          description: "Task targeting release branch",
+          column: "todo",
+          branch: "feature/fn-3428",
+          baseBranch: "release/2026-05",
+        }),
+      ];
+
+      renderBoard({ tasks: branchFilteredTasks, searchQuery: "release/2026-05" });
+
+      const todoColumn = screen.getByTestId("column-todo");
+      const todoTasks = JSON.parse(todoColumn.getAttribute("data-tasks") || "[]") as Task[];
+      expect(todoTasks).toHaveLength(1);
+      expect(todoTasks[0]?.id).toBe("FN-3428");
+      expect(todoTasks[0]?.branch).toBe("feature/fn-3428");
+      expect(todoTasks[0]?.baseBranch).toBe("release/2026-05");
     });
 
     it("shows all tasks for whitespace-only search query (server treats as empty)", () => {

@@ -3,32 +3,43 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, SourceType } from "./types.js";
-import { VALID_TRANSITIONS, DEFAULT_SETTINGS, isGlobalSettingsKey, WORKFLOW_STEP_TEMPLATES, validateDocumentKey } from "./types.js";
+import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, TaskDocumentWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, SourceType, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, TaskCommitAssociationMatchSource, TaskCommitAssociationConfidence } from "./types.js";
+import { createActivityLogSnapshot, createRunAuditSnapshot, createTaskMetadataSnapshot, toTaskMetadataRecord, validateSnapshotEnvelope, type ActivityLogSnapshot, type RunAuditSnapshot, type TaskMetadataSnapshot } from "./shared-mesh-state.js";
+import { VALID_TRANSITIONS, DEFAULT_SETTINGS, isGlobalOnlySettingsKey, WORKFLOW_STEP_TEMPLATES, validateDocumentKey } from "./types.js";
 import { normalizeTaskPriority } from "./task-priority.js";
+import { canAgentTakeImplementationTaskForExplicitRouting } from "./agent-role-policy.js";
 import { GlobalSettingsStore } from "./global-settings.js";
 import { Database, toJson, toJsonNullable, fromJson } from "./db.js";
 import { ArchiveDatabase } from "./archive-db.js";
 import { detectLegacyData, migrateFromLegacy } from "./db-migrate.js";
 import { MissionStore } from "./mission-store.js";
 import { PluginStore } from "./plugin-store.js";
-import { RoadmapStore } from "./roadmap-store.js";
 import { InsightStore } from "./insight-store.js";
 import { ResearchStore } from "./research-store.js";
 import { TodoStore } from "./todo-store.js";
+import { EvalStore } from "./eval-store.js";
 import { BackwardCompat, ProjectRequiredError } from "./migration.js";
 import { CentralCore } from "./central-core.js";
-import { getTaskMergeBlocker } from "./task-merge.js";
+import { getTaskMergeBlocker, resolveTaskMergeTarget } from "./task-merge.js";
 import { ensureMemoryFileWithBackend } from "./project-memory.js";
 import { runCommandAsync } from "./run-command.js";
 import { createLogger } from "./logger.js";
 import { validateNodeOverrideChange } from "./node-override-guard.js";
 import { sanitizeTitle } from "./ai-summarize.js";
 import { assertProjectRootDir } from "./project-root-guard.js";
+import { generateTaskLineageId, normalizeTaskCommitAssociation } from "./task-lineage.js";
+import { createDistributedTaskIdAllocator, resolveLocalNodeId, type DistributedTaskIdAllocator } from "./distributed-task-id.js";
+import {
+  buildBootstrapPrompt,
+  replicationCollisionError,
+  taskMatchesReplicatedCreate,
+} from "./mesh-task-replication.js";
+import type { MeshReplicatedTaskApplyResult, MeshReplicatedTaskCreatePayload } from "./types.js";
 
 /** Database row shape for the tasks table (all columns). */
 interface TaskRow {
   id: string;
+  lineageId: string | null;
   title: string | null;
   description: string;
   priority: string | null;
@@ -41,6 +52,7 @@ interface TaskRow {
   blockedBy: string | null;
   paused: number | null;
   baseBranch: string | null;
+  executionStartBranch: string | null;
   branch: string | null;
   baseCommitSha: string | null;
   modelPresetId: string | null;
@@ -80,9 +92,12 @@ interface TaskRow {
   attachments: string | null;
   steeringComments: string | null;
   comments: string | null;
+  review: string | null;
+  reviewState: string | null;
   workflowStepResults: string | null;
   prInfo: string | null;
   issueInfo: string | null;
+  githubTracking: string | null;
   sourceIssueProvider: string | null;
   sourceIssueRepository: string | null;
   sourceIssueExternalIssueId: string | null;
@@ -109,9 +124,63 @@ interface TaskRow {
   sourceMetadata: string | null;
   checkedOutBy: string | null;
   checkedOutAt: string | null;
+  checkoutNodeId: string | null;
+  checkoutRunId: string | null;
+  checkoutLeaseRenewedAt: string | null;
+  checkoutLeaseEpoch: number | null;
 }
 
 /** Database row shape for the task_documents table. */
+const TASK_BRANCH_CONTEXT_METADATA_KEY = "fusionBranchContext";
+
+function parseTaskBranchContextFromSourceMetadata(sourceMetadata: Record<string, unknown> | undefined): import("./types.js").TaskBranchContext | undefined {
+  const raw = sourceMetadata?.[TASK_BRANCH_CONTEXT_METADATA_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const candidate = raw as Record<string, unknown>;
+  if (typeof candidate.groupId !== "string" || !candidate.groupId.trim()) return undefined;
+  if (candidate.source !== "planning" && candidate.source !== "mission") return undefined;
+  if (candidate.assignmentMode !== "shared" && candidate.assignmentMode !== "per-task-derived") return undefined;
+  const inheritedBaseBranch = typeof candidate.inheritedBaseBranch === "string" && candidate.inheritedBaseBranch.trim().length > 0
+    ? candidate.inheritedBaseBranch.trim()
+    : undefined;
+  return {
+    groupId: candidate.groupId,
+    source: candidate.source,
+    assignmentMode: candidate.assignmentMode,
+    inheritedBaseBranch,
+  };
+}
+
+function withTaskBranchContextInSourceMetadata(
+  sourceMetadata: Record<string, unknown> | undefined,
+  branchContext: import("./types.js").TaskBranchContext | undefined,
+): Record<string, unknown> | undefined {
+  if (!branchContext) return sourceMetadata;
+  return {
+    ...(sourceMetadata ?? {}),
+    [TASK_BRANCH_CONTEXT_METADATA_KEY]: {
+      groupId: branchContext.groupId,
+      source: branchContext.source,
+      assignmentMode: branchContext.assignmentMode,
+      ...(branchContext.inheritedBaseBranch ? { inheritedBaseBranch: branchContext.inheritedBaseBranch } : {}),
+    },
+  };
+}
+
+interface TaskCommitAssociationRow {
+  id: string;
+  taskLineageId: string;
+  taskIdSnapshot: string;
+  commitSha: string;
+  commitSubject: string;
+  authoredAt: string;
+  matchedBy: TaskCommitAssociationMatchSource;
+  confidence: TaskCommitAssociationConfidence;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface TaskDocumentRow {
   id: string;
   taskId: string;
@@ -165,6 +234,40 @@ interface ActivityLogRow {
   taskTitle: string | null;
   details: string;
   metadata: string | null;
+}
+
+function normalizeTaskReviewState(reviewState: Task["reviewState"] | undefined): Task["reviewState"] | undefined {
+  if (!reviewState) {
+    return undefined;
+  }
+
+  const itemsById = new Map(reviewState.items.map((item) => [item.id, item]));
+  const sourceMode = reviewState.source;
+  const normalizedAddressing = reviewState.addressing.map((record) => {
+    const item = itemsById.get(record.itemId);
+    const source = item?.source === "reviewer-agent" ? "reviewer-agent" : "pr-review";
+    const summary = item?.summary?.trim() || item?.body?.trim().slice(0, 160) || `Review item ${record.itemId}`;
+    const body = item?.body ?? summary;
+    return {
+      ...record,
+      snapshot: record.snapshot ?? {
+        itemId: record.itemId,
+        sourceMode,
+        source,
+        summary,
+        body,
+        authorLogin: item?.author?.login,
+        filePath: item?.path,
+        threadId: item?.threadId,
+        url: item?.htmlUrl,
+      },
+    };
+  });
+
+  return {
+    ...reviewState,
+    addressing: normalizedAddressing,
+  };
 }
 
 const TASK_ACTIVITY_LOG_ENTRY_LIMIT = 1_000;
@@ -247,16 +350,6 @@ function compactTaskActivityLog(entries: TaskLogEntry[]): TaskLogEntry[] {
     ...entry,
     outcome: truncateTaskLogOutcome(entry.outcome),
   }));
-}
-
-/**
- * Build the exact PROMPT.md bytes that `createTask` writes for a triage task.
- * Single source of truth so the stub-detection comparison below stays in sync
- * with the bootstrap shape.
- */
-function buildBootstrapPrompt(taskId: string, title: string | undefined, description: string): string {
-  const heading = title ? `${taskId}: ${title}` : taskId;
-  return `# ${heading}\n\n${description}\n`;
 }
 
 /**
@@ -387,6 +480,10 @@ export interface TaskStoreEvents {
   "task:merged": [result: MergeResult];
   "settings:updated": [data: { settings: Settings; previous: Settings }];
   "agent:log": [entry: AgentLogEntry];
+  "merger:autostashOrphans": [data: {
+    rootDir: string;
+    records: AutostashOrphanRecord[];
+  }];
 }
 
 /**
@@ -479,10 +576,19 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private debounceMs = 150;
   /** Per-task promise chain for serializing writes */
   private taskLocks: Map<string, Promise<void>> = new Map();
+  /**
+   * Cross-task lock for worktree path allocation. Serializes the
+   * read-tasks → pick-name → write-task sequence so two concurrent
+   * `moveTask` calls (or a moveTask vs. a scheduler dispatch) cannot
+   * pick the same name from a stale snapshot.
+   */
+  private worktreeAllocationLock: Promise<void> = Promise.resolve();
   /** Promise chain for serializing config.json read-modify-write cycles */
   private configLock: Promise<void> = Promise.resolve();
   /** Cached workflow steps — invalidated on create/update/delete */
   private workflowStepsCache: import("./types.js").WorkflowStep[] | null = null;
+  /** Plugin-contributed workflow step templates injected by engine runtime. */
+  private _pluginWorkflowStepTemplates: Array<{ pluginId: string; template: WorkflowStepTemplate }> = [];
   /** Global settings store (`~/.fusion/settings.json`) */
   private globalSettingsStore: GlobalSettingsStore;
   /** Polling interval for change detection */
@@ -493,6 +599,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private lastKnownModified: number = 0;
   /** ISO timestamp of last poll — used to filter changed tasks */
   private lastPollTime: string | null = null;
+  /** Short-lived startup memo for repeated slim listTasks reads before steady-state watch/polling. */
+  private startupSlimListMemo = new Map<string, { expiresAt: number; promise: Promise<Task[]> }>();
+  private static readonly STARTUP_SLIM_LIST_MEMO_TTL_MS = 2_500;
 
   /** Whether the store is actively watching for changes (watcher or polling). */
   private get isWatching(): boolean {
@@ -502,14 +611,16 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private missionStore: MissionStore | null = null;
   /** Cached PluginStore instance */
   private pluginStore: PluginStore | null = null;
-  /** Cached RoadmapStore instance */
-  private roadmapStore: RoadmapStore | null = null;
   /** Cached InsightStore instance */
   private insightStore: InsightStore | null = null;
   /** Cached ResearchStore instance */
   private researchStore: ResearchStore | null = null;
   /** Cached TodoStore instance */
   private todoStore: TodoStore | null = null;
+  /** Cached EvalStore instance */
+  private evalStore: EvalStore | null = null;
+  /** Cached distributed task-id allocator instance. */
+  private distributedTaskIdAllocator: DistributedTaskIdAllocator | null = null;
 
   /** Buffer for batching agent log writes to reduce WAL pressure. */
   private agentLogBuffer: Array<{
@@ -535,6 +646,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   // Tests that need cross-instance persistence (open store A, close,
   // open store B on the same dir, expect data) must leave this false.
   private readonly inMemoryDb: boolean;
+  private readonly globalSettingsDir?: string;
 
   constructor(
     private rootDir: string,
@@ -550,6 +662,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     this.inMemoryDb = options?.inMemoryDb === true;
     const resolvedGlobalSettingsDir = globalSettingsDir
       ?? (process.env.VITEST === "true" ? join(rootDir, ".fusion-global-settings") : undefined);
+    this.globalSettingsDir = resolvedGlobalSettingsDir;
     this.globalSettingsStore = new GlobalSettingsStore(resolvedGlobalSettingsDir);
   }
 
@@ -656,6 +769,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private rowToTask(row: TaskRow): Task {
     return {
       id: row.id,
+      lineageId: row.lineageId || generateTaskLineageId(),
       title: row.title || undefined,
       description: row.description,
       priority: normalizeTaskPriority(row.priority),
@@ -668,6 +782,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       blockedBy: row.blockedBy || undefined,
       paused: row.paused ? true : undefined,
       baseBranch: row.baseBranch || undefined,
+      executionStartBranch: row.executionStartBranch || undefined,
       branch: row.branch || undefined,
       baseCommitSha: row.baseCommitSha || undefined,
       modelPresetId: row.modelPresetId || undefined,
@@ -737,9 +852,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         });
         return deduped.length > 0 ? deduped : undefined;
       })(),
+      review: fromJson<import("./types.js").TaskReview>(row.review) ?? undefined,
+      reviewState: normalizeTaskReviewState(fromJson<import("./types.js").TaskReviewState>(row.reviewState) ?? undefined),
       workflowStepResults: (() => { const w = fromJson<import("./types.js").WorkflowStepResult[]>(row.workflowStepResults); return w && w.length > 0 ? w : undefined; })(),
       prInfo: fromJson<import("./types.js").PrInfo>(row.prInfo),
       issueInfo: fromJson<import("./types.js").IssueInfo>(row.issueInfo),
+      githubTracking: fromJson<import("./types.js").TaskGithubTracking>(row.githubTracking) ?? undefined,
       sourceIssue: (() => {
         if (
           row.sourceIssueProvider === null
@@ -776,15 +894,27 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       sourceSessionId: row.sourceSessionId || undefined,
       sourceMessageId: row.sourceMessageId || undefined,
       sourceParentTaskId: row.sourceParentTaskId || undefined,
-      sourceMetadata: fromJson<Record<string, unknown>>(row.sourceMetadata) ?? undefined,
+      sourceMetadata: (() => {
+        const parsed = fromJson<Record<string, unknown>>(row.sourceMetadata) ?? undefined;
+        return withTaskBranchContextInSourceMetadata(parsed, parseTaskBranchContextFromSourceMetadata(parsed));
+      })(),
+      branchContext: (() => {
+        const parsed = fromJson<Record<string, unknown>>(row.sourceMetadata) ?? undefined;
+        return parseTaskBranchContextFromSourceMetadata(parsed);
+      })(),
       checkedOutBy: row.checkedOutBy || undefined,
       checkedOutAt: row.checkedOutAt || undefined,
+      checkoutNodeId: row.checkoutNodeId || undefined,
+      checkoutRunId: row.checkoutRunId || undefined,
+      checkoutLeaseRenewedAt: row.checkoutLeaseRenewedAt || undefined,
+      checkoutLeaseEpoch: row.checkoutLeaseEpoch ?? undefined,
     };
   }
 
   private archiveEntryToTask(entry: ArchivedTaskEntry, slim = false): Task {
     return {
       id: entry.id,
+      lineageId: entry.lineageId || generateTaskLineageId(),
       title: entry.title,
       description: entry.description,
       priority: normalizeTaskPriority(entry.priority),
@@ -796,9 +926,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       reviewLevel: entry.reviewLevel,
       prInfo: slim ? undefined : entry.prInfo,
       issueInfo: slim ? undefined : entry.issueInfo,
+      githubTracking: slim ? undefined : entry.githubTracking,
       sourceIssue: slim ? undefined : entry.sourceIssue,
       attachments: slim ? undefined : entry.attachments,
       comments: entry.comments,
+      review: slim ? undefined : entry.review,
       log: slim ? [] : entry.log ?? [],
       timedExecutionMs: slim ? this.computeTimedExecutionMs(entry.log) : undefined,
       createdAt: entry.createdAt,
@@ -908,6 +1040,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
     return {
       id: task.id,
+      lineageId: task.lineageId || generateTaskLineageId(),
       title: task.title,
       description: task.description,
       priority: normalizeTaskPriority(task.priority),
@@ -919,9 +1052,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       reviewLevel: task.reviewLevel,
       prInfo: task.prInfo,
       issueInfo: task.issueInfo,
+      githubTracking: task.githubTracking,
       sourceIssue: task.sourceIssue,
       attachments: task.attachments,
       comments: task.comments,
+      review: task.review,
+      reviewState: task.reviewState,
       prompt,
       ...agentLogFields,
       log: [{ timestamp: archivedAt, action: "Task archived" }],
@@ -991,8 +1127,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
     const prefix = tableAlias ? `${tableAlias}.` : "";
     return [
-      "id", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
-      "worktree", "blockedBy", "paused", "baseBranch", "branch", "baseCommitSha",
+      "id", "lineageId", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
+      "worktree", "blockedBy", "paused", "baseBranch", "branch", "executionStartBranch", "baseCommitSha",
       "modelPresetId", "modelProvider", "modelId",
       "validatorModelProvider", "validatorModelId",
       "planningModelProvider", "planningModelId",
@@ -1000,12 +1136,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       "error", "summary", "thinkingLevel", "executionMode",
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt",
       "createdAt", "updatedAt", "columnMovedAt", "executionStartedAt", "executionCompletedAt",
-      "dependencies", "steps", "comments", "workflowStepResults", "steeringComments",
-      "attachments", "prInfo", "issueInfo", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
+      "dependencies", "steps", "comments", "review", "reviewState", "workflowStepResults", "steeringComments",
+      "attachments", "prInfo", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
       "breakIntoSubtasks", "enabledWorkflowSteps", "modifiedFiles",
       "missionId", "sliceId", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
-      "checkedOutBy", "checkedOutAt",
+      "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch",
       // `log` is fetched in slim mode so the server can aggregate
       // `timedExecutionMs` from `[timing] … in <N>ms` entries before
       // returning. The log itself is stripped from the response —
@@ -1040,8 +1176,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
   private getTaskSelectClauseWithActivityLogLimit(limit: number): string {
     const columns = [
-      "id", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
-      "worktree", "blockedBy", "paused", "baseBranch", "branch", "baseCommitSha",
+      "id", "lineageId", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
+      "worktree", "blockedBy", "paused", "baseBranch", "branch", "executionStartBranch", "baseCommitSha",
       "modelPresetId", "modelProvider", "modelId",
       "validatorModelProvider", "validatorModelId",
       "planningModelProvider", "planningModelId",
@@ -1050,11 +1186,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       "tokenUsageInputTokens", "tokenUsageOutputTokens", "tokenUsageCachedTokens", "tokenUsageTotalTokens", "tokenUsageFirstUsedAt", "tokenUsageLastUsedAt",
       "createdAt", "updatedAt", "columnMovedAt", "executionStartedAt", "executionCompletedAt",
       "dependencies", "steps", "attachments", "steeringComments",
-      "comments", "workflowStepResults", "prInfo", "issueInfo", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
+      "comments", "review", "reviewState", "workflowStepResults", "prInfo", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
       "breakIntoSubtasks", "enabledWorkflowSteps", "modifiedFiles",
       "missionId", "sliceId", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
-      "checkedOutBy", "checkedOutAt",
+      "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch",
     ];
 
     const limitedLog = `
@@ -1085,21 +1221,22 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private upsertTask(task: Task): void {
     this.db.prepare(`
       INSERT INTO tasks (
-        id, title, description, priority, "column", status, size, reviewLevel, currentStep,
-        worktree, blockedBy, paused, baseBranch, branch, baseCommitSha, modelPresetId, modelProvider,
+        id, lineageId, title, description, priority, "column", status, size, reviewLevel, currentStep,
+        worktree, blockedBy, paused, baseBranch, branch, executionStartBranch, baseCommitSha, modelPresetId, modelProvider,
         modelId, validatorModelProvider, validatorModelId, planningModelProvider, planningModelId, mergeRetries,
         workflowStepRetries, stuckKillCount, postReviewFixCount, recoveryRetryCount, taskDoneRetryCount, verificationFailureCount, mergeConflictBounceCount, nextRecoveryAt, error,
         summary, thinkingLevel, executionMode, tokenUsageInputTokens, tokenUsageOutputTokens, tokenUsageCachedTokens,
         tokenUsageTotalTokens, tokenUsageFirstUsedAt, tokenUsageLastUsedAt, createdAt, updatedAt, columnMovedAt,
         executionStartedAt, executionCompletedAt,
         dependencies, steps, log, attachments, steeringComments,
-        comments, workflowStepResults, prInfo, issueInfo,
+        comments, review, reviewState, workflowStepResults, prInfo, issueInfo, githubTracking,
         sourceIssueProvider, sourceIssueRepository, sourceIssueExternalIssueId, sourceIssueNumber, sourceIssueUrl,
-        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt
+        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt, checkoutNodeId, checkoutRunId, checkoutLeaseRenewedAt, checkoutLeaseEpoch
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
+        lineageId = excluded.lineageId,
         title = excluded.title,
         description = excluded.description,
         priority = excluded.priority,
@@ -1113,6 +1250,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         paused = excluded.paused,
         baseBranch = excluded.baseBranch,
         branch = excluded.branch,
+        executionStartBranch = excluded.executionStartBranch,
         baseCommitSha = excluded.baseCommitSha,
         modelPresetId = excluded.modelPresetId,
         modelProvider = excluded.modelProvider,
@@ -1151,9 +1289,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         attachments = excluded.attachments,
         steeringComments = excluded.steeringComments,
         comments = excluded.comments,
+        review = excluded.review,
+        reviewState = excluded.reviewState,
         workflowStepResults = excluded.workflowStepResults,
         prInfo = excluded.prInfo,
         issueInfo = excluded.issueInfo,
+        githubTracking = excluded.githubTracking,
         sourceIssueProvider = excluded.sourceIssueProvider,
         sourceIssueRepository = excluded.sourceIssueRepository,
         sourceIssueExternalIssueId = excluded.sourceIssueExternalIssueId,
@@ -1179,9 +1320,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         sourceParentTaskId = excluded.sourceParentTaskId,
         sourceMetadata = excluded.sourceMetadata,
         checkedOutBy = excluded.checkedOutBy,
-        checkedOutAt = excluded.checkedOutAt
+        checkedOutAt = excluded.checkedOutAt,
+        checkoutNodeId = excluded.checkoutNodeId,
+        checkoutRunId = excluded.checkoutRunId,
+        checkoutLeaseRenewedAt = excluded.checkoutLeaseRenewedAt,
+        checkoutLeaseEpoch = excluded.checkoutLeaseEpoch
     `).run(
       task.id,
+      task.lineageId ?? generateTaskLineageId(),
       task.title ?? null,
       task.description,
       normalizeTaskPriority(task.priority),
@@ -1195,6 +1341,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       task.paused ? 1 : 0,
       task.baseBranch ?? null,
       task.branch ?? null,
+      task.executionStartBranch ?? null,
       task.baseCommitSha ?? null,
       task.modelPresetId ?? null,
       task.modelProvider ?? null,
@@ -1233,9 +1380,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       toJson(task.attachments || []),
       toJson(task.steeringComments || []),
       toJson(task.comments || []),
+      toJsonNullable(task.review),
+      toJsonNullable(task.reviewState),
       toJson(task.workflowStepResults || []),
       toJsonNullable(task.prInfo),
       toJsonNullable(task.issueInfo),
+      toJsonNullable(task.githubTracking),
       task.sourceIssue?.provider ?? null,
       task.sourceIssue?.repository ?? null,
       task.sourceIssue?.externalIssueId ?? null,
@@ -1262,6 +1412,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       toJsonNullable(task.sourceMetadata),
       task.checkedOutBy ?? null,
       task.checkedOutAt ?? null,
+      task.checkoutNodeId ?? null,
+      task.checkoutRunId ?? null,
+      task.checkoutLeaseRenewedAt ?? null,
+      task.checkoutLeaseEpoch ?? 0,
     );
     this.db.bumpLastModified();
   }
@@ -1491,6 +1645,21 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * Serialize all mutations to a given task's task.json by chaining promises
    * per task ID. Concurrent callers for the same ID will queue behind each other.
    */
+  private withWorktreeAllocationLock<T>(fn: () => Promise<T>): Promise<T> {
+    let resolve: () => void;
+    const next = new Promise<void>((r) => { resolve = r; });
+    const prev = this.worktreeAllocationLock;
+    this.worktreeAllocationLock = next;
+
+    return prev.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        resolve!();
+      }
+    });
+  }
+
   private withTaskLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.taskLocks.get(id) ?? Promise.resolve();
     let resolve: () => void;
@@ -1614,10 +1783,15 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       this.globalSettingsStore.getSettings(),
       this.readConfig(),
     ]);
+    // Strip global-only keys from project-level settings so stale project-scoped
+    // values don't override the correct global value during the spread merge.
+    const projectSettings = Object.fromEntries(
+      Object.entries(config.settings ?? {}).filter(([key]) => !isGlobalOnlySettingsKey(key)),
+    );
     return canonicalizeSettings({
       ...DEFAULT_SETTINGS,
       ...globalSettings,
-      ...config.settings,
+      ...projectSettings,
     });
   }
 
@@ -1639,7 +1813,17 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       this.db.prepare("SELECT settings FROM config WHERE id = 1").get() as { settings?: string } | undefined,
     ]);
 
-    const projectSettings = row?.settings ? fromJson<Settings>(row.settings) : undefined;
+    const raw = row?.settings ? fromJson<Settings>(row.settings) : undefined;
+
+    // Strip global-only keys from the project-level row so stale project-scoped
+    // values (e.g. an empty experimentalFeatures={}) don't override the correct
+    // global value during the spread merge below. getSettingsByScopeFast() has
+    // always done this; getSettingsFast() was missing the filter.
+    const projectSettings: Partial<Settings> | undefined = raw
+      ? (Object.fromEntries(
+          Object.entries(raw).filter(([key]) => !isGlobalOnlySettingsKey(key)),
+        ) as Partial<Settings>)
+      : undefined;
 
     return canonicalizeSettings({
       ...DEFAULT_SETTINGS,
@@ -1665,7 +1849,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const projectSettings: Partial<ProjectSettings> = {};
     if (config.settings) {
       for (const key of Object.keys(config.settings)) {
-        if (!isGlobalSettingsKey(key)) {
+        if (!isGlobalOnlySettingsKey(key)) {
           (projectSettings as Record<string, unknown>)[key] = (config.settings as Record<string, unknown>)[key];
         }
       }
@@ -1700,7 +1884,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const projectScoped: Partial<ProjectSettings> = {};
     if (projectSettings) {
       for (const key of Object.keys(projectSettings)) {
-        if (!isGlobalSettingsKey(key)) {
+        if (!isGlobalOnlySettingsKey(key)) {
           (projectScoped as Record<string, unknown>)[key] = (projectSettings as Record<string, unknown>)[key];
         }
       }
@@ -1723,7 +1907,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     // Filter out global-only fields — they should go through updateGlobalSettings()
     const projectPatch: Partial<Settings> = {};
     for (const [key, value] of Object.entries(patch)) {
-      if (!isGlobalSettingsKey(key)) {
+      if (!isGlobalOnlySettingsKey(key)) {
         (projectPatch as Record<string, unknown>)[key] = value;
       }
     }
@@ -1962,39 +2146,57 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
   }
 
-  private async allocateId(): Promise<string> {
-    // Use withConfigLock to ensure the entire ID allocation + config sync is serialized
-    return this.withConfigLock(async () => {
-      const id = this.db.transaction(() => {
-        const row = this.db.prepare("SELECT nextId, settings FROM config WHERE id = 1").get() as unknown as { nextId: number; settings: string | null } | undefined;
-        const settings = fromJson<Settings>(row?.settings ?? null);
-        const prefix = settings?.taskPrefix || "KB";
-        const nextId = row?.nextId || 1;
-        const taskId = `${prefix}-${String(nextId).padStart(3, "0")}`;
-        this.db.prepare("UPDATE config SET nextId = ? WHERE id = 1").run(nextId + 1);
-        this.db.bumpLastModified();
-        return taskId;
-      }); // Database.transaction() directly executes and returns the result
+  async resolveLocalNodeIdForTaskAllocation(): Promise<string> {
+    if (process.env.VITEST === "true") {
+      return "local";
+    }
+    const central = new CentralCore();
+    await central.init();
+    try {
+      const nodes = await central.listNodes();
+      return resolveLocalNodeId(nodes.map((node) => ({ id: node.id, type: node.type })));
+    } catch {
+      return "local";
+    } finally {
+      await central.close();
+    }
+  }
 
-      // Sync config.json to disk for backward compatibility.
-      // Use readConfigFast() to avoid the expensive listWorkflowSteps() query.
-      try {
-        const config = this.readConfigFast();
-        const tmpPath = this.configPath + ".tmp";
-        await writeFile(tmpPath, JSON.stringify(config, null, 2));
-        await rename(tmpPath, this.configPath);
-      } catch (err) {
-        // Non-fatal: SQLite is the primary store
-        storeLog.warn("Backward-compat config.json sync failed after ID allocation", {
-          phase: "allocateId:disk-sync",
-          configPath: this.configPath,
-          taskId: id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-
-      return id;
+  private async createTaskWithDistributedReservation(
+    input: TaskCreateInput,
+    options?: {
+      onSummarize?: (description: string) => Promise<string | null>;
+      settings?: { autoSummarizeTitles?: boolean };
+      createTaskWithId?: (taskId: string) => Promise<Task>;
+    },
+  ): Promise<Task> {
+    const settings = await this.getSettingsFast();
+    const prefix = (settings.taskPrefix || "KB").trim().toUpperCase();
+    const allocator = this.getDistributedTaskIdAllocator();
+    const nodeId = await this.resolveLocalNodeIdForTaskAllocation();
+    const reservation = await allocator.reserveDistributedTaskId({
+      prefix,
+      nodeId,
     });
+
+    let createdTask: Task | null = null;
+    try {
+      createdTask = options?.createTaskWithId
+        ? await options.createTaskWithId(reservation.taskId)
+        : await this.createTaskWithReservedId(input, { taskId: reservation.taskId });
+      await allocator.commitDistributedTaskIdReservation({
+        reservationId: reservation.reservationId,
+        nodeId,
+      });
+      return createdTask;
+    } catch (error) {
+      await allocator.abortDistributedTaskIdReservation({
+        reservationId: reservation.reservationId,
+        nodeId,
+        reason: "failed-create",
+      }).catch(() => undefined);
+      throw error;
+    }
   }
 
   private taskDir(id: string): string {
@@ -2130,6 +2332,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       const stepId = rawId.trim();
       if (!stepId) continue;
 
+      if (stepId.startsWith("plugin:")) {
+        if (!seen.has(stepId)) {
+          seen.add(stepId);
+          resolved.push(stepId);
+        }
+        continue;
+      }
+
       const template = this.getBuiltInWorkflowTemplate(stepId);
       const resolvedId = template
         ? (await this.ensureWorkflowStepForTemplate(stepId)).id
@@ -2155,26 +2365,18 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       throw new Error("Description is required and cannot be empty");
     }
 
-    const id = await this.allocateId();
-    // Validate that task doesn't depend on itself
-    if (input.dependencies?.includes(id)) {
-      throw new Error(`Task ${id} cannot depend on itself`);
-    }
-
     // Determine if we should try to summarize the title
     const title = input.title?.trim() || undefined;
     const shouldSummarize =
-      !title && // Only if no title provided
-      input.description.length > 200 && // Only if description is long enough
-      (input.summarize === true || // Explicit request
-        options?.settings?.autoSummarizeTitles === true); // Auto-enabled
+      !title &&
+      input.description.length > 200 &&
+      (input.summarize === true || options?.settings?.autoSummarizeTitles === true);
 
     // Determine enabledWorkflowSteps: explicit input takes precedence, otherwise auto-apply default-on steps
     let resolvedWorkflowSteps: string[] | undefined = input.enabledWorkflowSteps?.length
       ? await this.resolveEnabledWorkflowSteps(input.enabledWorkflowSteps)
       : undefined;
 
-    // When enabledWorkflowSteps is not provided at all (undefined), auto-apply default-on workflow steps
     if (input.enabledWorkflowSteps === undefined) {
       try {
         const allSteps = await this.listWorkflowSteps();
@@ -2185,7 +2387,6 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
           resolvedWorkflowSteps = defaultOnSteps;
         }
       } catch (err) {
-        // Non-fatal: default-on resolution is best-effort
         storeLog.warn("Failed to auto-apply default workflow steps during task creation; auto-defaulting skipped", {
           phase: "createTask:workflow-auto-default",
           skippedAutoDefaulting: true,
@@ -2194,22 +2395,25 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         });
       }
     } else if (input.enabledWorkflowSteps.length === 0) {
-      // Explicitly empty array — user intentionally selected no steps
       resolvedWorkflowSteps = undefined;
     }
 
-    // Create the task immediately with current title (may be undefined)
-    const task = await this._createTaskInternal(input, title, resolvedWorkflowSteps, id);
+    const task = await this.createTaskWithDistributedReservation(input, {
+      createTaskWithId: async (taskId) => {
+        if (input.dependencies?.includes(taskId)) {
+          throw new Error(`Task ${taskId} cannot depend on itself`);
+        }
+        return this._createTaskInternal(input, title, resolvedWorkflowSteps, taskId);
+      },
+    });
 
-    // Fire async background handler for title summarization (non-blocking)
     if (shouldSummarize && options?.onSummarize) {
+      const id = task.id;
       Promise.resolve().then(async () => {
         try {
           const generatedTitle = await options.onSummarize!(input.description);
           const normalizedTitle = sanitizeTitle(generatedTitle);
           if (normalizedTitle) {
-            // Guard against races: read directly from SQLite to avoid extra
-            // prompt/step file I/O in this background path.
             const currentTask = this.readTaskFromDb(id);
             if (currentTask && !currentTask.title) {
               await this.updateTask(id, { title: normalizedTitle });
@@ -2242,6 +2446,87 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return task;
   }
 
+  async createTaskWithReservedId(
+    input: TaskCreateInput,
+    options: {
+      taskId: string;
+      createdAt?: string;
+      updatedAt?: string;
+      prompt?: string;
+      applyDefaultWorkflowSteps?: boolean;
+    },
+  ): Promise<Task> {
+    if (!input.description?.trim()) {
+      throw new Error("Description is required and cannot be empty");
+    }
+
+    const id = options.taskId.trim();
+    if (!id) {
+      throw new Error("taskId is required");
+    }
+
+    if (input.dependencies?.includes(id)) {
+      throw new Error(`Task ${id} cannot depend on itself`);
+    }
+
+    if (this.readTaskFromDb(id)) {
+      throw new Error(`Task ID already exists: ${id}`);
+    }
+
+    const title = input.title?.trim() || undefined;
+    let resolvedWorkflowSteps: string[] | undefined = input.enabledWorkflowSteps?.length
+      ? await this.resolveEnabledWorkflowSteps(input.enabledWorkflowSteps)
+      : undefined;
+
+    if (input.enabledWorkflowSteps === undefined && options.applyDefaultWorkflowSteps !== false) {
+      try {
+        const allSteps = await this.listWorkflowSteps();
+        const defaultOnSteps = allSteps
+          .filter((ws) => ws.enabled && ws.defaultOn)
+          .map((ws) => ws.id);
+        if (defaultOnSteps.length > 0) {
+          resolvedWorkflowSteps = defaultOnSteps;
+        }
+      } catch (err) {
+        storeLog.warn("Failed to auto-apply default workflow steps during reserved task creation; auto-defaulting skipped", {
+          phase: "createTaskWithReservedId:workflow-auto-default",
+          skippedAutoDefaulting: true,
+          error: err instanceof Error ? err.message : String(err),
+          descriptionLength: input.description.length,
+        });
+      }
+    } else if (Array.isArray(input.enabledWorkflowSteps) && input.enabledWorkflowSteps.length === 0) {
+      resolvedWorkflowSteps = undefined;
+    }
+
+    return this._createTaskInternal(input, title, resolvedWorkflowSteps, id, {
+      createdAt: options.createdAt,
+      updatedAt: options.updatedAt,
+      promptOverride: options.prompt,
+    });
+  }
+
+  async applyReplicatedTaskCreate(payload: MeshReplicatedTaskCreatePayload): Promise<MeshReplicatedTaskApplyResult> {
+    const existing = this.readTaskFromDb(payload.taskId);
+    if (existing) {
+      const existingDetail = await this.getTask(payload.taskId);
+      if (taskMatchesReplicatedCreate(existingDetail, payload)) {
+        return { task: existingDetail, applied: false };
+      }
+      throw replicationCollisionError(payload.taskId);
+    }
+
+    const task = await this.createTaskWithReservedId(payload.input, {
+      taskId: payload.taskId,
+      createdAt: payload.createdAt,
+      updatedAt: payload.updatedAt,
+      prompt: payload.prompt,
+      applyDefaultWorkflowSteps: false,
+    });
+
+    return { task, applied: true };
+  }
+
   /**
    * Internal helper for task creation. Used by createTask() and potentially other
    * internal methods that need to create tasks without triggering summarization.
@@ -2250,23 +2535,31 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     input: TaskCreateInput,
     title: string | undefined,
     resolvedWorkflowSteps: string[] | undefined,
-    id: string
+    id: string,
+    options?: {
+      createdAt?: string;
+      updatedAt?: string;
+      promptOverride?: string;
+    },
   ): Promise<Task> {
-    const now = new Date().toISOString();
+    const now = options?.createdAt ?? new Date().toISOString();
     const task: Task = {
       id,
+      lineageId: input.lineageId ?? generateTaskLineageId(),
       title,
       description: input.description,
       priority: normalizeTaskPriority(input.priority),
       tokenUsage: input.tokenUsage,
       sourceIssue: input.sourceIssue,
+      githubTracking: input.githubTracking,
       sourceType: input.source?.sourceType ?? "unknown",
       sourceAgentId: input.source?.sourceAgentId,
       sourceRunId: input.source?.sourceRunId,
       sourceSessionId: input.source?.sourceSessionId,
       sourceMessageId: input.source?.sourceMessageId,
       sourceParentTaskId: input.source?.sourceParentTaskId,
-      sourceMetadata: input.source?.sourceMetadata,
+      sourceMetadata: withTaskBranchContextInSourceMetadata(input.source?.sourceMetadata, input.branchContext),
+      branchContext: input.branchContext,
       column: input.column || "triage",
       dependencies: input.dependencies || [],
       breakIntoSubtasks: input.breakIntoSubtasks === true ? true : undefined,
@@ -2284,6 +2577,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       thinkingLevel: input.thinkingLevel,
       reviewLevel: input.reviewLevel,
       executionMode: input.executionMode,
+      baseBranch: input.baseBranch,
+      branch: input.branch,
       missionId: input.missionId,
       sliceId: input.sliceId,
       steps: [],
@@ -2291,7 +2586,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       log: [{ timestamp: now, action: "Task created" }],
       columnMovedAt: now,
       createdAt: now,
-      updatedAt: now,
+      updatedAt: options?.updatedAt ?? now,
     };
 
     const dir = this.taskDir(id);
@@ -2301,9 +2596,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     // Update cache if watcher is active
     if (this.isWatching) this.taskCache.set(id, { ...task });
 
-    const prompt = task.column === "triage"
-      ? buildBootstrapPrompt(id, task.title, task.description)
-      : this.generateSpecifiedPrompt(task);
+    const prompt = options?.promptOverride
+      ?? (task.column === "triage"
+        ? buildBootstrapPrompt(id, task.title, task.description)
+        : this.generateSpecifiedPrompt(task));
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "PROMPT.md"), prompt);
 
@@ -2317,48 +2613,42 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * execution state. The new task will be re-specified by the AI.
    */
   async duplicateTask(id: string): Promise<Task> {
-    // Read the source task with its prompt
     const sourceTask = await this.getTask(id);
-
-    // Allocate a new ID
-    const newId = await this.allocateId();
     const now = new Date().toISOString();
 
-    // Create new task with copied title/description, but fresh state
-    const newTask: Task = {
-      id: newId,
-      title: sourceTask.title,
-      description: `${sourceTask.description}\n\n(Duplicated from ${id})`,
-      priority: normalizeTaskPriority(sourceTask.priority),
-      column: "triage",
-      modelPresetId: sourceTask.modelPresetId,
-      sourceType: "task_duplicate",
-      sourceParentTaskId: id,
-      dependencies: [], // Fresh task should have no dependencies
-      steps: [], // Reset execution state
-      currentStep: 0,
-      log: [{ timestamp: now, action: `Duplicated from ${id}` }],
-      columnMovedAt: now,
-      createdAt: now,
-      updatedAt: now,
-      // Explicitly NOT copied: worktree, status, blockedBy, paused, baseBranch,
-      // attachments, comments, prInfo, agent logs, size, reviewLevel
-    };
+    return this.createTaskWithDistributedReservation({ description: sourceTask.description }, {
+      createTaskWithId: async (newId) => {
+        const newTask: Task = {
+          id: newId,
+          lineageId: generateTaskLineageId(),
+          title: sourceTask.title,
+          description: `${sourceTask.description}\n\n(Duplicated from ${id})`,
+          priority: normalizeTaskPriority(sourceTask.priority),
+          column: "triage",
+          modelPresetId: sourceTask.modelPresetId,
+          sourceType: "task_duplicate",
+          sourceParentTaskId: id,
+          dependencies: [],
+          steps: [],
+          currentStep: 0,
+          log: [{ timestamp: now, action: `Duplicated from ${id}` }],
+          columnMovedAt: now,
+          createdAt: now,
+          updatedAt: now,
+          baseBranch: sourceTask.baseBranch,
+        };
 
-    const newDir = this.taskDir(newId);
-    await mkdir(newDir, { recursive: true });
-    await this.atomicWriteTaskJson(newDir, newTask);
+        const newDir = this.taskDir(newId);
+        await mkdir(newDir, { recursive: true });
+        await this.atomicWriteTaskJson(newDir, newTask);
+        await mkdir(newDir, { recursive: true });
+        await writeFile(join(newDir, "PROMPT.md"), sourceTask.prompt);
 
-    // Copy source PROMPT.md content (the AI will re-specify it in triage)
-    const sourcePrompt = sourceTask.prompt;
-    await mkdir(newDir, { recursive: true });
-    await writeFile(join(newDir, "PROMPT.md"), sourcePrompt);
-
-    // Update cache if watcher is active
-    if (this.isWatching) this.taskCache.set(newId, { ...newTask });
-
-    this.emit("task:created", newTask);
-    return newTask;
+        if (this.isWatching) this.taskCache.set(newId, { ...newTask });
+        this.emit("task:created", newTask);
+        return newTask;
+      },
+    });
   }
 
   /**
@@ -2367,27 +2657,19 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    * Validates the original is in 'done' or 'in-review' column.
    */
   async refineTask(id: string, feedback: string): Promise<Task> {
-    // Read the source task with its prompt
     const sourceTask = await this.getTask(id);
 
-    // Validate task is in done or in-review column
     if (sourceTask.column !== "done" && sourceTask.column !== "in-review") {
       throw new Error(
         `Cannot refine ${id}: task is in '${sourceTask.column}', must be in 'done' or 'in-review'`,
       );
     }
 
-    // Validate feedback is not empty
     if (!feedback?.trim()) {
       throw new Error("Feedback is required and cannot be empty");
     }
 
-    // Allocate a new ID
-    const newId = await this.allocateId();
     const now = new Date().toISOString();
-
-    // Derive a readable source label for the refinement title.
-    // Precedence: title → first non-empty line of description (collapsed) → task ID
     let sourceLabel: string;
     if (sourceTask.title?.trim()) {
       sourceLabel = sourceTask.title.trim();
@@ -2396,64 +2678,56 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         .split("\n")
         .map((line: string) => line.trim())
         .find((line: string) => line.length > 0);
-      if (firstLine) {
-        sourceLabel = firstLine.replace(/\s+/g, " ");
-      } else {
-        sourceLabel = sourceTask.id;
-      }
+      sourceLabel = firstLine ? firstLine.replace(/\s+/g, " ") : sourceTask.id;
     }
 
-    // Create new refinement task
-    const newTask: Task = {
-      id: newId,
-      title: `Refinement: ${sourceLabel}`,
-      description: `${feedback.trim()}\n\nRefines: ${id}`,
-      priority: normalizeTaskPriority(sourceTask.priority),
-      column: "triage",
-      dependencies: [id], // Refinement depends on the original being complete
-      sourceType: "task_refine",
-      sourceParentTaskId: id,
-      steps: [], // Reset execution state
-      currentStep: 0,
-      log: [{ timestamp: now, action: `Created as refinement of ${id}` }],
-      columnMovedAt: now,
-      createdAt: now,
-      updatedAt: now,
-      // Copy attachments from original for context (defensive copy)
-      attachments: sourceTask.attachments ? [...sourceTask.attachments] : undefined,
-    };
+    return this.createTaskWithDistributedReservation({ description: feedback.trim() }, {
+      createTaskWithId: async (newId) => {
+        const newTask: Task = {
+          id: newId,
+          lineageId: generateTaskLineageId(),
+          title: `Refinement: ${sourceLabel}`,
+          description: `${feedback.trim()}\n\nRefines: ${id}`,
+          priority: normalizeTaskPriority(sourceTask.priority),
+          column: "triage",
+          dependencies: [id],
+          sourceType: "task_refine",
+          sourceParentTaskId: id,
+          steps: [],
+          currentStep: 0,
+          log: [{ timestamp: now, action: `Created as refinement of ${id}` }],
+          columnMovedAt: now,
+          createdAt: now,
+          updatedAt: now,
+          attachments: sourceTask.attachments ? [...sourceTask.attachments] : undefined,
+        };
 
-    const newDir = this.taskDir(newId);
-    await mkdir(newDir, { recursive: true });
-    await this.atomicWriteTaskJson(newDir, newTask);
+        const newDir = this.taskDir(newId);
+        await mkdir(newDir, { recursive: true });
+        await this.atomicWriteTaskJson(newDir, newTask);
+        const prompt = `# ${newTask.title}\n\n${newTask.description}\n`;
+        await mkdir(newDir, { recursive: true });
+        await writeFile(join(newDir, "PROMPT.md"), prompt);
 
-    // Create a PROMPT.md for the refinement
-    const heading = newTask.title;
-    const prompt = `# ${heading}\n\n${newTask.description}\n`;
-    await mkdir(newDir, { recursive: true });
-    await writeFile(join(newDir, "PROMPT.md"), prompt);
-
-    // Copy attachments from source if any
-    if (sourceTask.attachments && sourceTask.attachments.length > 0) {
-      const sourceAttachDir = join(this.taskDir(id), "attachments");
-      const targetAttachDir = join(newDir, "attachments");
-      await mkdir(targetAttachDir, { recursive: true });
-
-      for (const attachment of sourceTask.attachments) {
-        const sourcePath = join(sourceAttachDir, attachment.filename);
-        const targetPath = join(targetAttachDir, attachment.filename);
-        if (existsSync(sourcePath)) {
-          const content = await readFile(sourcePath);
-          await writeFile(targetPath, content);
+        if (sourceTask.attachments && sourceTask.attachments.length > 0) {
+          const sourceAttachDir = join(this.taskDir(id), "attachments");
+          const targetAttachDir = join(newDir, "attachments");
+          await mkdir(targetAttachDir, { recursive: true });
+          for (const attachment of sourceTask.attachments) {
+            const sourcePath = join(sourceAttachDir, attachment.filename);
+            const targetPath = join(targetAttachDir, attachment.filename);
+            if (existsSync(sourcePath)) {
+              const content = await readFile(sourcePath);
+              await writeFile(targetPath, content);
+            }
+          }
         }
-      }
-    }
 
-    // Update cache if watcher is active
-    if (this.isWatching) this.taskCache.set(newId, { ...newTask });
-
-    this.emit("task:created", newTask);
-    return newTask;
+        if (this.isWatching) this.taskCache.set(newId, { ...newTask });
+        this.emit("task:created", newTask);
+        return newTask;
+      },
+    });
   }
 
   /**
@@ -2500,10 +2774,36 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     slim?: boolean;
     /** Restrict to a single column (e.g. 'in-review' for the auto-merge sweep). */
     column?: Column;
+    /** Opt-in startup-only memo for repeated slim reads during boot choreography. */
+    startupMemo?: boolean;
   }): Promise<Task[]> {
     const includeArchived = options?.includeArchived ?? true;
     const slim = options?.slim ?? false;
     const columnFilter = options?.column;
+    const startupMemoEnabled = options?.startupMemo ?? (!this.isWatching && slim);
+
+    if (startupMemoEnabled && slim && options?.limit === undefined && options?.offset === undefined) {
+      const memoKey = `${includeArchived ? "all" : "active"}:${columnFilter ?? "*"}`;
+      const now = Date.now();
+      const cached = this.startupSlimListMemo.get(memoKey);
+      if (cached && cached.expiresAt > now) {
+        const memoTasks = await cached.promise;
+        return JSON.parse(JSON.stringify(memoTasks)) as Task[];
+      }
+
+      const fetchPromise = this.listTasks({ ...options, startupMemo: false });
+      this.startupSlimListMemo.set(memoKey, {
+        expiresAt: now + TaskStore.STARTUP_SLIM_LIST_MEMO_TTL_MS,
+        promise: fetchPromise,
+      });
+      try {
+        const memoTasks = await fetchPromise;
+        return JSON.parse(JSON.stringify(memoTasks)) as Task[];
+      } catch (error) {
+        this.startupSlimListMemo.delete(memoKey);
+        throw error;
+      }
+    }
 
     // Slim mode drops ONLY the agent log column. On busy boards `log` accounts
     // for ~99% of the row payload (60+ MB across 1200 tasks); every other JSON
@@ -2537,6 +2837,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       if (slim) {
         task.timedExecutionMs = this.computeTimedExecutionMs(task.log);
         task.log = [];
+        task.githubTracking = undefined;
       }
 
       if (!slim || task.steps.length > 0) {
@@ -2568,6 +2869,56 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     }
 
     return sorted.slice(offset, offset + Math.max(0, limit));
+  }
+
+  private clearStartupSlimListMemo(): void {
+    this.startupSlimListMemo.clear();
+  }
+
+  /**
+   * List slim task rows with `updatedAt` strictly greater than the cursor.
+   *
+   * Uses strict `>` cursor semantics (rows where `updatedAt === since` are excluded),
+   * returns rows ordered by `updatedAt ASC`, defaults limit to 50, and caps at 200.
+   * Archived tasks are excluded by default unless `opts.includeArchived` is true.
+   *
+   * Callers should re-invoke this method with the last returned task's `updatedAt`
+   * as the next `since` cursor.
+   */
+  async listTasksModifiedSince(
+    since: string,
+    limit?: number,
+    opts?: { includeArchived?: boolean },
+  ): Promise<{ tasks: Task[]; hasMore: boolean }> {
+    if (Number.isNaN(Date.parse(since))) {
+      throw new TypeError("listTasksModifiedSince: invalid since cursor");
+    }
+
+    const defaultLimit = 50;
+    const resolvedLimit = typeof limit !== "number" || !Number.isFinite(limit)
+      ? defaultLimit
+      : Math.max(1, Math.min(200, Math.floor(limit)));
+    const includeArchived = opts?.includeArchived ?? false;
+    const selectClause = this.getTaskSelectClause(true);
+
+    const rows = includeArchived
+      ? (this.db.prepare(
+        `SELECT ${selectClause} FROM tasks WHERE updatedAt > ? ORDER BY updatedAt ASC LIMIT ?`,
+      ).all(since, resolvedLimit + 1) as TaskRow[])
+      : (this.db.prepare(
+        `SELECT ${selectClause} FROM tasks WHERE updatedAt > ? AND "column" != 'archived' ORDER BY updatedAt ASC LIMIT ?`,
+      ).all(since, resolvedLimit + 1) as TaskRow[]);
+
+    const hasMore = rows.length > resolvedLimit;
+    const tasks = rows.slice(0, resolvedLimit).map((row) => {
+      const task = this.rowToTask(row);
+      task.timedExecutionMs = this.computeTimedExecutionMs(task.log);
+      task.log = [];
+      task.githubTracking = undefined;
+      return task;
+    });
+
+    return { tasks, hasMore };
   }
 
   /**
@@ -2675,6 +3026,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       if (slim) {
         task.timedExecutionMs = this.computeTimedExecutionMs(task.log);
         task.log = [];
+        task.githubTracking = undefined;
       }
 
       if (task.steps.length > 0) {
@@ -2717,7 +3069,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return rows.map((row) => this.rowToTask(row));
   }
 
-  async selectNextTaskForAgent(agentId: string): Promise<InboxTask | null> {
+  async selectNextTaskForAgent(
+    agentId: string,
+    agent?: Pick<Agent, "id" | "role">,
+  ): Promise<InboxTask | null> {
+    const hasExecutorRoleOverride = (task: Task): boolean => task.sourceMetadata?.executorRoleOverride === true;
     const tasks = await this.listTasks({ slim: true });
     if (tasks.length === 0) {
       return null;
@@ -2743,7 +3099,16 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       };
     }
 
-    const todoCandidates = assignedTasks.filter((task) => task.column === "todo" && task.paused !== true);
+    const roleCompatibleAssignedTasks = agent
+      ? assignedTasks.filter((task) => {
+          if (task.column === "in-progress" || hasExecutorRoleOverride(task)) {
+            return true;
+          }
+          return canAgentTakeImplementationTaskForExplicitRouting(agent, task);
+        })
+      : assignedTasks;
+
+    const todoCandidates = roleCompatibleAssignedTasks.filter((task) => task.column === "todo" && task.paused !== true);
 
     const readyTodo = todoCandidates
       .filter((task) => {
@@ -2820,6 +3185,26 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
        * (worktree and wall-clock timing fields).
        */
       preserveProgress?: boolean;
+      /**
+       * Skip the default "release worktree on requeue" behavior. Used by
+       * internal bounce paths (e.g. workflow-rerun) that immediately
+       * promote the task back to in-progress on the same checkout, where
+       * publishing an interim `worktree=null` state to listeners would be
+       * misleading. Has no effect on transitions that don't otherwise
+       * clear the worktree.
+       */
+      preserveWorktree?: boolean;
+      /**
+       * When transitioning to in-progress on a task that has no worktree
+       * assigned, invoke this allocator to pick a path. The store calls
+       * the allocator with a fresh `reservedNames` set (built from every
+       * other task's current `worktree`) inside a cross-task allocation
+       * lock, so two concurrent moves cannot pick the same name. The
+       * allocator should return an absolute path or `null` to skip
+       * allocation. Provided by callers (the manual-move route, the
+       * scheduler) so the store stays free of worktree-naming policy.
+       */
+      allocateWorktree?: (reservedNames: Set<string>) => string | null;
     },
   ): Promise<Task> {
     return this.withTaskLock(id, async () => {
@@ -2897,8 +3282,24 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         const preserveStepProgress =
           options?.preserveResumeState || (options?.preserveProgress === true && hasNonPendingStepProgress);
 
-        if (!options?.preserveResumeState) {
+        // Default: release the on-disk worktree directory on requeue. The
+        // checkout may have been removed, may now collide with another
+        // task's allocation, or may simply be abandoned by the bounce.
+        // `task.branch` is intentionally left intact so the next run can
+        // reattach to the same line of work — the executor's worktree
+        // creation path falls back to `git worktree add <path> <branch>`
+        // when the branch already exists, so any committed progress is
+        // preserved even though a fresh directory is allocated.
+        //
+        // Opt-out: internal bounces that immediately re-promote the task
+        // to in-progress on the same checkout (e.g. workflow-rerun) pass
+        // `preserveWorktree: true` so listeners never observe an interim
+        // `worktree=null` state.
+        if (!options?.preserveWorktree) {
           task.worktree = undefined;
+        }
+
+        if (!options?.preserveResumeState) {
           // Reset wall-clock runtime so the next run gets a fresh timer.
           task.executionStartedAt = undefined;
           task.executionCompletedAt = undefined;
@@ -2934,11 +3335,34 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       // starts from scratch.
       if (fromColumn === "in-review" && (toColumn === "todo" || toColumn === "triage")) {
         task.branch = undefined;
-        task.baseBranch = undefined;
+        task.executionStartBranch = undefined;
         task.baseCommitSha = undefined;
         task.summary = undefined;
         task.recoveryRetryCount = undefined;
         task.nextRecoveryAt = undefined;
+      }
+
+      // Atomic worktree allocation on transition to in-progress.
+      // Wrapped in withWorktreeAllocationLock so the read-tasks → pick-name
+      // sequence cannot interleave with another concurrent moveTask. The
+      // caller supplies the naming policy via the `allocateWorktree`
+      // callback; the store builds `reservedNames` here so the snapshot
+      // is fresh under the global lock.
+      if (toColumn === "in-progress" && !task.worktree && options?.allocateWorktree) {
+        const allocator = options.allocateWorktree;
+        const allocated = await this.withWorktreeAllocationLock(async () => {
+          const others = await this.listTasks({ slim: true, includeArchived: false });
+          const reservedNames = new Set<string>();
+          for (const other of others) {
+            if (other.id === id || !other.worktree) continue;
+            const name = other.worktree.split("/").filter(Boolean).pop();
+            if (name) reservedNames.add(name);
+          }
+          return allocator(reservedNames);
+        });
+        if (allocated) {
+          task.worktree = allocated;
+        }
       }
 
       await this.atomicWriteTaskJson(dir, task);
@@ -2982,7 +3406,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
   async updateTask(
     id: string,
-    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; status?: string | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; currentStep?: number; blockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; assigneeUserId?: string | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; paused?: boolean; baseBranch?: string | null; branch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; workflowStepRetries?: number; stuckKillCount?: number | null; postReviewFixCount?: number | null; recoveryRetryCount?: number | null; taskDoneRetryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; modelProvider?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningModelId?: string | null; thinkingLevel?: string | null; error?: string | null; summary?: string | null; sessionFile?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; missionId?: string | null; sliceId?: string | null },
+    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; status?: string | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; currentStep?: number; blockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; assigneeUserId?: string | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; checkoutNodeId?: string | null; checkoutRunId?: string | null; checkoutLeaseRenewedAt?: string | null; checkoutLeaseEpoch?: number | null; paused?: boolean; baseBranch?: string | null; branch?: string | null; executionStartBranch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; workflowStepRetries?: number; stuckKillCount?: number | null; postReviewFixCount?: number | null; recoveryRetryCount?: number | null; taskDoneRetryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; modelProvider?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningModelId?: string | null; thinkingLevel?: string | null; error?: string | null; summary?: string | null; sessionFile?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; review?: import("./types.js").TaskReview | null; reviewState?: import("./types.js").TaskReviewState | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; githubTracking?: import("./types.js").TaskGithubTracking | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; missionId?: string | null; sliceId?: string | null },
     runContext?: RunMutationContext,
   ): Promise<Task> {
     return this.withTaskLock(id, async () => {
@@ -3061,10 +3485,35 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       } else if (updates.blockedBy !== undefined) {
         task.blockedBy = updates.blockedBy;
       }
+      const previousAssignedAgentId = task.assignedAgentId;
       if (updates.assignedAgentId === null) {
         task.assignedAgentId = undefined;
       } else if (updates.assignedAgentId !== undefined) {
         task.assignedAgentId = updates.assignedAgentId;
+      }
+      // If the agent that paused this task is being unassigned (or replaced),
+      // auto-unpause: the pause was tied to that agent's lifecycle, and now
+      // there's no longer a relationship that justifies keeping the task paused.
+      const assignmentChanged =
+        updates.assignedAgentId !== undefined && task.assignedAgentId !== previousAssignedAgentId;
+      if (
+        assignmentChanged &&
+        task.paused &&
+        task.pausedByAgentId &&
+        task.pausedByAgentId === previousAssignedAgentId
+      ) {
+        task.paused = undefined;
+        task.pausedByAgentId = undefined;
+        if (task.column === "in-progress" || task.column === "in-review") {
+          if (task.status === "paused") {
+            task.status = undefined;
+          }
+        }
+        task.log.push({
+          timestamp: new Date().toISOString(),
+          action: `Task unpaused (agent ${previousAssignedAgentId} unassigned)`,
+          ...(runContext ? { runContext } : {}),
+        });
       }
       if (updates.pausedByAgentId === null) {
         task.pausedByAgentId = undefined;
@@ -3094,10 +3543,35 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       if (updates.checkedOutBy === null) {
         task.checkedOutBy = undefined;
         task.checkedOutAt = undefined;
+        task.checkoutNodeId = undefined;
+        task.checkoutRunId = undefined;
+        task.checkoutLeaseRenewedAt = undefined;
       } else if (updates.checkedOutBy !== undefined) {
         task.checkedOutBy = updates.checkedOutBy;
-        // Auto-set checkedOutAt when acquiring a lease (use provided value or generate timestamp)
-        task.checkedOutAt = updates.checkedOutAt ?? new Date().toISOString();
+        task.checkedOutAt = updates.checkedOutAt ?? task.checkedOutAt ?? new Date().toISOString();
+        task.checkoutNodeId = updates.checkoutNodeId ?? task.checkoutNodeId;
+        task.checkoutRunId = updates.checkoutRunId ?? task.checkoutRunId;
+        task.checkoutLeaseRenewedAt = updates.checkoutLeaseRenewedAt ?? task.checkoutLeaseRenewedAt ?? task.checkedOutAt;
+      }
+      if (updates.checkoutNodeId === null) {
+        task.checkoutNodeId = undefined;
+      } else if (updates.checkoutNodeId !== undefined && updates.checkedOutBy === undefined) {
+        task.checkoutNodeId = updates.checkoutNodeId;
+      }
+      if (updates.checkoutRunId === null) {
+        task.checkoutRunId = undefined;
+      } else if (updates.checkoutRunId !== undefined && updates.checkedOutBy === undefined) {
+        task.checkoutRunId = updates.checkoutRunId;
+      }
+      if (updates.checkoutLeaseRenewedAt === null) {
+        task.checkoutLeaseRenewedAt = undefined;
+      } else if (updates.checkoutLeaseRenewedAt !== undefined && updates.checkedOutBy === undefined) {
+        task.checkoutLeaseRenewedAt = updates.checkoutLeaseRenewedAt;
+      }
+      if (updates.checkoutLeaseEpoch === null) {
+        task.checkoutLeaseEpoch = undefined;
+      } else if (updates.checkoutLeaseEpoch !== undefined) {
+        task.checkoutLeaseEpoch = updates.checkoutLeaseEpoch;
       }
       if (updates.paused !== undefined) task.paused = updates.paused || undefined;
       if (updates.baseBranch === null) {
@@ -3109,6 +3583,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         task.branch = undefined;
       } else if (updates.branch !== undefined) {
         task.branch = updates.branch;
+      }
+      if (updates.executionStartBranch === null) {
+        task.executionStartBranch = undefined;
+      } else if (updates.executionStartBranch !== undefined) {
+        task.executionStartBranch = updates.executionStartBranch;
       }
       if (updates.baseCommitSha === null) {
         task.baseCommitSha = undefined;
@@ -3222,6 +3701,16 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       } else if (updates.executionCompletedAt !== undefined) {
         task.executionCompletedAt = updates.executionCompletedAt;
       }
+      if (updates.review === null) {
+        task.review = undefined;
+      } else if (updates.review !== undefined) {
+        task.review = updates.review;
+      }
+      if (updates.reviewState === null) {
+        task.reviewState = undefined;
+      } else if (updates.reviewState !== undefined) {
+        task.reviewState = normalizeTaskReviewState(updates.reviewState);
+      }
       if (updates.workflowStepResults === null) {
         task.workflowStepResults = undefined;
       } else if (updates.workflowStepResults !== undefined) {
@@ -3236,6 +3725,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         task.sourceIssue = undefined;
       } else if (updates.sourceIssue !== undefined) {
         task.sourceIssue = updates.sourceIssue;
+      }
+      if (updates.githubTracking === null) {
+        task.githubTracking = undefined;
+      } else if (updates.githubTracking !== undefined) {
+        task.githubTracking = updates.githubTracking;
       }
       if (updates.tokenUsage === null) {
         task.tokenUsage = undefined;
@@ -3984,7 +4478,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       }
     }
     if (deleted.length > 0) {
-      this.clearStaleBaseBranchReferences(deleted, task.id);
+      this.clearStaleExecutionStartBranchReferences(deleted, task.id);
     }
     return deleted;
   }
@@ -4002,11 +4496,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    *
    * @returns IDs of tasks whose baseBranch was cleared
    */
-  clearStaleBaseBranchReferences(deletedBranches: string[], ownerTaskId?: string): string[] {
+  clearStaleExecutionStartBranchReferences(deletedBranches: string[], ownerTaskId?: string): string[] {
     if (deletedBranches.length === 0) return [];
     const placeholders = deletedBranches.map(() => "?").join(",");
     const params: string[] = [...deletedBranches];
-    let whereClause = `baseBranch IN (${placeholders})`;
+    let whereClause = `executionStartBranch IN (${placeholders})`;
     if (ownerTaskId) {
       whereClause += ` AND id != ?`;
       params.push(ownerTaskId);
@@ -4017,7 +4511,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
     if (rows.length === 0) return [];
     const update = this.db.prepare(
-      `UPDATE tasks SET baseBranch = NULL, updatedAt = ? WHERE id = ?`,
+      `UPDATE tasks SET executionStartBranch = NULL, updatedAt = ? WHERE id = ?`,
     );
     const now = new Date().toISOString();
     const clearedIds: string[] = [];
@@ -4027,7 +4521,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       if (this.isWatching) {
         const cached = this.taskCache.get(row.id);
         if (cached) {
-          cached.baseBranch = undefined;
+          cached.executionStartBranch = undefined;
           cached.updatedAt = now;
         }
       }
@@ -4036,7 +4530,13 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return clearedIds;
   }
 
-  private async collectMergeDetails(_id: string, _branch: string, task: Task, commitMessage: string): Promise<import("./types.js").MergeDetails> {
+  private async collectMergeDetails(
+    _id: string,
+    _branch: string,
+    task: Task,
+    commitMessage: string,
+    mergeTarget?: { branch: string; source: "task-base-branch" | "task-branch-context" | "project-default" | "legacy-main" },
+  ): Promise<import("./types.js").MergeDetails> {
     const mergedAt = new Date().toISOString();
     let commitSha: string | undefined;
     let filesChanged: number | undefined;
@@ -4075,6 +4575,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       mergedAt,
       mergeConfirmed: true,
       prNumber: task.prInfo?.number,
+      mergeTargetBranch: mergeTarget?.branch,
+      mergeTargetSource: mergeTarget?.source,
       resolutionStrategy: task.mergeDetails?.resolutionStrategy,
       resolutionMethod: task.mergeDetails?.resolutionMethod,
       attemptsMade: task.mergeDetails?.attemptsMade,
@@ -4090,7 +4592,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return this.withTaskLock(id, async () => {
       const dir = this.taskDir(id);
       const task = await this.readTaskJson(dir);
-      const branch = `fusion/${id.toLowerCase()}`;
+      const branch = task.branch || `fusion/${id.toLowerCase()}`;
       // Branch is derived from the task id (already validated at create time),
       // but assert as defense-in-depth against future id-format changes.
       assertSafeGitBranchName(branch);
@@ -4150,6 +4652,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         branchDeleted: false,
       };
 
+      const settings = await this.getSettings();
+      const projectDefaultBranch = typeof settings.baseBranch === "string" ? settings.baseBranch : undefined;
+      const mergeTarget = resolveTaskMergeTarget(task, {
+        projectDefaultBranch,
+      });
+
       // 1. Check the branch exists
       const verifyBranch = await this.runGitCommand(`git rev-parse --verify "${branch}"`);
       if (verifyBranch.exitCode !== 0) {
@@ -4159,11 +4667,18 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
           mergedAt: new Date().toISOString(),
           mergeConfirmed: false,
           prNumber: task.prInfo?.number,
+          mergeTargetBranch: mergeTarget.branch,
+          mergeTargetSource: mergeTarget.source,
         };
         await this.moveToDone(task, dir);
         result.task = { ...task, column: "done" };
         this.emit("task:merged", result);
         return result;
+      }
+
+      const checkoutTarget = await this.runGitCommand(`git checkout "${mergeTarget.branch}"`, 120_000);
+      if (checkoutTarget.exitCode !== 0) {
+        throw new Error(`Unable to checkout merge target branch '${mergeTarget.branch}' for ${id}`);
       }
 
       // 2. Merge the branch
@@ -4175,7 +4690,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
       if (merge.exitCode === 0 && commit.exitCode === 0) {
         result.merged = true;
-        const mergeDetails = await this.collectMergeDetails(id, branch, task, mergeCommitMessage);
+        const mergeDetails = await this.collectMergeDetails(id, branch, task, mergeCommitMessage, mergeTarget);
         task.mergeDetails = mergeDetails;
         Object.assign(result, mergeDetails);
       } else {
@@ -4437,11 +4952,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
    */
   async watch(): Promise<void> {
     if (this.watcher || this.pollInterval) return; // already watching
+    this.clearStartupSlimListMemo();
 
     // Populate cache with current state. The watcher only needs metadata to
     // detect created/updated/moved/deleted events; full task logs stay on the
     // detail path.
-    const tasks = await this.listTasks({ slim: true });
+    const tasks = await this.listTasks({ slim: true, startupMemo: true });
     this.taskCache.clear();
     for (const task of tasks) {
       this.taskCache.set(task.id, { ...task });
@@ -4480,6 +4996,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     this.pollInterval = setInterval(() => {
       void this.checkForChanges();
     }, 1000);
+    this.clearStartupSlimListMemo();
   }
 
   /**
@@ -4567,10 +5084,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       }
 
       const elapsed = Date.now() - startTime;
-      if (elapsed > 100) {
+      if (elapsed > 750) {
         storeLog.warn("checkForChanges took longer than expected", {
           elapsedMs: elapsed,
-          thresholdMs: 100,
+          thresholdMs: 750,
         });
       }
     } catch (err) {
@@ -4602,6 +5119,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     this.debounceTimers.clear();
     this.taskCache.clear();
     this.recentlyWritten.clear();
+    this.clearStartupSlimListMemo();
   }
 
   /**
@@ -5156,51 +5674,72 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       }
     }
 
-    // Phase 3: Invalidate stale spec approval when a user comments on
-    // a triage task that is awaiting manual approval. The new comment
-    // means the spec is now stale and must be re-specified/re-reviewed.
+    // Phase 3: user comments on already-planned, non-executing work should
+    // trigger triage re-specification. This includes awaiting-approval
+    // invalidation and todo/triage tasks that have a real non-bootstrap spec.
     // This remains best-effort: failures are logged for observability but
     // never fail the comment add operation itself.
     // Note: The `task` returned above reflects the state BEFORE this
     // transition. Callers that need the post-transition status should
     // re-read the task (e.g., via getTask).
-    if (
-      task.column === "triage"
-      && task.status === "awaiting-approval"
-      && author === "user"
-    ) {
-      let invalidatedStatus = false;
+    if (author === "user" && (task.column === "todo" || task.column === "triage")) {
+      let hasRealPrompt = false;
       try {
-        await this.updateTask(id, {
-          status: "needs-replan",
-        });
-        invalidatedStatus = true;
+        const promptPath = join(this.taskDir(id), "PROMPT.md");
+        if (existsSync(promptPath)) {
+          const prompt = await readFile(promptPath, "utf-8");
+          hasRealPrompt = !isBootstrapPromptStub(prompt, task.id, task.title, task.description);
+        }
       } catch (err) {
-        storeLog.warn("Best-effort post-comment awaiting-approval invalidation failed", {
+        storeLog.warn("Best-effort post-comment re-triage prompt-read failed", {
           ...commentContextBase,
-          phase: "addComment:awaiting-approval-invalidation",
-          stage: "status-update",
-          nextStatus: "needs-replan",
+          phase: "addComment:retriage-prompt-read",
           error: err instanceof Error ? err.message : String(err),
         });
       }
 
-      if (invalidatedStatus) {
+      const shouldInvalidateAwaitingApproval =
+        task.column === "triage" && task.status === "awaiting-approval";
+      const shouldRetriagePlannedTask = hasRealPrompt
+        && (
+          task.column === "todo"
+          || (task.column === "triage" && task.status !== "awaiting-approval")
+        );
+
+      if (shouldInvalidateAwaitingApproval || shouldRetriagePlannedTask) {
+        const phase = shouldInvalidateAwaitingApproval
+          ? "addComment:awaiting-approval-invalidation"
+          : "addComment:planned-task-retriage";
+        const action = shouldInvalidateAwaitingApproval
+          ? "User comment invalidated spec approval — task needs re-specification"
+          : "User comment requested re-specification of planned task";
+        let transitioned = false;
+
         try {
-          await this.logEntry(
-            id,
-            `User comment invalidated spec approval — task needs re-specification`,
-            undefined,
-            runContext,
-          );
+          await this.updateTask(id, { status: "needs-replan" });
+          transitioned = true;
         } catch (err) {
-          storeLog.warn("Best-effort post-comment awaiting-approval invalidation failed", {
+          storeLog.warn("Best-effort post-comment re-triage failed", {
             ...commentContextBase,
-            phase: "addComment:awaiting-approval-invalidation",
-            stage: "post-invalidation-log-entry",
+            phase,
+            stage: "status-update",
             nextStatus: "needs-replan",
             error: err instanceof Error ? err.message : String(err),
           });
+        }
+
+        if (transitioned) {
+          try {
+            await this.logEntry(id, action, text, runContext);
+          } catch (err) {
+            storeLog.warn("Best-effort post-comment re-triage failed", {
+              ...commentContextBase,
+              phase,
+              stage: "post-invalidation-log-entry",
+              nextStatus: "needs-replan",
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
     }
@@ -5551,6 +6090,98 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     });
   }
 
+  async updateGithubTracking(
+    id: string,
+    tracking: import("./types.js").TaskGithubTracking | null,
+  ): Promise<Task> {
+    return this.withTaskLock(id, async () => {
+      const dir = this.taskDir(id);
+      const task = await this.readTaskJson(dir);
+      const nextTracking = tracking ?? undefined;
+      const previousTracking = task.githubTracking;
+
+      if (JSON.stringify(previousTracking ?? null) === JSON.stringify(nextTracking ?? null)) {
+        return task;
+      }
+
+      task.githubTracking = nextTracking;
+      task.log.push({
+        timestamp: new Date().toISOString(),
+        action: tracking?.enabled === false ? "GitHub tracking disabled" : "GitHub tracking enabled",
+      });
+      task.updatedAt = new Date().toISOString();
+
+      await this.atomicWriteTaskJson(dir, task);
+      if (this.isWatching) this.taskCache.set(id, { ...task });
+      this.emit("task:updated", task);
+      return task;
+    });
+  }
+
+  async linkGithubIssue(
+    id: string,
+    issue: import("./types.js").TaskGithubTrackedIssue,
+  ): Promise<Task> {
+    return this.withTaskLock(id, async () => {
+      const dir = this.taskDir(id);
+      const task = await this.readTaskJson(dir);
+      const previous = task.githubTracking ?? {};
+
+      const nextTracking: import("./types.js").TaskGithubTracking = {
+        ...previous,
+        issue,
+        enabled: previous.enabled ?? true,
+      };
+
+      if (JSON.stringify(previous) === JSON.stringify(nextTracking)) {
+        return task;
+      }
+
+      task.githubTracking = nextTracking;
+      task.log.push({
+        timestamp: new Date().toISOString(),
+        action: "GitHub issue linked",
+        outcome: `${issue.owner}/${issue.repo}#${issue.number}`,
+      });
+      task.updatedAt = new Date().toISOString();
+
+      await this.atomicWriteTaskJson(dir, task);
+      if (this.isWatching) this.taskCache.set(id, { ...task });
+      this.emit("task:updated", task);
+      return task;
+    });
+  }
+
+  async unlinkGithubIssue(id: string): Promise<Task> {
+    return this.withTaskLock(id, async () => {
+      const dir = this.taskDir(id);
+      const task = await this.readTaskJson(dir);
+      const previous = task.githubTracking;
+      const previousIssue = previous?.issue;
+
+      if (!previousIssue || !previous) {
+        return task;
+      }
+
+      task.githubTracking = {
+        ...previous,
+        issue: undefined,
+        unlinkedAt: new Date().toISOString(),
+      };
+      task.log.push({
+        timestamp: new Date().toISOString(),
+        action: "GitHub issue unlinked",
+        outcome: `${previousIssue.owner}/${previousIssue.repo}#${previousIssue.number}`,
+      });
+      task.updatedAt = new Date().toISOString();
+
+      await this.atomicWriteTaskJson(dir, task);
+      if (this.isWatching) this.taskCache.set(id, { ...task });
+      this.emit("task:updated", task);
+      return task;
+    });
+  }
+
   /**
    * Read historical agent log entries for a task from SQLite.
    * Returns entries in chronological order (oldest first).
@@ -5839,6 +6470,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     // Build restored task (clear transient fields)
     const restoredTask: Task = {
       id: entry.id,
+      lineageId: entry.lineageId || generateTaskLineageId(),
       title: entry.title,
       description: entry.description,
       priority: normalizeTaskPriority(entry.priority),
@@ -5849,7 +6481,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       size: entry.size,
       reviewLevel: entry.reviewLevel,
       prInfo: entry.prInfo,
+      review: entry.review,
       issueInfo: entry.issueInfo,
+      githubTracking: entry.githubTracking,
       sourceIssue: entry.sourceIssue,
       attachments: entry.attachments,
       log: [...entry.log, { timestamp: new Date().toISOString(), action: "Task restored from archive" }],
@@ -5866,7 +6500,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       planningModelId: entry.planningModelId,
       breakIntoSubtasks: entry.breakIntoSubtasks,
       modifiedFiles: entry.modifiedFiles,
-      // Intentionally NOT restoring: worktree, status, blockedBy, paused, baseBranch, baseCommitSha, error
+      // Intentionally NOT restoring: worktree, status, blockedBy, paused, executionStartBranch, baseCommitSha, error
     };
 
     // Write task.json
@@ -6008,6 +6642,37 @@ ${stepsSection}`;
     });
   }
 
+  setPluginWorkflowStepTemplates(templates: Array<{ pluginId: string; template: WorkflowStepTemplate }>): void {
+    this._pluginWorkflowStepTemplates = [...templates];
+    this.workflowStepsCache = null;
+  }
+
+  private resolvePluginWorkflowStep(id: string): import("./types.js").WorkflowStep | undefined {
+    const match = id.match(/^plugin:([^:]+):(.+)$/);
+    if (!match) return undefined;
+
+    const [, pluginId, stepId] = match;
+    const entry = this._pluginWorkflowStepTemplates.find(
+      ({ pluginId: candidatePluginId, template }) => candidatePluginId === pluginId && template.id === id,
+    );
+    if (!entry) return undefined;
+
+    const now = new Date().toISOString();
+    return {
+      id,
+      templateId: stepId,
+      name: entry.template.name,
+      description: entry.template.description,
+      mode: "prompt",
+      phase: "pre-merge",
+      prompt: entry.template.prompt,
+      toolMode: entry.template.toolMode,
+      enabled: entry.template.enabled ?? true,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
   /**
    * List all workflow step definitions from workflow_steps.
    * Results are cached and invalidated on create/update/delete.
@@ -6031,7 +6696,11 @@ ${stepsSection}`;
       createdAt: string;
       updatedAt: string;
     }>;
-    this.workflowStepsCache = rows.map((row) => this.applyLegacyWorkflowStepOverrides(this.toStoredWorkflowStep(row)));
+    const storedSteps = rows.map((row) => this.applyLegacyWorkflowStepOverrides(this.toStoredWorkflowStep(row)));
+    const pluginSteps = this._pluginWorkflowStepTemplates
+      .map(({ template }) => this.resolvePluginWorkflowStep(template.id))
+      .filter((step): step is import("./types.js").WorkflowStep => Boolean(step));
+    this.workflowStepsCache = [...storedSteps, ...pluginSteps];
     return this.workflowStepsCache;
   }
 
@@ -6039,6 +6708,13 @@ ${stepsSection}`;
    * Get a single workflow step by ID.
    */
   async getWorkflowStep(id: string): Promise<import("./types.js").WorkflowStep | undefined> {
+    if (id.startsWith("plugin:")) {
+      const pluginStep = this.resolvePluginWorkflowStep(id);
+      if (pluginStep) {
+        return pluginStep;
+      }
+    }
+
     const byId = this.db.prepare("SELECT * FROM workflow_steps WHERE id = ?").get(id) as
       | {
           id: string;
@@ -6300,6 +6976,25 @@ ${stepsSection}`;
     return this.db;
   }
 
+  getDatabaseHealth(): {
+    corruptionDetected: boolean;
+    integrityCheckPending: boolean;
+    integrityCheckLastRunAt: string | null;
+  } {
+    return {
+      corruptionDetected: this.db.corruptionDetected,
+      integrityCheckPending: this.db.integrityCheckPending,
+      integrityCheckLastRunAt: this.db.integrityCheckLastRunAt,
+    };
+  }
+
+  getDistributedTaskIdAllocator(): DistributedTaskIdAllocator {
+    if (!this.distributedTaskIdAllocator) {
+      this.distributedTaskIdAllocator = createDistributedTaskIdAllocator(this.db);
+    }
+    return this.distributedTaskIdAllocator;
+  }
+
   /**
    * Perform a simple database health check.
    * Returns true if the database responds correctly, false otherwise.
@@ -6491,20 +7186,11 @@ ${notificationsSection}`;
    */
   getPluginStore(): PluginStore {
     if (!this.pluginStore) {
-      this.pluginStore = new PluginStore(this.rootDir);
+      // PluginStore persists install/state rows in central DB, so it must use
+      // the same resolved global settings directory as TaskStore.
+      this.pluginStore = new PluginStore(this.rootDir, { centralGlobalDir: this.globalSettingsDir });
     }
     return this.pluginStore;
-  }
-
-  /**
-   * Get the RoadmapStore instance for standalone roadmap operations.
-   * Lazily initializes the RoadmapStore on first access.
-   */
-  getRoadmapStore(): RoadmapStore {
-    if (!this.roadmapStore) {
-      this.roadmapStore = new RoadmapStore(this.db);
-    }
-    return this.roadmapStore;
   }
 
   /**
@@ -6538,6 +7224,17 @@ ${notificationsSection}`;
       this.todoStore = new TodoStore(this.db);
     }
     return this.todoStore;
+  }
+
+  /**
+   * Get the EvalStore instance for eval run and task result operations.
+   * Lazily initializes the EvalStore on first access.
+   */
+  getEvalStore(): EvalStore {
+    if (!this.evalStore) {
+      this.evalStore = new EvalStore(this.db);
+    }
+    return this.evalStore;
   }
 
   // ── Verification Cache ────────────────────────────────────────────────────
@@ -6592,6 +7289,165 @@ ${notificationsSection}`;
          VALUES (?, ?, ?, ?, ?)`,
       )
       .run(treeSha, normalizedTest, normalizedBuild, recordedAt, taskId);
+  }
+
+  // ── Shared mesh state export/apply helpers ───────────────────────────────
+
+  async getTaskMetadataSnapshot(): Promise<TaskMetadataSnapshot> {
+    const tasks = await this.listTasks({ slim: false, includeArchived: true });
+    return createTaskMetadataSnapshot(tasks as unknown as TaskMetadataSnapshot["payload"]["tasks"]);
+  }
+
+  async applyTaskMetadataSnapshot(snapshot: TaskMetadataSnapshot): Promise<{ applied: number; skipped: number }> {
+    validateSnapshotEnvelope(snapshot);
+    const existingTasks = new Map((await this.listTasks({ slim: false, includeArchived: true })).map((task) => [task.id, task]));
+    let applied = 0;
+    let skipped = 0;
+
+    for (const incoming of snapshot.payload.tasks) {
+      const current = existingTasks.get(incoming.id);
+      const currentMetadata = current ? toTaskMetadataRecord(current) : undefined;
+      if (currentMetadata && JSON.stringify(currentMetadata) === JSON.stringify(incoming)) {
+        skipped++;
+        continue;
+      }
+      const toUpsert: Task = {
+        ...(incoming as unknown as Task),
+        worktree: current?.worktree,
+        executionStartBranch: current?.executionStartBranch,
+        sessionFile: current?.sessionFile,
+      };
+      this.upsertTaskWithFtsRecovery(toUpsert);
+      applied++;
+    }
+
+    return { applied, skipped };
+  }
+
+  async getActivityLogSnapshot(limit = 10_000): Promise<ActivityLogSnapshot> {
+    const entries = await this.getActivityLog({ limit });
+    return createActivityLogSnapshot([...entries].reverse());
+  }
+
+  applyActivityLogSnapshot(snapshot: ActivityLogSnapshot): { applied: number; skipped: number } {
+    validateSnapshotEnvelope(snapshot);
+    let applied = 0;
+    let skipped = 0;
+
+    for (const entry of snapshot.payload.entries) {
+      const exists = this.db.prepare("SELECT 1 FROM activityLog WHERE id = ?").get(entry.id);
+      if (exists) {
+        skipped++;
+        continue;
+      }
+      this.db.prepare(
+        `INSERT INTO activityLog (id, timestamp, type, taskId, taskTitle, details, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        entry.id,
+        entry.timestamp,
+        entry.type,
+        entry.taskId ?? null,
+        entry.taskTitle ?? null,
+        entry.details,
+        entry.metadata ? JSON.stringify(entry.metadata) : null,
+      );
+      applied++;
+    }
+
+    return { applied, skipped };
+  }
+
+  getRunAuditSnapshot(filter: RunAuditEventFilter = {}): RunAuditSnapshot {
+    return createRunAuditSnapshot(this.getRunAuditEvents({ ...filter, limit: filter.limit ?? 10_000 }).reverse());
+  }
+
+  applyRunAuditSnapshot(snapshot: RunAuditSnapshot): { applied: number; skipped: number } {
+    validateSnapshotEnvelope(snapshot);
+    let applied = 0;
+    let skipped = 0;
+
+    for (const entry of snapshot.payload.entries) {
+      const exists = this.db.prepare("SELECT 1 FROM runAuditEvents WHERE id = ?").get(entry.id);
+      if (exists) {
+        skipped++;
+        continue;
+      }
+      this.db.prepare(`
+        INSERT INTO runAuditEvents (id, timestamp, taskId, agentId, runId, domain, mutationType, target, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        entry.id,
+        entry.timestamp,
+        entry.taskId ?? null,
+        entry.agentId,
+        entry.runId,
+        entry.domain,
+        entry.mutationType,
+        entry.target,
+        entry.metadata ? JSON.stringify(entry.metadata) : null,
+      );
+      applied++;
+    }
+
+    return { applied, skipped };
+  }
+
+  async upsertTaskCommitAssociation(
+    input: Omit<TaskCommitAssociation, "id" | "createdAt" | "updatedAt"> & { id?: string },
+  ): Promise<TaskCommitAssociation> {
+    const now = new Date().toISOString();
+    const association: TaskCommitAssociation = normalizeTaskCommitAssociation({
+      id: input.id ?? randomUUID(),
+      createdAt: now,
+      updatedAt: now,
+      ...input,
+    });
+    this.db.prepare(
+      `INSERT INTO task_commit_associations
+       (id, taskLineageId, taskIdSnapshot, commitSha, commitSubject, authoredAt, matchedBy, confidence, note, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(taskLineageId, commitSha, matchedBy) DO UPDATE SET
+         taskIdSnapshot = excluded.taskIdSnapshot,
+         commitSubject = excluded.commitSubject,
+         authoredAt = excluded.authoredAt,
+         confidence = excluded.confidence,
+         note = excluded.note,
+         updatedAt = excluded.updatedAt`,
+    ).run(
+      association.id,
+      association.taskLineageId,
+      association.taskIdSnapshot,
+      association.commitSha,
+      association.commitSubject,
+      association.authoredAt,
+      association.matchedBy,
+      association.confidence,
+      association.note ?? null,
+      association.createdAt,
+      association.updatedAt,
+    );
+    return association;
+  }
+
+  async getTaskCommitAssociationsByLineageId(lineageId: string): Promise<TaskCommitAssociation[]> {
+    const rows = this.db.prepare(
+      `SELECT * FROM task_commit_associations WHERE taskLineageId = ? ORDER BY authoredAt DESC, createdAt DESC`,
+    ).all(lineageId) as TaskCommitAssociationRow[];
+    return rows.map((row) => normalizeTaskCommitAssociation({ ...row, note: row.note ?? undefined }));
+  }
+
+  async replaceLegacyTaskCommitAssociations(
+    lineageId: string,
+    associations: Array<Omit<TaskCommitAssociation, "id" | "createdAt" | "updatedAt" | "taskLineageId">>,
+  ): Promise<void> {
+    const deleteStmt = this.db.prepare(
+      `DELETE FROM task_commit_associations WHERE taskLineageId = ? AND matchedBy IN ('legacy-task-id-trailer', 'legacy-subject', 'manual-reconciliation')`,
+    );
+    deleteStmt.run(lineageId);
+    for (const association of associations) {
+      await this.upsertTaskCommitAssociation({ ...association, taskLineageId: lineageId });
+    }
   }
 
   // ── Backward Compatibility (Multi-Project Support) ────────────────────────

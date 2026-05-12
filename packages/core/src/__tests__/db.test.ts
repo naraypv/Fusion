@@ -1,5 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { Database, createDatabase, toJson, toJsonNullable, fromJson, normalizeTaskComments } from "../db.js";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
+import {
+  Database,
+  createDatabase,
+  toJson,
+  toJsonNullable,
+  fromJson,
+  normalizeTaskComments,
+  getSchemaSqlTableSchemas,
+  MIGRATION_ONLY_TABLE_SCHEMAS,
+} from "../db.js";
 import { DEFAULT_PROJECT_SETTINGS } from "../types.js";
 import { TaskStore } from "../store.js";
 import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
@@ -7,10 +16,42 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { rm } from "node:fs/promises";
+import { ensureRoadmapSchema } from "../../../../plugins/fusion-plugin-roadmap/src/roadmap-schema.js";
+
+const createdTmpDirs = new Set<string>();
 
 function makeTmpDir(): string {
-  return mkdtempSync(join(tmpdir(), "kb-db-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "kb-db-test-"));
+  createdTmpDirs.add(dir);
+  return dir;
 }
+
+async function cleanupTmpDirsAsync(): Promise<void> {
+  const cleanup = Array.from(createdTmpDirs);
+  await Promise.all(
+    cleanup.map(async (dir) => {
+      await rm(dir, { recursive: true, force: true });
+      createdTmpDirs.delete(dir);
+    }),
+  );
+}
+
+function cleanupTmpDirsSync(): void {
+  const cleanup = Array.from(createdTmpDirs);
+  for (const dir of cleanup) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort fallback during teardown
+    } finally {
+      createdTmpDirs.delete(dir);
+    }
+  }
+}
+
+afterAll(() => {
+  cleanupTmpDirsSync();
+});
 
 describe("Database", () => {
   let tmpDir: string;
@@ -30,7 +71,7 @@ describe("Database", () => {
     } catch {
       // already closed
     }
-    await rm(tmpDir, { recursive: true, force: true });
+    await cleanupTmpDirsAsync();
   });
 
   describe("initialization", () => {
@@ -106,12 +147,11 @@ describe("Database", () => {
       expect(tableNames).toContain("agentRatings");
       expect(tableNames).toContain("task_documents");
       expect(tableNames).toContain("task_document_revisions");
-      // Roadmap tables
-      expect(tableNames).toContain("roadmaps");
-      expect(tableNames).toContain("roadmap_milestones");
-      expect(tableNames).toContain("roadmap_features");
+      // Roadmap tables are plugin-owned (FN-3159) and initialized via plugin schema hooks.
       // Verification cache (migration 61)
       expect(tableNames).toContain("verification_cache");
+      expect(tableNames).toContain("distributed_task_id_state");
+      expect(tableNames).toContain("distributed_task_id_reservations");
     });
 
     it("creates all expected indexes", () => {
@@ -123,6 +163,8 @@ describe("Database", () => {
       expect(indexNames).toContain("idxActivityLogTimestamp");
       expect(indexNames).toContain("idxActivityLogType");
       expect(indexNames).toContain("idxActivityLogTaskId");
+      expect(indexNames).toContain("idxDistributedTaskIdReservationsPrefixStatus");
+      expect(indexNames).toContain("idxDistributedTaskIdReservationsExpiry");
       expect(indexNames).toContain("idxActivityLogTaskIdTimestamp");
       expect(indexNames).toContain("idxActivityLogTypeTimestamp");
       expect(indexNames).toContain("idxArchivedTasksId");
@@ -152,17 +194,14 @@ describe("Database", () => {
       expect(indexNames).toContain("idxAgentApiKeysAgentId");
       expect(indexNames).toContain("idxAgentConfigRevisionsAgentIdCreatedAt");
       expect(indexNames).toContain("idxTasksCreatedAt");
-      // Roadmap indexes
-      expect(indexNames).toContain("idxRoadmapMilestonesRoadmapOrder");
-      expect(indexNames).toContain("idxRoadmapFeaturesMilestoneOrder");
+      // Roadmap indexes are plugin-owned (FN-3159) and initialized via plugin schema hooks.
       // Verification cache index (migration 61)
       expect(indexNames).toContain("idxVerificationCacheRecordedAt");
     });
 
     it("seeds schema version", () => {
-      expect(db.getSchemaVersion()).toBe(61);
+      expect(db.getSchemaVersion()).toBe(72);
     });
-
     it("seeds lastModified", () => {
       const ts = db.getLastModified();
       expect(ts).toBeGreaterThan(0);
@@ -183,9 +222,8 @@ describe("Database", () => {
 
     it("is idempotent - calling init() twice does not fail", () => {
       expect(() => db.init()).not.toThrow();
-      expect(db.getSchemaVersion()).toBe(61);
+      expect(db.getSchemaVersion()).toBe(72);
     });
-
     it("does not overwrite existing config on re-init", () => {
       // Update the config
       db.prepare("UPDATE config SET nextId = 42 WHERE id = 1").run();
@@ -231,23 +269,118 @@ describe("Database", () => {
   });
 
   describe("startup integrity check", () => {
-    it("passes silently on a healthy database", () => {
-      // db was already init'd in beforeEach — no warning means pass
-      const result = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
-      expect(result.integrity_check).toBe("ok");
-    });
+    it("schedules full integrity check after init instead of blocking startup", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck");
 
-    it("init completes without throwing even on a fresh database", () => {
       const freshDir = makeTmpDir();
       const freshFusionDir = join(freshDir, ".fusion");
       const freshDb = new Database(freshFusionDir);
 
       try {
-        // init includes the integrity check — should not throw
         expect(() => freshDb.init()).not.toThrow();
+        expect(freshDb.integrityCheckPending).toBe(true);
+        expect(integritySpy).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+        expect(freshDb.integrityCheckPending).toBe(false);
+        expect(freshDb.integrityCheckLastRunAt).toBeTruthy();
       } finally {
         freshDb.close();
         rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not schedule duplicate background integrity checks across repeated init calls", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck");
+      const freshDir = makeTmpDir();
+      const freshFusionDir = join(freshDir, ".fusion");
+      const freshDb = new Database(freshFusionDir);
+
+      try {
+        freshDb.init();
+        expect(freshDb.integrityCheckPending).toBe(true);
+
+        freshDb.init();
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+      } finally {
+        freshDb.close();
+        rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("deduplicates background integrity check across multiple instances sharing a db path", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck");
+      const freshDir = makeTmpDir();
+      const freshFusionDir = join(freshDir, ".fusion");
+      const dbA = new Database(freshFusionDir);
+      const dbB = new Database(freshFusionDir);
+
+      try {
+        dbA.init();
+        dbB.init();
+
+        expect(dbA.integrityCheckPending).toBe(true);
+        expect(dbB.integrityCheckPending).toBe(true);
+
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+        expect(dbA.integrityCheckPending).toBe(false);
+        expect(dbB.integrityCheckPending).toBe(false);
+        expect(dbA.integrityCheckLastRunAt).toBeTruthy();
+        expect(dbB.integrityCheckLastRunAt).toBeTruthy();
+        expect(dbA.corruptionDetected).toBe(false);
+        expect(dbB.corruptionDetected).toBe(false);
+      } finally {
+        dbA.close();
+        dbB.close();
+        rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("fans out corruption detection to all instances participating in shared background check", () => {
+      vi.useFakeTimers();
+      const integritySpy = vi.spyOn(Database.prototype, "integrityCheck").mockReturnValue({
+        ok: false,
+        errors: ["malformed database"],
+      });
+      const freshDir = makeTmpDir();
+      const freshFusionDir = join(freshDir, ".fusion");
+      const dbA = new Database(freshFusionDir);
+      const dbB = new Database(freshFusionDir);
+
+      try {
+        dbA.init();
+        dbB.init();
+
+        vi.advanceTimersByTime(3000);
+
+        expect(integritySpy).toHaveBeenCalledTimes(1);
+        expect(dbA.integrityCheckPending).toBe(false);
+        expect(dbB.integrityCheckPending).toBe(false);
+        expect(dbA.integrityCheckLastRunAt).toBeTruthy();
+        expect(dbB.integrityCheckLastRunAt).toBeTruthy();
+        expect(dbA.corruptionDetected).toBe(true);
+        expect(dbB.corruptionDetected).toBe(true);
+      } finally {
+        dbA.close();
+        dbB.close();
+        rmSync(freshDir, { recursive: true, force: true });
+        integritySpy.mockRestore();
+        vi.useRealTimers();
       }
     });
   });
@@ -556,6 +689,32 @@ describe("Database", () => {
       await expect(db.runPluginSchemaInits(hooks)).resolves.toBeUndefined();
       await expect(db.runPluginSchemaInits(hooks)).resolves.toBeUndefined();
     });
+
+    it("executes roadmap plugin schema hook to create roadmap-owned tables and indexes", async () => {
+      await db.runPluginSchemaInits([
+        {
+          pluginId: "fusion-plugin-roadmap",
+          hook: ensureRoadmapSchema,
+        },
+      ]);
+
+      const roadmapTables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('roadmaps', 'roadmap_milestones', 'roadmap_features') ORDER BY name")
+        .all() as Array<{ name: string }>;
+      expect(roadmapTables.map((table) => table.name)).toEqual([
+        "roadmap_features",
+        "roadmap_milestones",
+        "roadmaps",
+      ]);
+
+      const roadmapIndexes = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idxRoadmapMilestonesRoadmapOrder', 'idxRoadmapFeaturesMilestoneOrder') ORDER BY name")
+        .all() as Array<{ name: string }>;
+      expect(roadmapIndexes.map((index) => index.name)).toEqual([
+        "idxRoadmapFeaturesMilestoneOrder",
+        "idxRoadmapMilestonesRoadmapOrder",
+      ]);
+    });
   });
 
   describe("foreign key cascade", () => {
@@ -592,14 +751,17 @@ describe("Database", () => {
       const diskDb = new Database(fusionDir);
       diskDb.init();
       expect(diskDb.corruptionDetected).toBe(false);
+      expect(diskDb.integrityCheckPending).toBe(true);
       diskDb.close();
     });
 
-    it("skips integrity check side effects for in-memory databases", () => {
+    it("skips background integrity check scheduling for in-memory databases", () => {
       const memDb = new Database(fusionDir, { inMemory: true });
       memDb.init();
       expect(memDb.integrityCheck()).toEqual({ ok: true });
       expect(memDb.corruptionDetected).toBe(false);
+      expect(memDb.integrityCheckPending).toBe(false);
+      expect(memDb.integrityCheckLastRunAt).toBeNull();
       memDb.close();
     });
   });
@@ -957,7 +1119,7 @@ describe("schema migrations", () => {
     db.init();
 
     // Verify version bumped to 29 (includes v1→v2 through v26→v29)
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     // Verify new columns exist and existing data is intact
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
@@ -982,11 +1144,11 @@ describe("schema migrations", () => {
     const db = new Database(fusionDir);
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     // Re-init should not fail
     db.init();
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     db.close();
   });
@@ -1021,7 +1183,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     expect(cols.map((col) => col.name)).toContain("priority");
@@ -1062,7 +1224,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const colNames = cols.map((col) => col.name);
@@ -1131,7 +1293,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const colNames = cols.map((col) => col.name);
@@ -1157,6 +1319,143 @@ describe("schema migrations", () => {
     expect(task.sourceIssueExternalIssueId).toBeNull();
     expect(task.sourceIssueNumber).toBeNull();
     expect(task.sourceIssueUrl).toBeNull();
+
+    db.close();
+  });
+
+  it("reconciles missing columns across all SCHEMA_SQL tables even when schemaVersion is current", () => {
+    tmpDir = makeTmpDir();
+    const fusionDir = join(tmpDir, ".fusion");
+    const dbSourcePath = fileURLToPath(new URL("../db.ts", import.meta.url));
+    const source = readFileSync(dbSourcePath, "utf8");
+    const versionMatch = source.match(/^const SCHEMA_VERSION = (\d+);/m);
+    expect(versionMatch).not.toBeNull();
+    const schemaVersion = Number(versionMatch?.[1]);
+
+    const legacyDb = new Database(fusionDir);
+    legacyDb.exec("CREATE TABLE IF NOT EXISTS __meta (key TEXT PRIMARY KEY, value TEXT)");
+
+    const schemaTables = getSchemaSqlTableSchemas();
+    const indexedColumnsByTable = new Map<string, Set<string>>();
+    for (const match of source.matchAll(/CREATE INDEX IF NOT EXISTS\s+\w+\s+ON\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]+)\)/g)) {
+      const table = match[1];
+      const cols = match[2]
+        .split(",")
+        .map((column) => column.trim().replace(/\s+(ASC|DESC)$/i, ""));
+      const set = indexedColumnsByTable.get(table) ?? new Set<string>();
+      cols.forEach((column) => set.add(column));
+      indexedColumnsByTable.set(table, set);
+    }
+
+    const requiredDrops = new Map<string, string>([
+      ["tasks", "checkoutNodeId"],
+      ["agents", "currentTaskId"],
+      ["missions", "autoAdvance"],
+      ["routines", "agentId"],
+    ]);
+
+    const isSafeToDrop = (definition: string): boolean => {
+      const upper = definition.toUpperCase();
+      if (upper.includes("PRIMARY KEY")) return false;
+      if (upper.includes("NOT NULL") && !upper.includes("DEFAULT")) return false;
+      return true;
+    };
+
+    for (const [tableName, columns] of schemaTables) {
+      const entries = [...columns.entries()];
+      const dropped = new Set<string>();
+      const indexedColumns = indexedColumnsByTable.get(tableName) ?? new Set<string>();
+      entries.forEach(([name, definition], index) => {
+        if (index % 4 === 0 && entries.length > 1 && isSafeToDrop(definition) && !indexedColumns.has(name)) {
+          dropped.add(name);
+        }
+      });
+      const forcedDrop = requiredDrops.get(tableName);
+      if (forcedDrop) dropped.add(forcedDrop);
+
+      const kept = entries.filter(([name]) => !dropped.has(name));
+      const chosen = kept.length > 0 ? kept : entries.slice(0, 1);
+      const columnSql = chosen.map(([name, def]) => `  ${name} ${def}`).join(",\n");
+      legacyDb.exec(`CREATE TABLE IF NOT EXISTS ${tableName} (\n${columnSql}\n)`);
+    }
+
+    const validatorColumns = Object.entries(MIGRATION_ONLY_TABLE_SCHEMAS.mission_validator_runs)
+      .filter(([name, definition], index) => name === "id" || (name !== "taskId" && (index % 4 !== 0 || !isSafeToDrop(definition))))
+      .map(([name, def]) => `  ${name} ${def}`)
+      .join(",\n");
+    legacyDb.exec(`CREATE TABLE IF NOT EXISTS mission_validator_runs (\n${validatorColumns}\n)`);
+
+    legacyDb.exec(`INSERT INTO __meta (key, value) VALUES ('schemaVersion', '${schemaVersion}')`);
+    legacyDb.exec("INSERT INTO __meta (key, value) VALUES ('lastModified', '1000')");
+    legacyDb.close();
+
+    const opened = new Database(fusionDir);
+    opened.init();
+
+    for (const [tableName, columns] of schemaTables) {
+      const actualColumns = new Set(
+        (opened.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>).map((column) => column.name),
+      );
+      for (const [columnName] of columns) {
+        expect(actualColumns.has(columnName), `expected column ${tableName}.${columnName} after init() but it is missing`).toBe(true);
+      }
+    }
+
+    const missionValidatorColumns = new Set(
+      (opened.prepare("PRAGMA table_info(mission_validator_runs)").all() as Array<{ name: string }>).map((column) => column.name),
+    );
+    expect(
+      missionValidatorColumns.has("taskId"),
+      "expected column mission_validator_runs.taskId after init() but it is missing",
+    ).toBe(true);
+
+    opened.close();
+  });
+
+  it("backfills missing checkout lease columns when schemaVersion is already current", () => {
+    tmpDir = makeTmpDir();
+    const fusionDir = join(tmpDir, ".fusion");
+    const legacyDb = new Database(fusionDir);
+
+    legacyDb.exec(`
+      CREATE TABLE IF NOT EXISTS __meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        nextId INTEGER DEFAULT 1,
+        nextWorkflowStepId INTEGER DEFAULT 1,
+        settings TEXT DEFAULT '{}',
+        workflowSteps TEXT DEFAULT '[]',
+        updatedAt TEXT
+      );
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        "column" TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );
+    `);
+    legacyDb.exec("INSERT INTO __meta (key, value) VALUES ('schemaVersion', '70')");
+    legacyDb.exec("INSERT INTO __meta (key, value) VALUES ('lastModified', '1000')");
+    legacyDb.exec(`INSERT INTO tasks (id, description, "column", createdAt, updatedAt) VALUES ('FN-lease', 'legacy', 'triage', '2026-01-01', '2026-01-01')`);
+    legacyDb.close();
+
+    const db = new Database(fusionDir);
+    db.init();
+
+    expect(() => db.prepare("SELECT checkoutNodeId FROM tasks WHERE id = 'FN-lease'").get()).not.toThrow();
+
+    const columns = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    const columnNames = columns.map((column) => column.name);
+    expect(columnNames).toContain("checkedOutBy");
+    expect(columnNames).toContain("checkedOutAt");
+    expect(columnNames).toContain("checkoutNodeId");
+    expect(columnNames).toContain("checkoutRunId");
+    expect(columnNames).toContain("checkoutLeaseRenewedAt");
+    expect(columnNames).toContain("checkoutLeaseEpoch");
+
+    const task = db.prepare("SELECT checkoutLeaseEpoch FROM tasks WHERE id = 'FN-lease'").get() as { checkoutLeaseEpoch: number | null };
+    expect(task.checkoutLeaseEpoch).toBe(0);
 
     db.close();
   });
@@ -1234,7 +1533,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const cols = db.prepare("PRAGMA table_info(chat_messages)").all() as Array<{ name: string }>;
     expect(cols.map((col) => col.name)).toContain("attachments");
@@ -1308,7 +1607,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'agentRatings'").all() as Array<{ name: string }>;
     expect(tables).toEqual([{ name: "agentRatings" }]);
@@ -1332,7 +1631,7 @@ describe("schema migrations", () => {
 
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'mission_events'").all() as Array<{ name: string }>;
     expect(tables).toEqual([{ name: "mission_events" }]);
@@ -1436,7 +1735,7 @@ describe("schema migrations", () => {
     db.init();
 
     // Verify version bumped to 29
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
 
     // Verify new columns exist and existing data is intact
     const cols = db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
@@ -1905,7 +2204,7 @@ describe("createDatabase factory", () => {
     const db = createDatabase(fusionDir);
     db.init();
 
-    expect(db.getSchemaVersion()).toBe(61);
+    expect(db.getSchemaVersion()).toBe(72);
     expect(db.getLastModified()).toBeGreaterThan(0);
 
     db.close();
@@ -2016,5 +2315,48 @@ describe("TaskStore — verification cache", () => {
     const hit = store.getVerificationCacheHit(treeSha, "pnpm test", "");
     expect(hit).not.toBeNull();
     expect(hit!.taskId).toBe("FN-020");
+  });
+});
+
+describe("migration v67 drops orphan project auth tables", () => {
+  it("drops project_auth_* tables left over from the removed pluggable auth feature", () => {
+    const temp = makeTmpDir();
+    const fusion = join(temp, ".fusion");
+    const localDb = new Database(fusion);
+    localDb.init();
+    // Simulate a user who ran the old migration 63 (schema version 63–66) and
+    // therefore has the orphan project_auth_* tables sitting in their DB. We
+    // recreate them by hand and roll the schemaVersion back so the new
+    // migration runs on the next init.
+    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_users (id TEXT PRIMARY KEY)`);
+    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_memberships (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
+    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_providers (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
+    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_sessions (id TEXT PRIMARY KEY, userId TEXT, membershipId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE, FOREIGN KEY (membershipId) REFERENCES project_auth_memberships(id) ON DELETE CASCADE)`);
+    localDb.prepare("UPDATE __meta SET value = '66' WHERE key = 'schemaVersion'").run();
+    localDb.close();
+
+    const migrated = new Database(fusion);
+    migrated.init();
+    expect(migrated.getSchemaVersion()).toBe(72);
+    const tables = migrated
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
+      .all() as Array<{ name: string }>;
+    expect(tables).toEqual([]);
+    migrated.close();
+    rmSync(temp, { recursive: true, force: true });
+  });
+
+  it("is a no-op on fresh DBs that never had the auth tables", () => {
+    const temp = makeTmpDir();
+    const fusion = join(temp, ".fusion");
+    const fresh = new Database(fusion);
+    fresh.init();
+    expect(fresh.getSchemaVersion()).toBe(72);
+    const tables = fresh
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
+      .all() as Array<{ name: string }>;
+    expect(tables).toEqual([]);
+    fresh.close();
+    rmSync(temp, { recursive: true, force: true });
   });
 });

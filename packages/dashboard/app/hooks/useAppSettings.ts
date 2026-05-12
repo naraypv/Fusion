@@ -12,12 +12,12 @@ export interface UseAppSettingsResult {
   globalPaused: boolean;
   enginePaused: boolean;
   taskStuckTimeoutMs: number | undefined;
+  staleHighFanoutBlockerAgeThresholdMs: number;
   showQuickChatFAB: boolean;
   prAuthAvailable: boolean;
   settingsLoaded: boolean;
   experimentalFeatures: Record<string, boolean>;
   insightsEnabled: boolean;
-  roadmapEnabled: boolean;
   memoryEnabled: boolean;
   devServerEnabled: boolean;
   todosEnabled: boolean;
@@ -41,12 +41,12 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
   const [globalPaused, setGlobalPaused] = useState(false);
   const [enginePaused, setEnginePaused] = useState(false);
   const [taskStuckTimeoutMs, setTaskStuckTimeoutMs] = useState<number | undefined>(undefined);
+  const [staleHighFanoutBlockerAgeThresholdMs, setStaleHighFanoutBlockerAgeThresholdMs] = useState(2 * 60 * 60 * 1000);
   const [showQuickChatFAB, setShowQuickChatFAB] = useState(false);
   const [prAuthAvailable, setPrAuthAvailable] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [experimentalFeatures, setExperimentalFeatures] = useState<Record<string, boolean>>({});
   const [insightsEnabled, setInsightsEnabled] = useState(false);
-  const [roadmapEnabled, setRoadmapEnabled] = useState(false);
   const [memoryEnabled, setMemoryEnabled] = useState(false);
   const [devServerEnabled, setDevServerEnabled] = useState(false);
   const [todosEnabled, setTodosEnabled] = useState(false);
@@ -74,11 +74,13 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
       setEnginePaused(Boolean(settings.enginePaused));
       setPrAuthAvailable(Boolean(settings.prAuthAvailable));
       setTaskStuckTimeoutMs(settings.taskStuckTimeoutMs);
+      setStaleHighFanoutBlockerAgeThresholdMs(
+        settings.staleHighFanoutBlockerAgeThresholdMs ?? 2 * 60 * 60 * 1000,
+      );
       setShowQuickChatFAB(settings.showQuickChatFAB === true);
       setExperimentalFeatures(settings.experimentalFeatures ?? {});
       const features = settings.experimentalFeatures ?? {};
       setInsightsEnabled(features.insights === true);
-      setRoadmapEnabled(features.roadmap === true);
       setMemoryEnabled(features.memoryView === true);
       setDevServerEnabled(features.devServerView === true || features.devServer === true);
       setTodosEnabled(features.todoView === true);
@@ -95,7 +97,6 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
     setSettingsLoaded(false);
     setExperimentalFeatures({});
     setInsightsEnabled(false);
-    setRoadmapEnabled(false);
     setMemoryEnabled(false);
     setDevServerEnabled(false);
     setTodosEnabled(false);
@@ -172,12 +173,12 @@ export function useAppSettings(projectId?: string): UseAppSettingsResult {
     globalPaused,
     enginePaused,
     taskStuckTimeoutMs,
+    staleHighFanoutBlockerAgeThresholdMs,
     showQuickChatFAB,
     prAuthAvailable,
     settingsLoaded,
     experimentalFeatures,
     insightsEnabled,
-    roadmapEnabled,
     memoryEnabled,
     devServerEnabled,
     todosEnabled,

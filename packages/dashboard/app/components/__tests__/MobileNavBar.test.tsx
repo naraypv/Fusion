@@ -36,6 +36,7 @@ const createDefaultProps = () => ({
   onOpenMailbox: vi.fn(),
   onOpenNodes: vi.fn(),
   mailboxUnreadCount: 0,
+  mailboxPendingApprovalCount: 0,
   onOpenGitManager: vi.fn(),
   onOpenWorkflowSteps: vi.fn(),
   onOpenSchedules: vi.fn(),
@@ -70,29 +71,28 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-nav-tab-more")).toBeDefined();
   });
 
-  it("renders roadmaps tab when experimentalFeatures.roadmap is true", () => {
-    render(<MobileNavBar {...createDefaultProps()} experimentalFeatures={{ roadmap: true }} />);
-    expect(screen.getByTestId("mobile-nav-tab-roadmaps")).toBeDefined();
+  it("does not render legacy roadmaps tab", () => {
+    render(<MobileNavBar {...createDefaultProps()} experimentalFeatures={{}} />);
+    expect(screen.queryByTestId("mobile-nav-tab-roadmaps")).toBeNull();
   });
 
-  it("keeps optional tabs within mobile top-level capacity by overflowing roadmaps into More", () => {
-    render(<MobileNavBar {...createDefaultProps()} showSkillsTab={true} experimentalFeatures={{ roadmap: true }} />);
+  it("keeps skills available without rendering legacy roadmaps destinations", () => {
+    render(<MobileNavBar {...createDefaultProps()} showSkillsTab={true} experimentalFeatures={{}} />);
 
     expect(screen.getByTestId("mobile-nav-tab-skills")).toBeDefined();
     expect(screen.queryByTestId("mobile-nav-tab-roadmaps")).toBeNull();
 
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
-    expect(screen.getByTestId("mobile-more-item-roadmaps")).toBeDefined();
+    expect(screen.queryByTestId("mobile-more-item-roadmaps")).toBeNull();
   });
 
-  it("moves skills into More when roadmaps is the active optional top-level tab", () => {
-    render(<MobileNavBar {...createDefaultProps()} view="roadmaps" showSkillsTab={true} experimentalFeatures={{ roadmap: true }} />);
+  it("keeps skills top-level regardless of legacy roadmaps view value", () => {
+    render(<MobileNavBar {...createDefaultProps()} view="board" showSkillsTab={true} experimentalFeatures={{}} />);
 
-    expect(screen.getByTestId("mobile-nav-tab-roadmaps")).toBeDefined();
-    expect(screen.queryByTestId("mobile-nav-tab-skills")).toBeNull();
+    expect(screen.getByTestId("mobile-nav-tab-skills")).toBeDefined();
 
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
-    expect(screen.getByTestId("mobile-more-item-skills")).toBeDefined();
+    expect(screen.queryByTestId("mobile-more-item-skills")).toBeNull();
   });
 
   it("does not render skills tab when showSkillsTab is false", () => {
@@ -105,7 +105,33 @@ describe("MobileNavBar", () => {
     expect(screen.queryByTestId("mobile-nav-tab-skills")).toBeNull();
   });
 
-  it("renders dependency graph as a top-level tab and keeps additional plugin views in More", () => {
+  it("keeps Todos in the mobile More sheet when todoView is enabled", () => {
+    const onOpenTodos = vi.fn();
+    render(
+      <MobileNavBar
+        {...createDefaultProps()}
+        onOpenTodos={onOpenTodos}
+        experimentalFeatures={{ todoView: true }}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+    fireEvent.click(screen.getByTestId("mobile-more-item-todos"));
+
+    expect(onOpenTodos).toHaveBeenCalled();
+  });
+
+  it("shows mailbox pending-approval indicator when mailbox tab is inactive", () => {
+    render(<MobileNavBar {...createDefaultProps()} mailboxPendingApprovalCount={2} />);
+    expect(screen.getByLabelText("Pending approvals")).toBeInTheDocument();
+  });
+
+  it("hides mailbox pending-approval indicator when mailbox tab is active", () => {
+    render(<MobileNavBar {...createDefaultProps()} mailboxPendingApprovalCount={2} view="mailbox" />);
+    expect(screen.queryByLabelText("Pending approvals")).toBeNull();
+  });
+
+  it("keeps dependency graph in More and routes to canonical graph task view", () => {
     const props = createDefaultProps();
     render(
       <MobileNavBar
@@ -123,14 +149,14 @@ describe("MobileNavBar", () => {
       />,
     );
 
-    const primaryTab = screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph");
-    expect(primaryTab.querySelector(".lucide-map")).toBeTruthy();
-    fireEvent.click(primaryTab);
-    expect(props.onChangeView).toHaveBeenCalledWith("plugin:fusion-plugin-dependency-graph:graph");
+    expect(screen.queryByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
 
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
-    expect(screen.queryByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
+    const graphItem = screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-graph");
+    fireEvent.click(graphItem);
+    expect(props.onChangeView).toHaveBeenCalledWith("graph");
 
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
     const overflowItem = screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-queue");
     expect(overflowItem.querySelector(".lucide-workflow")).toBeTruthy();
     fireEvent.click(overflowItem);
@@ -161,11 +187,11 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-more-item-plugin-fusion-plugin-dependency-graph-queue")).toBeDefined();
   });
 
-  it("marks dependency graph plugin tab active when viewing its canonical plugin task-view", () => {
+  it("marks More active when current view is graph", () => {
     render(
       <MobileNavBar
         {...createDefaultProps()}
-        view="plugin:fusion-plugin-dependency-graph:graph"
+        view="graph"
         pluginDashboardViews={[
           {
             pluginId: "fusion-plugin-dependency-graph",
@@ -179,8 +205,7 @@ describe("MobileNavBar", () => {
       />,
     );
 
-    expect(screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph").className).toContain("mobile-nav-tab--active");
-    expect(screen.getByTestId("mobile-nav-tab-more").className).not.toContain("mobile-nav-tab--active");
+    expect(screen.getByTestId("mobile-nav-tab-more").className).toContain("mobile-nav-tab--active");
   });
 
   it("marks More active when current plugin view is overflow-only", () => {
@@ -202,7 +227,7 @@ describe("MobileNavBar", () => {
     );
 
     expect(screen.getByTestId("mobile-nav-tab-more").className).toContain("mobile-nav-tab--active");
-    expect(screen.getByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph").className).not.toContain("mobile-nav-tab--active");
+    expect(screen.queryByTestId("mobile-nav-tab-plugin-fusion-plugin-dependency-graph-graph")).toBeNull();
   });
 
   it("active tab is highlighted for mailbox", () => {
@@ -299,6 +324,16 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-nav-tab-missions").className).not.toContain("mobile-nav-tab--active");
   });
 
+  it("shows chat unread indicator when chatHasUnreadResponse is true and chat tab is inactive", () => {
+    render(<MobileNavBar {...createDefaultProps()} view="board" chatHasUnreadResponse={true} />);
+    expect(screen.getByLabelText("Unread chat response")).toBeInTheDocument();
+  });
+
+  it("hides chat unread indicator when chat tab is active", () => {
+    render(<MobileNavBar {...createDefaultProps()} view="chat" chatHasUnreadResponse={true} />);
+    expect(screen.queryByLabelText("Unread chat response")).toBeNull();
+  });
+
   it("skills tab calls onChangeView with 'skills'", () => {
     const props = createDefaultProps();
     render(<MobileNavBar {...props} view="board" showSkillsTab={true} />);
@@ -328,6 +363,19 @@ describe("MobileNavBar", () => {
     expect(container.querySelector(".mobile-more-sheet")).toBeNull();
   });
 
+  it("renders shell connection control in More sheet when provided", () => {
+    render(
+      <MobileNavBar
+        {...createDefaultProps()}
+        shellConnectionControl={<button type="button">Manage connections</button>}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+
+    expect(screen.getByTestId("mobile-more-shell-connection")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Manage connections" })).toBeInTheDocument();
+  });
+
   it("sheet contains expected navigation items including activity log", () => {
     render(<MobileNavBar {...createDefaultProps()} />);
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
@@ -350,17 +398,17 @@ describe("MobileNavBar", () => {
     expect(screen.getByTestId("mobile-more-item-settings")).toBeDefined();
   });
 
-  it("shows roadmaps in more sheet when experimentalFeatures.roadmap is true", () => {
-    render(<MobileNavBar {...createDefaultProps()} experimentalFeatures={{ roadmap: true }} />);
+  it("does not show legacy roadmaps in more sheet", () => {
+    render(<MobileNavBar {...createDefaultProps()} experimentalFeatures={{}} />);
     fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
-    expect(screen.getByTestId("mobile-more-item-roadmaps")).toBeDefined();
+    expect(screen.queryByTestId("mobile-more-item-roadmaps")).toBeNull();
   });
 
   it("suppresses legacy roadmaps entries when roadmap plugin view is registered", () => {
     render(
       <MobileNavBar
         {...createDefaultProps()}
-        experimentalFeatures={{ roadmap: true }}
+        experimentalFeatures={{}}
         pluginDashboardViews={[
           {
             pluginId: "fusion-plugin-roadmap",
@@ -448,6 +496,24 @@ describe("MobileNavBar", () => {
 
     expect(container.querySelector(".mobile-more-sheet")).toBeNull();
     expect(props.onChangeView).toHaveBeenCalledWith("research");
+  });
+
+  it("hides evals item in more sheet when evalsView is not enabled", () => {
+    render(<MobileNavBar {...createDefaultProps()} experimentalFeatures={{}} />);
+
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+    expect(screen.queryByTestId("mobile-more-item-evals")).toBeNull();
+  });
+
+  it("evals item in more sheet calls onChangeView with 'evals' when evalsView is enabled", () => {
+    const props = createDefaultProps();
+    const { container } = render(<MobileNavBar {...props} experimentalFeatures={{ evalsView: true }} />);
+
+    fireEvent.click(screen.getByTestId("mobile-nav-tab-more"));
+    fireEvent.click(screen.getByTestId("mobile-more-item-evals"));
+
+    expect(container.querySelector(".mobile-more-sheet")).toBeNull();
+    expect(props.onChangeView).toHaveBeenCalledWith("evals");
   });
 
   it("activity log item in more sheet calls onOpenActivityLog", () => {

@@ -562,6 +562,27 @@ vi.mock("../agent-session-helpers.js", async () => {
       pi.promptWithFallback(session, prompt, options as any),
     ),
     describeAgentModel: vi.fn(async (session: any) => pi.describeModel(session)),
+    resolveExecutorSessionModel: vi.fn((taskModelProvider?: string, taskModelId?: string, settings?: any, assignedAgentRuntimeConfig?: Record<string, unknown>) => {
+      const model = typeof assignedAgentRuntimeConfig?.model === "string" ? assignedAgentRuntimeConfig.model : "";
+      const slash = model.indexOf("/");
+      if (slash > 0 && slash < model.length - 1) {
+        return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+      }
+      if (taskModelProvider && taskModelId) return { provider: taskModelProvider, modelId: taskModelId };
+      if (settings?.executionProvider && settings?.executionModelId) {
+        return { provider: settings.executionProvider, modelId: settings.executionModelId };
+      }
+      if (settings?.executionGlobalProvider && settings?.executionGlobalModelId) {
+        return { provider: settings.executionGlobalProvider, modelId: settings.executionGlobalModelId };
+      }
+      if (settings?.defaultProviderOverride && settings?.defaultModelIdOverride) {
+        return { provider: settings.defaultProviderOverride, modelId: settings.defaultModelIdOverride };
+      }
+      if (settings?.defaultProvider && settings?.defaultModelId) {
+        return { provider: settings.defaultProvider, modelId: settings.defaultModelId };
+      }
+      return { provider: undefined, modelId: undefined };
+    }),
   };
 });
 
@@ -716,6 +737,32 @@ describe("StepSessionExecutor", () => {
   });
 
   describe("sequential execution", () => {
+    it("forwards taskEnv into step session creation", async () => {
+      const prompt = makeStepPrompt("FN-001", 1);
+      const task = makeTaskDetail({ prompt, steps: [{ name: "Step 0", status: "pending" }] });
+      const settings = makeSettings({ maxParallelSteps: 1 });
+      const session = makeMockSession();
+      mockedCreateFnAgent.mockResolvedValue({ session } as any);
+
+      const executor = new StepSessionExecutor({
+        taskDetail: task,
+        worktreePath: "/project/.worktrees/main",
+        rootDir: "/project",
+        settings,
+        pluginRunner: undefined,
+        taskEnv: { PATH: "/task/bin", TASK_ONLY: "1" },
+      } as any);
+
+      const result = await executor.executeAll();
+      expect(result).toHaveLength(1);
+      expect(result[0]?.success).toBe(true);
+      expect(mockedCreateFnAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskEnv: { PATH: "/task/bin", TASK_ONLY: "1" },
+        }),
+      );
+    });
+
     it("happy path: 3-step task, all steps succeed", async () => {
       const prompt = makeStepPrompt("FN-001", 3);
       const task = makeTaskDetail({ prompt, steps: [

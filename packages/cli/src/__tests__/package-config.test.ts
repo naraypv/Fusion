@@ -22,8 +22,19 @@ function loadRootPackageJson(): any {
   return JSON.parse(readFileSync(path, "utf-8"));
 }
 
+function loadCliPrepackScript(): string {
+  const path = join(workspaceRoot, "packages", "cli", "scripts", "prepare-publish-manifest.mjs");
+  return readFileSync(path, "utf-8");
+}
+
+function hasProjectArg(script: string | undefined, project: string): boolean {
+  const parts = script?.trim().split(/\s+/) ?? [];
+  return parts.some((part, index) => part === "--project" && parts[index + 1] === project);
+}
+
 describe("CLI package.json publishing config", () => {
   const pkg = loadPackageJson("cli");
+  const prepackScript = loadCliPrepackScript();
 
   it('has "bin" field with fn pointing to ./dist/bin.js', () => {
     expect(pkg.bin).toBeDefined();
@@ -80,6 +91,12 @@ describe("CLI package.json publishing config", () => {
     expect(deps).toContain("ioredis");
   });
 
+  it("prepack manifest rewrite strips workspace-only plugin/tooling devDependencies", () => {
+    expect(prepackScript).toContain('delete devDependencies["@fusion/pi-claude-cli"]');
+    expect(prepackScript).toContain('delete devDependencies["@fusion/pi-llama-cpp"]');
+    expect(prepackScript).toContain('delete devDependencies["@fusion-plugin-examples/roadmap"]');
+  });
+
   // Generalized guard derived from tsup.config.ts. Any non-builtin module
   // marked `external` MUST be a runtime dep (so `npm install @runfusion/fusion`
   // can resolve it after publish), and any module pulled in via `noExternal`
@@ -93,17 +110,20 @@ describe("CLI package.json publishing config", () => {
     );
 
     function extractStringArray(name: string): string[] {
-      const m = tsupRaw.match(new RegExp(`${name}:\\s*\\[([\\s\\S]*?)\\]`, "m"));
-      if (!m) return [];
-      return [...m[1].matchAll(/["']([^"']+)["']/g)].map((mm) => mm[1]);
+      const matches = [...tsupRaw.matchAll(new RegExp(`${name}:\\s*\\[([\\s\\S]*?)\\]`, "gm"))];
+      const values = matches.flatMap((m) =>
+        [...m[1].matchAll(/["']([^"']+)["']/g)].map((mm) => mm[1]),
+      );
+      return [...new Set(values)];
     }
 
     function extractRegexes(name: string): RegExp[] {
-      const m = tsupRaw.match(new RegExp(`${name}:\\s*\\[([\\s\\S]*?)\\]`, "m"));
-      if (!m) return [];
+      const matches = [...tsupRaw.matchAll(new RegExp(`${name}:\\s*\\[([\\s\\S]*?)\\]`, "gm"))];
       // Match `/PATTERN/flags` where PATTERN may contain escaped slashes (`\/`).
-      return [...m[1].matchAll(/\/((?:\\\/|[^/\n])+)\/[gimsuy]*/g)].map(
-        (mm) => new RegExp(mm[1].replace(/\\\//g, "/")),
+      return matches.flatMap((m) =>
+        [...m[1].matchAll(/\/((?:\\\/|[^/\n])+)\/[gimsuy]*/g)].map(
+          (mm) => new RegExp(mm[1].replace(/\\\//g, "/")),
+        ),
       );
     }
 
@@ -118,9 +138,10 @@ describe("CLI package.json publishing config", () => {
     const TRANSITIVE_EXTERNALS: Record<string, string> = {
       ssh2: "transitive dep of dockerode",
       "cpu-features": "transitive dep of dockerode (via ssh2)",
-      "node-pty": "only loaded by the Bun-compiled binary from dist/runtime/",
       "@homebridge/node-pty-prebuilt-multiarch":
-        "only loaded by the Bun-compiled binary from dist/runtime/",
+        "aliased as node-pty in dependencies; the alias entry satisfies the import",
+      "@fusion/core": "plugin-entry bundling external only; not a runtime dep of the CLI bin",
+      "@fusion/engine": "plugin-entry bundling external only; not a runtime dep of the CLI bin",
     };
 
     it("parses externals from tsup.config.ts", () => {
@@ -211,10 +232,11 @@ describe("Scoped @fusion/* packages publishing config", () => {
 
 describe("Workspace bootstrap script contract", () => {
   const rootPkg = loadRootPackageJson();
+  const dashboardPkg = loadPackageJson("dashboard");
 
   it("makes root test changed-only while keeping explicit full-suite and CI-shard commands", () => {
     expect(rootPkg.scripts?.test).toBe("node scripts/test-changed.mjs");
-    expect(rootPkg.scripts?.["test:full"]).toContain("pnpm -r --workspace-concurrency=2 test");
+    expect(rootPkg.scripts?.["test:full"]).toBe("node scripts/test-changed.mjs --full --no-cache");
     expect(rootPkg.scripts?.["test:full"]).not.toContain("pnpm build");
     expect(rootPkg.scripts?.["test:ci:shard"]).toBe("node scripts/ci-test-shard.mjs");
   });
@@ -246,6 +268,21 @@ describe("Workspace bootstrap script contract", () => {
     expect(rootPkg.scripts?.["mobile:build"]).toBe(
       "pnpm --filter @fusion/dashboard build && pnpm --filter @fusion/mobile cap sync",
     );
+  });
+
+  it("keeps dashboard's default test lane curated with explicit deep coverage", () => {
+    const defaultTest = dashboardPkg.scripts?.test;
+    const deepTest = dashboardPkg.scripts?.["test:deep"];
+
+    expect(hasProjectArg(defaultTest, "dashboard-app-quality")).toBe(true);
+    expect(hasProjectArg(defaultTest, "dashboard-api-quality")).toBe(true);
+    expect(hasProjectArg(defaultTest, "dashboard-app")).toBe(false);
+    expect(hasProjectArg(defaultTest, "dashboard-api")).toBe(false);
+
+    expect(hasProjectArg(deepTest, "dashboard-app")).toBe(true);
+    expect(hasProjectArg(deepTest, "dashboard-api")).toBe(true);
+    expect(hasProjectArg(deepTest, "dashboard-app-quality")).toBe(false);
+    expect(hasProjectArg(deepTest, "dashboard-api-quality")).toBe(false);
   });
 });
 

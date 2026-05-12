@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const { mockSyncStartupModels } = vi.hoisted(() => ({
   mockSyncStartupModels: vi.fn().mockResolvedValue(undefined),
@@ -53,7 +55,7 @@ const {
     mockSelfHealingStop: vi.fn(),
     mockCheckStuckBudget: vi.fn().mockResolvedValue(true),
     mockStuckCheckNow: vi.fn().mockResolvedValue(undefined),
-    mockResolveGlobalDir: vi.fn().mockReturnValue("/tmp/test-global"),
+    mockResolveGlobalDir: vi.fn(),
     mockGlobalSettingsGetSettings: vi.fn().mockResolvedValue({}),
     mockGlobalSettingsUpdateSettings: vi.fn().mockResolvedValue({}),
     mockDaemonTokenGetOrCreate: vi.fn().mockResolvedValue("fn_test_dashboard_token"),
@@ -74,6 +76,17 @@ function makeMockStore() {
     updateMission: vi.fn(),
     listMilestones: vi.fn().mockReturnValue([]),
     listFeatures: vi.fn().mockReturnValue([]),
+  };
+  const mockPluginStore = {
+    init: vi.fn().mockResolvedValue(undefined),
+    listPlugins: vi.fn().mockResolvedValue([]),
+    getPlugin: vi.fn(),
+    registerPlugin: vi.fn(),
+    enablePlugin: vi.fn(),
+    disablePlugin: vi.fn(),
+    updatePluginSettings: vi.fn(),
+    unregisterPlugin: vi.fn(),
+    updatePluginState: vi.fn(),
   };
   return {
     init: vi.fn().mockResolvedValue(undefined),
@@ -101,6 +114,7 @@ function makeMockStore() {
     })),
     getActiveMergingTask: vi.fn().mockReturnValue(undefined),
     getMissionStore: vi.fn().mockReturnValue(mockMissionStore),
+    getPluginStore: vi.fn().mockReturnValue(mockPluginStore),
     close: vi.fn(),
     on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
       emitter.on(event, handler);
@@ -792,12 +806,11 @@ function resetGitHubMocks() {
   });
 }
 
-const updateCacheDir = "/tmp/test-global";
-const updateCachePath = `${updateCacheDir}/update-check.json`;
+let updateCacheDir = "";
 
 function writeUpdateCache(payload: { updateAvailable: boolean; latestVersion: string; currentVersion: string }): void {
   mkdirSync(updateCacheDir, { recursive: true });
-  writeFileSync(updateCachePath, JSON.stringify(payload), "utf-8");
+  writeFileSync(`${updateCacheDir}/update-check.json`, JSON.stringify(payload), "utf-8");
 }
 
 beforeEach(() => {
@@ -811,8 +824,12 @@ beforeEach(() => {
   mockExec.mockClear();
   mockStuckCheckNow.mockReset();
   mockStuckCheckNow.mockResolvedValue(undefined);
+  if (updateCacheDir) {
+    rmSync(updateCacheDir, { recursive: true, force: true });
+  }
+  updateCacheDir = mkdtempSync(join(tmpdir(), "fusion-dashboard-test-"));
   mockResolveGlobalDir.mockReset();
-  mockResolveGlobalDir.mockReturnValue("/tmp/test-global");
+  mockResolveGlobalDir.mockReturnValue(updateCacheDir);
   mockGlobalSettingsGetSettings.mockReset();
   mockGlobalSettingsGetSettings.mockResolvedValue({});
   mockGlobalSettingsUpdateSettings.mockReset();
@@ -821,12 +838,14 @@ beforeEach(() => {
   mockDaemonTokenGetOrCreate.mockResolvedValue("fn_test_dashboard_token");
   mockGetCliPackageVersion.mockReset();
   mockGetCliPackageVersion.mockReturnValue(CLI_PACKAGE_VERSION);
-  rmSync(updateCacheDir, { recursive: true, force: true });
 });
 
 afterEach(() => {
   disposeTrackedDashboards();
-  rmSync(updateCacheDir, { recursive: true, force: true });
+  if (updateCacheDir) {
+    rmSync(updateCacheDir, { recursive: true, force: true });
+  }
+  updateCacheDir = "";
 });
 
 describe("PR merge helpers", () => {
@@ -882,6 +901,7 @@ describe("processPullRequestMergeTask", () => {
       title: "FN-093: Add support for creating pull requests",
       body: "Automated PR for FN-093.\n\nImplement PR automation",
       head: "fusion/fn-093",
+      base: "main",
     });
     expect(store.updatePrInfo).toHaveBeenCalledWith(
       "FN-093",
@@ -1107,6 +1127,7 @@ describe("runDashboard — PR-first auto-merge queue", () => {
       title: "FN-093: Task",
       body: "Automated PR for FN-093.\n\nDescription",
       head: "fusion/fn-093",
+      base: "main",
     });
     expect(aiMergeTask).not.toHaveBeenCalled();
   });
@@ -1135,6 +1156,7 @@ describe("runDashboard — PR-first auto-merge queue", () => {
       title: "FN-093: Task",
       body: "Automated PR for FN-093.\n\nDescription",
       head: "fusion/fn-093",
+      base: "main",
     });
     expect(aiMergeTask).not.toHaveBeenCalled();
   });

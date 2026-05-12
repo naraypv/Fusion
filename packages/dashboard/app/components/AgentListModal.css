@@ -160,8 +160,7 @@
   border-top-color: var(--state-active-border);
 }
 .agent-list-modal .agent-board-card[data-state="paused"] { border-top-color: var(--state-paused-border); }
-.agent-list-modal .agent-board-card[data-state="error"],
-.agent-list-modal .agent-board-card[data-state="terminated"] { border-top-color: var(--state-error-border); }
+.agent-list-modal .agent-board-card[data-state="error"] { border-top-color: var(--state-error-border); }
 
 .agent-list-modal .agent-board-badge[data-state="idle"],
 .agent-list-modal .agent-list-state-badge[data-state="idle"] {
@@ -187,9 +186,7 @@
 }
 
 .agent-list-modal .agent-board-badge[data-state="error"],
-.agent-list-modal .agent-board-badge[data-state="terminated"],
-.agent-list-modal .agent-list-state-badge[data-state="error"],
-.agent-list-modal .agent-list-state-badge[data-state="terminated"] {
+.agent-list-modal .agent-list-state-badge[data-state="error"] {
   background: var(--state-error-bg);
   color: var(--state-error-text);
   border: 1px solid var(--state-error-border);
@@ -222,8 +219,7 @@
   border-left-color: var(--state-active-border);
 }
 .agent-list-modal .agent-card[data-state="paused"] { border-left-color: var(--state-paused-border); }
-.agent-list-modal .agent-card[data-state="error"],
-.agent-list-modal .agent-card[data-state="terminated"] { border-left-color: var(--state-error-border); }
+.agent-list-modal .agent-card[data-state="error"] { border-left-color: var(--state-error-border); }
 
 .spin {
   animation: spin 1s linear infinite;

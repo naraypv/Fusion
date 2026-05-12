@@ -56,7 +56,18 @@ export function MergeDetails({ task }: MergeDetailsProps) {
           <div className="detail-log-entry">
             <div className="detail-log-header">
               <span className="detail-log-action">PR</span>
-              <span className="detail-log-outcome">#{details.prNumber}</span>
+              {task.prInfo?.url ? (
+                <a
+                  className="detail-source-link detail-log-outcome"
+                  href={task.prInfo.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  #{details.prNumber}
+                </a>
+              ) : (
+                <span className="detail-log-outcome">#{details.prNumber}</span>
+              )}
             </div>
           </div>
         ) : null}

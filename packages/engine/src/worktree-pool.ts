@@ -304,7 +304,7 @@ export async function scanIdleWorktrees(rootDir: string, store: TaskStore): Prom
   const registeredDirs = dirs.filter((dir) => registeredWorktrees.has(resolve(dir)));
 
   // Find worktree paths assigned to non-done tasks (active worktrees)
-  const tasks = await store.listTasks({ slim: true, includeArchived: false });
+  const tasks = await store.listTasks({ slim: true, includeArchived: false, startupMemo: true });
   const activeWorktrees = new Set<string>();
   for (const task of tasks) {
     if (task.worktree && task.column !== "done" && registeredWorktrees.has(resolve(task.worktree))) {

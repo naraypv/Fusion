@@ -29,6 +29,8 @@ The context provides core cross-cutting plumbing:
 - `register-node-routes.ts` — `/nodes` CRUD + operational endpoints (`/health-check`, `/metrics`, `/version`, `/sync-plugins`, `/compatibility`)
 - `register-settings-sync-routes.ts` — node settings/auth sync routes (`/nodes/:id/settings*`, `/nodes/:id/auth/sync`)
 - `register-mesh-routes.ts` — mesh topology routes (`/mesh/state`, `/mesh/sync`)
+  - `GET /mesh/state` now aggregates per-node local snapshots from reachable remote nodes by default so callers see full mesh state regardless of which node they are connected to.
+  - Internal peer calls should pass `?includeRemote=false` to return only the local node snapshot and avoid fan-out recursion.
 - `register-discovery-routes.ts` — discovery routes (`/discovery/status|start|stop|nodes|connect`) with `options?.centralCore` reuse
 - `register-settings-sync-inbound-routes.ts` — inbound sync/auth endpoints (`/settings/sync-receive`, `/settings/auth-receive`, `/settings/auth-export`)
 - `register-settings-sync-helpers.ts` — shared sync-domain helpers (`fetchFromRemoteNode`, `readStoredAuthProvidersFromDisk`)
@@ -135,8 +137,9 @@ Integrated routers are mounted through `register-integrated-routers.ts` and inte
 
 - `registerIntegratedRouters(...)` mounts:
   - `createMissionRouter` → `/api/missions`
-  - `createRoadmapRouter` → `/api/roadmaps`
   - `createInsightsRouter` → `/api/insights`
+  - `createTodoRouter` → `/api/todos`
+- Roadmap endpoints are plugin-owned and exposed under `/api/plugins/fusion-plugin-roadmap/...`.
 - `registerIntegratedDevServerRouter(...)` mounts:
   - `createDevServerRouter` → `/api/dev-server`
 

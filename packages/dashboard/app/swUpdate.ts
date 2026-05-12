@@ -15,9 +15,14 @@ function watchInstalling(installing: ServiceWorker): void {
 export function installSwUpdate(): void {
   if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
 
+  // controllerchange fires on first install too (sw.js calls clients.claim()),
+  // but there's no prior version to swap out — reloading there races with the
+  // in-flight chunk loads and strands the page on a blank shell. Only reload
+  // when an existing controller is being replaced by a new one.
+  const wasControlled = !!navigator.serviceWorker.controller;
   let reloading = false;
   navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (reloading) return;
+    if (reloading || !wasControlled) return;
     reloading = true;
     reloadOnce("service worker activated new version");
   });

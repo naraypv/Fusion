@@ -6,6 +6,7 @@ import { ResearchProviderError } from "../types.js";
 
 const log = createLogger("research:llm-synthesis");
 const DEFAULT_TIMEOUT_MS = 120_000;
+const SYNTHESIS_BUILTIN_WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
 const LARGE_MODEL_CONTEXT_CHARS = 100_000;
 const SMALL_MODEL_CONTEXT_CHARS = 30_000;
 
@@ -54,6 +55,7 @@ export class LLMSynthesisProvider implements ResearchProvider {
       const { session } = await createFnAgent({
         cwd: this.options.projectRoot,
         tools: "readonly",
+        builtinToolsAllowlist: [...SYNTHESIS_BUILTIN_WEB_TOOLS],
         systemPrompt: "You synthesize research findings into concise, cited outputs.",
         defaultProvider: modelSelection.provider,
         defaultModelId: modelSelection.modelId,

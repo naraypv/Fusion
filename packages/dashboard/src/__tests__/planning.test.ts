@@ -361,6 +361,18 @@ describe("planning module", () => {
       expect(session?.agent).toBeDefined();
     });
 
+    it("passes builtin web tool allowlist when creating non-streaming planning agent", async () => {
+      const createFnAgentSpy = vi.fn(async () => createMockAgent(STANDARD_QUESTION_RESPONSES));
+      __setCreateFnAgent(createFnAgentSpy as any);
+
+      await createSession(getUniqueIp(), initialPlan, undefined, TEST_ROOT_DIR);
+
+      expect(createFnAgentSpy).toHaveBeenCalledWith(expect.objectContaining({
+        tools: "readonly",
+        builtinToolsAllowlist: ["WebSearch", "WebFetch"],
+      }));
+    });
+
     it("cleans up session on agent failure", async () => {
       __setCreateFnAgent(async () => {
         throw new Error("Agent creation failed");
@@ -447,6 +459,7 @@ describe("planning module", () => {
       const callArg = createFnAgentSpy.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(callArg?.defaultProvider).toBeUndefined();
       expect(callArg?.defaultModelId).toBeUndefined();
+      expect(callArg?.builtinToolsAllowlist).toEqual(["WebSearch", "WebFetch"]);
     });
 
     it("uses custom prompt from promptOverrides when provided", async () => {
@@ -839,7 +852,7 @@ describe("planning module", () => {
       await expect(submitResponse("invalid-session-id", {})).rejects.toThrow(SessionNotFoundError);
     });
 
-    it("throws InvalidSessionStateError when no active question", async () => {
+    it("throws InvalidSessionStateError when no active question and not refining", async () => {
       const mockIp = getUniqueIp();
       const { sessionId } = await createSession(mockIp, initialPlan, undefined, TEST_ROOT_DIR);
 
@@ -850,6 +863,88 @@ describe("planning module", () => {
 
       // Try to submit another response
       await expect(submitResponse(sessionId, {})).rejects.toThrow(InvalidSessionStateError);
+    });
+
+    it("continues from summary when refine is requested", async () => {
+      const mockIp = getUniqueIp();
+      setupMockAgent([
+        ...STANDARD_QUESTION_RESPONSES,
+        JSON.stringify({
+          type: "question",
+          data: {
+            id: "q-refine",
+            type: "text",
+            question: "What should we tighten in this plan?",
+            description: "Refine follow-up",
+          },
+        }),
+      ]);
+
+      const { sessionId } = await createSession(mockIp, initialPlan, undefined, TEST_ROOT_DIR);
+      await submitResponse(sessionId, { scope: "small" }, TEST_ROOT_DIR);
+      await submitResponse(sessionId, { requirements: "test" }, TEST_ROOT_DIR);
+      await submitResponse(sessionId, { confirm: true }, TEST_ROOT_DIR);
+
+      const response = await submitResponse(sessionId, { refine: true }, TEST_ROOT_DIR);
+      expect(response.type).toBe("question");
+      if (response.type === "question") {
+        expect(response.data.id).toBe("q-refine");
+      }
+      expect(getSummary(sessionId)).toBeUndefined();
+    });
+
+    it("rehydrates a completed persisted session and refines from summary", async () => {
+      const store = new MockAiSessionStore();
+      const summary = {
+        title: "Recovered summary",
+        description: "Recovered summary description",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: ["Deliverable"],
+      };
+      const row = buildPlanningRow({
+        id: "planning-complete-refine",
+        status: "complete",
+        conversationHistory: JSON.stringify([
+          {
+            question: {
+              id: "q-existing",
+              type: "text",
+              question: "What should we build?",
+              description: "baseline",
+            },
+            response: { "q-existing": "A useful feature" },
+          },
+        ]),
+        currentQuestion: "null",
+        result: JSON.stringify(summary),
+      });
+      store.rows.set(row.id, row);
+      setAiSessionStore(store as any);
+
+      const resumedAgent = createMockAgent([
+        JSON.stringify({
+          type: "question",
+          data: {
+            id: "q-refine-rehydrated",
+            type: "text",
+            question: "Any additional constraints?",
+            description: "Refine resumed",
+          },
+        }),
+      ]);
+      const createFnAgentSpy = vi.fn(async () => resumedAgent);
+      __setCreateFnAgent(createFnAgentSpy as any);
+
+      const response = await submitResponse(row.id, { refine: true }, TEST_ROOT_DIR);
+      expect(response.type).toBe("question");
+      if (response.type === "question") {
+        expect(response.data.id).toBe("q-refine-rehydrated");
+      }
+      expect(createFnAgentSpy).toHaveBeenCalledTimes(1);
+      expect(resumedAgent.session.prompt).toHaveBeenCalledTimes(2);
+      expect(resumedAgent.session.prompt.mock.calls[0]?.[0]).toContain("Previous conversation summary");
+      expect(resumedAgent.session.prompt.mock.calls[1]?.[0]).toContain("Refine Further");
     });
 
     it("reconstructs agent for a rehydrated session and continues conversation", async () => {
@@ -1973,6 +2068,7 @@ describe("planning module", () => {
         title: "Implementation",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: [],
       });
 
@@ -1982,6 +2078,7 @@ describe("planning module", () => {
         title: "Tests",
         description: expect.any(String),
         suggestedSize: "M",
+        priority: "normal",
         dependsOn: ["subtask-1"],
       });
 
@@ -1991,8 +2088,24 @@ describe("planning module", () => {
         title: "Documentation",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: ["subtask-2"],
       });
+    });
+
+    it("inherits summary priority for generated subtasks", async () => {
+      const mockIp = getUniqueIp();
+      const sessionId = await createCompletedSession(mockIp, "Build auth with urgent priority");
+
+      const session = getSession(sessionId);
+      if (!session?.summary) {
+        throw new Error("Expected summary to exist for completed session");
+      }
+      session.summary.priority = "urgent";
+
+      const result = generateSubtasksFromPlanning(sessionId);
+      expect(result.length).toBeGreaterThan(0);
+      expect(result.every((subtask) => subtask.priority === "urgent")).toBe(true);
     });
 
     it("generates deliverable subtasks with distinct lead guidance plus separate plan context", async () => {
@@ -2061,6 +2174,7 @@ describe("planning module", () => {
         title: "Define implementation approach",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: [],
       });
       expect(result[1]).toEqual({
@@ -2068,6 +2182,7 @@ describe("planning module", () => {
         title: "Implement core changes",
         description: expect.any(String),
         suggestedSize: "M",
+        priority: "normal",
         dependsOn: ["subtask-1"],
       });
       expect(result[2]).toEqual({
@@ -2075,6 +2190,7 @@ describe("planning module", () => {
         title: "Verify and polish",
         description: expect.any(String),
         suggestedSize: "S",
+        priority: "normal",
         dependsOn: ["subtask-2"],
       });
       expect(result[0]?.description).toContain("Define the implementation approach for the plan");

@@ -4,6 +4,8 @@ export const GLOBAL_STORAGE_KEYS: string[] = [
   "kb-dashboard-view-mode",
   "kb-dashboard-current-project",
   "kb-dashboard-recent-projects",
+  "fn-agent-log-markdown",
+  "fn-agent-log-tool-output",
 ];
 
 export const PROJECT_STORAGE_KEYS: string[] = [
@@ -14,6 +16,7 @@ export const PROJECT_STORAGE_KEYS: string[] = [
   "kb-dashboard-selected-tasks",
   "kb-dashboard-list-selected-task",
   "kb-dashboard-list-sidebar-width",
+  "kb-dashboard-mailbox-sidebar-width",
   "kb-quick-entry-text",
   "kb-inline-create-text",
   "fn-agent-view",
@@ -26,6 +29,10 @@ export const PROJECT_STORAGE_KEYS: string[] = [
   "kb-usage-modal-size",
   "kb-usage-provider-order",
   "kb-chat-active-session",
+  "kb-dashboard-working-branch-filter",
+  "kb-dashboard-base-branch-filter",
+  "kb-files-line-numbers",
+  "fusion-plugin-dependency-graph:positions",
 ];
 
 export function scopedKey(baseKey: string, projectId?: string): string {
@@ -41,7 +48,12 @@ export function getScopedItem(baseKey: string, projectId?: string): string | nul
     return null;
   }
 
-  return window.localStorage.getItem(scopedKey(baseKey, projectId));
+  const getItem = window.localStorage?.getItem;
+  if (typeof getItem !== "function") {
+    return null;
+  }
+
+  return getItem.call(window.localStorage, scopedKey(baseKey, projectId));
 }
 
 export function setScopedItem(baseKey: string, value: string, projectId?: string): void {
@@ -49,7 +61,12 @@ export function setScopedItem(baseKey: string, value: string, projectId?: string
     return;
   }
 
-  window.localStorage.setItem(scopedKey(baseKey, projectId), value);
+  const setItem = window.localStorage?.setItem;
+  if (typeof setItem !== "function") {
+    return;
+  }
+
+  setItem.call(window.localStorage, scopedKey(baseKey, projectId), value);
 }
 
 export function removeScopedItem(baseKey: string, projectId?: string): void {
@@ -57,5 +74,10 @@ export function removeScopedItem(baseKey: string, projectId?: string): void {
     return;
   }
 
-  window.localStorage.removeItem(scopedKey(baseKey, projectId));
+  const removeItem = window.localStorage?.removeItem;
+  if (typeof removeItem !== "function") {
+    return;
+  }
+
+  removeItem.call(window.localStorage, scopedKey(baseKey, projectId));
 }

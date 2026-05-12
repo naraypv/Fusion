@@ -42,6 +42,16 @@ describe("MissionManager mobile styles", () => {
     expect(section).toContain("word-break: break-word;");
   });
 
+  it("keeps mission detail mobile bottom padding content-only (no shared nav duplication)", () => {
+    const css = loadAllAppCss();
+    const section = getMissionMobileSection(css);
+    const detailRule = section.match(/\.mission-detail\s*\{[^}]*\}/)?.[0] ?? "";
+
+    expect(detailRule).toContain("padding-bottom: var(--space-lg);");
+    expect(detailRule).not.toContain("safe-area-inset-bottom");
+    expect(detailRule).not.toContain("--mobile-nav-height");
+  });
+
   it("hides desktop split layout on mobile", () => {
     const css = loadAllAppCss();
     const section = getMissionMobileSection(css);
@@ -56,6 +66,23 @@ describe("MissionManager mobile styles", () => {
 
     expect(section).toContain(".mission-manager__body--stacked {");
     expect(section).toContain("display: block;");
+  });
+
+  it("keeps the mobile top mission CTA full-width and token-driven", () => {
+    const css = loadAllAppCss();
+
+    const topActionRule = css.match(/\.mission-list__top-action\s*\{[^}]*\}/)?.[0];
+    expect(topActionRule).toContain("display: flex;");
+
+    const topCtaRule = css.match(/\.mission-list__primary-cta\s*\{[^}]*\}/)?.[0];
+    expect(topCtaRule).toContain("width: 100%;");
+    expect(topCtaRule).toContain("justify-content: center;");
+    expect(topCtaRule).toContain("gap: var(--space-sm);");
+
+    const taskCreateRule = css.match(/\.btn-task-create\s*\{[^}]*\}/)?.[0];
+    expect(taskCreateRule).toContain("background: var(--cta-bg);");
+    expect(taskCreateRule).toContain("border-color: var(--cta-border);");
+    expect(taskCreateRule).toContain("color: var(--cta-text);");
   });
 
   it("hides back button on desktop and restores it on mobile", () => {
@@ -116,6 +143,18 @@ describe("desktop two-panel split CSS", () => {
     const css = loadAllAppCss();
     expect(css).toContain(".mission-manager__sidebar-list {");
     expect(css).toContain("overflow-y: auto;");
+  });
+
+  it("anchors desktop Plan New Mission CTA in a sidebar footer with tokenized height", () => {
+    const css = loadAllAppCss();
+
+    const footerRule = css.match(/\.mission-manager__sidebar-footer\s*\{[^}]*\}/)?.[0];
+    expect(footerRule).toContain("border-top: var(--btn-border-width) solid var(--border);");
+
+    const ctaRule = css.match(/\.mission-manager__sidebar-cta\s*\{[^}]*\}/)?.[0];
+    expect(ctaRule).toContain("width: 100%;");
+    expect(ctaRule).toContain("min-height: calc(var(--space-lg) * 2 + var(--space-xs));");
+    expect(ctaRule).toContain("justify-content: center;");
   });
 
   it("defines split container as flex row", () => {

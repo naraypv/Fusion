@@ -13,12 +13,13 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
-import { Eye, EyeOff, MessageSquare, Paperclip, Plus, Send, Square, Wrench, X } from "lucide-react";
+import { ChevronDown, Eye, EyeOff, MessageSquare, Paperclip, Plus, Send, Square, Wrench, X } from "lucide-react";
 import { fetchDiscoveredSkills, fetchModels, type Agent, type ModelInfo } from "../api";
 import type { DiscoveredSkill } from "@fusion/dashboard";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { ProviderIcon } from "./ProviderIcon";
 import { AgentMentionPopup } from "./AgentMentionPopup";
+import { matchesAgentMentionFilter } from "./mentionMatching";
 import { FN_AGENT_ID, useQuickChat, type ChatMessageInfo, type ToolCallInfo } from "../hooks/useQuickChat";
 import { useAgents } from "../hooks/useAgents";
 import { FileMentionPopup } from "./FileMentionPopup";
@@ -30,6 +31,11 @@ interface PendingAttachment {
   file: File;
   /** Object URL for image previews; empty string for non-image attachments. */
   previewUrl: string;
+}
+
+interface QuickChatRoomContext {
+  roomName: string;
+  memberIds: ReadonlySet<string>;
 }
 
 interface QuickChatFABProps {
@@ -49,6 +55,8 @@ interface QuickChatFABProps {
   onToggleFavorite?: (provider: string) => void;
   /** Called when user toggles a model's favorite status */
   onToggleModelFavorite?: (modelId: string) => void;
+  /** Optional room context for member-aware mention UX */
+  roomContext?: QuickChatRoomContext | null;
 }
 
 interface ParsedModelSelection {
@@ -751,6 +759,7 @@ interface QuickChatMessageItemProps {
   message: ChatMessageInfo;
   forcePlain: boolean;
   mentionAgentsByName: Map<string, Agent>;
+  roomContext: QuickChatRoomContext | null;
   onToggleRender: (id: string) => void;
 }
 
@@ -760,6 +769,7 @@ const QuickChatMessageItem = memo(function QuickChatMessageItem({
   message,
   forcePlain,
   mentionAgentsByName,
+  roomContext,
   onToggleRender,
 }: QuickChatMessageItemProps) {
   const isSent = message.role === "user";
@@ -778,8 +788,15 @@ const QuickChatMessageItem = memo(function QuickChatMessageItem({
       const normalizedName = rawName.replace(/_/g, " ").toLowerCase();
       const mentionedAgent = mentionAgentsByName.get(normalizedName);
       if (mentionedAgent) {
+        const isNonMember = Boolean(roomContext && !roomContext.memberIds.has(mentionedAgent.id));
+        const nonMemberLabel = isNonMember ? `Not a member of ${roomContext?.roomName}` : undefined;
         parts.push(
-          <span key={`${mentionedAgent.id}-${start}`} className="chat-mention-chip">
+          <span
+            key={`${mentionedAgent.id}-${start}`}
+            className={`chat-mention-chip${isNonMember ? " chat-mention-chip--non-member" : ""}`}
+            title={nonMemberLabel}
+            aria-label={nonMemberLabel}
+          >
             @{mentionedAgent.name.replace(/\s+/g, "_")}
           </span>,
         );
@@ -791,7 +808,7 @@ const QuickChatMessageItem = memo(function QuickChatMessageItem({
     }
     if (lastIndex < content.length) parts.push(content.slice(lastIndex));
     return parts.length === 0 ? content : parts;
-  }, [isSent, message.content, mentionAgentsByName]);
+  }, [isSent, message.content, mentionAgentsByName, roomContext]);
 
   const assistantBody = useMemo<ReactNode>(() => {
     if (isSent) return null;
@@ -843,6 +860,7 @@ export function QuickChatFAB({
   favoriteModels = [],
   onToggleFavorite,
   onToggleModelFavorite,
+  roomContext = null,
 }: QuickChatFABProps) {
   const { agents } = useAgents(projectId);
   // Internal state for uncontrolled mode, controlled state when open prop is provided
@@ -864,8 +882,9 @@ export function QuickChatFAB({
   // directly on the panel DOM in a layout effect below — going through
   // React state introduces a per-event reconciliation lag that the human
   // eye reads as jank while the iOS keyboard is animating in.
-  useMobileKeyboard({ enabled: isOpen });
+  const { keyboardOpen } = useMobileKeyboard({ enabled: isOpen });
   const viewportMode = useViewportMode();
+  const isMobile = viewportMode === "mobile";
 
   const [chatMode, setChatMode] = useState<"agent" | "model">("agent");
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
@@ -892,6 +911,7 @@ export function QuickChatFAB({
   /** Pending attachments staged in the composer before being sent. */
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [isAttachmentDragOver, setIsAttachmentDragOver] = useState(false);
+  const [isUserScrolling, setIsUserScrolling] = useState(false);
 
   // File mention state and hook
   const [, setFileMentionPopupVisible] = useState(false);
@@ -954,6 +974,7 @@ export function QuickChatFAB({
     startModelChat,
     startFreshSession,
     refreshSessions,
+    skipNextSessionInitRef,
   } = useQuickChat(projectId, addToast);
 
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -977,6 +998,8 @@ export function QuickChatFAB({
   // visually grows to full height immediately on blur and the keyboard
   // slides down on top of it.
   const suppressVvShrinkRef = useRef(false);
+  const isUserScrollingRef = useRef(false);
+  const previousOpenStateRef = useRef<{ isOpen: boolean; sessionId: string | null }>({ isOpen: false, sessionId: null });
 
   // Pin the document at the top while the panel is open on mobile.
   // Otherwise iOS can leave window.scrollY > 0 (e.g. after the keyboard
@@ -1181,6 +1204,10 @@ export function QuickChatFAB({
   }, [isOpen, refreshSessions]);
 
   // Initialize/switch quick chat session whenever the selected target changes.
+  // NOTE: activeSession and sessionsLoading are in the dependency array to
+  // enable retry-when-null (see shouldRetrySessionInit), but the hook's
+  // switchSession now reads activeSession from a ref so it doesn't get a
+  // new identity on every activeSession change.
   useEffect(() => {
     if (!isOpen) {
       prevSessionTargetRef.current = "";
@@ -1189,6 +1216,15 @@ export function QuickChatFAB({
 
     if (!sessionTargetKey) {
       prevSessionTargetRef.current = "";
+      return;
+    }
+
+    // When startFreshSession is in progress, skip the automatic init to
+    // prevent racing with the explicit fresh-session creation.  Record the
+    // target key as "seen" so a later render won't re-trigger for the same
+    // target.
+    if (skipNextSessionInitRef.current) {
+      prevSessionTargetRef.current = sessionTargetKey;
       return;
     }
 
@@ -1220,6 +1256,7 @@ export function QuickChatFAB({
     sessionsLoading,
     startModelChat,
     switchSession,
+    skipNextSessionInitRef,
   ]);
 
   useEffect(() => {
@@ -1327,13 +1364,19 @@ export function QuickChatFAB({
   }, [discoveredSkills, skillFilter]);
 
   const filteredMentionAgents = useMemo(() => {
-    const normalizedFilter = mentionFilter.trim().toLowerCase();
-    if (!normalizedFilter) {
-      return agents;
+    const matchingAgents = agents.filter((agent) => matchesAgentMentionFilter(agent.name, mentionFilter));
+    if (!roomContext) {
+      return matchingAgents;
     }
 
-    return agents.filter((agent) => agent.name.toLowerCase().includes(normalizedFilter));
-  }, [agents, mentionFilter]);
+    const memberAgents = matchingAgents.filter((agent) => roomContext.memberIds.has(agent.id));
+    if (mentionFilter.trim().length === 0) {
+      return memberAgents;
+    }
+
+    const otherAgents = matchingAgents.filter((agent) => !roomContext.memberIds.has(agent.id));
+    return [...memberAgents, ...otherAgents];
+  }, [agents, mentionFilter, roomContext]);
 
   const mentionAgentsByName = useMemo(() => {
     const byName = new Map<string, Agent>();
@@ -1392,13 +1435,111 @@ export function QuickChatFAB({
     };
   }, [isOpen, setIsOpen]);
 
-  // Auto-scroll messages
-  useEffect(() => {
-    if (!isOpen) return;
+  const updateScrollState = useCallback(() => {
     const messagesEl = messagesRef.current;
     if (!messagesEl) return;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }, [messages, streamingText, streamingThinking, isStreaming, isOpen]);
+
+    const threshold = 50;
+    const atBottom = messagesEl.scrollTop + messagesEl.clientHeight >= messagesEl.scrollHeight - threshold;
+    setIsUserScrolling(!atBottom);
+    isUserScrollingRef.current = !atBottom;
+  }, []);
+
+  const anchorToBottom = useCallback((container: HTMLElement) => {
+    if (!container.isConnected) return;
+
+    let frame = 0;
+    let stableFrames = 0;
+    let lastScrollHeight = -1;
+    const maxFrames = 6;
+
+    const writeBottom = () => {
+      if (!container.isConnected) return;
+
+      container.scrollTop = container.scrollHeight;
+      if (container.scrollHeight === lastScrollHeight) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+        lastScrollHeight = container.scrollHeight;
+      }
+
+      frame += 1;
+      if (frame >= maxFrames || stableFrames >= 2) {
+        setIsUserScrolling(false);
+        isUserScrollingRef.current = false;
+        return;
+      }
+
+      window.requestAnimationFrame(writeBottom);
+    };
+
+    writeBottom();
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    const messagesEl = messagesRef.current;
+    if (!messagesEl) return;
+    anchorToBottom(messagesEl);
+  }, [anchorToBottom]);
+
+  useLayoutEffect(() => {
+    const sessionId = activeSession?.id ?? null;
+    const previousState = previousOpenStateRef.current;
+    previousOpenStateRef.current = { isOpen, sessionId };
+
+    if (!isOpen || !sessionId) {
+      return;
+    }
+
+    const openingNow = !previousState.isOpen && isOpen;
+    const sessionChangedWhileOpen = previousState.isOpen && previousState.sessionId !== sessionId;
+    if (!openingNow && !sessionChangedWhileOpen) {
+      return;
+    }
+
+    const messagesEl = messagesRef.current;
+    if (!messagesEl) return;
+
+    anchorToBottom(messagesEl);
+  }, [isOpen, activeSession?.id, anchorToBottom]);
+
+  useEffect(() => {
+    if (!isMobile || !isOpen || !activeSession) {
+      return;
+    }
+
+    const reAnchorToLatest = () => {
+      const messagesEl = messagesRef.current;
+      if (!messagesEl) {
+        return;
+      }
+      anchorToBottom(messagesEl);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      reAnchorToLatest();
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pageshow", reAnchorToLatest);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pageshow", reAnchorToLatest);
+    };
+  }, [isMobile, isOpen, activeSession, anchorToBottom]);
+
+  // Auto-scroll messages when user is near the live tail.
+  useEffect(() => {
+    if (!isOpen) return;
+    if (!isUserScrollingRef.current) {
+      scrollToBottom();
+    }
+  }, [messages, streamingText, streamingThinking, isStreaming, isOpen, scrollToBottom]);
 
   const sessionOptions = useMemo(() => {
     const agentNameById = new Map(agents.map((agent) => [agent.id, agent.name?.trim() || agent.id]));
@@ -1562,7 +1703,7 @@ export function QuickChatFAB({
       return;
     }
 
-    if (trimmed === "/clear") {
+    if (trimmed === "/clear" || trimmed === "/new") {
       stopStreaming();
       clearPendingMessage();
       attachmentsToSend.forEach((attachment) => {
@@ -2020,7 +2161,7 @@ export function QuickChatFAB({
 
       {isOpen && (
         <div
-          className="quick-chat-panel"
+          className={`quick-chat-panel${isMobile && keyboardOpen ? " quick-chat-panel--keyboard-open" : ""}`}
           ref={panelRef}
           data-testid="quick-chat-panel"
           style={{
@@ -2254,7 +2395,7 @@ export function QuickChatFAB({
             </div>
           )}
 
-          <div className="quick-chat-panel-messages" ref={messagesRef} data-testid="quick-chat-messages">
+          <div className="quick-chat-panel-messages" ref={messagesRef} data-testid="quick-chat-messages" onScroll={updateScrollState}>
             {sessionsLoading ? (
               <div className="quick-chat-panel-empty">Loading conversation…</div>
             ) : isStreaming ? (
@@ -2265,12 +2406,13 @@ export function QuickChatFAB({
                     message={message}
                     forcePlain={message.role !== "user" && plainTextMessageIds.has(message.id)}
                     mentionAgentsByName={mentionAgentsByName}
+                    roomContext={roomContext}
                     onToggleRender={toggleMessageRenderMode}
                   />
                 ))}
                 {helpMessageVisible && (
                   <div className="quick-chat-panel-message quick-chat-panel-message--received" data-testid="quick-chat-help-message">
-                    {renderAssistantMessageContent("Available commands:\n- `/clear` — Clear conversation and start fresh\n- `/skill:{name}` — Use a specific skill\n- `/help` — Show this help")}
+                    {renderAssistantMessageContent("Available commands:\n- `/new` or `/clear` — Clear conversation and start fresh\n- `/skill:{name}` — Use a specific skill\n- `/help` — Show this help")}
                   </div>
                 )}
                 <div
@@ -2318,17 +2460,30 @@ export function QuickChatFAB({
                     message={message}
                     forcePlain={message.role !== "user" && plainTextMessageIds.has(message.id)}
                     mentionAgentsByName={mentionAgentsByName}
+                    roomContext={roomContext}
                     onToggleRender={toggleMessageRenderMode}
                   />
                 ))}
                 {helpMessageVisible && (
                   <div className="quick-chat-panel-message quick-chat-panel-message--received" data-testid="quick-chat-help-message">
-                    {renderAssistantMessageContent("Available commands:\n- `/clear` — Clear conversation and start fresh\n- `/skill:{name}` — Use a specific skill\n- `/help` — Show this help")}
+                    {renderAssistantMessageContent("Available commands:\n- `/new` or `/clear` — Clear conversation and start fresh\n- `/skill:{name}` — Use a specific skill\n- `/help` — Show this help")}
                   </div>
                 )}
               </>
             )}
           </div>
+
+          {isUserScrolling && (
+            <button
+              type="button"
+              className="btn btn-sm quick-chat-jump-to-latest"
+              data-testid="quick-chat-jump-to-latest"
+              onClick={scrollToBottom}
+            >
+              <ChevronDown size={14} />
+              Latest
+            </button>
+          )}
 
           {pendingAttachments.length > 0 && (
             <div className="quick-chat-attachment-previews" data-testid="quick-chat-attachment-previews">
@@ -2497,6 +2652,8 @@ export function QuickChatFAB({
                 visible={mentionPopupVisible}
                 onSelect={handleMentionSelect}
                 position="above"
+                roomMemberIds={roomContext?.memberIds}
+                roomName={roomContext?.roomName}
               />
               <FileMentionPopup
                 visible={fileMention.mentionActive && !mentionPopupVisible}

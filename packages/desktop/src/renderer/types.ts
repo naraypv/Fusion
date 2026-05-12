@@ -20,19 +20,13 @@ export interface ElectronApiResponsePayload {
 
 export interface ElectronAPI {
   invoke?: (channel: string, payload?: unknown) => Promise<unknown>;
-  apiRequest?: (method: string, path: string, body?: unknown) => Promise<ElectronApiResponsePayload>;
-  getServerPort?: () => Promise<number>;
+  apiRequest?: (method: string, path: string, body?: unknown) => Promise<unknown>;
+  getServerPort?: () => Promise<number | undefined>;
   windowControl?: (action: WindowControlAction) => Promise<boolean | void>;
   onUpdateAvailable?: (callback: (info: Record<string, unknown>) => void) => (() => void) | void;
   installUpdate?: () => Promise<void>;
-  onDeepLink?: (callback: (url: string) => void) => (() => void) | void;
+  onDeepLink?: (callback: (result: { type: "task" | "project" | "unknown"; id: string; raw: string } | string) => void) => (() => void) | void;
   getPlatform?: () => Promise<DesktopPlatform>;
-}
-
-declare global {
-  interface Window {
-    electronAPI?: ElectronAPI;
-  }
 }
 
 export {};

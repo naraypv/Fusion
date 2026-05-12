@@ -5,6 +5,7 @@ import type {
   CentralCore,
   Settings,
   MergeResult,
+  AutostashOrphanRecord,
   AutomationStore as AutomationStoreType,
   ScheduledTask,
   AutomationRunResult,
@@ -21,7 +22,7 @@ import { NotificationService } from "./notification/index.js";
 import { GridlockDetector } from "./gridlock-detector.js";
 import { CronRunner, createAiPromptExecutor } from "./cron-runner.js";
 import type { RoutineRunner } from "./routine-runner.js";
-import { aiMergeTask } from "./merger.js";
+import { aiMergeTask, sweepStaleAutostashes, VerificationError } from "./merger.js";
 import { PRIORITY_MERGE } from "./concurrency.js";
 import { runtimeLog } from "./logger.js";
 import type { HeartbeatTriggerScheduler } from "./agent-heartbeat.js";
@@ -77,6 +78,11 @@ function formatErrorDetails(error: unknown): { message: string; detail: string }
   }
   const detail = String(error);
   return { message: detail, detail };
+}
+
+function isInvalidDoneTransitionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("Invalid transition:") && message.includes("→ 'done'");
 }
 
 export interface AutomationSubsystemHealth {
@@ -139,6 +145,7 @@ export interface ProjectEngineOptions {
  */
 export class ProjectEngine {
   private runtime: InProcessRuntime;
+  private started = false;
   private prMonitor?: PrMonitor;
   private prCommentHandler?: PrCommentHandler;
   private notifier?: NtfyNotifier;
@@ -169,6 +176,7 @@ export class ProjectEngine {
   private activeMergeTaskId: string | null = null;
   private mergeAbortController: AbortController | null = null;
   private mergeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private autostashSweepTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * Pending manual merge resolvers — keyed by taskId.
@@ -201,6 +209,7 @@ export class ProjectEngine {
   private settingsHandlers: Array<(...args: any[]) => void> = [];
   private taskMovedHandler?: (...args: any[]) => void;
   private taskUpdatedHandler?: (...args: any[]) => void;
+  private autostashOrphansHandler?: (...args: any[]) => void;
 
   constructor(
     private config: ProjectRuntimeConfig,
@@ -223,6 +232,7 @@ export class ProjectEngine {
     // cause `internalEnqueueMerge` to silently no-op.
     //
     // Tests substitute a minimal runtime mock that may not implement this hook.
+    this.runtime.setActiveMergeTaskIdProvider?.(() => this.getActiveMergeTaskId());
     this.runtime.setMergeEnqueuer?.((taskId) => {
       // If the wedged attempt was the active one, abort its in-flight signal
       // and dispose its session so subsequent code paths can release file
@@ -239,10 +249,18 @@ export class ProjectEngine {
     });
   }
 
+  getActiveMergeTaskId(): string | null {
+    return this.activeMergeTaskId;
+  }
+
   /**
    * Start the engine: initialize the runtime and all auxiliary subsystems.
    */
   async start(): Promise<void> {
+    if (this.started) {
+      return;
+    }
+
     // 1. Start the core runtime (TaskStore, Scheduler, Executor, Triage, etc.)
     await this.runtime.start();
 
@@ -281,9 +299,20 @@ export class ProjectEngine {
 
     // 3. Initialize notification services (unless caller manages them externally)
     if (!this.options.skipNotifier) {
+      const agentStore = this.runtime.getAgentStore();
+      const agentNameResolver = agentStore
+        ? async (agentId: string): Promise<string | null> => {
+          const agent = await agentStore.getAgent(agentId);
+          const name = typeof agent?.name === "string" ? agent.name.trim() : "";
+          return name.length > 0 ? name : null;
+        }
+        : undefined;
+
       this.notificationService = new NotificationService(store, {
         projectId: this.options.projectId,
         ntfyBaseUrl: this.options.ntfyBaseUrl,
+        messageStore: this.runtime.getMessageStore(),
+        agentNameResolver,
       });
       await this.notificationService.start();
 
@@ -293,6 +322,7 @@ export class ProjectEngine {
         {
           projectId: this.options.projectId,
           ntfyBaseUrl: this.options.ntfyBaseUrl,
+          agentNameResolver,
         },
         this.notificationService,
       );
@@ -320,6 +350,8 @@ export class ProjectEngine {
       this.cronRunner = new CronRunner(store, this.automationStore, {
         aiPromptExecutor,
         onScheduleRunProcessed: this.buildInsightRunHandler(cwd),
+        workingDirectory: cwd,
+        projectId: this.config.projectId,
         scope: "project", // Project-scoped execution — global schedules run separately
       });
 
@@ -365,6 +397,19 @@ export class ProjectEngine {
         runtimeLog.warn("syncMemoryDreamsAutomation is unavailable; skipping startup sync");
       }
 
+      // Sync scheduled eval batch automation on startup
+      if (typeof coreAutomationModule.syncScheduledEvalBatchAutomation === "function") {
+        try {
+          await coreAutomationModule.syncScheduledEvalBatchAutomation(this.automationStore, settings);
+        } catch (err) {
+          const { message, detail } = formatErrorDetails(err);
+          startupSyncFailures.push(`scheduled eval: ${message}`);
+          runtimeLog.warn(`Scheduled eval automation startup sync failed:\n${detail}`);
+        }
+      } else {
+        runtimeLog.warn("syncScheduledEvalBatchAutomation is unavailable; skipping startup sync");
+      }
+
       this.cronRunner.start();
 
       if (startupSyncFailures.length > 0) {
@@ -400,6 +445,7 @@ export class ProjectEngine {
     // 6. Wire auto-merge on task:moved and task:updated pause interruptions
     this.wireAutoMerge(store, cwd);
     this.wireTaskPauseMergeInterruption(store);
+    this.wireAutostashOrphanRecovery(store);
 
     // 7. Auto-merge startup sweep
     await this.startupMergeSweep(store);
@@ -407,6 +453,11 @@ export class ProjectEngine {
     // 8. Start periodic merge retry sweep
     this.scheduleMergeRetry(store);
 
+    // 9. Startup + periodic stale autostash sweeps (independent of autoMerge)
+    void this.runStaleAutostashSweep(store, "startup");
+    this.scheduleStaleAutostashSweep(store);
+
+    this.started = true;
     runtimeLog.log(`ProjectEngine started for ${this.config.projectId}`);
   }
 
@@ -418,12 +469,20 @@ export class ProjectEngine {
    * promptly without continuing git/verification work after shutdown starts.
    */
   async stop(): Promise<void> {
+    if (!this.started) {
+      return;
+    }
+
     this.shuttingDown = true;
 
     // Stop merge retry timer
     if (this.mergeRetryTimer) {
       clearTimeout(this.mergeRetryTimer);
       this.mergeRetryTimer = null;
+    }
+    if (this.autostashSweepTimer) {
+      clearTimeout(this.autostashSweepTimer);
+      this.autostashSweepTimer = null;
     }
 
     // Abort active/pending merge work before tearing down sessions.
@@ -461,6 +520,9 @@ export class ProjectEngine {
       }
       if (this.taskUpdatedHandler) {
         store.off("task:updated", this.taskUpdatedHandler);
+      }
+      if (this.autostashOrphansHandler) {
+        store.off("merger:autostashOrphans", this.autostashOrphansHandler as any);
       }
     } catch {
       // Store may not be initialized if start() failed partway
@@ -503,6 +565,8 @@ export class ProjectEngine {
     // Stop the core runtime (Triage, Scheduler, Executor, etc.)
     await this.runtime.stop();
 
+    this.started = false;
+    this.shuttingDown = false;
     runtimeLog.log(`ProjectEngine stopped for ${this.config.projectId}`);
   }
 
@@ -1009,8 +1073,12 @@ export class ProjectEngine {
     updatedAt?: string | null;
     mergeDetails?: { mergeConfirmed?: boolean } | null;
   }): boolean {
-    // Already-confirmed merges always eligible — just need to move to done
-    if (task.mergeDetails?.mergeConfirmed) return true;
+    // Merge-confirmed tasks use the fast-path finalizer, which applies blocker
+    // checks after clearing transient status/error state. Once that path parks
+    // a blocked task as failed, skip future auto-merge retries.
+    if (task.mergeDetails?.mergeConfirmed) {
+      return task.status !== "failed";
+    }
     if (this.options.getTaskMergeBlocker?.(task as Task)) return false;
     // Terminal failure: don't let the cooldown sweep re-attempt a merge that
     // already gave up (verification cap, conflict-bounce cap, or non-conflict
@@ -1079,7 +1147,22 @@ export class ProjectEngine {
 
   private internalEnqueueMerge(taskId: string): void {
     if (this.shuttingDown) return;
-    if (this.mergeActive.has(taskId)) return;
+    if (this.mergeActive.has(taskId)) {
+      // Distinguish "actually being processed" (queued or active) from a
+      // leaked entry. Leaks are dropped by reconcileStaleMergeActive() on the
+      // next 15s sweep, so we only log the genuinely-busy case at debug
+      // verbosity. Without this log the de-dup was invisible — a leaked
+      // entry made every subsequent enqueue silently no-op until the 15-min
+      // maintenance loop woke up.
+      const isActuallyLive =
+        this.mergeQueue.includes(taskId) || this.activeMergeTaskId === taskId;
+      if (!isActuallyLive) {
+        runtimeLog.warn(
+          `internalEnqueueMerge(${taskId}): skipped — mergeActive entry is leaked (not queued, not active). reconcileStaleMergeActive() will clear it on the next sweep.`,
+        );
+      }
+      return;
+    }
     this.mergeActive.add(taskId);
     this.mergeQueue.push(taskId);
     void this.drainMergeQueue().catch((err: unknown) => {
@@ -1105,6 +1188,32 @@ export class ProjectEngine {
       this.internalEnqueueMerge(t.id);
     }
     return eligible.length;
+  }
+
+  private async findActiveRecoveryFollowUp(
+    store: TaskStore,
+    parentTaskId: string,
+    branch?: string,
+  ): Promise<{ task: Task; reason: "parent" | "branch" } | null> {
+    const tasks = await store.listTasks({ slim: true }).catch(() => [] as Task[]);
+    const activeRecoveryTasks = tasks.filter(
+      (task) =>
+        task.column !== "done" &&
+        task.column !== "archived" &&
+        task.sourceType === "recovery",
+    );
+
+    const sameParent = activeRecoveryTasks.find(
+      (task) => task.sourceParentTaskId === parentTaskId,
+    );
+    if (sameParent) return { task: sameParent, reason: "parent" };
+
+    if (branch) {
+      const sameBranch = activeRecoveryTasks.find((task) => task.branch === branch);
+      if (sameBranch) return { task: sameBranch, reason: "branch" };
+    }
+
+    return null;
   }
 
   private async drainMergeQueue(): Promise<void> {
@@ -1157,6 +1266,26 @@ export class ProjectEngine {
             // in-review by auto-recovery after a successful merge) — just
             // complete the task without re-running the merge process.
             if (task.mergeDetails?.mergeConfirmed) {
+              const blockerReason = this.options.getTaskMergeBlocker?.({
+                ...(task as Task),
+                status: undefined,
+                error: undefined,
+              });
+              if (blockerReason) {
+                await store.updateTask(taskId, {
+                  status: "failed",
+                  error: `Merge confirmed but finalization blocked: ${blockerReason}`,
+                });
+                await store.logEntry(
+                  taskId,
+                  `Merge confirmed finalization blocked — ${blockerReason}. Task parked in in-review for manual completion.`,
+                );
+                runtimeLog.warn(
+                  `Auto-merge: ${taskId} merge-confirmed finalize blocked — ${blockerReason}`,
+                );
+                continue;
+              }
+
               runtimeLog.log(
                 `Auto-merge: ${taskId} already has mergeConfirmed — moving to done`,
               );
@@ -1164,8 +1293,25 @@ export class ProjectEngine {
                 taskId,
                 "Merge already confirmed; completing task (recovered from post-merge state inconsistency)",
               );
-              await store.updateTask(taskId, { status: null });
-              await store.moveTask(taskId, "done");
+              await store.updateTask(taskId, { status: null, error: null });
+              try {
+                await store.moveTask(taskId, "done");
+              } catch (error) {
+                if (isInvalidDoneTransitionError(error)) {
+                  const latest = await store.getTask(taskId).catch(() => null);
+                  if (latest && latest.column !== "in-review") {
+                    runtimeLog.warn(
+                      `Auto-merge: ${taskId} merge-confirmed finalize skipped — task moved to ${latest.column} before done transition`,
+                    );
+                    await store.logEntry(
+                      taskId,
+                      `Merge confirmed finalize skipped: task moved to '${latest.column}' before in-review → done transition`,
+                    );
+                    continue;
+                  }
+                }
+                throw error;
+              }
               continue;
             }
 
@@ -1346,6 +1492,18 @@ export class ProjectEngine {
             errorMsg.includes("Deterministic build verification failed");
 
           if (taskOnErr && isVerificationError) {
+            if (
+              err instanceof VerificationError
+              && err.verificationResult?.environmentFault?.kind === "missing-workspace-entry"
+              && err.verificationResult.environmentFault.recovered === false
+            ) {
+              const packageName = err.verificationResult.environmentFault.packageName;
+              const message = `${taskId}: verification failed with environment fault (missing-workspace-entry: ${packageName}) — leaving in-review for next sweep, not incrementing verificationFailureCount`;
+              await store.logEntry(taskId, message, "VerificationError").catch(() => undefined);
+              runtimeLog.log(`Auto-merge: ${message}`);
+              continue;
+            }
+
             const failedKind = errorMsg.includes("build verification") ? "build" : "test";
             const previousBounces = taskOnErr.verificationFailureCount ?? 0;
             const nextBounces = previousBounces + 1;
@@ -1368,28 +1526,45 @@ export class ProjectEngine {
                   `Investigate repeated ${failedKind} verification failure on ${taskId} (${taskOnErr.title || "untitled"}). ` +
                   `Auto-merge attempted to fix and re-verify ${nextBounces} times without success — likely a flaky test or unrelated regression rather than a fix this task can produce on its own. ` +
                   `Look at the most recent [verification] log entries on ${taskId} for the failing command and output, then either fix the underlying issue or quarantine the flake.`;
-                const followUp = await store.createTask({
-                  description: followUpDescription,
-                  column: "triage",
-                  priority: "high",
-                  source: {
-                    sourceType: "recovery",
-                    sourceParentTaskId: taskId,
-                  },
-                });
-                await store.addTaskComment(
-                  taskId,
-                  `Auto-merge giving up after ${nextBounces} verification-failure bounces. Created follow-up ${followUp.id} to investigate.`,
-                  "agent",
-                );
-                await store.logEntry(
-                  taskId,
-                  `Auto-merge gave up after ${nextBounces} verification-failure bounces — created follow-up ${followUp.id}`,
-                  "VerificationError",
-                );
-                runtimeLog.warn(
-                  `Auto-merge: ${taskId} hit verification-failure cap (${nextBounces}/${cap}) — failed task and created follow-up ${followUp.id}`,
-                );
+                const existingFollowUp = await this.findActiveRecoveryFollowUp(store, taskId);
+                if (existingFollowUp) {
+                  await store.addTaskComment(
+                    taskId,
+                    `Auto-merge giving up after ${nextBounces} verification-failure bounces. Reusing existing follow-up ${existingFollowUp.task.id}.`,
+                    "agent",
+                  );
+                  await store.logEntry(
+                    taskId,
+                    `Auto-merge gave up after ${nextBounces} verification-failure bounces — skipped creating duplicate follow-up (existing ${existingFollowUp.task.id})`,
+                    "VerificationError",
+                  );
+                  runtimeLog.warn(
+                    `Auto-merge: ${taskId} hit verification-failure cap (${nextBounces}/${cap}) — skipped duplicate follow-up (existing ${existingFollowUp.task.id})`,
+                  );
+                } else {
+                  const followUp = await store.createTask({
+                    description: followUpDescription,
+                    column: "triage",
+                    priority: "high",
+                    source: {
+                      sourceType: "recovery",
+                      sourceParentTaskId: taskId,
+                    },
+                  });
+                  await store.addTaskComment(
+                    taskId,
+                    `Auto-merge giving up after ${nextBounces} verification-failure bounces. Created follow-up ${followUp.id} to investigate.`,
+                    "agent",
+                  );
+                  await store.logEntry(
+                    taskId,
+                    `Auto-merge gave up after ${nextBounces} verification-failure bounces — created follow-up ${followUp.id}`,
+                    "VerificationError",
+                  );
+                  runtimeLog.warn(
+                    `Auto-merge: ${taskId} hit verification-failure cap (${nextBounces}/${cap}) — failed task and created follow-up ${followUp.id}`,
+                  );
+                }
               } catch (followUpErr) {
                 runtimeLog.error(
                   `Auto-merge: failed to fail-and-followup ${taskId} after verification cap: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
@@ -1503,24 +1678,49 @@ export class ProjectEngine {
                       // auto-resolve is just disabled, the user is presumed to
                       // be handling merges manually and a follow-up is noise.
                       try {
-                        const followUp = await store.createTask({
-                          description:
-                            `Resolve auto-merge conflict on ${taskId} (${taskOnErr.title || "untitled"}). ` +
-                            `Auto-merge attempted to rebase + resolve ${nextBounces - 1} times against main and exhausted retries each pass. ` +
-                            `Branch: \`${taskOnErr.branch ?? "?"}\`. Worktree: \`${taskOnErr.worktree ?? "?"}\`. ` +
-                            `Last merge error: ${errorMsg}`,
-                          column: "triage",
-                          priority: "high",
-                          source: {
-                            sourceType: "recovery",
-                            sourceParentTaskId: taskId,
-                          },
-                        });
-                        await store.addTaskComment(
+                        const existingFollowUp = await this.findActiveRecoveryFollowUp(
+                          store,
                           taskId,
-                          `Created follow-up ${followUp.id} to track manual conflict resolution.`,
-                          "agent",
+                          taskOnErr.branch,
                         );
+                        if (existingFollowUp) {
+                          const dedupReason =
+                            existingFollowUp.reason === "branch"
+                              ? `active recovery already owns branch \`${taskOnErr.branch ?? "?"}\``
+                              : "active recovery already exists for this parent task";
+                          await store.addTaskComment(
+                            taskId,
+                            `Auto-merge recovery follow-up already exists (${existingFollowUp.task.id}; ${dedupReason}). Skipping duplicate follow-up creation.`,
+                            "agent",
+                          );
+                          await store.logEntry(
+                            taskId,
+                            `Auto-merge conflict recovery skipped duplicate follow-up (existing ${existingFollowUp.task.id}; ${dedupReason})`,
+                            "MergeConflictGiveUp",
+                          );
+                          runtimeLog.warn(
+                            `Auto-merge: ${taskId} conflict give-up skipped duplicate follow-up (existing ${existingFollowUp.task.id}; reason=${existingFollowUp.reason})`,
+                          );
+                        } else {
+                          const followUp = await store.createTask({
+                            description:
+                              `Resolve auto-merge conflict on ${taskId} (${taskOnErr.title || "untitled"}). ` +
+                              `Auto-merge attempted to rebase + resolve ${nextBounces - 1} times against main and exhausted retries each pass. ` +
+                              `Branch: \`${taskOnErr.branch ?? "?"}\`. Worktree: \`${taskOnErr.worktree ?? "?"}\`. ` +
+                              `Last merge error: ${errorMsg}`,
+                            column: "triage",
+                            priority: "high",
+                            source: {
+                              sourceType: "recovery",
+                              sourceParentTaskId: taskId,
+                            },
+                          });
+                          await store.addTaskComment(
+                            taskId,
+                            `Created follow-up ${followUp.id} to track manual conflict resolution.`,
+                            "agent",
+                          );
+                        }
                       } catch (followUpErr) {
                         runtimeLog.warn(
                           `Auto-merge: failed to create follow-up for ${taskId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
@@ -1646,22 +1846,86 @@ export class ProjectEngine {
           // Re-validate eligibility after the grace period — the task may
           // have been paused, moved, or had its merge blocked.
           const latestTask = await store.getTask(task.id).catch(() => null);
-          if (!latestTask) return;
-          if (latestTask.column !== "in-review") return;
-          if (latestTask.paused) return;
-          if (this.options.getTaskMergeBlocker?.(latestTask)) return;
+          if (!latestTask) {
+            runtimeLog.warn(`Auto-merge handoff (${task.id}): task disappeared during grace period`);
+            return;
+          }
+          if (latestTask.column !== "in-review") {
+            runtimeLog.log(`Auto-merge handoff (${task.id}) skipped: column changed to ${latestTask.column}`);
+            return;
+          }
+          if (latestTask.paused) {
+            runtimeLog.log(`Auto-merge handoff (${task.id}) skipped: task paused`);
+            return;
+          }
+          const blockerReason = this.options.getTaskMergeBlocker?.(latestTask);
+          if (blockerReason) {
+            runtimeLog.log(`Auto-merge handoff (${task.id}) skipped: ${blockerReason}`);
+            return;
+          }
           const settings = await store.getSettings();
-          if (settings.globalPause || settings.enginePaused) return;
-          if (!settings.autoMerge) return;
+          if (settings.globalPause || settings.enginePaused) {
+            runtimeLog.log(`Auto-merge handoff (${task.id}) skipped: ${settings.globalPause ? "globalPause" : "enginePaused"} active`);
+            return;
+          }
+          if (!settings.autoMerge) {
+            runtimeLog.log(`Auto-merge handoff (${task.id}) skipped: autoMerge disabled`);
+            return;
+          }
+          // Belt-and-braces: clear any stale mergeActive entry from a wedged
+          // prior attempt so this enqueue isn't silently no-op'd. The 15s
+          // sweep also reconciles via reconcileStaleMergeActive(), but waiting
+          // up to 15s for a fresh in-review task to start merging is the
+          // exact regression we're fixing.
+          if (
+            this.mergeActive.has(task.id) &&
+            !this.mergeQueue.includes(task.id) &&
+            this.activeMergeTaskId !== task.id
+          ) {
+            runtimeLog.warn(`Auto-merge handoff (${task.id}): clearing stale mergeActive before enqueue`);
+            this.mergeActive.delete(task.id);
+          }
           this.internalEnqueueMerge(task.id);
         } catch (err: unknown) {
           runtimeLog.warn(
-            `Auto-merge: failed to read settings for task:moved on ${task.id}: ${err instanceof Error ? err.message : String(err)}`,
+            `Auto-merge handoff (${task.id}) failed: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }, MERGE_HANDOFF_GRACE_MS);
     };
     store.on("task:moved", this.taskMovedHandler);
+  }
+
+  private wireAutostashOrphanRecovery(store: TaskStore): void {
+    this.autostashOrphansHandler = async ({ records }: { rootDir: string; records: AutostashOrphanRecord[] }) => {
+      const liveRecords = records.filter((record) => record.classification === "live");
+      for (const record of liveRecords) {
+        const parentTaskId = record.sourceTaskId;
+        if (!parentTaskId) continue;
+        try {
+          const existingFollowUp = await this.findActiveRecoveryFollowUp(store, parentTaskId);
+          if (existingFollowUp) continue;
+          const sourcePhase = record.sourcePhase ?? "unknown";
+          await store.createTask({
+            description:
+              `Investigate preserved merger autostash leftover from ${parentTaskId} (${record.sha.slice(0, 7)}). ` +
+              `Detected by ${record.detectedByTaskId ?? "merge sweep"} during ${sourcePhase}; ` +
+              `stash label: ${record.label}. Recover from stash-recovery before dropping.`,
+            sourceType: "recovery",
+            sourceParentTaskId: parentTaskId,
+          } as any);
+          await store.logEntry(
+            parentTaskId,
+            `Auto-created recovery follow-up for live autostash orphan ${record.sha.slice(0, 7)}`,
+            `detectedBy=${record.detectedByTaskId ?? "unknown"}; phase=${sourcePhase}; stash=${record.label}`,
+          ).catch(() => undefined);
+        } catch (err: unknown) {
+          runtimeLog.warn(`Autostash orphan recovery follow-up failed for ${parentTaskId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    };
+
+    store.on("merger:autostashOrphans", this.autostashOrphansHandler as any);
   }
 
   private wireTaskPauseMergeInterruption(store: TaskStore): void {
@@ -1761,6 +2025,44 @@ export class ProjectEngine {
     }
   }
 
+  private resolveAutostashMaxAgeMs(settings: Settings): number {
+    const hours = Math.max(1, Math.trunc(settings.mergerAutostashMaxAgeHours ?? 24));
+    return hours * 60 * 60 * 1000;
+  }
+
+  private async runStaleAutostashSweep(store: TaskStore, reason: "startup" | "periodic"): Promise<void> {
+    try {
+      const settings = await store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return;
+      const maxAgeMs = this.resolveAutostashMaxAgeMs(settings);
+      const result = await sweepStaleAutostashes(this.config.workingDirectory, {
+        maxAgeMs,
+        taskStore: store,
+      });
+      if (result.dropped > 0) {
+        runtimeLog.log(`${reason === "startup" ? "Startup" : "Periodic"} stale autostash sweep dropped ${result.dropped} stash(es)`);
+      }
+    } catch (err: unknown) {
+      runtimeLog.warn(`Stale autostash ${reason} sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private scheduleStaleAutostashSweep(store: TaskStore): void {
+    if (this.shuttingDown) return;
+    const schedule = async () => {
+      if (this.shuttingDown) return;
+      try {
+        await this.runStaleAutostashSweep(store, "periodic");
+      } finally {
+        if (!this.shuttingDown) {
+          this.autostashSweepTimer = setTimeout(() => void schedule(), 60 * 60 * 1000);
+        }
+      }
+    };
+
+    this.autostashSweepTimer = setTimeout(() => void schedule(), 60 * 60 * 1000);
+  }
+
   private scheduleMergeRetry(store: TaskStore): void {
     if (this.shuttingDown) return;
 
@@ -1833,7 +2135,47 @@ export class ProjectEngine {
   }
 
   private wireSettingsListeners(store: TaskStore): void {
-    // 1. Global pause — terminate active merge session AND abort any running
+    const applyDetectorPauseLifecycle = (paused: boolean, source: string): void => {
+      try {
+        const detector = (this.runtime as any).stuckTaskDetector;
+        if (paused) {
+          detector?.pause?.();
+        } else {
+          detector?.resume?.();
+        }
+      } catch (err: unknown) {
+        runtimeLog.warn(
+          `${source}: stuck detector ${paused ? "pause" : "resume"} hook failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+
+    // 1. Unified pause lifecycle — detector only resumes once BOTH pause sources
+    // are clear, and pauses when either source engages.
+    const onPauseLifecycleTransition = ({
+      settings: s,
+      previous: prev,
+    }: {
+      settings: Settings;
+      previous: Settings;
+    }) => {
+      const wasPaused = prev.globalPause || prev.enginePaused;
+      const isPaused = s.globalPause || s.enginePaused;
+
+      if (!wasPaused && isPaused) {
+        const source = s.globalPause && !prev.globalPause ? "Global pause" : "Engine pause";
+        applyDetectorPauseLifecycle(true, source);
+      }
+
+      if (wasPaused && !isPaused) {
+        const source = prev.globalPause && !s.globalPause ? "Global unpause" : "Engine unpause";
+        applyDetectorPauseLifecycle(false, source);
+      }
+    };
+    store.on("settings:updated", onPauseLifecycleTransition);
+    this.settingsHandlers.push(onPauseLifecycleTransition);
+
+    // 2. Global pause — terminate active merge session AND abort any running
     // deterministic verification (pnpm test/build). The abort controller gates
     // both the AI merge agent and the spawned child processes; without it,
     // verification commands keep churning until they finish naturally.
@@ -1854,7 +2196,7 @@ export class ProjectEngine {
     store.on("settings:updated", onGlobalPause);
     this.settingsHandlers.push(onGlobalPause);
 
-    // 2. Global unpause — resume orphaned tasks + sweep in-review
+    // 3. Global unpause — resume orphaned tasks + sweep in-review
     const onGlobalUnpause = async ({
       settings: s,
       previous: prev,
@@ -1870,7 +2212,7 @@ export class ProjectEngine {
     store.on("settings:updated", onGlobalUnpause);
     this.settingsHandlers.push(onGlobalUnpause);
 
-    // 3. Engine unpause — same as global unpause
+    // 4. Engine unpause — same as global unpause
     const onEngineUnpause = async ({
       settings: s,
       previous: prev,
@@ -1886,7 +2228,7 @@ export class ProjectEngine {
     store.on("settings:updated", onEngineUnpause);
     this.settingsHandlers.push(onEngineUnpause);
 
-    // 4. Stuck task timeout change — trigger immediate check
+    // 5. Stuck task timeout change — trigger immediate check
     const onStuckTimeoutChange = async ({
       settings: s,
       previous: prev,
@@ -1993,6 +2335,40 @@ export class ProjectEngine {
     };
     store.on("settings:updated", onAutoSummarizeSettingsChange);
     this.settingsHandlers.push(onAutoSummarizeSettingsChange);
+
+    // 7. Scheduled eval settings change — sync automation
+    const onScheduledEvalSettingsChange = async ({
+      settings: s,
+      previous: prev,
+    }: {
+      settings: Settings;
+      previous: Settings;
+    }) => {
+      const evalKeys = [
+        "taskEvaluationEnabled",
+        "taskEvaluationSchedule",
+      ] as const;
+
+      const changed = evalKeys.some((key) => (s as any)[key] !== (prev as any)[key]);
+      if (!changed || !this.automationStore) return;
+
+      try {
+        const { syncScheduledEvalBatchAutomation } = await import("@fusion/core");
+        if (typeof syncScheduledEvalBatchAutomation === "function") {
+          await syncScheduledEvalBatchAutomation(this.automationStore, s);
+          runtimeLog.log("Scheduled eval automation synced with settings");
+        }
+      } catch (err) {
+        const { message, detail } = formatErrorDetails(err);
+        this.setAutomationSubsystemHealth(
+          "degraded",
+          `Failed to sync scheduled eval automation: ${message}`,
+        );
+        runtimeLog.warn(`Failed to sync scheduled eval automation:\n${detail}`);
+      }
+    };
+    store.on("settings:updated", onScheduledEvalSettingsChange);
+    this.settingsHandlers.push(onScheduledEvalSettingsChange);
   }
 
   /**

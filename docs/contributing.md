@@ -41,11 +41,16 @@ pnpm build:all  # full recursive build including desktop/mobile
 ## Development Workflow
 
 ```bash
-pnpm dev               # build + run CLI entrypoint in dev mode
+pnpm local             # fast local dashboard/API startup on a safe localhost port
+pnpm local --engine    # fast local startup with the AI engine enabled
+pnpm local --prebuild <none|client|full>  # local dashboard/API startup with an explicit prebuild level
+pnpm dev               # source-mode CLI; dashboard gets a client-only prebuild, other commands skip it
+FUSION_DEV_PREBUILD=full pnpm dev dashboard  # production-like full workspace prebuild
 pnpm dev:ui            # dashboard dev server only
+pnpm dev:hmr           # dashboard API + Vite HMR UI, with no startup prebuild
 pnpm lint              # lint all packages
 pnpm test              # changed-only workspace tests (falls back to full suite in safety contexts)
-pnpm test:full         # full workspace test suite (clean-worktree compatible)
+pnpm test:full         # full workspace quality gate (clean-worktree compatible)
 pnpm build             # workspace builds (excludes desktop/mobile)
 pnpm build:all         # full workspace build (includes desktop/mobile)
 pnpm verify:workspace  # canonical lint -> test -> build verification gate
@@ -58,7 +63,8 @@ Fusion codifies workspace verification as a deterministic contract:
 
 - Use `pnpm install --frozen-lockfile` for clean bootstrap and dependency repair paths.
 - `pnpm test:full` must be runnable in a clean worktree without requiring a prior `pnpm build`.
-- This includes clean states where `packages/core/dist`, `packages/engine/dist`, and `packages/dashboard/dist` are absent.
+- Root test entrypoints (`pnpm test` via `scripts/test-changed.mjs` and `pnpm test:ci:shard` via `scripts/ci-test-shard.mjs`) call `scripts/ensure-test-artifacts.mjs`, which deterministically builds only missing required workspace dist artifacts (`@fusion/core`, `@fusion/plugin-sdk`, and runtime plugins that export from `dist/*`).
+- This includes clean states where those required dist directories are absent.
 - `pnpm verify:workspace` is the canonical pre-merge gate and runs in strict order:
   1. `pnpm lint`
   2. `pnpm test:full`
@@ -67,12 +73,26 @@ Fusion codifies workspace verification as a deterministic contract:
 GitHub Actions now runs deterministic test sharding via `pnpm test:ci:shard --shard <index> --total <count>` in both PR checks and manual CI, while keeping local semantics unchanged:
 
 - `pnpm test` remains changed-only local iteration.
-- `pnpm test:full` remains the canonical full local suite.
+- `pnpm test:full` remains the canonical workspace quality gate; dashboard exhaustive coverage is explicit via `pnpm --filter @fusion/dashboard test:deep`.
 - `pnpm verify:workspace` remains the canonical local lint -> test -> build gate.
 
-`test:ci:shard` is a CI-focused entrypoint (`scripts/ci-test-shard.mjs`) that partitions a fixed package list by shard index modulo total shard count so coverage is deterministic and reproducible.
+`test:ci:shard` is a CI-focused entrypoint (`scripts/ci-test-shard.mjs`) that deterministically balances workspace packages with `test` scripts by counting package-local `**/__tests__/**/*.test.{ts,tsx,mjs}` files, then assigning packages to shards with a largest-fit-decreasing planner (heaviest first, lexical package-name tie-break, then lowest-current-weight shard with lower-index tie-break) so coverage stays reproducible while spreading shard load more evenly.
 
-`pnpm test` now uses a changed-only entrypoint (`scripts/test-changed.mjs`) for faster local iteration. It resolves the comparison base from `.changeset/config.json` (`baseBranch`) and runs only affected package test scripts using safe package-first filtering (`pnpm --filter <pkg> test`). It automatically falls back to the full suite when the run is forced (CI / `--full`), the git comparison base or diff cannot be resolved, no changes are detected, or shared/root test infrastructure changes.
+`pnpm test` now uses a changed-only entrypoint (`scripts/test-changed.mjs`) for faster local iteration. It resolves the comparison base from `.changeset/config.json` (`baseBranch`) and runs only affected workspaces from `pnpm-workspace.yaml` (both `packages/*` and `plugins/**`) using safe package-first filtering (`pnpm --filter <pkg> test`). It automatically falls back to the full suite when the run is forced (CI / `--full`), the git comparison base or diff cannot be resolved, no changes are detected, shared/root test infrastructure changes, or changed workspace paths cannot be resolved to a workspace package (fail-safe coverage behavior).
+
+Root test entrypoints (`pnpm test`, `pnpm test:full`, and `pnpm test:ci:shard`) now use a shared CPU-aware default worker budget instead of fixed low values. By default, Fusion sets `FUSION_TEST_TOTAL_WORKERS` to `max(4, min(12, cpuCount - 1))` and `FUSION_TEST_CONCURRENCY` to `2` (clamped to the total budget), while still honoring explicit overrides from `VITEST_MAX_WORKERS`, `FUSION_TEST_TOTAL_WORKERS`, and `FUSION_TEST_CONCURRENCY`.
+
+### Test isolation contract (required)
+
+Fusion tests must run against disposable test data, never live local state:
+
+- The canonical Vitest bootstrap is `packages/core/src/__test-utils__/vitest-setup.ts`.
+- Workspace/package Vitest configs should use package-local `src/__tests__/setup-test-isolation.ts` shims that call into the shared core bootstrap rather than re-implementing HOME/cwd isolation.
+- Test runs must use temp HOME and temp workspace/project roots so global settings resolve under temporary directories instead of real `~/.fusion`.
+- The repository `.fusion` directory is treated as protected live data; root test entrypoints run `scripts/check-test-isolation.mjs` to fail if tests mutate protected Fusion data paths.
+- `pnpm test` (`scripts/test-changed.mjs`) now creates a disposable temp HOME/USERPROFILE for the entire run (including cache-hit no-op guard checks), so concurrent writes from an active local Fusion session to your real `~/.fusion` do not trigger false positives.
+
+If you add or change test entrypoints, keep this isolation guard path intact and ensure guard + test execution share the same disposable HOME so changed/full/cached paths stay consistent.
 
 ## Quality Gate Checklist
 
@@ -143,6 +163,21 @@ pnpm --filter @runfusion/fusion test:extension-integration
 ```
 
 `test:extension-integration` enables `FUSION_TEST_EXTENSION_INTEGRATION=1` and runs the full fn pi extension integration suite. It remains an explicit opt-in lane so default workspace verification stays fast, while still providing a discoverable command for full extension-tool integration coverage.
+
+## Dashboard Test Lanes
+
+Dashboard tests are split into explicit local lanes. The default dashboard package gate is a curated quality gate that keeps representative app/API coverage without running every exhaustive modal, view, and route permutation on every local or PR pass:
+
+```bash
+pnpm --filter @fusion/dashboard test                # curated app/API quality gate
+pnpm --filter @fusion/dashboard test:deep           # exhaustive app + API suite
+pnpm --filter @fusion/dashboard test:app            # exhaustive React/jsdom app tests
+pnpm --filter @fusion/dashboard test:api            # exhaustive Node API/server tests
+pnpm --filter @fusion/dashboard test:browser-smoke  # local browser layout smoke
+pnpm --filter @fusion/dashboard test:build          # built client output contract
+```
+
+Use the default lane for normal local iteration before PRs. Run `test:deep` when changing broad dashboard architecture, shared modal/view infrastructure, or route registration behavior where the exhaustive permutations are still useful. The built-client contract remains a separate lane because it performs its own production build. `pnpm build` remains an explicit PR gate, and PR test shards avoid a redundant pre-test workspace build to save GitHub Actions minutes.
 
 ## Release Process
 

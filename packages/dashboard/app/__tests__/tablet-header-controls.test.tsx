@@ -94,7 +94,7 @@ describe("tablet header controls", () => {
     expect(screen.getByTitle("Board view")).toBeDefined();
     expect(screen.getByTitle("List view")).toBeDefined();
     expect(screen.getByTitle("Agents view")).toBeDefined();
-    // Skills, Roadmaps, Insights are NOT inline (they're in overflow)
+    // Skills and Insights are NOT inline (they're in overflow)
     expect(screen.queryByTitle("Skills view")).toBeNull();
     expect(screen.queryByTitle("Roadmaps view")).toBeNull();
     expect(screen.queryByTitle("Insights view")).toBeNull();
@@ -105,11 +105,10 @@ describe("tablet header controls", () => {
     expect(screen.getByTestId("view-toggle-overflow-trigger")).toBeDefined();
   });
 
-  it("opens overflow menu with Insights, Roadmaps, Skills on tablet when trigger is clicked", () => {
-    renderTabletHeader({ onChangeView: noop, showSkillsTab: true, experimentalFeatures: { insights: true, roadmap: true } });
+  it("opens overflow menu with Insights and Skills on tablet when trigger is clicked", () => {
+    renderTabletHeader({ onChangeView: noop, showSkillsTab: true, experimentalFeatures: { insights: true } });
     fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
     expect(screen.getByTestId("view-overflow-insights")).toBeDefined();
-    expect(screen.getByTestId("view-overflow-roadmaps")).toBeDefined();
     expect(screen.getByTestId("view-overflow-skills")).toBeDefined();
   });
 
@@ -122,7 +121,7 @@ describe("tablet header controls", () => {
   });
 
   it("closes overflow menu on tablet after selecting an item", async () => {
-    renderTabletHeader({ onChangeView: noop, showSkillsTab: true, experimentalFeatures: { insights: true, roadmap: true } });
+    renderTabletHeader({ onChangeView: noop, showSkillsTab: true, experimentalFeatures: { insights: true } });
     fireEvent.click(screen.getByTestId("view-toggle-overflow-trigger"));
     expect(screen.getByTestId("view-overflow-insights")).toBeDefined();
     fireEvent.click(screen.getByTestId("view-overflow-skills"));

@@ -10,11 +10,67 @@
  */
 
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { readFile } from "node:fs/promises";
+import { dirname, extname, join, resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
 import * as readline from "node:readline";
-import { PluginStore, PluginLoader, validatePluginManifest } from "@fusion/core";
+import { PluginStore, PluginLoader, validatePluginManifest, resolveGlobalDir } from "@fusion/core";
 import { resolveProject } from "../project-context.js";
+
+export interface BuiltinPluginCatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+  category: "runtime" | "integration";
+  path?: string;
+  experimental?: boolean;
+}
+
+export const BUILTIN_PLUGINS: BuiltinPluginCatalogEntry[] = [
+  {
+    id: "fusion-plugin-hermes-runtime",
+    name: "Hermes Runtime",
+    description: "Runtime provider for Hermes CLI-backed execution.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-hermes-runtime",
+    experimental: true,
+  },
+  {
+    id: "fusion-plugin-paperclip-runtime",
+    name: "Paperclip Runtime",
+    description: "Runtime provider for Paperclip agent connections.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-paperclip-runtime",
+  },
+  {
+    id: "fusion-plugin-openclaw-runtime",
+    name: "OpenClaw Runtime",
+    description: "Runtime provider for OpenClaw execution.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-openclaw-runtime",
+    experimental: true,
+  },
+  {
+    id: "fusion-plugin-droid-runtime",
+    name: "Droid Runtime",
+    description: "Runtime provider for Droid CLI execution.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-droid-runtime",
+    experimental: true,
+  },
+  {
+    id: "fusion-plugin-dependency-graph",
+    name: "Dependency Graph",
+    description: "Dashboard plugin for task dependency graph visualization.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-dependency-graph",
+  },
+  {
+    id: "fusion-plugin-agent-browser",
+    name: "Agent Browser",
+    description: "Built-in integration metadata. Package install support lands in FN-3101.",
+    category: "integration",
+  },
+];
 
 /**
  * Get the project path for plugin operations.
@@ -36,11 +92,23 @@ async function getProjectPath(projectName?: string): Promise<string> {
 /**
  * Create a PluginStore for the given project.
  */
-async function createPluginStore(projectName?: string): Promise<PluginStore> {
-  const projectPath = await getProjectPath(projectName);
-  const pluginStore = new PluginStore(projectPath);
-  await pluginStore.init();
-  return pluginStore;
+async function createPluginStore(
+  projectName?: string,
+  options?: { centralGlobalDir?: string },
+): Promise<PluginStore> {
+  try {
+    const context = await resolveProject(projectName, process.cwd(), options?.centralGlobalDir);
+    const pluginStore = context.store.getPluginStore();
+    await pluginStore.init();
+    return pluginStore;
+  } catch {
+    const projectPath = await getProjectPath(projectName);
+    const pluginStore = new PluginStore(projectPath, {
+      centralGlobalDir: options?.centralGlobalDir ?? resolveGlobalDir(),
+    });
+    await pluginStore.init();
+    return pluginStore;
+  }
 }
 
 /**
@@ -67,13 +135,111 @@ async function createPluginLoader(
   return { store: pluginStore, loader };
 }
 
+const JS_ENTRY_EXTENSIONS = new Set([".js", ".mjs", ".cjs"]);
+const TS_SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
+
+function isJsEntryFile(path: string): boolean {
+  return JS_ENTRY_EXTENSIONS.has(extname(path).toLowerCase());
+}
+
+function isTypeScriptSource(path: string): boolean {
+  return TS_SOURCE_EXTENSIONS.has(extname(path).toLowerCase());
+}
+
+async function statPath(path: string): Promise<import("node:fs").Stats | undefined> {
+  try {
+    return await stat(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Resolve plugin installation source to a compiled JavaScript entry file.
+ */
+export async function resolvePluginEntryFile(pluginDir: string): Promise<string> {
+  const absoluteInputPath = resolve(pluginDir);
+  const inputStats = await statPath(absoluteInputPath);
+
+  if (inputStats?.isFile()) {
+    if (isTypeScriptSource(absoluteInputPath)) {
+      throw new Error(
+        `Plugin entry must be compiled JavaScript, but got TypeScript source: ${absoluteInputPath}. Build the plugin first (for example: pnpm build in the plugin directory).`,
+      );
+    }
+    if (isJsEntryFile(absoluteInputPath)) {
+      return absoluteInputPath;
+    }
+    throw new Error(`Plugin entry file must end with .js, .mjs, or .cjs: ${absoluteInputPath}`);
+  }
+
+  const packageJsonPath = join(absoluteInputPath, "package.json");
+  let selectedCandidate: string | undefined;
+
+  if (existsSync(packageJsonPath)) {
+    const packageJson = JSON.parse(await readFile(packageJsonPath, "utf-8")) as Record<string, unknown>;
+    const exportsRecord = asRecord(packageJson.exports);
+    const dotExport = exportsRecord?.["."];
+
+    const dotExportRecord = asRecord(dotExport);
+    if (typeof dotExportRecord?.import === "string") {
+      selectedCandidate = dotExportRecord.import;
+    } else if (typeof dotExportRecord?.default === "string") {
+      selectedCandidate = dotExportRecord.default;
+    } else if (typeof dotExport === "string") {
+      selectedCandidate = dotExport;
+    } else if (typeof packageJson.main === "string") {
+      selectedCandidate = packageJson.main;
+    }
+  }
+
+  if (selectedCandidate) {
+    const absoluteCandidate = resolve(absoluteInputPath, selectedCandidate);
+    if (isTypeScriptSource(absoluteCandidate)) {
+      throw new Error(
+        `Plugin entry resolves to TypeScript source (${absoluteCandidate}). Build the plugin first (for example: pnpm build in the plugin directory).`,
+      );
+    }
+    const candidateStats = await statPath(absoluteCandidate);
+    if (!candidateStats?.isFile()) {
+      throw new Error(
+        `Plugin entry file not found: ${absoluteCandidate}. Build the plugin first (for example: pnpm build in the plugin directory).`,
+      );
+    }
+    return absoluteCandidate;
+  }
+
+  const distIndexPath = resolve(absoluteInputPath, "dist/index.js");
+  const distStats = await statPath(distIndexPath);
+  if (distStats?.isFile()) {
+    return distIndexPath;
+  }
+
+  const indexPath = resolve(absoluteInputPath, "index.js");
+  const indexStats = await statPath(indexPath);
+  if (indexStats?.isFile()) {
+    return indexPath;
+  }
+
+  throw new Error(
+    `Could not resolve a plugin JavaScript entry file in ${absoluteInputPath}. Tried package.json exports/main, dist/index.js, and index.js. Build the plugin first (for example: pnpm build in the plugin directory).`,
+  );
+}
+
 /**
  * Load plugin manifest from a local path.
  */
 async function loadManifestFromPath(
   pluginPath: string,
 ): Promise<{ manifest: import("@fusion/core").PluginManifest; path: string }> {
-  const manifestPath = join(pluginPath, "manifest.json");
+  const absoluteInputPath = resolve(pluginPath);
+  const inputStats = await statPath(absoluteInputPath);
+  const manifestDir = inputStats?.isFile() ? dirname(absoluteInputPath) : absoluteInputPath;
+  const manifestPath = join(manifestDir, "manifest.json");
 
   if (!existsSync(manifestPath)) {
     throw new Error(`Plugin manifest not found at: ${manifestPath}`);
@@ -87,7 +253,7 @@ async function loadManifestFromPath(
     throw new Error(`Invalid plugin manifest: ${validation.errors.join(", ")}`);
   }
 
-  return { manifest, path: pluginPath };
+  return { manifest, path: manifestDir };
 }
 
 /**
@@ -122,7 +288,7 @@ export async function runPluginList(projectName?: string): Promise<void> {
   }
 
   console.log();
-  console.log("  ID                  Name                    Version  State     Enabled");
+  console.log("  ID                  Name                    Version  State     Project Enabled");
   console.log("  ─────────────────────────────────────────────────────────────────────");
 
   for (const plugin of plugins) {
@@ -142,7 +308,7 @@ export async function runPluginList(projectName?: string): Promise<void> {
  */
 export async function runPluginInstall(
   source: string,
-  options?: { projectName?: string },
+  options?: { projectName?: string; aiScan?: boolean },
 ): Promise<void> {
   const projectName = options?.projectName;
   const { store, loader } = await createPluginLoader(await createPluginStore(projectName), projectName);
@@ -162,27 +328,29 @@ export async function runPluginInstall(
   }
 
   try {
-    const { manifest, path } = await loadManifestFromPath(source);
+    const entryPath = await resolvePluginEntryFile(source);
+    const { manifest } = await loadManifestFromPath(source);
 
     console.log();
-    console.log(`  Installing ${manifest.name} v${manifest.version}...`);
+    console.log(`  Installing ${manifest.name} v${manifest.version} globally...`);
 
     // Register the plugin
     const plugin = await store.registerPlugin({
       manifest,
-      path,
+      path: entryPath,
+      aiScanOnLoad: options?.aiScan ?? false,
     });
 
     // Try to load it
     if (plugin.enabled) {
       try {
         await loader.loadPlugin(plugin.id);
-        console.log(`  ✓ ${manifest.name} installed and loaded`);
+        console.log(`  ✓ ${manifest.name} installed globally and enabled for this project`);
       } catch (loadErr) {
         console.log(`  ⚠ ${manifest.name} installed but failed to load: ${loadErr instanceof Error ? loadErr.message : String(loadErr)}`);
       }
     } else {
-      console.log(`  ✓ ${manifest.name} installed (disabled)`);
+      console.log(`  ✓ ${manifest.name} installed globally (disabled for this project)`);
     }
     console.log();
   } catch (err) {
@@ -215,8 +383,8 @@ export async function runPluginUninstall(
   // Confirm unless force
   if (!options?.force) {
     console.log();
-    console.log(`  Uninstall "${plugin.name}"?`);
-    console.log(`  This will stop and remove the plugin.`);
+    console.log(`  Uninstall "${plugin.name}" globally?`);
+    console.log("  This removes it for all projects.");
     console.log();
 
     const response = await new Promise<string>((resolve) => {
@@ -247,7 +415,7 @@ export async function runPluginUninstall(
   await store.unregisterPlugin(id);
 
   console.log();
-  console.log(`  ✓ ${plugin.name} uninstalled`);
+  console.log(`  ✓ ${plugin.name} uninstalled globally`);
   console.log();
 }
 
@@ -289,7 +457,7 @@ export async function runPluginEnable(
   }
 
   console.log();
-  console.log(`  ✓ ${plugin.name} enabled and started`);
+  console.log(`  ✓ ${plugin.name} enabled for this project and started`);
   console.log();
 }
 
@@ -324,6 +492,173 @@ export async function runPluginDisable(
   await store.disablePlugin(id);
 
   console.log();
-  console.log(`  ✓ ${plugin.name} disabled and stopped`);
+  console.log(`  ✓ ${plugin.name} disabled for this project and stopped`);
   console.log();
+}
+
+export async function runPluginSetupStatus(
+  id: string,
+  options?: { projectName?: string },
+): Promise<void> {
+  const projectName = options?.projectName;
+  const { store, loader } = await createPluginLoader(await createPluginStore(projectName), projectName);
+
+  try {
+    await store.getPlugin(id);
+  } catch {
+    console.error(`Plugin "${id}" not found`);
+    process.exit(1);
+  }
+
+  if (!loader.isPluginLoaded(id)) {
+    console.error(`Plugin "${id}" is not loaded. Enable the plugin first.`);
+    process.exit(1);
+  }
+
+  const loadedPlugin = loader.getPlugin(id);
+  if (!loadedPlugin?.setup) {
+    console.log("Plugin has no setup requirements");
+    return;
+  }
+
+  const result = await loader.checkPluginSetup(id);
+  console.log(`status: ${result.status}`);
+  if (result.version) console.log(`version: ${result.version}`);
+  if (result.binaryPath) console.log(`binaryPath: ${result.binaryPath}`);
+  if (result.error) console.log(`error: ${result.error}`);
+}
+
+export async function runPluginAvailable(): Promise<void> {
+  console.log();
+  console.log("  ID                             Name                 Category      Installable");
+  console.log("  ──────────────────────────────────────────────────────────────────────────────");
+  for (const plugin of BUILTIN_PLUGINS) {
+    const id = plugin.id.padEnd(30);
+    const name = plugin.name.padEnd(20);
+    const category = plugin.category.padEnd(13);
+    const installable = plugin.path ? "yes" : "metadata-only";
+    console.log(`  ${id} ${name} ${category} ${installable}`);
+  }
+  console.log();
+}
+
+export async function runPluginSettings(
+  id: string,
+  key?: string,
+  value?: string,
+  options?: { projectName?: string },
+): Promise<void> {
+  const pluginStore = await createPluginStore(options?.projectName);
+  const plugin = await pluginStore.getPlugin(id);
+
+  if (!key) {
+    console.log(JSON.stringify(plugin.settings ?? {}, null, 2));
+    return;
+  }
+
+  if (value === undefined) {
+    const currentValue = (plugin.settings ?? {})[key];
+    console.log(currentValue === undefined ? "undefined" : JSON.stringify(currentValue, null, 2));
+    return;
+  }
+
+  const parsedValue = (() => {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  })();
+
+  await pluginStore.updatePluginSettings(id, { [key]: parsedValue });
+  console.log(`✓ Updated ${id}.${key}`);
+}
+
+export async function runPluginRescan(
+  id: string,
+  options?: { projectName?: string },
+): Promise<void> {
+  const projectName = options?.projectName;
+  const { store, loader } = await createPluginLoader(await createPluginStore(projectName), projectName);
+
+  let plugin;
+  try {
+    plugin = await store.getPlugin(id);
+  } catch {
+    console.error(`Plugin "${id}" not found`);
+    process.exit(1);
+  }
+
+  try {
+    if (plugin.state === "started" && typeof loader.reloadPlugin === "function") {
+      await loader.reloadPlugin(id);
+    } else if (plugin.enabled) {
+      await loader.loadPlugin(id);
+    }
+  } catch (error) {
+    // keep going to show persisted scan verdict/state
+    console.error(`Rescan/load failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const refreshed = await store.getPlugin(id);
+  const scan = refreshed.lastSecurityScan;
+  const verdict = scan?.verdict ?? "unavailable";
+  const summary = scan?.summary ?? refreshed.error ?? "No scan result available";
+  const findingCount = scan?.findings?.length ?? 0;
+
+  console.log(`${refreshed.name}`);
+  console.log(`verdict: ${verdict}`);
+  console.log(`summary: ${summary}`);
+  console.log(`findings: ${findingCount}`);
+
+  if (verdict === "blocked" || verdict === "error" || verdict === "unavailable") {
+    process.exit(1);
+  }
+}
+
+export async function runPluginSetup(
+  id: string,
+  options?: { action?: "install" | "uninstall"; projectName?: string },
+): Promise<void> {
+  const projectName = options?.projectName;
+  const action = options?.action ?? "install";
+  const { store, loader } = await createPluginLoader(await createPluginStore(projectName), projectName);
+
+  let plugin;
+  try {
+    plugin = await store.getPlugin(id);
+  } catch {
+    console.error(`Plugin "${id}" not found`);
+    process.exit(1);
+  }
+
+  if (!loader.isPluginLoaded(id)) {
+    console.error(`Plugin "${id}" is not loaded. Enable the plugin first.`);
+    process.exit(1);
+  }
+
+  const loadedPlugin = loader.getPlugin(id);
+  if (!loadedPlugin?.setup) {
+    console.log("Plugin has no setup requirements");
+    return;
+  }
+
+  try {
+    if (action === "uninstall") {
+      await loader.uninstallPluginSetup(id);
+      console.log(`✓ ${plugin.name} setup uninstalled`);
+      return;
+    }
+
+    if (!loadedPlugin.setup.hooks.install) {
+      console.error("Plugin has no install hook");
+      process.exit(1);
+    }
+
+    await loader.installPluginSetup(id);
+    console.log(`✓ ${plugin.name} setup installed`);
+  } catch (error) {
+    console.error(`Failed to ${action} setup for "${id}": ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
 }

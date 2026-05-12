@@ -8,14 +8,31 @@
  */
 
 import type { AgentRuntimeOptions } from "./agent-runtime.js";
+import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { PluginRunner } from "./plugin-runner.js";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import {
+  resolveExecutionSettingsModel,
+  resolveTaskExecutionModel,
+  resolveTaskPlanningModel,
+  type Settings,
+} from "@fusion/core";
 import { resolveRuntime, buildRuntimeResolutionContext, type SessionPurpose } from "./runtime-resolution.js";
 import { createLogger } from "./logger.js";
 import { promptWithFallback, describeModel } from "./pi.js";
 
 /** Logger for agent session helpers */
 const sessionLog = createLogger("agent-session");
+
+function extractSkillNamesFromSelection(skillSelection: SkillSelectionContext | undefined): string[] {
+  if (!skillSelection || !Array.isArray(skillSelection.requestedSkillNames)) {
+    return [];
+  }
+
+  return skillSelection.requestedSkillNames
+    .map((name) => (typeof name === "string" ? name.trim() : ""))
+    .filter((name) => name.length > 0);
+}
 
 /**
  * Options for creating an agent session with runtime resolution.
@@ -28,13 +45,9 @@ export interface ResolvedSessionOptions extends AgentRuntimeOptions {
   /** Optional runtime hint from task/agent configuration */
   runtimeHint?: string;
   /**
-   * `beforeSpawnSession` is inherited from {@link AgentRuntimeOptions} — see
-   * its definition there for the contract. Callers (e.g. the reviewer's
-   * pause gate) throw from this callback to cancel session creation when
-   * external state changed during the async setup window. Forwarded
-   * verbatim to `runtime.createSession()`; the runtime is responsible for
-   * invoking it at its latest synchronous point before the underlying LLM
-   * session is instantiated.
+   * `beforeSpawnSession` and `taskEnv` are inherited from
+   * {@link AgentRuntimeOptions}. Both are forwarded verbatim to
+   * `runtime.createSession()`.
    */
 }
 
@@ -101,6 +114,105 @@ export function extractRuntimeModel(
   };
 }
 
+export function resolveExecutorSessionModel(
+  taskModelProvider: string | undefined,
+  taskModelId: string | undefined,
+  settings: Partial<Settings> | undefined,
+  assignedAgentRuntimeConfig?: Record<string, unknown>,
+): { provider: string | undefined; modelId: string | undefined } {
+  const assignedRuntimeModel = extractRuntimeModel(assignedAgentRuntimeConfig);
+  if (assignedRuntimeModel.provider && assignedRuntimeModel.modelId) {
+    return assignedRuntimeModel;
+  }
+
+  const resolvedTaskModel = resolveTaskExecutionModel(
+    {
+      modelProvider: taskModelProvider,
+      modelId: taskModelId,
+    },
+    settings,
+  );
+
+  return {
+    provider: resolvedTaskModel.provider,
+    modelId: resolvedTaskModel.modelId,
+  };
+}
+
+export function resolvePlanningSessionModel(
+  taskPlanningModelProvider: string | undefined,
+  taskPlanningModelId: string | undefined,
+  settings: Partial<Settings> | undefined,
+  assignedAgentRuntimeConfig?: Record<string, unknown>,
+): { provider: string | undefined; modelId: string | undefined } {
+  const assignedRuntimeModel = extractRuntimeModel(assignedAgentRuntimeConfig);
+  if (assignedRuntimeModel.provider && assignedRuntimeModel.modelId) {
+    return assignedRuntimeModel;
+  }
+
+  const resolvedTaskPlanningModel = resolveTaskPlanningModel(
+    {
+      planningModelProvider: taskPlanningModelProvider,
+      planningModelId: taskPlanningModelId,
+    },
+    settings,
+  );
+
+  return {
+    provider: resolvedTaskPlanningModel.provider,
+    modelId: resolvedTaskPlanningModel.modelId,
+  };
+}
+
+export function resolveHeartbeatSessionModels(
+  settings: Partial<Settings> | undefined,
+  assignedAgentRuntimeConfig?: Record<string, unknown>,
+): {
+  defaultProvider: string | undefined;
+  defaultModelId: string | undefined;
+  fallbackProvider: string | undefined;
+  fallbackModelId: string | undefined;
+} {
+  const assignedRuntimeModel = extractRuntimeModel(assignedAgentRuntimeConfig);
+  const executionSettingsModel = resolveExecutionSettingsModel(settings);
+
+  const defaultProvider = assignedRuntimeModel.provider ?? executionSettingsModel.provider;
+  const defaultModelId = assignedRuntimeModel.modelId ?? executionSettingsModel.modelId;
+
+  const executionPairAvailable = Boolean(executionSettingsModel.provider && executionSettingsModel.modelId);
+  const defaultMatchesExecution =
+    defaultProvider === executionSettingsModel.provider && defaultModelId === executionSettingsModel.modelId;
+
+  return {
+    defaultProvider,
+    defaultModelId,
+    fallbackProvider: executionPairAvailable && !defaultMatchesExecution ? executionSettingsModel.provider : undefined,
+    fallbackModelId: executionPairAvailable && !defaultMatchesExecution ? executionSettingsModel.modelId : undefined,
+  };
+}
+
+export function resolveMergerSessionModel(
+  settings: Partial<Settings> | undefined,
+  assignedAgentRuntimeConfig?: Record<string, unknown>,
+): { provider: string | undefined; modelId: string | undefined } {
+  const assignedRuntimeModel = extractRuntimeModel(assignedAgentRuntimeConfig);
+  if (assignedRuntimeModel.provider && assignedRuntimeModel.modelId) {
+    return assignedRuntimeModel;
+  }
+
+  if (settings?.defaultProviderOverride && settings.defaultModelIdOverride) {
+    return {
+      provider: settings.defaultProviderOverride,
+      modelId: settings.defaultModelIdOverride,
+    };
+  }
+
+  return {
+    provider: settings?.defaultProvider,
+    modelId: settings?.defaultModelId,
+  };
+}
+
 /**
  * Create an agent session using runtime resolution.
  *
@@ -115,7 +227,17 @@ export function extractRuntimeModel(
 export async function createResolvedAgentSession(
   options: ResolvedSessionOptions,
 ): Promise<ResolvedSessionResult> {
-  const { sessionPurpose, pluginRunner, runtimeHint, ...runtimeOptions } = options;
+  const { sessionPurpose, pluginRunner, runtimeHint, ...runtimeOptionsRaw } = options;
+
+  const skillNamesFromSelection = extractSkillNamesFromSelection(runtimeOptionsRaw.skillSelection);
+  const mergedSkillNames = runtimeOptionsRaw.skills && runtimeOptionsRaw.skills.length > 0
+    ? runtimeOptionsRaw.skills
+    : skillNamesFromSelection;
+
+  const runtimeOptions: AgentRuntimeOptions = {
+    ...runtimeOptionsRaw,
+    ...(mergedSkillNames.length > 0 ? { skills: mergedSkillNames } : {}),
+  };
 
   // Build the resolution context
   const context = buildRuntimeResolutionContext(sessionPurpose, pluginRunner, runtimeHint);

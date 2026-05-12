@@ -98,6 +98,10 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
   const [localDescription, setLocalDescription] = useState(initialDescription);
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [branchMode, setBranchMode] = useState<"project-default" | "auto-new" | "existing" | "custom-new">("project-default");
+  const [branchName, setBranchName] = useState("");
+  const [baseBranch, setBaseBranch] = useState("");
+  const [branchAssignmentMode, setBranchAssignmentMode] = useState<"shared" | "per-task-derived">("shared");
   
   // Drag-and-drop state
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -130,8 +134,9 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
   const isInvalid = useMemo(() => {
     if (subtasks.length === 0) return true;
     if (subtasks.some((subtask) => !subtask.title.trim())) return true;
+    if ((branchMode === "existing" || branchMode === "custom-new") && !branchName.trim()) return true;
     return hasDependencyCycle(subtasks);
-  }, [subtasks]);
+  }, [branchMode, branchName, subtasks]);
 
   const showSendToBackgroundButton = view.type === "generating" || view.type === "editing" || view.type === "error";
   const activeLockInfo = sessionId ? activeTabMap.get(sessionId) : null;
@@ -156,6 +161,10 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
     setIsRetrying(false);
     setError(null);
     setDirty(false);
+    setBranchMode("project-default");
+    setBranchName("");
+    setBaseBranch("");
+    setBranchAssignmentMode("shared");
     autoStartedRef.current = false;
   }, [localDescription, projectId]);
 
@@ -500,7 +509,14 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
     setError(null);
     setView({ type: "creating", sessionId });
     try {
-      const result = await createTasksFromBreakdown(sessionId, subtasks, parentTaskId, projectId);
+      const result = await createTasksFromBreakdown(sessionId, subtasks, parentTaskId, projectId, {
+        branchSelection: {
+          mode: branchMode,
+          ...(branchMode === "existing" || branchMode === "custom-new" ? { branchName } : {}),
+          ...(baseBranch.trim() ? { baseBranch: baseBranch.trim() } : {}),
+        },
+        branchAssignment: { mode: branchAssignmentMode },
+      });
       onTasksCreated(result.tasks);
       resetState();
       onClose();
@@ -508,7 +524,7 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
       setError(getErrorMessage(err) || "Failed to create tasks");
       setView({ type: "editing", sessionId });
     }
-  }, [isInvalid, onClose, onTasksCreated, parentTaskId, projectId, resetState, sessionId, subtasks]);
+  }, [baseBranch, branchAssignmentMode, branchMode, branchName, isInvalid, onClose, onTasksCreated, parentTaskId, projectId, resetState, sessionId, subtasks]);
 
   const handleRetry = useCallback(async () => {
     if (view.type !== "error") {
@@ -692,6 +708,34 @@ export function SubtaskBreakdownModal({ isOpen, onClose, initialDescription, onT
                 </div>
 
                 <div className="planning-summary-form">
+                  <div className="task-detail-section">
+                    <div className="form-group">
+                      <label>Branch strategy</label>
+                      <select value={branchMode} onChange={(event) => setBranchMode(event.target.value as typeof branchMode)} disabled={view.type === "creating"}>
+                        <option value="project-default">Use project/default branch</option>
+                        <option value="auto-new">Create auto-named branch per task</option>
+                        <option value="existing">Use existing branch</option>
+                        <option value="custom-new">Create custom new branch</option>
+                      </select>
+                    </div>
+                    {(branchMode === "existing" || branchMode === "custom-new") && (
+                      <div className="form-group">
+                        <label>Branch name</label>
+                        <input value={branchName} onChange={(event) => setBranchName(event.target.value)} disabled={view.type === "creating"} />
+                      </div>
+                    )}
+                    <div className="form-group">
+                      <label>Merge target / base branch (optional)</label>
+                      <input value={baseBranch} onChange={(event) => setBaseBranch(event.target.value)} disabled={view.type === "creating"} placeholder="main" />
+                    </div>
+                    <div className="form-group">
+                      <label>Planning branch mode</label>
+                      <select value={branchAssignmentMode} onChange={(event) => setBranchAssignmentMode(event.target.value as typeof branchAssignmentMode)} disabled={view.type === "creating"}>
+                        <option value="shared">Shared branch for all subtasks</option>
+                        <option value="per-task-derived">Per-task branch derived from planning branch</option>
+                      </select>
+                    </div>
+                  </div>
                   {subtasks.map((subtask, index) => {
                     const isDragging = draggingId === subtask.id;
                     const isDragOver = dragOverId === subtask.id;

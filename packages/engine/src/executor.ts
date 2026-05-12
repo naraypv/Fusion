@@ -2,17 +2,18 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
-import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, Slice, AgentState, AgentCapability, RunMutationContext } from "@fusion/core";
+import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent } from "@fusion/core";
 import {
+  ApprovalRequestStore,
   buildExecutionMemoryInstructions,
   getTaskMergeBlocker,
+  isEphemeralAgent,
   resolveAgentPrompt,
-  resolveModelFallbackChain,
+  resolveEffectiveAgentPermissionPolicy,
   resolveProjectDefaultModel,
-  resolveRouteAllLlmCallsViaDspy,
   type RunCommandResult,
 } from "@fusion/core";
 import { findWorktreeUser } from "./merger.js";
@@ -26,7 +27,11 @@ import { generateWorktreeName, slugify } from "./worktree-names.js";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import { describeModel, promptWithFallback, compactSessionContext } from "./pi.js";
 import { accumulateSessionTokenUsage } from "./session-token-usage.js";
-import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
+import {
+  createResolvedAgentSession,
+  extractRuntimeHint,
+  resolveExecutorSessionModel,
+} from "./agent-session-helpers.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { reviewStep, type ReviewVerdict } from "./reviewer.js";
 import { ModelRegistry, SessionManager, type ToolDefinition, type AgentSession } from "@mariozechner/pi-coding-agent";
@@ -43,15 +48,24 @@ import type { StuckTaskDetector, StuckTaskEvent } from "./stuck-task-detector.js
 import type { PluginRunner } from "./plugin-runner.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { StepSessionExecutor } from "./step-session-executor.js";
-import { resolveAgentInstructions, buildSystemPromptWithInstructions } from "./agent-instructions.js";
+import { hydrateWorktreeDb } from "./worktree-db-hydrate.js";
+import {
+  resolveAgentInstructions,
+  buildSystemPromptWithInstructions,
+  buildPluginPromptSection,
+} from "./agent-instructions.js";
+import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from "./run-audit.js";
 import { evaluateSpecStaleness, getPromptPath } from "./spec-staleness.js";
 import {
+  createAgentCreateTool,
+  createAgentDeleteTool,
   createDelegateTaskTool,
   createGetAgentConfigTool,
   createListAgentsTool,
   createMemoryTools,
+  createWebFetchTool,
   createReadMessagesTool,
   createReflectOnPerformanceTool,
   createUpdateAgentConfigTool,
@@ -63,14 +77,21 @@ import {
   createTaskLogTool as sharedCreateTaskLogTool,
 } from "./agent-tools.js";
 import { getTaskCompletionBlockerForStore } from "./task-completion.js";
+import {
+  getEnabledPluginTools,
+  getResearchGuidanceForSurface,
+  isResearchToolSurfaceEnabled,
+} from "./tool-availability.js";
 import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
 import { createRunVerificationTool } from "./run-verification-tool.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
-import { buildBoundPlanGoalPromptContext, persistBoundPlanGoalCompletion } from "./planned-execution.js";
+import type { AgentActionGateContext } from "./agent-action-gate.js";
 
 // Re-export for backward compatibility (tests import from executor.ts)
 export { summarizeToolArgs } from "./agent-logger.js";
 export {
+  createAgentCreateTool,
+  createAgentDeleteTool,
   createDelegateTaskTool,
   createGetAgentConfigTool,
   createListAgentsTool,
@@ -106,10 +127,9 @@ const COMPLETED_TASK_WATCHDOG_MS = 60_000;
 const WORKFLOW_RERUN_WATCHDOG_MS = 15_000;
 
 /**
- * @deprecated Kept exported so existing unit tests in executor.test.ts still
- * link, but no longer called from the executor. Revision feedback is applied
- * as an in-place fix via `reopenLastStepForRevision` — earlier completed
- * steps stay done instead of being replayed.
+ * Determines the step index from which revision should restart given a set of
+ * completed steps and user feedback. Exported for unit tests; no longer called
+ * from the executor (revision is now handled via `reopenLastStepForRevision`).
  */
 export function determineRevisionResetStart(
   steps: ReadonlyArray<{ name: string }>,
@@ -153,6 +173,7 @@ async function runConfiguredCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<RunCommandResult> {
   try {
     const { stdout, stderr } = await execAsync(command, {
@@ -160,6 +181,7 @@ async function runConfiguredCommand(
       timeout: timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
       encoding: "utf-8",
+      ...(extraEnv !== undefined && { env: extraEnv }),
     });
 
     return {
@@ -197,7 +219,7 @@ async function runConfiguredCommand(
 // ── Tool parameter schemas (module-level for reuse in ToolDefinition generics) ──
 
 const taskUpdateParams = Type.Object({
-  step: Type.Number({ description: "Step number (0-indexed)" }),
+  step: Type.Number({ description: "Step number (1-indexed)" }),
   status: Type.Union(
     STEP_STATUSES.map((s) => Type.Literal(s)),
     { description: "New status: pending, in-progress, done, or skipped" },
@@ -372,12 +394,6 @@ You can save and retrieve named documents for this task. Use these to store plan
 
 Documents are versioned — each write creates a new revision. Use meaningful keys like "plan", "notes", "research", "architecture".
 
-## Research tools
-When implementation needs external context, you may use research tools (
-\`fn_research_run\`, \`fn_research_list\`, \`fn_research_get\`, \`fn_research_cancel\`) to run bounded research.
-Keep runs focused and short, and persist durable conclusions into task documents (for example key="research").
-If research is disabled or providers are not configured, use the actionable tool response and continue with available local context.
-
 **IMPORTANT — Save your deliverables as documents:** When your task produces written output (documentation, specifications, reports, API references, README updates, guides, or any other content), you MUST save that content as a task document using \`fn_task_document_write\`. Use a key that describes the deliverable (e.g., key="readme", key="api-docs", key="changelog"). Do this in addition to writing the file to disk — the document persists in the task for review even after the worktree is cleaned up.
 
 If the task's PROMPT.md includes a "Documentation Requirements" section listing files to update, save each updated file's final content as a task document with a matching key.
@@ -404,7 +420,7 @@ You are running in an **isolated git worktree**. This means:
 - **All code changes must be made inside the current worktree directory.** Do not modify files outside the worktree — the worktree is your isolated execution environment.
 - **Exception — Project memory:** You MAY read and write to files under .fusion/memory/ at the project root to save durable project learnings (architecture patterns, conventions, pitfalls).
 - **Exception — Task attachments:** You MAY read files under .fusion/tasks/{taskId}/attachments/ at the project root for context screenshots and documents attached to this task.
-- **Exception — Sibling task specs:** You MAY read .fusion/tasks/{taskId}/PROMPT.md and .fusion/tasks/{taskId}/task.json at the project root (read-only) to consult dependency tasks' specifications.
+- **Exception — Sibling task specs:** You MAY read .fusion/tasks/{taskId}/PROMPT.md and .fusion/tasks/{taskId}/task.json at the project root (read-only) to consult dependency tasks' specifications. If those files do not exist, the dependency has been archived — call \`fn_task_show\` with its ID to load the spec from the archive.
 - **Shell commands** run inside the worktree by default. Avoid using cd to navigate outside the worktree.
 
 If you attempt to write to a path outside the worktree, the file tools will reject the operation with an error explaining the boundary.
@@ -494,43 +510,14 @@ The tool prevents your session from being killed by the inactivity watchdog duri
 /** Resolve the executor system prompt from settings, falling back to the hardcoded constant. */
 function getExecutorSystemPrompt(settings: Settings): string {
   const customPrompt = resolveAgentPrompt("executor", settings.agentPrompts);
-  return customPrompt || EXECUTOR_SYSTEM_PROMPT;
+  const basePrompt = customPrompt || EXECUTOR_SYSTEM_PROMPT;
+  const sections = [
+    basePrompt,
+    isResearchToolSurfaceEnabled(settings) ? getResearchGuidanceForSurface("executor") : "",
+  ].filter((section) => section.trim());
+  return sections.join("\n\n");
 }
 
-function resolveExecutorModelPair(
-  taskModelProvider: string | undefined,
-  taskModelId: string | undefined,
-  settings: Partial<Settings> | undefined,
-): { provider: string | undefined; modelId: string | undefined } {
-  if (taskModelProvider && taskModelId) {
-    return { provider: taskModelProvider, modelId: taskModelId };
-  }
-  if (settings?.executionProvider && settings?.executionModelId) {
-    return {
-      provider: settings.executionProvider,
-      modelId: settings.executionModelId,
-    };
-  }
-  if (settings?.executionGlobalProvider && settings?.executionGlobalModelId) {
-    return {
-      provider: settings.executionGlobalProvider,
-      modelId: settings.executionGlobalModelId,
-    };
-  }
-  if (settings?.defaultProviderOverride && settings?.defaultModelIdOverride) {
-    return {
-      provider: settings.defaultProviderOverride,
-      modelId: settings.defaultModelIdOverride,
-    };
-  }
-  if (settings?.defaultProvider && settings?.defaultModelId) {
-    return {
-      provider: settings.defaultProvider,
-      modelId: settings.defaultModelId,
-    };
-  }
-  return { provider: undefined, modelId: undefined };
-}
 
 export interface TaskExecutorOptions {
   semaphore?: AgentSemaphore;
@@ -572,8 +559,11 @@ export class TaskExecutor {
   private activeSessions = new Map<string, {
     session: AgentSession;
     seenSteeringIds: Set<string>;
-    lastModelProvider?: string | null;
-    lastModelId?: string | null;
+    lastResolvedModelProvider?: string;
+    lastResolvedModelId?: string;
+    lastTaskModelProvider?: string | null;
+    lastTaskModelId?: string | null;
+    lastAssignedAgentId?: string | null;
   }>();
   /** Active step-session executors per task (mutually exclusive with activeSessions). */
   private activeStepExecutors = new Map<string, StepSessionExecutor>();
@@ -606,10 +596,36 @@ export class TaskExecutor {
   private completedTaskWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
   /** One-shot watchdogs for workflow reruns that should have bounced back to in-progress. */
   private workflowRerunWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Set of ephemeral spawned agent IDs with scheduled cleanup (prevents duplicate deletion attempts). */
+  /** Set of ephemeral spawned agent IDs with in-flight cleanup (prevents duplicate deletion attempts). */
   private pendingEphemeralDeletions = new Set<string>();
-  /** Map of spawned agent IDs to scheduled cleanup timer handles for shutdown disposal. */
-  private ephemeralCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  private async renewTaskLease(
+    taskId: string,
+    agentId: string,
+    leaseEpoch: number,
+    nodeId: string,
+    runId: string | undefined,
+  ): Promise<void> {
+    const renewedAt = new Date().toISOString();
+    if (this.options.agentStore) {
+      await this.options.agentStore.checkoutTask(
+        agentId,
+        taskId,
+        {
+          nodeId,
+          runId,
+          leaseEpoch,
+          renewedAt,
+        },
+        this.currentRunContext,
+      );
+      return;
+    }
+    await this.store.updateTask(taskId, {
+      checkoutRunId: runId ?? null,
+      checkoutLeaseRenewedAt: renewedAt,
+    });
+  }
 
   private async finalizeAlreadyReviewedTask(taskId: string): Promise<"merged" | "blocked" | "missing"> {
     const latestTask = await this.store.getTask(taskId);
@@ -717,6 +733,7 @@ export class TaskExecutor {
   /** Token cap detector for proactive context compaction. */
   private tokenCapDetector = new TokenCapDetector();
   private _modelRegistry?: ModelRegistry;
+  private _approvalRequestStore?: ApprovalRequestStore;
   /** Current run context for mutation correlation. Set at execute() start, cleared in finally. */
   private currentRunContext: RunMutationContext | undefined;
 
@@ -729,6 +746,121 @@ export class TaskExecutor {
     return this._modelRegistry;
   }
 
+  private get approvalRequestStore(): ApprovalRequestStore {
+    if (!this._approvalRequestStore) {
+      this._approvalRequestStore = new ApprovalRequestStore(this.store.getDatabase());
+    }
+    return this._approvalRequestStore;
+  }
+
+  private buildActionGateContext(taskId: string | undefined, agent: Agent | null | undefined): AgentActionGateContext | undefined {
+    if (!agent || isEphemeralAgent(agent)) {
+      return undefined;
+    }
+    const policy = resolveEffectiveAgentPermissionPolicy(agent.permissionPolicy);
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      isEphemeral: false,
+      taskId,
+      runId: this.currentRunContext?.runId,
+      permissionPolicy: policy,
+      createApprovalRequest: async (decision, args) => this.approvalRequestStore.create({
+        requester: {
+          actorId: agent.id,
+          actorType: "agent",
+          actorName: agent.name,
+        },
+        taskId,
+        runId: this.currentRunContext?.runId,
+        targetAction: {
+          category: decision.category === "exempt" ? "command_execution" : decision.category,
+          action: decision.operation,
+          summary: decision.summary,
+          resourceType: decision.resourceType,
+          resourceId: decision.resourceId ?? "",
+          context: {
+            ...decision.metadata,
+            approvalDedupeKey: decision.approvalDedupeKey,
+            toolName: decision.toolName,
+            toolArgs: args,
+          },
+        },
+      }),
+      findApprovalByDedupeKey: async (dedupeKey) => {
+        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
+        return latest ? { id: latest.id, status: latest.status } : null;
+      },
+      findPendingApprovalByDedupeKey: async (dedupeKey) => {
+        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: agent.id, taskId, dedupeKey });
+        return latest?.status === "pending" ? { id: latest.id } : null;
+      },
+      pauseForApproval: async ({ approvalRequestId, decision }) => {
+        if (taskId) {
+          await this.store.pauseTask(taskId, true, this.currentRunContext, { pausedByAgentId: agent.id });
+          await this.store.logEntry(
+            taskId,
+            `Approval required for ${decision.toolName}. Request ${approvalRequestId} created; task and agent paused awaiting decision.`,
+            undefined,
+            this.currentRunContext,
+          );
+        }
+        if (this.options.agentStore) {
+          await this.options.agentStore.updateAgentState(agent.id, "paused");
+          await this.options.agentStore.updateAgent(agent.id, { pauseReason: "awaiting-approval" });
+        }
+      },
+      markApprovalCompleted: async (approvalRequestId) => {
+        await this.approvalRequestStore.markCompleted(approvalRequestId, {
+          actor: { actorId: agent.id, actorType: "agent", actorName: agent.name },
+          note: "Tool executed after approval",
+        });
+      },
+    };
+  }
+
+  private buildPermanentAgentGatingContext(taskId: string | undefined, agent: Agent | null | undefined): import("@fusion/core").PermanentAgentGatingContext | undefined {
+    if (!agent || isEphemeralAgent(agent)) {
+      return undefined;
+    }
+
+    return {
+      permissionPolicy: resolveEffectiveAgentPermissionPolicy(agent.permissionPolicy),
+      requester: {
+        actorId: agent.id,
+        actorType: "agent",
+        actorName: agent.name,
+      },
+      taskId,
+      runId: this.currentRunContext?.runId,
+      createApprovalRequest: async ({ category, toolName, args }) => this.approvalRequestStore.create({
+        requester: {
+          actorId: agent.id,
+          actorType: "agent",
+          actorName: agent.name,
+        },
+        taskId,
+        runId: this.currentRunContext?.runId,
+        targetAction: {
+          category,
+          action: toolName,
+          summary: `Permanent-agent gated action for ${toolName}`,
+          resourceType: "tool",
+          resourceId: toolName,
+          context: {
+            toolName,
+            toolArgs: args,
+            source: "permanent-agent-gating",
+          },
+        },
+      }),
+      findPendingApprovalRequest: async (dedupeKey) => {
+        const pending = this.approvalRequestStore.list({ status: "pending", requesterActorId: agent.id, taskId, limit: 100 });
+        return pending.find((request) => request.targetAction.context?.approvalDedupeKey === dedupeKey) ?? null;
+      },
+    };
+  }
+
   /** Returns the set of task IDs currently being executed. */
   getExecutingTaskIds(): Set<string> {
     return new Set([...this.executing, ...this.recoveringCompleted, ...this.resumingUnpaused]);
@@ -739,15 +871,7 @@ export class TaskExecutor {
   }
 
   disposeEphemeralTimers(): void {
-    const timerCount = this.ephemeralCleanupTimers.size;
-    for (const timerId of this.ephemeralCleanupTimers.values()) {
-      clearTimeout(timerId);
-    }
-    this.ephemeralCleanupTimers.clear();
     this.pendingEphemeralDeletions.clear();
-    if (timerCount > 0) {
-      executorLog.log(`Cleared ${timerCount} pending spawned-agent cleanup timer(s)`);
-    }
   }
 
   private isBenignEphemeralDeleteRaceError(agentId: string, err: unknown): boolean {
@@ -1039,20 +1163,31 @@ export class TaskExecutor {
         // Handle executor model hot-swap on active single-session executions
         if (this.activeSessions.has(task.id) && !task.paused) {
           const activeEntry = this.activeSessions.get(task.id)!;
-          const providerChanged = task.modelProvider !== activeEntry.lastModelProvider;
-          const modelIdChanged = task.modelId !== activeEntry.lastModelId;
+          const taskModelProviderChanged = task.modelProvider !== activeEntry.lastTaskModelProvider;
+          const taskModelIdChanged = task.modelId !== activeEntry.lastTaskModelId;
+          const assignedAgentChanged = (task.assignedAgentId ?? null) !== (activeEntry.lastAssignedAgentId ?? null);
 
-          if (providerChanged || modelIdChanged) {
-            activeEntry.lastModelProvider = task.modelProvider;
-            activeEntry.lastModelId = task.modelId;
+          if (taskModelProviderChanged || taskModelIdChanged || assignedAgentChanged) {
+            activeEntry.lastTaskModelProvider = task.modelProvider;
+            activeEntry.lastTaskModelId = task.modelId;
+            activeEntry.lastAssignedAgentId = task.assignedAgentId ?? null;
 
             const settings = await this.store.getSettings();
-            // Resolve model using canonical lane hierarchy for hot-swap
-            const { provider: newProvider, modelId: newModelId } = resolveExecutorModelPair(
+            const assignedRuntimeConfig = await this.getAssignedAgentRuntimeConfig(task.assignedAgentId);
+            const { provider: newProvider, modelId: newModelId } = resolveExecutorSessionModel(
               task.modelProvider,
               task.modelId,
               settings,
+              assignedRuntimeConfig,
             );
+
+            const providerChanged = newProvider !== activeEntry.lastResolvedModelProvider;
+            const modelIdChanged = newModelId !== activeEntry.lastResolvedModelId;
+            if (!providerChanged && !modelIdChanged) {
+              return;
+            }
+            activeEntry.lastResolvedModelProvider = newProvider;
+            activeEntry.lastResolvedModelId = newModelId;
 
             if (newProvider && newModelId) {
               try {
@@ -1436,11 +1571,25 @@ export class TaskExecutor {
         // moveTask's default reopen-to-todo path resets every step to
         // pending and rewrites PROMPT.md checkboxes, which would discard
         // the partial progress this bounce is supposed to retry on top of.
+        // `preserveWorktree` keeps the same checkout assigned across the
+        // hop so listeners never observe an interim `worktree=null` state
+        // — this bounce immediately re-promotes the task on the same
+        // directory, so releasing it would publish a misleading snapshot
+        // and could let self-healing reclaim the worktree as idle.
         if (preserveResumeState) {
-          await this.store.moveTask(taskId, "todo", { preserveResumeState: true });
+          await this.store.moveTask(taskId, "todo", {
+            preserveResumeState: true,
+            preserveWorktree: true,
+          });
         } else {
-          await this.store.moveTask(taskId, "todo");
+          await this.store.moveTask(taskId, "todo", { preserveWorktree: true });
         }
+        // Restore worktree + executionStartedAt unconditionally to match
+        // the original bounce contract: even with preserveWorktree the
+        // worktree pointer could have been cleared by an in-flight
+        // updateTask, and executionStartedAt is reset by moveTask when
+        // preserveResumeState is false. Keep the writes so callers and
+        // tests can observe the restoration deterministically.
         await this.store.updateTask(taskId, {
           worktree: worktreePath,
           executionStartedAt: originalExecutionStartedAt ?? null,
@@ -1680,7 +1829,7 @@ export class TaskExecutor {
   private async executeReviewHandoff(
     task: Task,
     _session: AgentSession,
-    _sessionEntry: { session: AgentSession; seenSteeringIds: Set<string>; lastModelProvider?: string | null; lastModelId?: string | null },
+    _sessionEntry: { session: AgentSession; seenSteeringIds: Set<string>; lastResolvedModelProvider?: string; lastResolvedModelId?: string; lastTaskModelProvider?: string | null; lastTaskModelId?: string | null; lastAssignedAgentId?: string | null },
   ): Promise<void> {
     try {
       executorLog.log(`Executing review handoff for ${task.id}`);
@@ -1768,7 +1917,7 @@ export class TaskExecutor {
           if (await this.shouldDeferCompletionForGlobalPause(task.id, "before workflow steps during completed-task recovery")) {
             return false;
           }
-          const workflowResult = await this.runWorkflowSteps(task, task.worktree, settings);
+          const workflowResult = await this.runWorkflowSteps(task, task.worktree, settings, undefined);
           if (workflowResult === "deferred-paused") {
             if (this.pausedAborted.has(task.id)) {
               this.pausedAborted.delete(task.id);
@@ -1849,6 +1998,59 @@ export class TaskExecutor {
       const errorMessage = err instanceof Error ? err.message : String(err);
       executorLog.error(`Failed to recover failed pre-merge workflow step for ${task.id}: ${errorMessage}`);
       return false;
+    }
+  }
+
+  /**
+   * Returns true when execute() should be deferred because the agent bound to
+   * this task has an active heartbeat run and allowParallelExecution=false.
+   *
+   * Only applies to permanent (non-ephemeral) agents. Always returns false
+   * when agentStore is unavailable or the agent cannot be resolved.
+   */
+  private async shouldDeferForHeartbeat(agentId: string): Promise<boolean> {
+    if (!this.options.agentStore) return false;
+    const agent = await this.options.agentStore.getAgent(agentId).catch(() => null);
+    if (!agent) return false;
+    if (isEphemeralAgent(agent)) return false;
+    const rc = (agent.runtimeConfig ?? {}) as AgentHeartbeatConfig;
+    if (rc.allowParallelExecution !== false) return false;
+    const activeRun = await this.options.agentStore.getActiveHeartbeatRun(agentId).catch(() => null);
+    return activeRun !== null;
+  }
+
+  private async getAssignedAgentRuntimeConfig(
+    assignedAgentId: string | null | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
+    const normalizedId = assignedAgentId?.trim();
+    if (!normalizedId || !this.options.agentStore) return undefined;
+    const agent = await this.options.agentStore.getAgent(normalizedId).catch(() => null);
+    return (agent?.runtimeConfig ?? undefined) as Record<string, unknown> | undefined;
+  }
+
+  /**
+   * Re-dispatch execute() for any unstarted in-progress task belonging to the
+   * given agent. Called after a heartbeat run completes to unblock tasks that
+   * were deferred by the allowParallelExecution=false gate.
+   */
+  async resumeTaskForAgent(agentId: string): Promise<void> {
+    const settings = await this.store.getSettings();
+    if (settings.globalPause || settings.enginePaused) return;
+    const tasks = await this.store.listTasks({ slim: true, column: "in-progress" });
+    for (const task of tasks) {
+      if (
+        task.assignedAgentId === agentId
+        && !task.paused
+        && !this.executing.has(task.id)
+        && !this.activeSessions.has(task.id)
+        && !this.activeStepExecutors.has(task.id)
+        && !this.activeWorkflowStepSessions.has(task.id)
+      ) {
+        executorLog.log(`${task.id}: re-dispatching execute() after heartbeat completion for agent ${agentId}`);
+        this.execute(task).catch((err) =>
+          executorLog.error(`Failed to resume ${task.id} after heartbeat completion:`, err),
+        );
+      }
     }
   }
 
@@ -1957,36 +2159,6 @@ export class TaskExecutor {
     return "";
   }
 
-  private resolveDependencyWorktree(task: Task, allTasks: Task[]): string | null {
-    if (task.dependencies.length === 0) return null;
-
-    for (const depId of task.dependencies) {
-      const dep = allTasks.find((t) => t.id === depId);
-      if (
-        dep &&
-        dep.worktree &&
-        (dep.column === "done" || dep.column === "in-review") &&
-        existsSync(dep.worktree)
-      ) {
-        return dep.worktree;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Reuse an existing worktree directory from a dependency task.
-   * Instead of creating a new worktree with `git worktree add`, this creates
-   * a new branch in the existing worktree via `git checkout -b`. The worktree
-   * directory (and its build caches) are preserved.
-   */
-  private async reuseWorktree(branch: string, worktreePath: string): Promise<void> {
-    await execAsync(`git checkout -b "${branch}"`, {
-      cwd: worktreePath,
-    });
-    executorLog.log(`Reused worktree at ${worktreePath}, created branch ${branch}`);
-  }
-
   /**
    * Execute a task in an isolated git worktree.
    *
@@ -2000,12 +2172,25 @@ export class TaskExecutor {
   async execute(task: Task): Promise<void> {
     executorLog.log(`execute() called for ${task.id} (already executing=${this.executing.has(task.id)})`);
     if (this.executing.has(task.id)) return;
+
+    const assignedAgentId = task.assignedAgentId;
+    if (assignedAgentId && await this.shouldDeferForHeartbeat(assignedAgentId)) {
+      executorLog.log(`${task.id}: skipping execute — agent ${assignedAgentId} has active heartbeat run (allowParallelExecution=false)`);
+      return;
+    }
+
     this.executing.add(task.id);
 
     executorLog.log(`Starting ${task.id}: ${task.title || task.description.slice(0, 60)}`);
 
     // Fetch settings early — needed for worktree naming and later configuration
     const settings = await this.store.getSettings();
+
+    // Keep runtime plugin workflow step templates synchronized into TaskStore.
+    // TaskStore resolves plugin-prefixed workflow IDs from this injected cache
+    // to avoid a PluginLoader↔TaskStore circular dependency.
+    const pluginWorkflowStepTemplates = this.options.pluginRunner?.getPluginWorkflowStepTemplates() ?? [];
+    this.store.setPluginWorkflowStepTemplates(pluginWorkflowStepTemplates);
 
     // Read execution mode to determine whether to skip review and workflow steps
     const executionMode = task.executionMode ?? "standard";
@@ -2113,8 +2298,12 @@ export class TaskExecutor {
     // true = requeue to todo, false = budget exhausted (already marked failed).
     let stuckRequeue: boolean | null = null;
     let taskDone = false;
+    let reviewAddressingActivated = false;
+    let taskEnv: NodeJS.ProcessEnv | undefined;
 
     try {
+      await this.transitionReviewAddressing(task.id, ["queued"], "in-progress");
+      reviewAddressingActivated = true;
       // Check dependencies
       const allTasks = await this.store.listTasks({ slim: true, includeArchived: false });
       const unmetDeps = task.dependencies.filter((depId) => {
@@ -2147,7 +2336,7 @@ export class TaskExecutor {
       let acquiredFromPool = false;
 
       // Resolve the base branch — set by the scheduler when a dep is in-review
-      const baseBranch = task.baseBranch || null;
+      const baseBranch = task.executionStartBranch || null;
 
       if (task.worktree && isResume && !await isUsableTaskWorktree(this.rootDir, worktreePath)) {
         const invalidWorktreePath = worktreePath;
@@ -2182,6 +2371,35 @@ export class TaskExecutor {
                 await this.store.logEntry(task.id, `Acquired worktree from pool: ${worktreePath} (branch conflict: using ${actualBranch})`, undefined, this.currentRunContext);
               } else {
                 await this.store.logEntry(task.id, `Acquired worktree from pool: ${worktreePath}`, undefined, this.currentRunContext);
+              }
+
+              if (this.rootDir !== worktreePath) {
+                try {
+                  const hydration = await hydrateWorktreeDb({
+                    rootDir: this.rootDir,
+                    worktreePath,
+                    taskId: task.id,
+                    store: this.store,
+                    logger: executorLog,
+                  });
+                if (hydration.degraded) {
+                  await this.store.logEntry(
+                    task.id,
+                    `Worktree DB hydration degraded: ${hydration.reason ?? "unknown"}`,
+                    undefined,
+                    this.currentRunContext,
+                  );
+                } else {
+                  await this.store.logEntry(
+                    task.id,
+                    `Hydrated worktree DB: ${hydration.tasksCopied} tasks, ${hydration.documentsCopied} task_documents`,
+                    undefined,
+                    this.currentRunContext,
+                  );
+                }
+                } catch (error) {
+                  executorLog.warn(`${task.id}: worktree DB hydration failed: ${formatError(error)}`);
+                }
               }
             } catch (poolErr: unknown) {
               // Pool preparation failed — release the worktree back and fall through
@@ -2230,7 +2448,7 @@ export class TaskExecutor {
           if (settings.worktreeInitCommand) {
             const initStartedAt = Date.now();
             try {
-              const initResult = await runConfiguredCommand(settings.worktreeInitCommand, worktreePath, 300_000);
+              const initResult = await runConfiguredCommand(settings.worktreeInitCommand, worktreePath, 300_000, taskEnv);
               if (initResult.spawnError || initResult.timedOut || initResult.exitCode !== 0) {
                 throw new Error(configuredCommandErrorMessage(initResult));
               }
@@ -2257,7 +2475,7 @@ export class TaskExecutor {
             if (scriptCommand) {
               const setupStartedAt = Date.now();
               try {
-                const setupResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000);
+                const setupResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000, taskEnv);
                 if (setupResult.spawnError || setupResult.timedOut || setupResult.exitCode !== 0) {
                   throw new Error(configuredCommandErrorMessage(setupResult));
                 }
@@ -2274,9 +2492,68 @@ export class TaskExecutor {
             }
           }
         }
+
+        if (!acquiredFromPool) {
+          if (this.rootDir !== worktreePath) {
+            try {
+              const hydration = await hydrateWorktreeDb({
+                rootDir: this.rootDir,
+                worktreePath,
+                taskId: task.id,
+                store: this.store,
+                logger: executorLog,
+              });
+            if (hydration.degraded) {
+              await this.store.logEntry(
+                task.id,
+                `Worktree DB hydration degraded: ${hydration.reason ?? "unknown"}`,
+                undefined,
+                this.currentRunContext,
+              );
+            } else {
+              await this.store.logEntry(
+                task.id,
+                `Hydrated worktree DB: ${hydration.tasksCopied} tasks, ${hydration.documentsCopied} task_documents`,
+                undefined,
+                this.currentRunContext,
+              );
+            }
+            } catch (error) {
+              executorLog.warn(`${task.id}: worktree DB hydration failed: ${formatError(error)}`);
+            }
+          }
+        }
       } else if (task.worktree) {
         // Task already had a worktree assigned and it exists on disk — reuse it
         executorLog.log(`Reusing existing worktree: ${worktreePath}`);
+        if (this.rootDir !== worktreePath) {
+          try {
+            const hydration = await hydrateWorktreeDb({
+              rootDir: this.rootDir,
+              worktreePath,
+              taskId: task.id,
+              store: this.store,
+              logger: executorLog,
+            });
+          if (hydration.degraded) {
+            await this.store.logEntry(
+              task.id,
+              `Worktree DB hydration degraded: ${hydration.reason ?? "unknown"}`,
+              undefined,
+              this.currentRunContext,
+            );
+          } else {
+            await this.store.logEntry(
+              task.id,
+              `Hydrated worktree DB: ${hydration.tasksCopied} tasks, ${hydration.documentsCopied} task_documents`,
+              undefined,
+              this.currentRunContext,
+            );
+          }
+          } catch (error) {
+            executorLog.warn(`${task.id}: worktree DB hydration failed: ${formatError(error)}`);
+          }
+        }
       } else {
         // Directory exists at generated path but task has no worktree — create via normal flow
         const created = await this.createWorktree(branchName, worktreePath, task.id);
@@ -2310,6 +2587,26 @@ export class TaskExecutor {
 
       this.activeWorktrees.set(task.id, worktreePath);
       executorLog.log(`${task.id}: worktree ready at ${worktreePath}`);
+
+      const runtimeEnvContribution = await this.options.pluginRunner?.collectExecutorRuntimeEnv({
+        taskId: task.id,
+        worktreePath,
+        rootDir: this.rootDir,
+        branch: task.branch ?? undefined,
+      });
+      const pathPrepend = runtimeEnvContribution?.pathPrepend ?? [];
+      const injectedEnv = runtimeEnvContribution?.env ?? {};
+      // We intentionally do NOT mutate process.env globally. This task-scoped env is
+      // passed through AgentRuntimeOptions so executor session subprocesses inherit it
+      // without leaking across concurrent tasks.
+      taskEnv = {
+        ...process.env,
+        ...injectedEnv,
+        PATH: [...pathPrepend, process.env.PATH ?? ""].filter(Boolean).join(delimiter),
+      };
+      executorLog.log(
+        `${task.id}: executor runtime env injected (${pathPrepend.length} PATH entries, ${Object.keys(injectedEnv).length} env keys)`,
+      );
 
       this.options.onStart?.(task, worktreePath);
 
@@ -2366,11 +2663,15 @@ export class TaskExecutor {
           stuckTaskDetector: this.options.stuckTaskDetector,
           pluginRunner: this.options.pluginRunner,
           runtimeHint: stepSessionRuntimeHint,
+          assignedAgentRuntimeConfig: (stepSessionAgent?.runtimeConfig ?? undefined) as Record<string, unknown> | undefined,
+          actionGateContext: this.buildActionGateContext(task.id, stepSessionAgent),
+          permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, stepSessionAgent),
           // Pass skill selection context from the main executor session
           skillSelection: skillContext.skillSelectionContext,
           // Pass agentStore and messageStore for delegation and messaging tools
           agentStore: this.options.agentStore,
           messageStore: this.options.messageStore,
+          taskEnv,
           onStepStart: (stepIndex) => {
             this.options.stuckTaskDetector?.recordProgress(task.id);
             try {
@@ -2462,7 +2763,7 @@ export class TaskExecutor {
             // and when no verification commands are configured.
             if (executionMode !== "fast") {
               if (settings.testCommand?.trim() || settings.buildCommand?.trim()) {
-                const verificationResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings);
+                const verificationResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings, taskEnv);
 
                 if (!verificationResult.allPassed) {
                   const failedType = verificationResult.failedCommand === "testCommand" ? "test" : "build";
@@ -2507,6 +2808,7 @@ export class TaskExecutor {
                       settings,
                       attempt,
                       maxFixRetries,
+                      taskEnv,
                     );
                     if (fixed) {
                       fixSucceeded = true;
@@ -2546,7 +2848,7 @@ export class TaskExecutor {
 
             // Run workflow steps before moving to in-review — skip in fast mode
             if (executionMode !== "fast") {
-              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
               if (workflowResult === "deferred-paused") {
                 if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                   this.pausedAborted.delete(task.id);
@@ -2707,22 +3009,37 @@ export class TaskExecutor {
           // Stuck-requeue: clean up worktree and move to todo
           if (stuckRequeue === true) {
             try {
-              // Reset steps whose work was never committed before destroying the worktree
+              // Re-read latest task state. Self-healing may have already moved
+              // the task out of in-progress while this step-session execution
+              // was unwinding; continuing the cleanup would clobber a valid
+              // recovery (see the analogous block in the outer finally for the
+              // full reasoning).
               const latestTask = await this.store.getTask(task.id);
-              await this.resetStepsIfWorkLost(latestTask);
+              if (latestTask.column !== "in-progress" && latestTask.column !== "todo") {
+                executorLog.log(
+                  `${task.id} stuck-requeue skipped — task is now in '${latestTask.column}' (recovered concurrently)`,
+                );
+              } else {
+                const settings = await this.store.getSettings();
+                const preserveProgress = settings.preserveProgressOnStuckRequeue !== false;
 
-              if (worktreePath && existsSync(worktreePath)) {
-                try {
-                  await execAsync(`git worktree remove "${worktreePath}" --force`, { cwd: this.rootDir });
-                } catch (wtErr: unknown) {
-                  const msg = wtErr instanceof Error ? wtErr.message : String(wtErr);
-                  executorLog.warn(`${task.id}: worktree removal failed during stuck-requeue cleanup (${worktreePath}): ${msg}`);
+                if (!preserveProgress) {
+                  await this.resetStepsIfWorkLost(latestTask);
                 }
-              }
-              await this.store.updateTask(task.id, { status: "stuck-killed", worktree: null, branch: null });
-              if (task.column !== "todo") {
-                await this.store.moveTask(task.id, "todo");
-                executorLog.log(`${task.id} moved to todo for retry after stuck kill`);
+
+                if (worktreePath && existsSync(worktreePath)) {
+                  try {
+                    await execAsync(`git worktree remove "${worktreePath}" --force`, { cwd: this.rootDir });
+                  } catch (wtErr: unknown) {
+                    const msg = wtErr instanceof Error ? wtErr.message : String(wtErr);
+                    executorLog.warn(`${task.id}: worktree removal failed during stuck-requeue cleanup (${worktreePath}): ${msg}`);
+                  }
+                }
+                await this.store.updateTask(task.id, { status: "stuck-killed", worktree: null, branch: null });
+                if (latestTask.column !== "todo") {
+                  await this.store.moveTask(task.id, "todo", preserveProgress ? { preserveProgress: true } : undefined);
+                  executorLog.log(`${task.id} moved to todo for retry after stuck kill${preserveProgress ? " (progress preserved)" : ""}`);
+                }
               }
             } catch (err: unknown) {
               const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2739,11 +3056,14 @@ export class TaskExecutor {
       // Build custom tools for the worker
       // Track the last code review verdict per step so we can enforce REVISE
       // (block fn_task_update status="done" until the agent re-reviews and gets APPROVE).
+      // Keyed by 0-indexed step (stepIndex). fn_task_update translates from
+      // its 1-indexed `step` parameter via `stepIndex = step - 1` (FN-3757).
       const codeReviewVerdicts = new Map<number, ReviewVerdict>();
 
       let wasPaused = false;
       // Mutable ref — populated after createFnAgent, tools access lazily via closure
       const sessionRef: { current: AgentSession | null } = { current: null };
+      // Keyed by 0-indexed step (stepIndex) to match fn_review_step.
       const stepCheckpoints = new Map<number, string>();
 
       const stuckDetector = this.options.stuckTaskDetector;
@@ -2782,14 +3102,17 @@ export class TaskExecutor {
         ...(executionMode !== "fast" ? [
           this.createReviewStepTool(task.id, worktreePath, detail.prompt, codeReviewVerdicts, sessionRef, stepCheckpoints, detail, stuckDetector),
         ] : []),
-        this.createSpawnAgentTool(task.id, worktreePath, settings),
+        this.createSpawnAgentTool(task.id, worktreePath, settings, taskEnv),
         this.createTaskDocumentWriteTool(task.id),
         this.createTaskDocumentReadTool(task.id),
-        ...createResearchTools({
-          store: this.store,
-          rootDir: this.rootDir,
-          getSettings: async () => this.store.getSettings(),
-        }),
+        ...(isResearchToolSurfaceEnabled(settings)
+          ? createResearchTools({
+            store: this.store,
+            rootDir: this.rootDir,
+            getSettings: async () => this.store.getSettings(),
+          })
+          : []),
+        createWebFetchTool(),
         ...createMemoryTools(this.rootDir, settings, assignedAgent ? {
           agentMemory: {
             agentId: assignedAgent.id,
@@ -2806,6 +3129,8 @@ export class TaskExecutor {
           ...(assignedAgentId ? [
             createGetAgentConfigTool(this.options.agentStore, assignedAgentId),
             createUpdateAgentConfigTool(this.options.agentStore, assignedAgentId),
+            createAgentCreateTool(this.options.agentStore, assignedAgentId),
+            createAgentDeleteTool(this.options.agentStore, assignedAgentId),
           ] : []),
         ] : []),
         // Messaging tools — allows executor agents to send and receive messages.
@@ -2814,7 +3139,7 @@ export class TaskExecutor {
           createReadMessagesTool(this.options.messageStore, assignedAgentId),
         ] : []),
         // Add plugin tools from PluginRunner
-        ...(this.options.pluginRunner?.getPluginTools() ?? []),
+        ...getEnabledPluginTools(this.options.pluginRunner),
       ];
 
       // Accumulates the full assistant text output for the most recent session.
@@ -2827,6 +3152,7 @@ export class TaskExecutor {
         taskId: task.id,
         agent: "executor",
         persistAgentToolOutput: settings.persistAgentToolOutput,
+        persistAgentThinkingLog: settings.persistAgentThinkingLog,
         onAgentText: (taskId, delta) => {
           lastAssistantText += delta;
           stuckDetector?.recordActivity(taskId);
@@ -2845,15 +3171,14 @@ export class TaskExecutor {
         // 3. Global execution lane pair (executionGlobalProvider + executionGlobalModelId)
         // 4. Project default override pair (defaultProviderOverride + defaultModelIdOverride)
         // 5. Global default pair (defaultProvider + defaultModelId)
-        const { provider: executorProvider, modelId: executorModelId } = resolveExecutorModelPair(
+        const { provider: executorProvider, modelId: executorModelId } = resolveExecutorSessionModel(
           detail.modelProvider,
           detail.modelId,
           settings,
+          (assignedAgent?.runtimeConfig ?? undefined) as Record<string, unknown> | undefined,
         );
         const executorFallbackProvider = settings.fallbackProvider;
         const executorFallbackModelId = settings.fallbackModelId;
-        const executorModelFallbackChain = resolveModelFallbackChain(settings);
-        const executorRouteViaDspy = resolveRouteAllLlmCallsViaDspy(settings);
         const executorThinkingLevel = detail.thinkingLevel ?? settings.defaultThinkingLevel;
 
         // Determine whether we're resuming a previous session (pause/resume)
@@ -2868,10 +3193,23 @@ export class TaskExecutor {
 
         // Resolve per-agent custom instructions for the executor role
         const executorInstructions = await this.resolveInstructionsForRole("executor");
-        const executorSystemPrompt = buildSystemPromptWithInstructions(
-          getExecutorSystemPrompt(settings),
-          executorInstructions,
+
+        // Build structured layers for cross-session prompt caching.
+        const executorPluginContributions = buildPluginPromptSection(
+          "executor-system",
+          this.options.pluginRunner,
         );
+        if (executorPluginContributions) {
+          executorLog.log(`${task.id}: applied plugin prompt contributions for executor-system surface`);
+        }
+
+        const executorLayers = buildPromptLayers({
+          basePrompt: getExecutorSystemPrompt(settings),
+          agentInstructions: executorInstructions,
+          pluginContributions: executorPluginContributions,
+        });
+
+        const executorSystemPromptFinal = collapsePromptLayers(executorLayers);
 
         // sessionFile must be let because it's destructured alongside session which is reassigned
         // eslint-disable-next-line prefer-const
@@ -2880,7 +3218,8 @@ export class TaskExecutor {
           runtimeHint: executorRuntimeHint,
           pluginRunner: this.options.pluginRunner,
           cwd: worktreePath,
-          systemPrompt: executorSystemPrompt,
+          systemPrompt: executorSystemPromptFinal,
+          systemPromptLayers: executorLayers,
           tools: "coding",
           customTools,
           onText: agentLogger.onText,
@@ -2891,12 +3230,13 @@ export class TaskExecutor {
           defaultModelId: executorModelId,
           fallbackProvider: executorFallbackProvider,
           fallbackModelId: executorFallbackModelId,
-          modelFallbackChain: executorModelFallbackChain,
-          routeViaDspy: executorRouteViaDspy,
           defaultThinkingLevel: executorThinkingLevel,
           sessionManager,
+          taskEnv,
           // Skill selection: use assigned agent skills if available, otherwise role fallback
           ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+          actionGateContext: this.buildActionGateContext(task.id, assignedAgent),
+          permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, assignedAgent),
           taskId: task.id,
           taskTitle: detail.title,
           onFallbackModelUsed: createFallbackModelObserver({
@@ -2908,17 +3248,20 @@ export class TaskExecutor {
           }),
         });
 
+        const executorModelDesc = describeModel(session);
+        const executorModelMarker = `Executor using model: ${executorModelDesc}`;
         if (isResuming) {
           executorLog.log(`${task.id}: resumed session from ${task.sessionFile}`);
-          await this.store.logEntry(task.id, `Resumed agent session after unpause (model: ${describeModel(session)})`, undefined, this.currentRunContext);
+          await this.store.logEntry(task.id, `Resumed agent session after unpause (model: ${executorModelDesc})`, undefined, this.currentRunContext);
         } else {
-          executorLog.log(`${task.id}: using model ${describeModel(session)}`);
-          await this.store.logEntry(task.id, `Executor using model: ${describeModel(session)}`, undefined, this.currentRunContext);
+          executorLog.log(`${task.id}: using model ${executorModelDesc}`);
+          await this.store.logEntry(task.id, executorModelMarker, undefined, this.currentRunContext);
           // Persist session file path so pause/resume can reopen it
           if (sessionFile) {
             await this.store.updateTask(task.id, { sessionFile });
           }
         }
+        await this.store.appendAgentLog(task.id, executorModelMarker, "text", undefined, "executor");
 
         // Make session available to custom tools (fn_task_update checkpoint capture, fn_review_step rewind)
         sessionRef.current = session;
@@ -2934,9 +3277,23 @@ export class TaskExecutor {
         this.activeSessions.set(task.id, {
           session,
           seenSteeringIds,
-          lastModelProvider: detail.modelProvider,
-          lastModelId: detail.modelId,
+          lastResolvedModelProvider: executorProvider,
+          lastResolvedModelId: executorModelId,
+          lastTaskModelProvider: detail.modelProvider,
+          lastTaskModelId: detail.modelId,
+          lastAssignedAgentId: detail.assignedAgentId ?? null,
         });
+
+        let leaseRenewalTimer: ReturnType<typeof setInterval> | undefined;
+        if (detail.assignedAgentId && detail.checkedOutBy === detail.assignedAgentId) {
+          const leaseEpoch = detail.checkoutLeaseEpoch ?? 0;
+          const checkoutNodeId = detail.checkoutNodeId ?? detail.effectiveNodeId ?? detail.nodeId ?? "local";
+          const runId = this.currentRunContext?.runId;
+          await this.renewTaskLease(task.id, detail.assignedAgentId, leaseEpoch, checkoutNodeId, runId).catch(() => {});
+          leaseRenewalTimer = setInterval(() => {
+            void this.renewTaskLease(task.id, detail.assignedAgentId!, leaseEpoch, checkoutNodeId, runId).catch(() => {});
+          }, 30_000);
+        }
 
         // Register with stuck task detector for heartbeat monitoring
         stuckDetector?.trackTask(task.id, session);
@@ -2960,12 +3317,13 @@ export class TaskExecutor {
               "Review the current state of your worktree and proceed with the next pending step.",
             ].join("\n"));
           } else {
-            const basePrompt = buildExecutionPrompt(detail, this.rootDir, settings, worktreePath);
-            const planGoalContext = await buildBoundPlanGoalPromptContext({
-              fusionDir: this.store.getFusionDir(),
-              taskId: task.id,
-            });
-            const agentPrompt = planGoalContext ? `${basePrompt}\n\n${planGoalContext}` : basePrompt;
+            const agentPrompt = buildExecutionPrompt(
+              detail,
+              this.rootDir,
+              settings,
+              worktreePath,
+              this.options.pluginRunner,
+            );
             await promptWithFallback(session, agentPrompt);
           }
 
@@ -3106,7 +3464,7 @@ export class TaskExecutor {
 
             // Run workflow steps before moving to in-review — skip in fast mode
             if (executionMode !== "fast") {
-              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+              const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
               if (workflowResult === "deferred-paused") {
                 if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                   this.pausedAborted.delete(task.id);
@@ -3191,7 +3549,8 @@ export class TaskExecutor {
                 runtimeHint: executorRuntimeHint,
                 pluginRunner: this.options.pluginRunner,
                 cwd: worktreePath,
-                systemPrompt: executorSystemPrompt,
+                systemPrompt: executorSystemPromptFinal,
+                systemPromptLayers: executorLayers,
                 tools: "coding",
                 customTools,
                 onText: agentLogger.onText,
@@ -3202,12 +3561,13 @@ export class TaskExecutor {
                 defaultModelId: executorModelId,
                 fallbackProvider: executorFallbackProvider,
                 fallbackModelId: executorFallbackModelId,
-                modelFallbackChain: executorModelFallbackChain,
-                routeViaDspy: executorRouteViaDspy,
                 defaultThinkingLevel: executorThinkingLevel,
                 sessionManager: SessionManager.create(worktreePath),
+                taskEnv,
                 // Skill selection: use assigned agent skills if available, otherwise role fallback
                 ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
+                actionGateContext: this.buildActionGateContext(task.id, assignedAgent),
+                permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, assignedAgent),
               });
               if (retrySessionFile) {
                 this.store.updateTask(task.id, { sessionFile: retrySessionFile }).catch((err: unknown) => {
@@ -3221,8 +3581,11 @@ export class TaskExecutor {
               this.activeSessions.set(task.id, {
                 session: retrySession,
                 seenSteeringIds,
-                lastModelProvider: detail.modelProvider,
-                lastModelId: detail.modelId,
+                lastResolvedModelProvider: executorProvider,
+                lastResolvedModelId: executorModelId,
+                lastTaskModelProvider: detail.modelProvider,
+                lastTaskModelId: detail.modelId,
+                lastAssignedAgentId: detail.assignedAgentId ?? null,
               });
               stuckDetector?.trackTask(task.id, retrySession);
 
@@ -3245,7 +3608,7 @@ export class TaskExecutor {
                   "Do NOT ask for permission. Do NOT write a summary. Just call a tool and keep working.",
                   "",
                   "Original task:",
-                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath),
+                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath, this.options.pluginRunner),
                 ].join("\n");
               } else {
                 retryPrompt = [
@@ -3255,7 +3618,7 @@ export class TaskExecutor {
                   "2. If there is remaining work, finish it and then call fn_task_done.",
                   "",
                   "Original task:",
-                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath),
+                  buildExecutionPrompt(detail, this.rootDir, settings, worktreePath, this.options.pluginRunner),
                 ].join("\n");
               }
 
@@ -3291,7 +3654,7 @@ export class TaskExecutor {
 
               // Run workflow steps before moving to in-review — skip in fast mode
               if (executionMode !== "fast") {
-                const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings);
+                const workflowResult = await this.runWorkflowSteps(task, worktreePath, settings, taskEnv);
                 if (workflowResult === "deferred-paused") {
                   if (await this.parkTaskAfterWorkflowStepPause(task.id)) {
                     this.pausedAborted.delete(task.id);
@@ -3357,6 +3720,9 @@ export class TaskExecutor {
             }
           }
         } finally {
+          if (leaseRenewalTimer) {
+            clearInterval(leaseRenewalTimer);
+          }
           this.activeSessions.delete(task.id);
           stuckDetector?.untrackTask(task.id);
           await agentLogger.flush();
@@ -3624,6 +3990,15 @@ export class TaskExecutor {
         this.options.onError?.(task, err instanceof Error ? err : new Error(errorMessage));
       }
     } finally {
+      if (reviewAddressingActivated) {
+        const latestTask = await this.store.getTask(task.id);
+        if (taskDone) {
+          await this.transitionReviewAddressing(task.id, ["in-progress", "queued"], "addressed");
+        } else if (latestTask.status === "failed") {
+          await this.transitionReviewAddressing(task.id, ["in-progress", "queued"], "failed");
+        }
+      }
+
       this.executing.delete(task.id);
       // Clear run context at end of execute() lifecycle
       this.currentRunContext = undefined;
@@ -3650,33 +4025,55 @@ export class TaskExecutor {
       // task in "in-progress" with no active session or worktree.
       if (stuckRequeue === true) {
         try {
-          // Reset steps whose work was never committed before destroying the worktree
+          // Re-read latest task state. While this execute() invocation was
+          // unwinding, self-healing (e.g. recoverCompletedTasks) may have
+          // already transitioned the task to in-review or done. Continuing
+          // the stuck-requeue cleanup in that case would destroy the worktree
+          // the recovery now relies on and clobber the task back to todo with
+          // all step progress reset, undoing valid completion. Skip the
+          // entire cleanup if the column has moved on past in-progress/todo.
           const latestTask = await this.store.getTask(task.id);
-          await this.resetStepsIfWorkLost(latestTask);
-
-          // Clean up the old worktree so the retry gets a fresh one
-          if (worktreePath && existsSync(worktreePath)) {
-            try {
-              await execAsync(`git worktree remove "${worktreePath}" --force`, { cwd: this.rootDir });
-              executorLog.log(`Removed old worktree for stuck-killed retry: ${worktreePath}`);
-              // Audit trail: record worktree removal (FN-1404)
-              await audit.git({ type: "worktree:remove", target: worktreePath });
-            } catch (cleanupErr: unknown) {
-              const cleanupErrMessage = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
-              executorLog.warn(`Failed to remove old worktree ${worktreePath}: ${cleanupErrMessage}`);
-            }
-          }
-          await this.store.updateTask(task.id, { status: "stuck-killed", worktree: null, branch: null });
-          // Only move to todo if not already there. The task.column check uses the
-          // captured task object from execute() start — if the task was already in "todo"
-          // when execute() started (e.g., resumed orphan), we skip the redundant move.
-          if (task.column !== "todo") {
-            await this.store.moveTask(task.id, "todo");
-            // Audit trail: record task move (FN-1404)
-            await audit.database({ type: "task:move", target: task.id, metadata: { to: "todo" } });
-            executorLog.log(`${task.id} moved to todo for retry after stuck kill`);
+          if (latestTask.column !== "in-progress" && latestTask.column !== "todo") {
+            executorLog.log(
+              `${task.id} stuck-requeue skipped — task is now in '${latestTask.column}' (recovered concurrently)`,
+            );
           } else {
-            executorLog.log(`${task.id} already in todo — skipping redundant move`);
+            const settings = await this.store.getSettings();
+            const preserveProgress = settings.preserveProgressOnStuckRequeue !== false;
+
+            // Reset steps whose work was never committed before destroying
+            // the worktree. Skipped when preserveProgress is on — the
+            // setting's whole point is to keep step status across the
+            // requeue so the agent can resume from where it left off.
+            if (!preserveProgress) {
+              await this.resetStepsIfWorkLost(latestTask);
+            }
+
+            // Clean up the old worktree so the retry gets a fresh one
+            if (worktreePath && existsSync(worktreePath)) {
+              try {
+                await execAsync(`git worktree remove "${worktreePath}" --force`, { cwd: this.rootDir });
+                executorLog.log(`Removed old worktree for stuck-killed retry: ${worktreePath}`);
+                // Audit trail: record worktree removal (FN-1404)
+                await audit.git({ type: "worktree:remove", target: worktreePath });
+              } catch (cleanupErr: unknown) {
+                const cleanupErrMessage = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+                executorLog.warn(`Failed to remove old worktree ${worktreePath}: ${cleanupErrMessage}`);
+              }
+            }
+            await this.store.updateTask(task.id, { status: "stuck-killed", worktree: null, branch: null });
+            // Only move to todo if not already there. Use the freshly-read
+            // latestTask.column rather than the stale captured task.column —
+            // the captured snapshot can be hours old and would race against
+            // any concurrent recovery (see comment above).
+            if (latestTask.column !== "todo") {
+              await this.store.moveTask(task.id, "todo", preserveProgress ? { preserveProgress: true } : undefined);
+              // Audit trail: record task move (FN-1404)
+              await audit.database({ type: "task:move", target: task.id, metadata: { to: "todo" } });
+              executorLog.log(`${task.id} moved to todo for retry after stuck kill${preserveProgress ? " (progress preserved)" : ""}`);
+            } else {
+              executorLog.log(`${task.id} already in todo — skipping redundant move`);
+            }
           }
         } catch (err: unknown) {
           const errorMessage = err instanceof Error ? err.message : String(err);
@@ -3715,10 +4112,23 @@ export class TaskExecutor {
           stuckDetector?.recordProgress(taskId);
         }
 
+        if (!Number.isInteger(step) || step < 1) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Invalid step number: ${step}. Steps are 1-indexed.`,
+            }],
+            details: {},
+          };
+        }
+
+        const stepIndex = step - 1;
+
         // Enforce code review REVISE: block advancing to "done" when the last
         // code review for this step returned REVISE. The agent must fix the
         // issues and call fn_review_step(type="code") again before proceeding.
-        if (status === "done" && codeReviewVerdicts.get(step) === "REVISE") {
+        // FN-3757: verdict/checkpoint maps are keyed by 0-indexed stepIndex.
+        if (status === "done" && codeReviewVerdicts.get(stepIndex) === "REVISE") {
           return {
             content: [{
               type: "text" as const,
@@ -3731,19 +4141,17 @@ export class TaskExecutor {
           };
         }
 
-        const stepIndex = step - 1;
-        if (!Number.isInteger(stepIndex) || stepIndex < 0) {
+        const task = await store.updateStep(taskId, stepIndex, status as StepStatus);
+        const stepInfo = task.steps[stepIndex];
+        if (!stepInfo) {
           return {
             content: [{
               type: "text" as const,
-              text: `Invalid step number: ${step}. Steps are 1-indexed.`,
+              text: `Invalid step number: ${step}. This task has ${task.steps.length} step(s) (1-indexed).`,
             }],
             details: {},
           };
         }
-
-        const task = await store.updateStep(taskId, stepIndex, status as StepStatus);
-        const stepInfo = task.steps[stepIndex];
         const persistedStatus = stepInfo.status;
         const progress = task.steps.filter((s) => s.status === "done").length;
 
@@ -3759,7 +4167,8 @@ export class TaskExecutor {
         ) {
           const leafId = sessionRef.current.sessionManager.getLeafId();
           if (leafId) {
-            stepCheckpoints.set(step, leafId);
+            // FN-3757: verdict/checkpoint maps are keyed by 0-indexed stepIndex.
+            stepCheckpoints.set(stepIndex, leafId);
           }
         }
 
@@ -3897,6 +4306,41 @@ export class TaskExecutor {
     };
   }
 
+  private async transitionReviewAddressing(taskId: string, from: Array<"queued" | "in-progress" | "addressed" | "failed">, to: "queued" | "in-progress" | "addressed" | "failed"): Promise<void> {
+    const task = await this.store.getTask(taskId);
+    const reviewState = task.reviewState;
+    if (!reviewState || reviewState.addressing.length === 0) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    let changed = false;
+    const addressing = reviewState.addressing.map((record) => {
+      if (!from.includes(record.status)) {
+        return record;
+      }
+      changed = true;
+      return {
+        ...record,
+        status: to,
+        startedAt: to === "in-progress" ? now : record.startedAt,
+        completedAt: to === "addressed" || to === "failed" ? now : record.completedAt,
+        error: to === "addressed" ? undefined : record.error,
+      };
+    });
+
+    if (!changed) {
+      return;
+    }
+
+    await this.store.updateTask(taskId, {
+      reviewState: {
+        ...reviewState,
+        addressing,
+      },
+    });
+  }
+
   private createTaskDoneTool(taskId: string, onDone: () => void): ToolDefinition {
     const store = this.store;
     return {
@@ -3945,18 +4389,6 @@ export class TaskExecutor {
           await store.updateTask(taskId, { paused: false, status: null });
         }
         await store.logEntry(taskId, "Task marked done by agent");
-        const planCompletion = await persistBoundPlanGoalCompletion({
-          fusionDir: store.getFusionDir(),
-          taskId,
-          reason: params.summary,
-          evidence: { source: "fn_task_done" },
-        });
-        if (planCompletion) {
-          await store.logEntry(
-            taskId,
-            `Plan goal completed: ${planCompletion.planId}/${planCompletion.goalId}`,
-          );
-        }
 
         const latestTask = await store.getTask(taskId);
         let latestColumn = latestTask.column;
@@ -4025,6 +4457,29 @@ export class TaskExecutor {
         reviewerLog.log(`${taskId}: ${reviewType} review for Step ${step} (${step_name})`);
         await store.logEntry(taskId, `${reviewType} review requested for Step ${step} (${step_name})`);
 
+        // Auto-advance the step to "in-progress" if the agent is requesting a
+        // review without having flipped it themselves. Some runtimes (notably
+        // permanent-agent CEO sessions on the openai-codex transport) skip the
+        // bookkeeping fn_task_update call entirely. Tying step state to the
+        // review tool keeps the dashboard accurate without a second tool call.
+        // Skip the auto-update if the step is already done/skipped (don't
+        // regress completed work) — updateStep guards against that anyway.
+        try {
+          const currentTask = await store.getTask(taskId);
+          if (
+            Number.isInteger(step) &&
+            step >= 0 &&
+            step < currentTask.steps.length &&
+            currentTask.steps[step].status === "pending"
+          ) {
+            await store.updateStep(taskId, step, "in-progress");
+          }
+        } catch (autoUpdateErr) {
+          reviewerLog.warn(
+            `${taskId}: failed to auto-advance Step ${step} to in-progress on review entry: ${autoUpdateErr instanceof Error ? autoUpdateErr.message : String(autoUpdateErr)}`,
+          );
+        }
+
         try {
           const settings = await store.getSettings();
           // Run the reviewer via semaphore.runNested so its slot accounting
@@ -4046,8 +4501,6 @@ export class TaskExecutor {
               defaultModelId: settings.defaultModelId,
               fallbackProvider: settings.fallbackProvider,
               fallbackModelId: settings.fallbackModelId,
-              modelFallbackChain: resolveModelFallbackChain(settings),
-              routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
               defaultThinkingLevel: detail.thinkingLevel ?? settings.defaultThinkingLevel,
               // Task-level validator override (from task)
               taskValidatorProvider: detail.validatorModelProvider,
@@ -4097,6 +4550,31 @@ export class TaskExecutor {
               codeReviewVerdicts.set(step, "REVISE");
             } else if (result.verdict === "APPROVE") {
               codeReviewVerdicts.delete(step);
+              // Auto-mark the step as done once its code review passes. The
+              // recoverApprovedStepsOnResume path (executor.ts) already does
+              // this on engine restart from log scan; doing it inline avoids
+              // depending on the agent's follow-up fn_task_update call, which
+              // permanent-agent runtimes routinely skip.
+              try {
+                const currentTask = await store.getTask(taskId);
+                if (
+                  Number.isInteger(step) &&
+                  step >= 0 &&
+                  step < currentTask.steps.length &&
+                  currentTask.steps[step].status !== "done" &&
+                  currentTask.steps[step].status !== "skipped"
+                ) {
+                  await store.updateStep(taskId, step, "done");
+                  await store.logEntry(
+                    taskId,
+                    `Step ${step} (${step_name}) auto-marked done by code review APPROVE`,
+                  );
+                }
+              } catch (autoDoneErr) {
+                reviewerLog.warn(
+                  `${taskId}: failed to auto-mark Step ${step} done after APPROVE: ${autoDoneErr instanceof Error ? autoDoneErr.message : String(autoDoneErr)}`,
+                );
+              }
             }
           }
 
@@ -4217,7 +4695,7 @@ export class TaskExecutor {
     }
     if (branchDeleted) {
       // FN-2165 regression guard: null baseBranch on any task that stored this branch
-      try { this.store.clearStaleBaseBranchReferences([branch], taskId); } catch { /* best-effort */ }
+      try { this.store.clearStaleExecutionStartBranchReferences([branch], taskId); } catch { /* best-effort */ }
     }
 
     // Clear worktree tracking
@@ -4393,6 +4871,7 @@ ${feedback}
     task: Task,
     worktreePath: string,
     settings: Settings,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<VerificationResult> {
     const testCommand = settings.testCommand?.trim();
     const buildCommand = settings.buildCommand?.trim();
@@ -4418,7 +4897,7 @@ ${feedback}
     // Run test command first if configured
     if (testCommand) {
       const testResult = await runVerificationCommand(
-        this.store, worktreePath, task.id, testCommand, "test", undefined, executorLog, "executor",
+        this.store, worktreePath, task.id, testCommand, "test", undefined, executorLog, "executor", extraEnv,
       );
       result.testResult = testResult;
 
@@ -4433,7 +4912,7 @@ ${feedback}
     // Run build command second if configured
     if (buildCommand) {
       const buildResult = await runVerificationCommand(
-        this.store, worktreePath, task.id, buildCommand, "build", undefined, executorLog, "executor",
+        this.store, worktreePath, task.id, buildCommand, "build", undefined, executorLog, "executor", extraEnv,
       );
       result.buildResult = buildResult;
 
@@ -4472,6 +4951,7 @@ ${feedback}
     settings: Settings,
     retryNumber: number,
     maxRetries: number,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<boolean> {
     try {
       executorLog.log(`${task.id}: spawning executor verification fix agent (attempt ${retryNumber}/${maxRetries})`);
@@ -4481,6 +4961,7 @@ ${feedback}
         taskId: task.id,
         agent: "executor",
         persistAgentToolOutput: settings.persistAgentToolOutput,
+        persistAgentThinkingLog: settings.persistAgentThinkingLog,
         onAgentText: this.options.onAgentText,
         onAgentTool: this.options.onAgentTool,
       });
@@ -4502,10 +4983,12 @@ ${feedback}
       }
 
       // Resolve model using the executor's model hierarchy
-      const { provider: executorProvider, modelId: executorModelId } = resolveExecutorModelPair(
+      const assignedRuntimeConfig = await this.getAssignedAgentRuntimeConfig(task.assignedAgentId);
+      const { provider: executorProvider, modelId: executorModelId } = resolveExecutorSessionModel(
         task.modelProvider,
         task.modelId,
         settings,
+        assignedRuntimeConfig,
       );
 
       // Create the fix agent session
@@ -4537,6 +5020,7 @@ Do not refactor, rename broadly, or make opportunistic improvements.
         defaultProvider: executorProvider,
         defaultModelId: executorModelId,
         defaultThinkingLevel: settings.defaultThinkingLevel,
+        taskEnv: extraEnv,
         ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
       });
 
@@ -4598,12 +5082,12 @@ ${failureContext.output.slice(0, VERIFICATION_LOG_MAX_CHARS)}
           undefined,
           "executor",
         );
-        const reRunResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings);
+        const reRunResult = await this.runExecutorDeterministicVerification(task, worktreePath, settings, extraEnv);
 
         return reRunResult.allPassed;
       } finally {
         await logger.flush();
-        await session.dispose();
+        session.dispose();
       }
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -4891,6 +5375,7 @@ ${failureFeedback}
     task: Task,
     worktreePath: string,
     settings: Settings,
+    taskEnv?: NodeJS.ProcessEnv,
   ): Promise<WorkflowStepResult | "deferred-paused"> {
     // Check if task has enabled workflow steps
     const currentTask = await this.store.getTask(task.id);
@@ -4951,11 +5436,35 @@ ${failureFeedback}
         continue;
       }
 
+      if (this.isFrontendUxStep(ws)) {
+        try {
+          const scopedFiles = await this.captureModifiedFiles(worktreePath, currentTask.baseCommitSha);
+          if (scopedFiles.length > 0 && !this.hasFrontendFilesInScope(scopedFiles)) {
+            results.push({
+              workflowStepId: ws.id,
+              workflowStepName: ws.name,
+              phase: stepPhase,
+              status: "skipped",
+              output: "No frontend/UI files in diff scope — auto-skipped (FN-3906)",
+            });
+            await this.store.updateTask(task.id, { workflowStepResults: results });
+            await this.store.logEntry(task.id, "[pre-merge] Auto-skipped Frontend UX Design — no frontend/UI files in diff scope");
+            continue;
+          }
+        } catch {
+          // best-effort scope detection only; fall through to regular execution/defer flow
+        }
+      }
+
       if (await this.shouldDeferWorkflowStepCompletion(task.id, `before workflow step '${ws.name}'`)) {
         return "deferred-paused";
       }
 
-      await this.store.logEntry(task.id, `[pre-merge] Starting workflow step: ${ws.name} (${stepMode} mode)`);
+      if (ws.id.startsWith("plugin:")) {
+        await this.store.logEntry(task.id, `[pre-merge] Starting plugin workflow step: ${ws.name} (${ws.id})`);
+      } else {
+        await this.store.logEntry(task.id, `[pre-merge] Starting workflow step: ${ws.name} (${stepMode} mode)`);
+      }
       executorLog.log(`${task.id} — [pre-merge] running workflow step: ${ws.name} (${stepMode} mode)`);
 
       const startedAt = new Date().toISOString();
@@ -4973,8 +5482,8 @@ ${failureFeedback}
 
       try {
         const result: WorkflowStepOutcome = stepMode === "script"
-          ? await this.executeScriptWorkflowStep(task, ws, worktreePath, settings)
-          : await this.executeWorkflowStep(task, ws, worktreePath, settings);
+          ? await this.executeScriptWorkflowStep(task, ws, worktreePath, settings, taskEnv)
+          : await this.executeWorkflowStep(task, ws, worktreePath, settings, taskEnv);
         if (await this.shouldDeferWorkflowStepCompletion(task.id, `workflow step '${ws.name}'`)) {
           return "deferred-paused";
         }
@@ -5092,6 +5601,7 @@ ${failureFeedback}
     workflowStep: WorkflowStep,
     worktreePath: string,
     settings: Settings,
+    extraEnv?: NodeJS.ProcessEnv,
   ): Promise<{ success: boolean; output?: string; error?: string }> {
     const scriptName = workflowStep.scriptName!.trim();
     const scriptCommand = settings.scripts?.[scriptName];
@@ -5107,7 +5617,7 @@ ${failureFeedback}
     await this.store.logEntry(task.id, `Workflow step '${workflowStep.name}' executing script '${scriptName}': ${scriptCommand}`);
 
     try {
-      const scriptResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000);
+      const scriptResult = await runConfiguredCommand(scriptCommand, worktreePath, 120_000, extraEnv);
       if (scriptResult.spawnError || scriptResult.timedOut || scriptResult.exitCode !== 0) {
         return { success: false, error: configuredCommandErrorMessage(scriptResult) };
       }
@@ -5128,6 +5638,42 @@ ${failureFeedback}
   }
 
   /**
+   * FN-3906: Only the built-in Frontend UX Design step gets orchestrator-level
+   * diff-scope auto-skip. Match by canonical template id only.
+   */
+  private isFrontendUxStep(workflowStep: WorkflowStep): boolean {
+    return workflowStep.id === "frontend-ux-design";
+  }
+
+  /**
+   * FN-3906: Detect whether the task diff scope contains frontend/UI-related
+   * files so Frontend UX Design can be safely skipped when irrelevant.
+   */
+  private hasFrontendFilesInScope(files: string[]): boolean {
+    const frontendExtensionPattern = /\.(tsx|jsx|vue|svelte|astro|html|css|scss|sass|less|styl)$/i;
+    const frontendPathMarkers = [
+      "/components/",
+      "/app/components/",
+      "/dashboard/",
+      "/frontend/",
+      "/ui/",
+      "/styles/",
+      "/themes/",
+      "/design-system/",
+      "/design-tokens/",
+    ];
+    const frontendTokenFilenamePattern = /(^|\/)(tokens|theme)\.(ts|js|json|css)$/i;
+
+    return files.some((file) => {
+      const normalized = file.replace(/\\/g, "/");
+      const lowered = normalized.toLowerCase();
+      return frontendExtensionPattern.test(normalized)
+        || frontendPathMarkers.some((marker) => lowered.includes(marker))
+        || frontendTokenFilenamePattern.test(lowered);
+    });
+  }
+
+  /**
    * Execute a single workflow step by spawning an agent with the step's prompt.
    * Returns structured outcome with support for revision requests.
    */
@@ -5136,6 +5682,7 @@ ${failureFeedback}
     workflowStep: WorkflowStep,
     worktreePath: string,
     settings: Settings,
+    taskEnv?: NodeJS.ProcessEnv,
   ): Promise<WorkflowStepOutcome> {
     const toolMode: "coding" | "readonly" = workflowStep.toolMode || "readonly";
 
@@ -5224,6 +5771,7 @@ and show an appropriate message to the user.\`
       taskId: task.id,
       agent: "reviewer",
       persistAgentToolOutput: settings.persistAgentToolOutput,
+      persistAgentThinkingLog: settings.persistAgentThinkingLog,
       onAgentText: (taskId, delta) => {
         this.options.onAgentText?.(taskId, delta);
       },
@@ -5287,9 +5835,8 @@ and show an appropriate message to the user.\`
         defaultModelId: modelId,
         fallbackProvider: settings.fallbackProvider,
         fallbackModelId: settings.fallbackModelId,
-        modelFallbackChain: resolveModelFallbackChain(settings),
-        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
         defaultThinkingLevel: settings.defaultThinkingLevel,
+        taskEnv,
         // Skill selection: use assigned agent skills if available, otherwise role fallback
         ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
       });
@@ -5426,7 +5973,7 @@ and show an appropriate message to the user.\`
         // Stored baseBranch no longer exists (e.g., upstream dep merged and branch
         // deleted while this task sat queued/stuck). Clear it on the task so any
         // subsequent retry branches from the default base, and proceed from HEAD.
-        await this.store.updateTask(taskId, { baseBranch: null });
+        await this.store.updateTask(taskId, { executionStartBranch: null });
       } else {
         resolvedStartPoint = resolved;
       }
@@ -5527,7 +6074,7 @@ and show an appropriate message to the user.\`
    * resolved SHA of the dep's tip — that's what gets squash-merged.
    */
   private async planSquashImportFromDep(
-    taskId: string,
+    _taskId: string,
     depTip: string,
     originalStartPoint: string | undefined,
   ): Promise<{ depTip: string; mainBase: string; label: string } | null> {
@@ -6151,7 +6698,7 @@ and show an appropriate message to the user.\`
         });
         await this.store.logEntry(taskId, `Deleted branch`, branch);
         // FN-2165 regression guard: null baseBranch on any task that stored this branch
-        this.store.clearStaleBaseBranchReferences([branch], taskId);
+        this.store.clearStaleExecutionStartBranchReferences([branch], taskId);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         executorLog.warn(`${taskId}: failed to delete conflicting branch ${branch}: ${msg}`);
@@ -6198,7 +6745,7 @@ and show an appropriate message to the user.\`
       });
       await this.store.logEntry(taskId, `Removed stale branch`, branch);
       // FN-2165 regression guard: null baseBranch on any task that stored this branch
-      try { this.store.clearStaleBaseBranchReferences([branch], taskId); } catch { /* best-effort */ }
+      try { this.store.clearStaleExecutionStartBranchReferences([branch], taskId); } catch { /* best-effort */ }
       return true;
     } catch (branchDeleteError: unknown) {
       const branchDeleteErrorMessage = branchDeleteError instanceof Error ? branchDeleteError.message : String(branchDeleteError);
@@ -6217,7 +6764,7 @@ and show an appropriate message to the user.\`
       });
       await this.store.logEntry(taskId, `Force-removed stale branch reference via update-ref`, refPath);
       // FN-2165 regression guard: null baseBranch on any task that stored this branch
-      try { this.store.clearStaleBaseBranchReferences([branch], taskId); } catch { /* best-effort */ }
+      try { this.store.clearStaleExecutionStartBranchReferences([branch], taskId); } catch { /* best-effort */ }
       return true;
     } catch (updateRefError: unknown) {
       const updateRefErrorMessage = updateRefError instanceof Error ? updateRefError.message : String(updateRefError);
@@ -6544,17 +7091,41 @@ and show an appropriate message to the user.\`
       const FORCE_REQUEUE_GRACE_MS = 60_000; // 60 s — generous, but bounded
       setTimeout(async () => {
         if (!this.executing.has(taskId)) return; // executor unwound normally — nothing to do
+        // Re-check the latest column: self-healing may have already moved the
+        // task out of in-progress (e.g. recoverCompletedTasks → in-review).
+        // Force-requeueing in that case would clobber a valid recovery, undo
+        // the worktree/branch state that recovery now relies on, and reset
+        // step progress.
+        let latestColumn: string | undefined;
+        try {
+          const latestTask = await this.store.getTask(taskId);
+          latestColumn = latestTask.column;
+        } catch (err: unknown) {
+          executorLog.warn(
+            `${taskId} force-requeue could not read latest task state: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (latestColumn && latestColumn !== "in-progress") {
+          executorLog.log(
+            `${taskId} force-requeue skipped — task is now in '${latestColumn}' (recovered concurrently)`,
+          );
+          this.executing.delete(taskId);
+          this.stuckAborted.delete(taskId);
+          return;
+        }
         executorLog.warn(
           `${taskId} still executing ${FORCE_REQUEUE_GRACE_MS / 1000}s after stuck-kill signal ` +
           `(likely a hung subprocess) — force-requeueing`,
         );
         try {
+          const settings = await this.store.getSettings();
+          const preserveProgress = settings.preserveProgressOnStuckRequeue !== false;
           await this.store.logEntry(
             taskId,
-            `Force-requeued after stuck-kill: executor did not unwind within ${FORCE_REQUEUE_GRACE_MS / 1000}s (hung subprocess)`,
+            `Force-requeued after stuck-kill: executor did not unwind within ${FORCE_REQUEUE_GRACE_MS / 1000}s (hung subprocess)${preserveProgress ? " — progress preserved" : ""}`,
           );
           await this.store.updateTask(taskId, { status: "stuck-killed", worktree: null, branch: null });
-          await this.store.moveTask(taskId, "todo");
+          await this.store.moveTask(taskId, "todo", preserveProgress ? { preserveProgress: true } : undefined);
           // Remove from executing so the scheduler can re-dispatch normally.
           // The old Promise is still running but the executing guard is cleared so
           // a fresh execute() call won't be blocked.
@@ -6670,29 +7241,23 @@ and show an appropriate message to the user.\`
     }
 
     try {
-      await this.options.agentStore?.updateAgentState(childId, "terminated");
+      await this.options.agentStore?.updateAgentState(childId, "paused");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       executorLog.warn(`Failed to update spawned child ${childId} state to 'terminated' during cleanup: ${msg}`);
     }
 
-    // Auto-delete the child agent after a short delay so the UI can observe
-    // the terminal state before the agent is removed.
     this.pendingEphemeralDeletions.add(childId);
-    const timerId = setTimeout(async () => {
-      this.ephemeralCleanupTimers.delete(childId);
-      this.pendingEphemeralDeletions.delete(childId);
-      try {
-        await this.options.agentStore?.deleteAgent(childId);
-      } catch (err: unknown) {
-        if (this.isBenignEphemeralDeleteRaceError(childId, err)) {
-          return;
-        }
+    try {
+      await this.options.agentStore?.deleteAgent(childId);
+    } catch (err: unknown) {
+      if (!this.isBenignEphemeralDeleteRaceError(childId, err)) {
         const msg = err instanceof Error ? err.message : String(err);
         executorLog.warn(`Failed to delete spawned agent ${childId}: ${msg}`);
       }
-    }, 5000);
-    this.ephemeralCleanupTimers.set(childId, timerId);
+    } finally {
+      this.pendingEphemeralDeletions.delete(childId);
+    }
 
     this.totalSpawnedCount = Math.max(0, this.totalSpawnedCount - 1);
   }
@@ -6740,7 +7305,12 @@ and show an appropriate message to the user.\`
    * Create the fn_spawn_agent tool definition.
    * Allows the parent agent to spawn child agents with delegated tasks.
    */
-  private createSpawnAgentTool(taskId: string, worktreePath: string, settings: Settings): ToolDefinition {
+  private createSpawnAgentTool(
+    taskId: string,
+    worktreePath: string,
+    settings: Settings,
+    taskEnv?: NodeJS.ProcessEnv,
+  ): ToolDefinition {
     return {
       name: "fn_spawn_agent",
       label: "Spawn Agent",
@@ -6838,7 +7408,7 @@ Child agent: ${agent.id} (${name})`;
           // honor project executionProvider/executionModelId overrides (parity
           // with main executor at the top of agentWork()).
           const { provider: childExecutorProvider, modelId: childExecutorModelId } =
-            resolveExecutorModelPair(undefined, undefined, settings);
+            resolveExecutorSessionModel(undefined, undefined, settings, agent.runtimeConfig as Record<string, unknown> | undefined);
 
           // Create child agent session
           const { session: childSession } = await createResolvedAgentSession({
@@ -6852,8 +7422,7 @@ Child agent: ${agent.id} (${name})`;
             defaultModelId: childExecutorModelId,
             fallbackProvider: settings.fallbackProvider,
             fallbackModelId: settings.fallbackModelId,
-            modelFallbackChain: resolveModelFallbackChain(settings),
-            routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
+            taskEnv,
             // Skill selection: use assigned agent skills if available, otherwise role fallback
             ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
           });
@@ -6928,7 +7497,28 @@ function scopePromptToWorktree(prompt: string, rootDir?: string, worktreePath?: 
     .replaceAll(`${worktreePath}/.fusion/`, `${rootDir}/.fusion/`);
 }
 
-export function buildExecutionPrompt(task: TaskDetail, rootDir?: string, settings?: Settings, worktreePath?: string): string {
+function buildSourceIssueRef(sourceIssue: TaskDetail["sourceIssue"]): string {
+  if (!sourceIssue || sourceIssue.provider !== "github" || !sourceIssue.repository) {
+    return "";
+  }
+
+  const issueNumber = sourceIssue.issueNumber
+    ?? Number.parseInt(sourceIssue.externalIssueId ?? "", 10);
+
+  if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+    return "";
+  }
+
+  return `${sourceIssue.repository}#${issueNumber}`;
+}
+
+export function buildExecutionPrompt(
+  task: TaskDetail,
+  rootDir?: string,
+  settings?: Settings,
+  worktreePath?: string,
+  pluginRunner?: PluginRunner,
+): string {
   const prompt = scopePromptToWorktree(task.prompt, rootDir, worktreePath);
   const reviewMatch = prompt.match(/##\s*Review Level[:\s]*(\d)/);
   const reviewLevel = reviewMatch ? parseInt(reviewMatch[1], 10) : 0;
@@ -6938,9 +7528,7 @@ export function buildExecutionPrompt(task: TaskDetail, rootDir?: string, setting
     ? ` --author="${settings?.commitAuthorName || "Fusion"} <${settings?.commitAuthorEmail || "noreply@runfusion.ai"}>"`
     : "";
 
-  const sourceIssueRef = task.sourceIssue?.provider === "github" && task.sourceIssue.repository && task.sourceIssue.issueNumber
-    ? `${task.sourceIssue.repository}#${task.sourceIssue.issueNumber}`
-    : "";
+  const sourceIssueRef = buildSourceIssueRef(task.sourceIssue);
 
   // Build step progress for resume
   const hasProgress = task.steps.length > 0 && task.steps.some((s) => s.status !== "pending");
@@ -7024,6 +7612,12 @@ git log --oneline
     steeringSection = lines.join("\n");
   }
 
+  const taskPromptContributions = pluginRunner?.getPromptContributionsForSurface("executor-task") ?? [];
+  if (taskPromptContributions.length > 0) {
+    executorLog.log(`${task.id}: applied ${taskPromptContributions.length} plugin prompt contributions for executor-task surface`);
+  }
+  const pluginTaskContributions = buildPluginPromptSection("executor-task", pluginRunner);
+
   return `Execute this task.
 
 ## Task: ${task.id}
@@ -7042,6 +7636,10 @@ ${reviewLevel >= 1 ? `Before implementing each step (except Step 0 and the final
 ${reviewLevel >= 2 ? `After implementing + committing each step, call:
 \`fn_review_step(step=N, type="code", step_name="...", baseline="<SHA from before step>")\`` : ""}
 ${reviewLevel >= 3 ? `After tests, also call fn_review_step with type="code" for test review.` : ""}
+${pluginTaskContributions ? `
+
+${pluginTaskContributions}
+` : ""}
 
 ## Worktree Boundaries
 
@@ -7050,7 +7648,7 @@ You are running in an **isolated git worktree**. This means:
 - **All code changes must be made inside the current worktree directory.** Do not modify files outside the worktree.
 - **Exception — Project memory:** You MAY read and write to files under \`.fusion/memory/\` at the project root to save durable project learnings.
 - **Exception — Task attachments:** You MAY read files under \`.fusion/tasks/{taskId}/attachments/\` at the project root for context.
-- **Exception — Sibling task specs:** You MAY read \`.fusion/tasks/{taskId}/PROMPT.md\` and \`.fusion/tasks/{taskId}/task.json\` at the project root (read-only) to consult dependency tasks' specifications.
+- **Exception — Sibling task specs:** You MAY read \`.fusion/tasks/{taskId}/PROMPT.md\` and \`.fusion/tasks/{taskId}/task.json\` at the project root (read-only) to consult dependency tasks' specifications. If those files do not exist, the dependency has been archived — call \`fn_task_show\` with its ID to load the spec from the archive.
 - **Shell commands** run inside the worktree by default. Avoid using \`cd\` to navigate outside the worktree.
 
 ## Begin
