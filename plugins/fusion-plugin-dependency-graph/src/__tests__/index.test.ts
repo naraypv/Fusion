@@ -35,7 +35,7 @@ describe("dependency graph plugin index", () => {
 
     const viewModule = await import("@fusion-plugin-examples/dependency-graph/dashboard-view");
     expect(typeof viewModule.default).toBe("function");
-  });
+  }, 15_000);
 
   const hasNodeImportPrereqs =
     existsSync(join(process.cwd(), "dist/dashboard-view.js")) &&

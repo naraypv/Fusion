@@ -378,6 +378,8 @@ describe("Agents view", () => {
     await waitForFrameContains(lastFrame, "Run history (latest first):");
     await waitForFrameContains(lastFrame, "Completed");
 
+    stdin.write("\u001b[C");
+    await waitForFrameUpdateAfterInput();
     stdin.write("\r");
     await waitForFrameContains(lastFrame, "Run logs (1)");
     await waitForFrameContains(lastFrame, "plan generated");
