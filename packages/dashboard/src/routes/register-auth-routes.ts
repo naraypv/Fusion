@@ -5,7 +5,7 @@ import { probeDroidCli } from "../droid-cli-probe.js";
 import { probeCursorCliProvider } from "../runtime-provider-probes.js";
 import { probeLlamaCpp } from "../llama-cpp-probe.js";
 import { probeCliAccountProvider, startCliAccountLogin, type CliAccountProviderId, type StartedCliAccountLogin } from "../cli-account-auth.js";
-import { ApiError, badRequest, conflict } from "../api-error.js";
+import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
 import { clearUsageCache } from "../usage.js";
 import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js";
 import type { AuthStorageLike } from "../routes.js";
@@ -92,30 +92,34 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
     return cliAccountLoginStarting.has(provider) || cliAccountLoginInProgress.has(provider);
   }
 
+  function toSafeAccountSummary(account: AccountCredentialSummary): AccountCredentialSummary {
+    return {
+      id: account.id,
+      providerId: account.providerId,
+      label: account.label,
+      credentialKind: account.credentialKind,
+      ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
+      priority: account.priority,
+      status: account.status,
+      ...(account.isDefault ? { isDefault: true } : {}),
+      createdAt: account.createdAt,
+      updatedAt: account.updatedAt,
+      ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),
+      ...(typeof account.failureCount === "number" ? { failureCount: account.failureCount } : {}),
+      ...(account.lastFailure ? { lastFailure: account.lastFailure } : {}),
+    };
+  }
+
   function toSafeAddAccountResult(result: AddAccountResult): SafeAddAccountResult {
-    const account = result.account;
     return {
       status: result.status,
       message: result.message,
-      account: {
-        id: account.id,
-        providerId: account.providerId,
-        label: account.label,
-        credentialKind: account.credentialKind,
-        ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
-        priority: account.priority,
-        status: account.status,
-        createdAt: account.createdAt,
-        updatedAt: account.updatedAt,
-        ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),
-        ...(typeof account.failureCount === "number" ? { failureCount: account.failureCount } : {}),
-        ...(account.lastFailure ? { lastFailure: account.lastFailure } : {}),
-      },
+      account: toSafeAccountSummary(result.account),
     };
   }
 
   function getProviderAccounts(storage: AuthStorageLike, providerId: string): AccountCredentialSummary[] {
-    return storage.listAccounts?.(providerId) ?? [];
+    return (storage.listAccounts?.(providerId) ?? []).map(toSafeAccountSummary);
   }
 
   async function enableClaudeCliAfterAccountLogin(provider: CliAccountProviderId): Promise<void> {
@@ -1238,6 +1242,60 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
       storage.logout(provider);
       clearUsageCache();
       res.json({ success: true });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.post("/auth/accounts/:accountId/switch", (req, res) => {
+    try {
+      const accountId = req.params.accountId;
+      if (!accountId || typeof accountId !== "string") {
+        throw badRequest("accountId is required");
+      }
+
+      const storage = getAuthStorage();
+      if (!storage.switchAccount) {
+        throw badRequest("Multi-account switching is not supported");
+      }
+
+      const account = storage.switchAccount(accountId);
+      if (!account) {
+        throw notFound(`Account ${accountId} was not found`);
+      }
+
+      clearUsageCache();
+      res.json({ success: true, account: toSafeAccountSummary(account) });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        throw err;
+      }
+      rethrowAsApiError(err);
+    }
+  });
+
+  router.delete("/auth/accounts/:accountId", (req, res) => {
+    try {
+      const accountId = req.params.accountId;
+      if (!accountId || typeof accountId !== "string") {
+        throw badRequest("accountId is required");
+      }
+
+      const storage = getAuthStorage();
+      if (!storage.removeAccount) {
+        throw badRequest("Multi-account removal is not supported");
+      }
+
+      const removed = storage.removeAccount(accountId);
+      if (!removed) {
+        throw notFound(`Account ${accountId} was not found`);
+      }
+
+      clearUsageCache();
+      res.json({ success: true, removed: true });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;

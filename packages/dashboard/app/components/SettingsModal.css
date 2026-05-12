@@ -1421,6 +1421,19 @@
   text-transform: capitalize;
 }
 
+.auth-account-default {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: calc(var(--space-sm) + var(--space-xs));
+}
+
+.auth-account-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  flex-shrink: 0;
+}
+
 .auth-account-status--active {
   color: var(--color-success);
 }
@@ -1815,6 +1828,11 @@
 
   .auth-account-row {
     flex-wrap: wrap;
+  }
+
+  .auth-account-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   .auth-apikey-section {

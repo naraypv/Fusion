@@ -19,6 +19,8 @@ interface CliAccountProviderCardProps {
   onManualCodeSubmit?: () => void;
   onCancelLogin?: () => void;
   onAddAccount: () => void;
+  onSwitchAccount?: (accountId: string) => void;
+  onRemoveAccount?: (accountId: string) => void;
 }
 
 export function CliAccountProviderCard({
@@ -36,6 +38,8 @@ export function CliAccountProviderCard({
   onManualCodeSubmit,
   onCancelLogin,
   onAddAccount,
+  onSwitchAccount,
+  onRemoveAccount,
 }: CliAccountProviderCardProps) {
   return (
     <div
@@ -113,6 +117,33 @@ export function CliAccountProviderCard({
               <span className={`auth-account-status auth-account-status--${account.status}`}>
                 {account.status}
               </span>
+              {account.isDefault && (
+                <span className="auth-account-default">Default</span>
+              )}
+              {(onSwitchAccount || onRemoveAccount) && (
+                <div className="auth-account-actions">
+                  {onSwitchAccount && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={busy || account.isDefault === true}
+                      onClick={() => onSwitchAccount(account.id)}
+                    >
+                      Use
+                    </button>
+                  )}
+                  {onRemoveAccount && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      disabled={busy}
+                      onClick={() => onRemoveAccount(account.id)}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ))}
         </div>

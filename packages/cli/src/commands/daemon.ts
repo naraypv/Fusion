@@ -422,7 +422,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   ]);
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, [supplementalAuthStorage]);
   const modelRegistry = ModelRegistry.create(mergedAuthStorage, getModelRegistryModelsPath());
-  const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(mergedAuthStorage, modelRegistry);
+  const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(authStorage, modelRegistry, [supplementalAuthStorage]);
 
   // PackageManager may be used for skills adapter even if extension loading fails
   let packageManager: DefaultPackageManager | undefined;

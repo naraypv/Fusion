@@ -53,6 +53,7 @@ export interface AccountCredentialSummary {
   accountDisplayHint?: string;
   priority: number;
   status: AccountCredentialStatus;
+  isDefault?: boolean;
   createdAt: string;
   updatedAt: string;
   cooldownUntil?: string;
@@ -248,7 +249,10 @@ function normalizeRecord(value: unknown): AccountCredentialRecord | undefined {
   };
 }
 
-export function summarizeAccount(account: AccountCredentialRecord): AccountCredentialSummary {
+export function summarizeAccount(
+  account: AccountCredentialRecord,
+  options: { isDefault?: boolean } = {},
+): AccountCredentialSummary {
   return {
     id: account.id,
     providerId: account.providerId,
@@ -257,6 +261,7 @@ export function summarizeAccount(account: AccountCredentialRecord): AccountCrede
     ...(account.accountDisplayHint ? { accountDisplayHint: account.accountDisplayHint } : {}),
     priority: account.priority,
     status: account.status,
+    ...(options.isDefault ? { isDefault: true } : {}),
     createdAt: account.createdAt,
     updatedAt: account.updatedAt,
     ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),
@@ -301,7 +306,25 @@ export class MultiAccountAuthStore {
   }
 
   listSummaries(providerId?: string): AccountCredentialSummary[] {
-    return this.list(providerId).map(summarizeAccount);
+    const accounts = this.list(providerId);
+    const defaultIds = new Map<string, string>();
+    const now = new Date();
+    for (const account of accounts) {
+      if (defaultIds.has(account.providerId)) {
+        continue;
+      }
+      const selected = accounts
+        .filter((candidate) => candidate.providerId === account.providerId)
+        .filter((candidate) => candidate.status !== "disabled")
+        .filter((candidate) => !candidate.cooldownUntil || Date.parse(candidate.cooldownUntil) <= now.getTime())
+        .sort((a, b) => a.priority - b.priority || a.createdAt.localeCompare(b.createdAt))[0];
+      if (selected) {
+        defaultIds.set(account.providerId, selected.id);
+      }
+    }
+    return accounts.map((account) => summarizeAccount(account, {
+      isDefault: defaultIds.get(account.providerId) === account.id,
+    }));
   }
 
   addCredentialAccount(
@@ -470,6 +493,54 @@ export class MultiAccountAuthStore {
       return key ? { type: "api_key", key } : undefined;
     }
     return undefined;
+  }
+
+  switchAccount(accountId: string, now = new Date()): AccountCredentialRecord | undefined {
+    const data = this.read();
+    const target = data.accounts.find((account) => account.id === accountId);
+    if (!target || target.status === "disabled") {
+      return undefined;
+    }
+
+    const nowIso = now.toISOString();
+    const providerAccounts = data.accounts
+      .filter((account) => account.providerId === target.providerId)
+      .sort((a, b) => {
+        if (a.id === accountId) return -1;
+        if (b.id === accountId) return 1;
+        return a.priority - b.priority || a.createdAt.localeCompare(b.createdAt);
+      });
+    const priorityById = new Map(providerAccounts.map((account, index) => [account.id, (index + 1) * 10]));
+
+    let switched: AccountCredentialRecord | undefined;
+    data.accounts = data.accounts.map((account) => {
+      if (account.providerId !== target.providerId) {
+        return account;
+      }
+      const nextPriority = priorityById.get(account.id) ?? account.priority;
+      if (account.id !== accountId && account.priority === nextPriority) {
+        return account;
+      }
+
+      const updated: AccountCredentialRecord = {
+        ...account,
+        priority: nextPriority,
+        updatedAt: nowIso,
+        ...(account.id === accountId ? { status: "active" } : {}),
+      };
+      if (account.id === accountId) {
+        delete updated.cooldownUntil;
+        delete updated.lastFailure;
+        updated.failureCount = 0;
+        switched = updated;
+      }
+      return updated;
+    });
+
+    if (switched) {
+      this.write(data);
+    }
+    return switched;
   }
 
   markFailure(options: MarkAccountFailureOptions): AccountCredentialRecord | undefined {

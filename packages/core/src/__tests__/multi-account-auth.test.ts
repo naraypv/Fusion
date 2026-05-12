@@ -112,6 +112,30 @@ describe("MultiAccountAuthStore", () => {
     }
   });
 
+  it("switches the default account for a provider", () => {
+    const { dir, path } = tempAccountPath();
+    try {
+      const store = new MultiAccountAuthStore(path);
+      const first = store.addApiKeyAccount("minimax", "first", { priority: 10 }).account;
+      const second = store.addApiKeyAccount("minimax", "second", { priority: 20 }).account;
+
+      expect(store.selectAccount({ providerId: "minimax" })?.id).toBe(first.id);
+
+      const switched = store.switchAccount(second.id);
+
+      expect(switched?.id).toBe(second.id);
+      expect(store.selectAccount({ providerId: "minimax" })?.id).toBe(second.id);
+      expect(store.credentialFor("minimax")?.key).toBe("second");
+      const summaries = store.listSummaries("minimax");
+      expect(summaries.find((account) => account.id === first.id)).not.toHaveProperty("isDefault");
+      expect(summaries.find((account) => account.id === second.id)).toEqual(
+        expect.objectContaining({ isDefault: true }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("registers CLI-home OAuth accounts without storing raw tokens", () => {
     const { dir, path } = tempAccountPath();
     try {

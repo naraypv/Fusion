@@ -8,6 +8,7 @@ import {
   MultiAccountAuthStore,
   readStoredCredentialsFromAuthFile,
   shouldHydrateStoredCredential,
+  summarizeAccount,
   type AccountCredentialSummary,
   type AddAccountResult,
   type StoredAuthCredential,
@@ -33,6 +34,7 @@ export interface DashboardAuthStorage {
   get(providerId: string): { type?: string; key?: string } | undefined;
   listAccounts?(providerId?: string): AccountCredentialSummary[];
   removeAccount?(accountId: string): boolean;
+  switchAccount?(accountId: string): AccountCredentialSummary | undefined;
 }
 
 interface ReadFallbackAuthStorage {
@@ -82,6 +84,24 @@ export function wrapAuthStorageWithApiKeyProviders(
   const mergedAuthStorage = mergeAuthStorageReads(authStorage, readFallbackAuthStorages);
   const accountCredential = (providerId: string): StoredCredential | undefined =>
     accountStore.credentialFor(providerId);
+  const removeProviderAccounts = (
+    providerId: string,
+    kinds?: ReadonlySet<AccountCredentialSummary["credentialKind"]>,
+  ): void => {
+    for (const account of accountStore.list(providerId)) {
+      if (!kinds || kinds.has(account.credentialKind)) {
+        accountStore.removeAccount(account.id);
+      }
+    }
+  };
+  const syncPrimaryCredentialForProvider = (providerId: string): void => {
+    const selected = accountStore.selectAccount({ providerId });
+    if (selected?.credential && (selected.credential.type === "oauth" || selected.credential.type === "api_key")) {
+      mergedAuthStorage.set(providerId, selected.credential as AuthCredential);
+      return;
+    }
+    mergedAuthStorage.remove(providerId);
+  };
 
   return {
     reload: () => mergedAuthStorage.reload(),
@@ -95,13 +115,16 @@ export function wrapAuthStorageWithApiKeyProviders(
         providerId as Parameters<AuthStorage["login"]>[0],
         callbacks as Parameters<AuthStorage["login"]>[1],
       );
-      const credential = mergedAuthStorage.get(providerId);
+      const credential = authStorage.get(providerId) as StoredCredential | undefined;
       if (credential?.type === "oauth" || credential?.type === "api_key") {
         return accountStore.addCredentialAccount(providerId, credential, { metadata: { source: "fusion-login" } });
       }
       return undefined;
     },
-    logout: (provider) => mergedAuthStorage.logout(provider),
+    logout: (provider) => {
+      mergedAuthStorage.logout(provider);
+      removeProviderAccounts(provider, new Set(["oauth"]));
+    },
     getApiKeyProviders: () => {
       const oauthProviderIds = new Set(
         mergedAuthStorage
@@ -139,6 +162,7 @@ export function wrapAuthStorageWithApiKeyProviders(
     },
     clearApiKey: (providerId) => {
       mergedAuthStorage.remove(providerId);
+      removeProviderAccounts(providerId, new Set(["api_key", "env_api_key"]));
     },
     hasApiKey: (providerId) => {
       const credential = accountCredential(providerId) ?? mergedAuthStorage.get(providerId);
@@ -151,7 +175,21 @@ export function wrapAuthStorageWithApiKeyProviders(
     },
     get: (providerId) => accountCredential(providerId) ?? mergedAuthStorage.get(providerId),
     listAccounts: (providerId) => accountStore.listSummaries(providerId),
-    removeAccount: (accountId) => accountStore.removeAccount(accountId),
+    removeAccount: (accountId) => {
+      const account = accountStore.list().find((candidate) => candidate.id === accountId);
+      const removed = accountStore.removeAccount(accountId);
+      if (removed && account) {
+        syncPrimaryCredentialForProvider(account.providerId);
+      }
+      return removed;
+    },
+    switchAccount: (accountId) => {
+      const account = accountStore.switchAccount(accountId);
+      if (account) {
+        syncPrimaryCredentialForProvider(account.providerId);
+      }
+      return account ? summarizeAccount(account, { isDefault: true }) : undefined;
+    },
   };
 }
 

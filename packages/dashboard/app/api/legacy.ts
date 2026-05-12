@@ -1367,6 +1367,8 @@ export interface AuthAccountSummary {
   accountDisplayHint?: string;
   priority: number;
   status: "active" | "cooldown" | "disabled";
+  /** True when this account is the provider default used for new model sessions. */
+  isDefault?: boolean;
   createdAt: string;
   updatedAt: string;
   cooldownUntil?: string;
@@ -1987,6 +1989,20 @@ export function clearApiKey(provider: string): Promise<{ success: boolean }> {
   return api<{ success: boolean }>("/auth/api-key", {
     method: "DELETE",
     body: JSON.stringify({ provider }),
+  });
+}
+
+/** Select a stored multi-account credential as the provider default. */
+export function switchAuthAccount(accountId: string): Promise<{ success: boolean; account: AuthAccountSummary }> {
+  return api<{ success: boolean; account: AuthAccountSummary }>(`/auth/accounts/${encodeURIComponent(accountId)}/switch`, {
+    method: "POST",
+  });
+}
+
+/** Remove one stored multi-account credential. */
+export function removeAuthAccount(accountId: string): Promise<{ success: boolean; removed: boolean }> {
+  return api<{ success: boolean; removed: boolean }>(`/auth/accounts/${encodeURIComponent(accountId)}`, {
+    method: "DELETE",
   });
 }
 

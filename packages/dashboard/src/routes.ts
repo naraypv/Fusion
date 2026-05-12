@@ -225,6 +225,8 @@ export interface AuthStorageLike {
   listAccounts?(providerId?: string): AccountCredentialSummary[];
   /** Remove a stored multi-account credential by account ID. */
   removeAccount?(accountId: string): boolean;
+  /** Select a stored multi-account credential as the provider default. */
+  switchAccount?(accountId: string): AccountCredentialSummary | undefined;
 }
 
 /**

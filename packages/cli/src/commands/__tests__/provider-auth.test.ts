@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { MultiAccountAuthStore } from "@fusion/core";
 import { tempWorkspace } from "@fusion/test-utils";
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "../provider-auth.js";
 
@@ -55,6 +56,67 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
 
     expect(fusionAuth.set).toHaveBeenCalledWith("openrouter", { type: "api_key", key: "fusion-key" });
     expect(legacyAuth.set).not.toHaveBeenCalled();
+  });
+
+  it("adds the just-written OAuth credential as the account even when fallback credentials exist", async () => {
+    const tempDir = tempWorkspace("fusion-provider-auth-account-");
+    const fusionAuth = makeAuthStorage();
+    const legacyAuth = makeAuthStorage({
+      "openai-codex": {
+        type: "oauth",
+        access: "legacy-access",
+        refresh: "legacy-refresh",
+        expires: Date.now() + 120_000,
+        accountId: "legacy-account",
+      },
+    });
+    fusionAuth.getOAuthProviders = vi.fn(() => [{ id: "openai-codex", name: "OpenAI Codex" }]);
+    fusionAuth.login = vi.fn(async () => {
+      fusionAuth.set("openai-codex", {
+        type: "oauth",
+        access: "fresh-access",
+        refresh: "fresh-refresh",
+        expires: Date.now() + 60_000,
+        accountId: "fresh-account",
+      });
+    });
+    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+    const accountStore = new MultiAccountAuthStore(join(tempDir, ".fusion", "agent", "accounts.json"));
+
+    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [legacyAuth], accountStore);
+    const result = await wrapped.login("openai-codex", {
+      onAuth: vi.fn(),
+      onPrompt: vi.fn(),
+      onProgress: vi.fn(),
+    } as any);
+
+    expect(result?.status).toBe("added");
+    expect(wrapped.listAccounts?.("openai-codex")).toHaveLength(1);
+    expect(wrapped.get("openai-codex")).toEqual(expect.objectContaining({
+      access: "fresh-access",
+      accountId: "fresh-account",
+    }));
+  });
+
+  it("can switch and remove stored multi-account API keys", async () => {
+    const tempDir = tempWorkspace("fusion-provider-auth-switch-");
+    const fusionAuth = makeAuthStorage();
+    const modelRegistry = { getAll: vi.fn(() => []) } as any;
+    const accountStore = new MultiAccountAuthStore(join(tempDir, ".fusion", "agent", "accounts.json"));
+
+    const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry, [], accountStore);
+    const first = wrapped.setApiKey("minimax", "first-key")?.account;
+    const second = wrapped.setApiKey("minimax", "second-key")?.account;
+
+    expect(first?.id).toBeDefined();
+    expect(second?.id).toBeDefined();
+    expect(await wrapped.getApiKey("minimax")).toBe("first-key");
+    const switched = wrapped.switchAccount?.(second!.id);
+    expect(switched).toEqual(expect.objectContaining({ id: second!.id, isDefault: true }));
+    expect(await wrapped.getApiKey("minimax")).toBe("second-key");
+    expect(wrapped.removeAccount?.(second!.id)).toBe(true);
+    expect(wrapped.listAccounts?.("minimax").map((account) => account.id)).toEqual([first!.id]);
+    expect(await wrapped.getApiKey("minimax")).toBe("first-key");
   });
 
   it("reloads all read stores so status reflects both locations", () => {

@@ -30,6 +30,7 @@ export interface FusionAuthStorageExtras {
   listAccounts(providerId?: string): AccountCredentialSummary[];
   getSelectedAccount(providerId: string): AccountCredentialRecord | undefined;
   selectAccount(providerId: string): AccountCredentialRecord | undefined;
+  switchAccount(accountId: string): AccountCredentialRecord | undefined;
   markAccountFailure(accountId: string, failure: AccountFailureState, cooldownMs?: number): AccountCredentialRecord | undefined;
   markAccountSuccess(accountId: string): AccountCredentialRecord | undefined;
   removeAccount(accountId: string): boolean;
@@ -365,6 +366,22 @@ export function createFusionAuthStorage(options: FusionAuthStorageOptions = {}):
         };
       }
 
+      if (prop === "switchAccount") {
+        return (accountId: string) => {
+          const account = accountStore.switchAccount(accountId);
+          if (account) {
+            selectedAccountIds[account.providerId] = account.id;
+            loggedOutProviders.delete(account.providerId);
+            if (account.credential && (account.credential.type === "oauth" || account.credential.type === "api_key")) {
+              target.set(account.providerId, account.credential as AuthCredential);
+            } else {
+              target.remove(account.providerId);
+            }
+          }
+          return account;
+        };
+      }
+
       if (prop === "markAccountFailure") {
         return (accountId: string, failure: AccountFailureState, cooldownMs?: number) => {
           const updated = accountStore.markFailure({ accountId, failure, cooldownMs });
@@ -385,6 +402,18 @@ export function createFusionAuthStorage(options: FusionAuthStorageOptions = {}):
           const removed = accountStore.removeAccount(accountId);
           if (removed && account && selectedAccountIds[account.providerId] === accountId) {
             delete selectedAccountIds[account.providerId];
+          }
+          if (removed && account) {
+            const selected = accountStore.selectAccount({ providerId: account.providerId });
+            if (selected?.credential && (selected.credential.type === "oauth" || selected.credential.type === "api_key")) {
+              target.set(account.providerId, selected.credential as AuthCredential);
+              loggedOutProviders.delete(account.providerId);
+            } else {
+              target.remove(account.providerId);
+              if (!selected) {
+                loggedOutProviders.add(account.providerId);
+              }
+            }
           }
           return removed;
         };

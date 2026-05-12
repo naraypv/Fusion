@@ -537,6 +537,8 @@ function createMockAuthStorage(overrides: Partial<AuthStorageLike> = {}): AuthSt
     setApiKey: vi.fn(),
     clearApiKey: vi.fn(),
     listAccounts: vi.fn().mockReturnValue([]),
+    removeAccount: vi.fn().mockReturnValue(false),
+    switchAccount: vi.fn().mockReturnValue(undefined),
     ...overrides,
   } as unknown as AuthStorageLike;
 }
@@ -697,6 +699,43 @@ describe("GET /auth/status", () => {
         expect.objectContaining({ id: "tavily", type: "api_key" }),
       ]),
     );
+  });
+
+  it("switches a stored multi-account credential", async () => {
+    (authStorage.switchAccount as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: "minimax-account-2",
+      providerId: "minimax",
+      label: "MiniMax account 2",
+      credentialKind: "api_key",
+      priority: 10,
+      status: "active",
+      isDefault: true,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/auth/accounts/minimax-account-2/switch", undefined, {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      success: true,
+      account: expect.objectContaining({ id: "minimax-account-2", isDefault: true }),
+    });
+    expect(authStorage.switchAccount).toHaveBeenCalledWith("minimax-account-2");
+  });
+
+  it("removes a stored multi-account credential", async () => {
+    (authStorage.removeAccount as ReturnType<typeof vi.fn>).mockReturnValue(true);
+
+    const res = await REQUEST(buildApp(), "DELETE", "/api/auth/accounts/minimax-account-2", undefined, {
+      "Content-Type": "application/json",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, removed: true });
+    expect(authStorage.removeAccount).toHaveBeenCalledWith("minimax-account-2");
   });
 
   it("returns 500 on error", async () => {

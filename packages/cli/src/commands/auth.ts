@@ -8,7 +8,7 @@ import { MultiAccountAuthStore, type AddAccountResult, type AccountCredentialSum
 import { createReadOnlyAuthFileStorage, mergeAuthStorageReads, wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getCodexCliAuthPath, getFusionAuthPath, getLegacyAuthPaths, getModelRegistryModelsPath } from "./auth-paths.js";
 
-type AuthAction = "status" | "login" | "add-account" | "api-key" | "remove-account";
+type AuthAction = "status" | "login" | "add-account" | "api-key" | "remove-account" | "switch-account";
 
 interface CliHomeProvider {
   providerId: "claude-cli" | "cursor" | "google-gemini-cli";
@@ -131,7 +131,8 @@ function stableHash(providerId: string, value: string): string {
 function formatAccount(account: AccountCredentialSummary): string {
   const hint = account.accountDisplayHint ? ` (${account.accountDisplayHint})` : "";
   const cooldown = account.cooldownUntil ? ` until ${account.cooldownUntil}` : "";
-  return `  - ${account.label}${hint} [${account.status}${cooldown}] id=${account.id}`;
+  const defaultMarker = account.isDefault ? ", default" : "";
+  return `  - ${account.label}${hint} [${account.status}${cooldown}${defaultMarker}] id=${account.id}`;
 }
 
 function printAddAccountResult(result: AddAccountResult): void {
@@ -160,7 +161,7 @@ function createDashboardAuthStorage() {
   ]);
   const merged = mergeAuthStorageReads(primary, [supplemental]);
   const modelRegistry = ModelRegistry.create(merged, getModelRegistryModelsPath());
-  return wrapAuthStorageWithApiKeyProviders(merged, modelRegistry);
+  return wrapAuthStorageWithApiKeyProviders(primary, modelRegistry, [supplemental]);
 }
 
 function runProcess(
@@ -333,7 +334,16 @@ export async function runAuth(args: string[]): Promise<void> {
       console.log(removed ? `Removed account ${accountId}.` : `Account ${accountId} was not found.`);
       return;
     }
+    case "switch-account": {
+      const accountId = args[1];
+      if (!accountId) {
+        throw new Error("Usage: fn auth switch-account <account-id>");
+      }
+      const account = new MultiAccountAuthStore().switchAccount(accountId);
+      console.log(account ? `Selected ${account.label} for ${account.providerId}.` : `Account ${accountId} was not found.`);
+      return;
+    }
     default:
-      throw new Error(`Unknown auth command: ${action}. Try: fn auth status | login | add-account | api-key | remove-account`);
+      throw new Error(`Unknown auth command: ${action}. Try: fn auth status | login | add-account | api-key | remove-account | switch-account`);
   }
 }

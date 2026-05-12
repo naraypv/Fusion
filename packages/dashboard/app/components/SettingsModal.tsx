@@ -11,7 +11,7 @@ import {
   resolveTitleSummarizerSettingsModel,
 } from "@fusion/core";
 import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, ModelFallbackChainEntry, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, addCliAccountProvider } from "../api";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, switchAuthAccount, removeAuthAccount, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, addCliAccountProvider } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemoteDetailed, RemoteSettings, RemoteStatus, UpdateCheckResponse } from "../api";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
@@ -1256,6 +1256,33 @@ export function SettingsModal({
       addToast("API key cleared", "success");
     } catch (err) {
       addToast(getErrorMessage(err) || "Failed to clear API key", "error");
+    } finally {
+      setAuthActionInProgress(null);
+    }
+  }, [addToast, loadAuthStatus]);
+
+  const handleSwitchAccount = useCallback(async (providerId: string, accountId: string) => {
+    setAuthActionInProgress(providerId);
+    try {
+      const result = await switchAuthAccount(accountId);
+      await loadAuthStatus();
+      addToast(`Selected ${result.account.label}`, "success");
+      scrollSettingsToTop();
+    } catch (err) {
+      addToast(getErrorMessage(err) || "Failed to switch account", "error");
+    } finally {
+      setAuthActionInProgress(null);
+    }
+  }, [addToast, loadAuthStatus, scrollSettingsToTop]);
+
+  const handleRemoveAccount = useCallback(async (providerId: string, accountId: string) => {
+    setAuthActionInProgress(providerId);
+    try {
+      await removeAuthAccount(accountId);
+      await loadAuthStatus();
+      addToast("Account removed", "success");
+    } catch (err) {
+      addToast(getErrorMessage(err) || "Failed to remove account", "error");
     } finally {
       setAuthActionInProgress(null);
     }
@@ -5979,6 +6006,12 @@ export function SettingsModal({
             onAddAccount={() => {
               void handleAddCliAccount("claude-cli");
             }}
+            onSwitchAccount={(accountId) => {
+              void handleSwitchAccount("claude-cli", accountId);
+            }}
+            onRemoveAccount={(accountId) => {
+              void handleRemoveAccount("claude-cli", accountId);
+            }}
             onToggled={() => {
               void loadAuthStatus();
             }}
@@ -6002,6 +6035,12 @@ export function SettingsModal({
             onAddAccount={() => {
               void handleAddCliAccount("cursor");
             }}
+            onSwitchAccount={(accountId) => {
+              void handleSwitchAccount("cursor", accountId);
+            }}
+            onRemoveAccount={(accountId) => {
+              void handleRemoveAccount("cursor", accountId);
+            }}
           />
         ) : null;
         const geminiCliCard = geminiCliProvider ? (
@@ -6021,6 +6060,12 @@ export function SettingsModal({
             onCancelLogin={() => void handleCancelLogin("google-gemini-cli")}
             onAddAccount={() => {
               void handleAddCliAccount("google-gemini-cli");
+            }}
+            onSwitchAccount={(accountId) => {
+              void handleSwitchAccount("google-gemini-cli", accountId);
+            }}
+            onRemoveAccount={(accountId) => {
+              void handleRemoveAccount("google-gemini-cli", accountId);
             }}
           />
         ) : null;
@@ -6221,6 +6266,31 @@ export function SettingsModal({
                               <span className={`auth-account-status auth-account-status--${account.status}`}>
                                 {account.status}
                               </span>
+                              {account.isDefault && (
+                                <span className="auth-account-default">Default</span>
+                              )}
+                              <div className="auth-account-actions">
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  disabled={authActionInProgress === provider.id || account.isDefault === true}
+                                  onClick={() => {
+                                    void handleSwitchAccount(provider.id, account.id);
+                                  }}
+                                >
+                                  Use
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  disabled={authActionInProgress === provider.id}
+                                  onClick={() => {
+                                    void handleRemoveAccount(provider.id, account.id);
+                                  }}
+                                >
+                                  Remove
+                                </button>
+                              </div>
                             </div>
                           ))}
                         </div>
