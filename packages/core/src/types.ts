@@ -5231,6 +5231,7 @@ export {
   resolveExecutionSettingsModel,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTaskExecutionModel,
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,

@@ -47,6 +47,7 @@ interface ReadFallbackAuthStorage {
 type StoredCredential = StoredAuthCredential;
 
 const BUILT_IN_API_KEY_PROVIDERS: Array<{ id: string; name: string }> = [
+  { id: "anthropic", name: "Anthropic" },
   { id: "brave", name: "Brave Search" },
   { id: "kimi-coding", name: "Kimi" },
   { id: "minimax", name: "Minimax" },

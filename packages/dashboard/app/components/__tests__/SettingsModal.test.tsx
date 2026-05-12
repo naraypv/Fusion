@@ -1099,7 +1099,7 @@ describe("SettingsModal", () => {
       expect(screen.getByTestId("auth-status-openai")).toHaveTextContent("✗ Not connected");
     });
 
-    it("hides deprecated Google CLI and antigravity auth providers", async () => {
+    it("hides deprecated antigravity auth providers while keeping the supported Gemini CLI account provider visible", async () => {
       mockFetchAuthStatus.mockResolvedValueOnce({
         providers: [
           { id: "google", name: "Google", authenticated: false, type: "api_key" },
@@ -1117,7 +1117,7 @@ describe("SettingsModal", () => {
       expect(screen.getByTestId("auth-provider-icon-gemini")).toBeInTheDocument();
       expect(screen.queryByTestId("auth-provider-icon-google-antigravity")).not.toBeInTheDocument();
       expect(screen.queryByTestId("auth-provider-icon-antigravity")).not.toBeInTheDocument();
-      expect(screen.queryByText("Google Gemini CLI")).not.toBeInTheDocument();
+      expect(screen.getByText("Google Gemini CLI")).toBeInTheDocument();
     });
 
     it("scrolls settings content to top after OAuth login succeeds", async () => {

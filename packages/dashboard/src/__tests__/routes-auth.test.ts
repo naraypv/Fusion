@@ -536,6 +536,7 @@ function createMockAuthStorage(overrides: Partial<AuthStorageLike> = {}): AuthSt
     hasApiKey: vi.fn().mockReturnValue(false),
     setApiKey: vi.fn(),
     clearApiKey: vi.fn(),
+    listAccounts: vi.fn().mockReturnValue([]),
     ...overrides,
   } as unknown as AuthStorageLike;
 }
@@ -564,11 +565,11 @@ describe("GET /auth/status", () => {
     expect(res.status).toBe(200);
     // Filter out synthetic CLI providers — they have dedicated route tests.
     // Structural assertions here are about OAuth + API-key paths only.
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => !["claude-cli", "droid-cli", "cursor-cli", "cursor", "google-gemini-cli", "llama-cpp"].includes(p.id));
     expect(providers).toEqual([
-      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
     expect(authStorage.reload).toHaveBeenCalled();
   });
@@ -589,6 +590,9 @@ describe("GET /auth/status", () => {
       authenticated: true,
       type: "oauth",
       loginInProgress: false,
+      accounts: [],
+      accountCount: 0,
+      supportsMultipleAccounts: false,
     });
   });
 
@@ -608,13 +612,13 @@ describe("GET /auth/status", () => {
     const res = await GET(buildApp(), "/api/auth/status");
 
     expect(res.status).toBe(200);
-    const providers = res.body.providers.filter((p: any) => p.id !== "claude-cli" && p.id !== "droid-cli" && p.id !== "cursor-cli" && p.id !== "llama-cpp");
+    const providers = res.body.providers.filter((p: any) => !["claude-cli", "droid-cli", "cursor-cli", "cursor", "google-gemini-cli", "llama-cpp"].includes(p.id));
     expect(providers).toEqual([
-      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false },
-      { id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: false },
-      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key" },
-      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key" },
-      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key" },
+      { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
+      { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
   });
 

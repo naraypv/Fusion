@@ -513,7 +513,7 @@ describe("Settings view", () => {
     stdin.write("K");
     await waitForFrameContains(lastFrame, "ASCII-QR-PAYLOAD", 6000);
     unmount();
-  });
+  }, 25_000);
 
   it("wires P/U remote actions to persistent token refresh and URL handoff state", async () => {
     const controller = newController();

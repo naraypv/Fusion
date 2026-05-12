@@ -149,6 +149,16 @@ describe("wrapAuthStorageWithApiKeyProviders", () => {
   });
 
   describe("Anthropic provider classification", () => {
+    it("exposes anthropic as an API-key provider when OAuth is unavailable", () => {
+      const fusionAuth = makeAuthStorage();
+      const modelRegistry = { getAll: vi.fn(() => []) } as any;
+
+      const wrapped = wrapAuthStorageWithApiKeyProviders(fusionAuth, modelRegistry);
+      const apiKeyProviders = wrapped.getApiKeyProviders();
+
+      expect(apiKeyProviders.map((p) => p.id)).toContain("anthropic");
+    });
+
     it("keeps anthropic in getOAuthProviders when upstream reports it as OAuth", () => {
       const fusionAuth = makeAuthStorage();
       fusionAuth.getOAuthProviders = vi.fn(() => [

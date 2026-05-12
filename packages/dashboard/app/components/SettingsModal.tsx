@@ -7,10 +7,11 @@ import {
   isProjectSettingsKey,
   resolvePlanningSettingsModel,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   resolveTitleSummarizerSettingsModel,
 } from "@fusion/core";
-import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
+import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset, ModelFallbackChainEntry, NtfyNotificationEvent, AgentPromptsConfig, ThinkingLevel } from "@fusion/core";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotesDetailed, fetchDashboardHealth, checkForUpdates, fetchRemoteSettings, updateRemoteSettings, fetchRemoteStatus, installCloudflared, startRemoteTunnel, stopRemoteTunnel, killExternalTunnel, regenerateRemotePersistentToken, generateShortLivedRemoteToken, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode, addCliAccountProvider } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemoteDetailed, RemoteSettings, RemoteStatus, UpdateCheckResponse } from "../api";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
@@ -26,6 +27,7 @@ import { useModalResizePersist } from "../hooks/useModalResizePersist";
 const PluginManager = lazy(() => import("./PluginManager").then((m) => ({ default: m.PluginManager })));
 const PiExtensionsManager = lazy(() => import("./PiExtensionsManager").then((m) => ({ default: m.PiExtensionsManager })));
 import { ClaudeCliProviderCard } from "./ClaudeCliProviderCard";
+import { CliAccountProviderCard } from "./CliAccountProviderCard";
 import { CursorCliProviderCard } from "./CursorCliProviderCard";
 import { CliBinaryPanel } from "./CliBinaryPanel";
 import { LlamaCppProviderCard } from "./LlamaCppProviderCard";
@@ -65,6 +67,28 @@ function getNodeStatusLabel(status: "online" | "offline" | "connecting" | "error
   if (status === "connecting") return "Connecting";
   if (status === "error") return "Error";
   return "Offline";
+}
+
+function areStringRecordsEqual(left: Record<string, string>, right: Record<string, string>): boolean {
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) return false;
+  return leftKeys.every((key) => left[key] === right[key]);
+}
+
+function areManualCodeRecordsEqual(
+  left: Record<string, ManualOAuthCodeInfo>,
+  right: Record<string, ManualOAuthCodeInfo>,
+): boolean {
+  const leftKeys = Object.keys(left);
+  if (leftKeys.length !== Object.keys(right).length) return false;
+  return leftKeys.every((key) => {
+    const leftConfig = left[key];
+    const rightConfig = right[key];
+    return Boolean(rightConfig)
+      && leftConfig.prompt === rightConfig.prompt
+      && leftConfig.placeholder === rightConfig.placeholder
+      && leftConfig.helpText === rightConfig.helpText;
+  });
 }
 
 /**
@@ -183,6 +207,7 @@ type SettingsSection = {
 const MOBILE_SETTINGS_MEDIA_QUERY = "(max-width: 768px)";
 const DEFAULT_MEMORY_EDITOR_PATH = ".fusion/memory/DREAMS.md";
 const MEMORY_FILE_OPTION_LABEL_MAX_CHARS = 72;
+const MODEL_FALLBACK_CHAIN_SLOT_COUNT = 10;
 
 function truncateMiddle(value: string, maxChars: number): string {
   if (value.length <= maxChars) {
@@ -200,6 +225,37 @@ function formatMemoryFileOptionLabel(file: MemoryFileInfo): string {
   return truncateMiddle(fullLabel, MEMORY_FILE_OPTION_LABEL_MAX_CHARS);
 }
 
+function accountResultToast(result: AuthProvider["lastLoginResult"] | undefined): { message: string; type: ToastType } {
+  if (!result) {
+    return { message: "Login successful", type: "success" };
+  }
+
+  return {
+    message: result.message,
+    type: result.status === "same-account" ? "warning" : "success",
+  };
+}
+
+const REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS = new Set([
+  "openai-codex",
+  "codex",
+  "anthropic",
+  "claude-cli",
+  "cursor",
+  "minimax",
+  "google-gemini-cli",
+]);
+
+function canAddAnotherAuthAccount(provider: AuthProvider): boolean {
+  return provider.supportsMultipleAccounts === true
+    || (provider.accountCount ?? 0) > 0
+    || REQUIRED_MULTI_ACCOUNT_AUTH_PROVIDER_IDS.has(provider.id);
+}
+
+function fallbackChainSlots(chain: ModelFallbackChainEntry[] | undefined): ModelFallbackChainEntry[] {
+  return Array.from({ length: MODEL_FALLBACK_CHAIN_SLOT_COUNT }, (_unused, index) => chain?.[index] ?? {});
+}
+
 const SETTINGS_SECTIONS: SettingsSection[] = [
   // Account group (scope-less items — independent of settings storage)
   { id: "__account_header", label: "Account", scope: undefined, isGroupHeader: true },
@@ -212,6 +268,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "notifications", label: "Notifications", scope: "global" },
   { id: "node-sync", label: "Node Sync", scope: "global" },
   { id: "global-models", label: "Models", scope: "global" },
+  { id: "dspy-global", label: "DSPy", scope: "global" },
   { id: "research-global", label: "Research Defaults", scope: "global" },
   { id: "experimental", label: "Experimental Features", scope: "global" },
   { id: "remote", label: "Remote Access", scope: "global" },
@@ -226,6 +283,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "__project_header", label: "Project", scope: undefined, isGroupHeader: true },
   { id: "general", label: "Project General", scope: "project" },
   { id: "project-models", label: "Project Models", scope: "project" },
+  { id: "dspy-project", label: "DSPy", scope: "project" },
   { id: "scheduling", label: "Scheduling", scope: "project" },
   { id: "scheduled-evals", label: "Scheduled Evals", scope: "project" },
   { id: "node-routing", label: "Node Routing", scope: "project" },
@@ -740,7 +798,7 @@ export function SettingsModal({
             next[provider.id] = pending.instructions;
           }
         }
-        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+        return areStringRecordsEqual(prev, next) ? prev : next;
       });
       setManualCodeConfigs((prev) => {
         const next: Record<string, ManualOAuthCodeInfo> = {};
@@ -760,7 +818,7 @@ export function SettingsModal({
             next[providerId] = manualCode;
           }
         }
-        return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+        return areManualCodeRecordsEqual(prev, next) ? prev : next;
       });
     } catch {
       // Silently fail — auth may not be configured
@@ -1013,18 +1071,20 @@ export function SettingsModal({
     });
   }, []);
 
-  const handleLogin = useCallback(async (providerId: string) => {
+  const handleLogin = useCallback(async (providerId: string, addAnother = false) => {
     setAuthActionInProgress(providerId);
     clearAuthLoginUiState(providerId);
+    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
 
     try {
-      const { url, instructions, manualCode } = await loginProvider(providerId);
+      const { url, instructions, manualCode } = await loginProvider(providerId, { addAnother });
       if (instructions?.trim()) {
         setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
       }
       if (manualCode) {
         setManualCodeConfigs((prev) => ({ ...prev, [providerId]: manualCode }));
       }
+      savePendingAuthLoginUiState(providerId, { instructions, manualCode });
       window.open(appendTokenQuery(url), "_blank");
 
       // Poll for auth completion every 2 seconds
@@ -1034,14 +1094,20 @@ export function SettingsModal({
           const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
           setAuthProviders(visibleProviders);
           const provider = visibleProviders.find((p) => p.id === providerId);
-          if (provider?.authenticated) {
+          const result = provider?.lastLoginResult;
+          const addAnotherCompleted =
+            addAnother &&
+            (Boolean(result) || ((provider?.accountCount ?? 0) > startingAccountCount));
+          const loginCompleted = addAnother ? addAnotherCompleted : provider?.authenticated;
+          if (loginCompleted) {
             if (pollIntervalRef.current) {
               clearInterval(pollIntervalRef.current);
               pollIntervalRef.current = null;
             }
             setAuthActionInProgress(null);
             clearAuthLoginUiState(providerId);
-            addToast("Login successful", "success");
+            const toast = accountResultToast(result);
+            addToast(toast.message, toast.type);
             scrollSettingsToTop();
             return;
           }
@@ -1071,7 +1137,7 @@ export function SettingsModal({
       setAuthActionInProgress(null);
       clearAuthLoginUiState(providerId);
     }
-  }, [addToast, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
+  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleSubmitManualCode = useCallback(async (providerId: string) => {
     const code = manualCodeInputs[providerId]?.trim();
@@ -1151,14 +1217,19 @@ export function SettingsModal({
       return next;
     });
     try {
-      await saveApiKey(providerId, key);
+      const result = await saveApiKey(providerId, key);
       setApiKeyInputs((prev) => {
         const next = { ...prev };
         delete next[providerId];
         return next;
       });
       await loadAuthStatus();
-      addToast("API key saved", "success");
+      if (result?.result) {
+        const toast = accountResultToast(result.result);
+        addToast(toast.message, toast.type);
+      } else {
+        addToast("API key saved", "success");
+      }
       scrollSettingsToTop();
     } catch (err) {
       setApiKeyErrors((prev) => ({ ...prev, [providerId]: getErrorMessage(err) || "Failed to save API key" }));
@@ -1189,6 +1260,87 @@ export function SettingsModal({
       setAuthActionInProgress(null);
     }
   }, [addToast, loadAuthStatus]);
+
+  const handleAddCliAccount = useCallback(async (providerId: string) => {
+    setAuthActionInProgress(providerId);
+    clearAuthLoginUiState(providerId);
+    const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
+    try {
+      const result = await addCliAccountProvider(providerId);
+      if (result.instructions?.trim()) {
+        setLoginInstructions((prev) => ({ ...prev, [providerId]: result.instructions! }));
+      }
+      if (result.manualCode) {
+        setManualCodeConfigs((prev) => ({ ...prev, [providerId]: result.manualCode! }));
+      }
+      savePendingAuthLoginUiState(providerId, {
+        instructions: result.instructions,
+        manualCode: result.manualCode,
+      });
+      if (result.url) {
+        setAuthProviders((prev) => prev.map((provider) =>
+          provider.id === providerId ? { ...provider, loginInProgress: true } : provider,
+        ));
+        window.open(appendTokenQuery(result.url), "_blank");
+
+        pollIntervalRef.current = setInterval(async () => {
+          try {
+            const { providers } = await fetchAuthStatus();
+            const visibleProviders = filterVisibleOnboardingAndSettingsProviders(providers);
+            setAuthProviders(visibleProviders);
+            const provider = visibleProviders.find((p) => p.id === providerId);
+            const loginResult = provider?.lastLoginResult;
+            const loginCompleted =
+              Boolean(loginResult) ||
+              ((provider?.accountCount ?? 0) > startingAccountCount) ||
+              (startingAccountCount === 0 && provider?.authenticated === true);
+
+            if (loginCompleted) {
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              setAuthActionInProgress(null);
+              clearAuthLoginUiState(providerId);
+              const toast = accountResultToast(loginResult);
+              addToast(toast.message, toast.type);
+              scrollSettingsToTop();
+              return;
+            }
+
+            if (!provider?.loginInProgress) {
+              if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+              }
+              setAuthActionInProgress(null);
+              clearAuthLoginUiState(providerId);
+              addToast("CLI login did not complete. Please try again.", "error");
+            }
+          } catch {
+            // Continue polling on transient errors.
+          }
+        }, 2000);
+        return;
+      }
+
+      await loadAuthStatus();
+      const toast = accountResultToast(result.result);
+      addToast(toast.message, toast.type);
+      scrollSettingsToTop();
+    } catch (err) {
+      const message = getErrorMessage(err) || "Failed to add CLI account";
+      const isConflict = message.includes("already in progress") || (typeof err === "object" && err !== null && "status" in err && (err as { status?: number }).status === 409);
+      if (isConflict) {
+        addToast("CLI login already in progress. You can cancel it and retry.", "warning");
+        await loadAuthStatus().catch(() => {});
+      } else {
+        addToast(message, "error");
+      }
+      setAuthActionInProgress(null);
+      clearAuthLoginUiState(providerId);
+    }
+  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
   const handleTestProviderNotification = useCallback(async (providerId: "ntfy" | "webhook" | "ntfy-message") => {
     if (providerId === "ntfy" || providerId === "ntfy-message") {
@@ -1541,6 +1693,119 @@ export function SettingsModal({
       [lane.projectProviderKey]: undefined,
       [lane.projectModelKey]: undefined,
     }));
+  }
+
+  function updateModelFallbackChainValue(
+    scope: "global" | "project",
+    index: number,
+    value: string,
+  ): void {
+    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
+    setForm((current) => {
+      const next = fallbackChainSlots(current[key]);
+      if (!value) {
+        next[index] = {};
+      } else {
+        const accountMarker = "?account=";
+        const accountIdx = value.indexOf(accountMarker);
+        const modelValue = accountIdx === -1 ? value : value.slice(0, accountIdx);
+        const accountId = accountIdx === -1 ? undefined : decodeURIComponent(value.slice(accountIdx + accountMarker.length));
+        const slashIdx = modelValue.indexOf("/");
+        const provider = modelValue.slice(0, slashIdx);
+        const modelId = modelValue.slice(slashIdx + 1);
+        const selectedModel = availableModels.find((model) =>
+          model.provider === provider &&
+          model.id === modelId &&
+          model.accountId === accountId,
+        );
+        next[index] = {
+          provider,
+          modelId,
+          ...(accountId ? { accountId } : {}),
+          ...(selectedModel?.accountProvider ? { accountProvider: selectedModel.accountProvider } : {}),
+          enabled: true,
+        };
+      }
+      return { ...current, [key]: next };
+    });
+  }
+
+  function renderModelFallbackChain(scope: "global" | "project") {
+    const key = scope === "global" ? "modelFallbackChain" : "projectModelFallbackChain";
+    const slots = fallbackChainSlots(form[key]);
+    return (
+      <div className="settings-fallback-chain">
+        {slots.map((entry, index) => {
+          const value = entry.provider && entry.modelId
+            ? `${entry.provider}/${entry.modelId}${entry.accountId ? `?account=${encodeURIComponent(entry.accountId)}` : ""}`
+            : "";
+          return (
+            <div className="settings-fallback-chain-row" key={`${scope}-fallback-${index}`}>
+              <label htmlFor={`${scope}-fallback-chain-${index}`}>Priority {index + 1}</label>
+              <CustomModelDropdown
+                id={`${scope}-fallback-chain-${index}`}
+                label={`Priority ${index + 1}`}
+                models={availableModels}
+                value={value}
+                onChange={(selected) => updateModelFallbackChainValue(scope, index, selected)}
+                placeholder="No fallback"
+                favoriteProviders={favoriteProviders}
+                onToggleFavorite={handleToggleFavorite}
+                favoriteModels={favoriteModels}
+                onToggleModelFavorite={handleToggleModelFavorite}
+              />
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderDspyRoutingControls(scope: "global" | "project") {
+    const enabled = scope === "global"
+      ? form.routeAllLlmCallsViaDspy === true
+      : resolveRouteAllLlmCallsViaDspy(form);
+    const inherited = form.routeAllLlmCallsViaDspy === true;
+    return (
+      <>
+        {renderScopeBanner()}
+        <h4 className="settings-section-heading">DSPy Routing</h4>
+        <div className="form-group">
+          <label htmlFor={`${scope}-route-all-llm-calls-via-dspy`} className="checkbox-label">
+            <input
+              id={`${scope}-route-all-llm-calls-via-dspy`}
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                if (scope === "global") {
+                  setForm((current) => ({ ...current, routeAllLlmCallsViaDspy: checked }));
+                  return;
+                }
+                setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: checked }));
+              }}
+            />
+            Route all LLM calls via DSPy
+          </label>
+          <small>
+            {scope === "global"
+              ? "Applies to all projects unless a project override is set."
+              : inherited && form.projectRouteAllLlmCallsViaDspy === undefined
+                ? "Currently inherited from the global DSPy routing setting."
+                : "Overrides the global DSPy routing setting for this project."}
+          </small>
+        </div>
+        {scope === "project" && form.projectRouteAllLlmCallsViaDspy !== undefined && (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setForm((current) => ({ ...current, projectRouteAllLlmCallsViaDspy: undefined }))}
+          >
+            Reset to global
+          </button>
+        )}
+      </>
+    );
   }
 
   const openOverlapPathPicker = useCallback((index: number) => {
@@ -2257,6 +2522,12 @@ export function SettingsModal({
                   />
                   <small>Used automatically if the primary default model hits a retryable provider error like rate limiting or overload.</small>
                 </div>
+
+                <div className="form-group">
+                  <label>Model Fallback Chain</label>
+                  {renderModelFallbackChain("global")}
+                  <small>Priority 1 is tried first, then priority 2 through 10 when a retryable model/provider failure occurs.</small>
+                </div>
               </>
             )}
             {(() => {
@@ -2372,6 +2643,9 @@ export function SettingsModal({
           </>
         );
       }
+
+      case "dspy-global":
+        return renderDspyRoutingControls("global");
 
       case "project-models": {
         const presets = form.modelPresets || [];
@@ -2564,6 +2838,11 @@ export function SettingsModal({
                     onToggleModelFavorite={handleToggleModelFavorite}
                   />
                   <small>Used if the reviewer model fails due to rate limits or provider overload. Defaults to the global fallback model.</small>
+                </div>
+                <div className="form-group">
+                  <label>Project Model Fallback Chain</label>
+                  {renderModelFallbackChain("project")}
+                  <small>When any project fallback slots are set, this ordered chain overrides the global chain for this project.</small>
                 </div>
               </>
             )}
@@ -2909,6 +3188,9 @@ export function SettingsModal({
           </>
         );
       }
+
+      case "dspy-project":
+        return renderDspyRoutingControls("project");
 
       case "appearance":
         return (
@@ -5677,13 +5959,68 @@ export function SettingsModal({
         // auth state (Authenticated when signed in, Available otherwise).
         const claudeCliProvider = cliAuthProviders.find((p) => p.id === "claude-cli");
         const cursorCliProvider = cliAuthProviders.find((p) => p.id === "cursor-cli");
+        const cursorProvider = cliAuthProviders.find((p) => p.id === "cursor");
+        const geminiCliProvider = cliAuthProviders.find((p) => p.id === "google-gemini-cli");
         const llamaCppProvider = cliAuthProviders.find((p) => p.id === "llama-cpp");
         const claudeCliCard = claudeCliProvider ? (
           <ClaudeCliProviderCard
             compact
             authenticated={claudeCliProvider.authenticated}
+            accounts={claudeCliProvider.accounts}
+            addAccountBusy={authActionInProgress === "claude-cli"}
+            loginInProgress={claudeCliProvider.loginInProgress || authActionInProgress === "claude-cli"}
+            instructions={loginInstructions["claude-cli"]}
+            manualCode={manualCodeConfigs["claude-cli"]}
+            manualCodeValue={manualCodeInputs["claude-cli"] ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "claude-cli"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "claude-cli": value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("claude-cli")}
+            onCancelLogin={() => void handleCancelLogin("claude-cli")}
+            onAddAccount={() => {
+              void handleAddCliAccount("claude-cli");
+            }}
             onToggled={() => {
               void loadAuthStatus();
+            }}
+          />
+        ) : null;
+        const cursorAccountCard = cursorProvider ? (
+          <CliAccountProviderCard
+            providerId="cursor"
+            name={cursorProvider.name}
+            authenticated={cursorProvider.authenticated}
+            accounts={cursorProvider.accounts}
+            busy={authActionInProgress === "cursor"}
+            loginInProgress={cursorProvider.loginInProgress || authActionInProgress === "cursor"}
+            instructions={loginInstructions["cursor"]}
+            manualCode={manualCodeConfigs["cursor"]}
+            manualCodeValue={manualCodeInputs["cursor"] ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "cursor"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, cursor: value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("cursor")}
+            onCancelLogin={() => void handleCancelLogin("cursor")}
+            onAddAccount={() => {
+              void handleAddCliAccount("cursor");
+            }}
+          />
+        ) : null;
+        const geminiCliCard = geminiCliProvider ? (
+          <CliAccountProviderCard
+            providerId="google-gemini-cli"
+            name={geminiCliProvider.name}
+            authenticated={geminiCliProvider.authenticated}
+            accounts={geminiCliProvider.accounts}
+            busy={authActionInProgress === "google-gemini-cli"}
+            loginInProgress={geminiCliProvider.loginInProgress || authActionInProgress === "google-gemini-cli"}
+            instructions={loginInstructions["google-gemini-cli"]}
+            manualCode={manualCodeConfigs["google-gemini-cli"]}
+            manualCodeValue={manualCodeInputs["google-gemini-cli"] ?? ""}
+            manualCodeSubmitInProgress={manualCodeSubmitInProgress === "google-gemini-cli"}
+            onManualCodeChange={(value) => setManualCodeInputs((prev) => ({ ...prev, "google-gemini-cli": value }))}
+            onManualCodeSubmit={() => void handleSubmitManualCode("google-gemini-cli")}
+            onCancelLogin={() => void handleCancelLogin("google-gemini-cli")}
+            onAddAccount={() => {
+              void handleAddCliAccount("google-gemini-cli");
             }}
           />
         ) : null;
@@ -5709,11 +6046,15 @@ export function SettingsModal({
           authenticatedProviders.length > 0
           || (claudeCliProvider?.authenticated ?? false)
           || (cursorCliProvider?.authenticated ?? false)
+          || (cursorProvider?.authenticated ?? false)
+          || (geminiCliProvider?.authenticated ?? false)
           || (llamaCppProvider?.authenticated ?? false);
         const showAvailableGroup =
           unauthenticatedProviders.length > 0
           || (claudeCliProvider && !claudeCliProvider.authenticated)
           || (cursorCliProvider && !cursorCliProvider.authenticated)
+          || (cursorProvider && !cursorProvider.authenticated)
+          || (geminiCliProvider && !geminiCliProvider.authenticated)
           || (llamaCppProvider && !llamaCppProvider.authenticated);
         return (
           <>
@@ -5748,8 +6089,12 @@ export function SettingsModal({
                   <div className="auth-group-label">Authenticated</div>
                   {claudeCliProvider?.authenticated && claudeCliCard}
                   {cursorCliProvider?.authenticated && cursorCliCard}
+                  {cursorProvider?.authenticated && cursorAccountCard}
+                  {geminiCliProvider?.authenticated && geminiCliCard}
                   {llamaCppProvider?.authenticated && llamaCppCard}
-                  {authenticatedProviders.map((provider) => (
+                  {authenticatedProviders.map((provider) => {
+                    const canAddAnotherAccount = canAddAnotherAuthAccount(provider);
+                    return (
                     <div key={provider.id} className="auth-provider-card auth-provider-card--authenticated">
                       <div className="auth-provider-header">
                         <div className="auth-provider-info">
@@ -5783,7 +6128,7 @@ export function SettingsModal({
                                 onChange={(e) => setApiKeyInputs((prev) => ({ ...prev, [provider.id]: e.target.value }))}
                                 disabled={authActionInProgress === provider.id}
                               />
-                              {provider.authenticated && !apiKeyInputs[provider.id] ? (
+                              {provider.authenticated && (
                                 <button
                                   className="btn btn-sm"
                                   onClick={() => handleClearApiKey(provider.id)}
@@ -5791,15 +6136,15 @@ export function SettingsModal({
                                 >
                                   Clear
                                 </button>
-                              ) : (
-                                <button
-                                  className="btn btn-primary btn-sm"
-                                  onClick={() => handleSaveApiKey(provider.id)}
-                                  disabled={authActionInProgress === provider.id}
-                                >
-                                  Save
-                                </button>
                               )}
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                onClick={() => handleSaveApiKey(provider.id)}
+                                disabled={authActionInProgress === provider.id}
+                              >
+                                {provider.authenticated && canAddAnotherAccount ? "Add another account" : "Save"}
+                              </button>
                             </div>
                             {authActionInProgress === provider.id && (
                               <small className="auth-apikey-progress">Saving…</small>
@@ -5812,7 +6157,7 @@ export function SettingsModal({
                           <div>
                             {authActionInProgress === provider.id ? (
                               <button className="btn btn-sm" disabled>
-                                Logging out…
+                                Working…
                               </button>
                             ) : provider.loginInProgress ? (
                               <div className="auth-provider-actions-row">
@@ -5824,18 +6169,65 @@ export function SettingsModal({
                                 </button>
                               </div>
                             ) : (
-                              <button
-                                className="btn btn-sm"
-                                onClick={() => handleLogout(provider.id)}
-                              >
-                                Logout
-                              </button>
+                              <div className="auth-provider-actions-row">
+                                {canAddAnotherAccount && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm"
+                                    onClick={() => handleLogin(provider.id, true)}
+                                  >
+                                    Add another account
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="btn btn-sm"
+                                  onClick={() => handleLogout(provider.id)}
+                                >
+                                  Logout
+                                </button>
+                              </div>
+                            )}
+                            {loginInstructions[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
+                              <LoginInstructions
+                                instructions={loginInstructions[provider.id]}
+                                data-testid={`auth-login-instructions-${provider.id}`}
+                              />
+                            )}
+                            {manualCodeConfigs[provider.id] && (provider.loginInProgress || authActionInProgress === provider.id) && (
+                              <OAuthManualCodeForm
+                                value={manualCodeInputs[provider.id] ?? ""}
+                                onChange={(value) => setManualCodeInputs((prev) => ({ ...prev, [provider.id]: value }))}
+                                onSubmit={() => void handleSubmitManualCode(provider.id)}
+                                prompt={manualCodeConfigs[provider.id].prompt}
+                                placeholder={manualCodeConfigs[provider.id].placeholder}
+                                helpText={manualCodeConfigs[provider.id].helpText}
+                                disabled={manualCodeSubmitInProgress === provider.id}
+                                submitLabel={manualCodeSubmitInProgress === provider.id ? "Submitting…" : "Submit code"}
+                                data-testid={`auth-manual-code-${provider.id}`}
+                              />
                             )}
                           </div>
                         )}
                       </div>
+                      {provider.accounts && provider.accounts.length > 0 && (
+                        <div className="auth-account-list" data-testid={`auth-account-list-${provider.id}`}>
+                          {provider.accounts.map((account) => (
+                            <div key={account.id} className="auth-account-row">
+                              <span className="auth-account-label">{account.label}</span>
+                              {account.accountDisplayHint && (
+                                <span className="auth-account-hint">{account.accountDisplayHint}</span>
+                              )}
+                              <span className={`auth-account-status auth-account-status--${account.status}`}>
+                                {account.status}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               {showAvailableGroup && (
@@ -5843,6 +6235,8 @@ export function SettingsModal({
                   <div className="auth-group-label">Available</div>
                   {claudeCliProvider && !claudeCliProvider.authenticated && claudeCliCard}
                   {cursorCliProvider && !cursorCliProvider.authenticated && cursorCliCard}
+                  {cursorProvider && !cursorProvider.authenticated && cursorAccountCard}
+                  {geminiCliProvider && !geminiCliProvider.authenticated && geminiCliCard}
                   {llamaCppProvider && !llamaCppProvider.authenticated && llamaCppCard}
                   {unauthenticatedProviders.map((provider) => (
                     <div key={provider.id} className="auth-provider-card">

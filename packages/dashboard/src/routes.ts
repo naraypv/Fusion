@@ -13,7 +13,7 @@ import * as nodeFs from "node:fs";
 import os from "node:os";
 import v8 from "node:v8";
 
-import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType, WorkflowStepTemplate, AddAccountResult } from "@fusion/core";
+import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType, WorkflowStepTemplate, AddAccountResult, AccountCredentialSummary } from "@fusion/core";
 import {
   type Task,
   type PiExtensionEntry,
@@ -221,6 +221,10 @@ export interface AuthStorageLike {
   getApiKey?(providerId: string): string | null | undefined | Promise<string | null | undefined>;
   /** Get raw stored credentials for usage providers. */
   get?(providerId: string): { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [key: string]: unknown } | null | undefined;
+  /** List configured accounts for providers that support multi-account auth. */
+  listAccounts?(providerId?: string): AccountCredentialSummary[];
+  /** Remove a stored multi-account credential by account ID. */
+  removeAccount?(accountId: string): boolean;
 }
 
 /**

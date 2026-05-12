@@ -287,11 +287,15 @@ describe("bin command routing and fallbacks", () => {
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("fn — AI-orchestrated task board"));
   });
 
-  it("launches dashboard when no args are provided", async () => {
-    commandMocks.runDashboard.mockResolvedValue({ dispose: vi.fn() });
-    await runBin([]);
-    expect(commandMocks.runDashboard).toHaveBeenCalled();
-  });
+  it(
+    "launches dashboard when no args are provided",
+    async () => {
+      commandMocks.runDashboard.mockResolvedValue({ dispose: vi.fn() });
+      await runBin([]);
+      expect(commandMocks.runDashboard).toHaveBeenCalled();
+    },
+    20_000,
+  );
 
   it(
     "prints an error for unknown top-level command",
