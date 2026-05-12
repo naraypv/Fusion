@@ -7,7 +7,7 @@ import {
   ExternalLink, CheckCircle, XCircle, Loader2, GitBranch, ListChecks,
   AlertCircle,
   ChevronDown, ChevronRight, ChevronLeft, BarChart3, BookOpen, Eye, FileEdit,
-  Mail, Send, Inbox as InboxIcon, User
+  Mail, Send, Inbox as InboxIcon, User, MoreVertical
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -15,7 +15,7 @@ import type { AgentDetail, AgentState, AgentHeartbeatRun, AgentBudgetStatus, Mod
 import { fetchAgent, updateAgent, updateAgentState, deleteAgent, fetchAgentLogsWithMeta, fetchAgentRunLogs, fetchAgentChildren, fetchAgentRuns, fetchAgentRunDetail, startAgentRun, stopAgentRun, updateAgentInstructions, updateAgentSoul, updateAgentMemory, fetchAgentMemoryFiles, fetchAgentMemoryFile, saveAgentMemoryFile, fetchAgentTasks, fetchChainOfCommand, fetchAgentBudgetStatus, resetAgentBudget, fetchWorkspaceFileContent, saveWorkspaceFileContent, fetchModels, fetchPluginRuntimes, fetchAgents, upgradeAgentHeartbeatProcedure, updateGlobalSettings, fetchSkillContent, uploadAgentAvatar, deleteAgentAvatar, fetchAgentMailbox, markMessageRead } from "../api";
 import type { Agent } from "../api";
 import type { AgentLogEntry, Task, Message, ParticipantType } from "@fusion/core";
-import { getErrorMessage } from "@fusion/core";
+import { getErrorMessage, isEphemeralAgent } from "@fusion/core";
 import { AgentLogViewer } from "./AgentLogViewer";
 import { AgentReflectionsTab } from "./AgentReflectionsTab";
 import { getAgentHealthStatus } from "../utils/agentHealth";
@@ -141,12 +141,18 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
   const [isStreaming, setIsStreaming] = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [isStartingRun, setIsStartingRun] = useState(false);
+  const [isBulkMenuOpen, setIsBulkMenuOpen] = useState(false);
+  const [isBulkActionRunning, setIsBulkActionRunning] = useState(false);
+  const [isBulkEligibilityLoading, setIsBulkEligibilityLoading] = useState(false);
+  const [bulkPauseEligibleCount, setBulkPauseEligibleCount] = useState(0);
+  const [bulkResumeEligibleCount, setBulkResumeEligibleCount] = useState(0);
   const [runNowRefreshToken, setRunNowRefreshToken] = useState(0);
   const [latestRun, setLatestRun] = useState<AgentHeartbeatRun | null>(null);
   const [agentMailbox, setAgentMailbox] = useState<AgentMailboxResponse | null>(null);
   const [isLoadingMailbox, setIsLoadingMailbox] = useState(false);
   const [mailboxError, setMailboxError] = useState<string | null>(null);
   const agentDetailModalRef = useRef<HTMLDivElement>(null);
+  const bulkMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayMouseDownRef = useRef(false);
   useModalResizePersist(agentDetailModalRef, !inline, "fusion:agent-detail-modal-size");
   const onCloseRef = useRef(onClose);
@@ -287,6 +293,59 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
       void loadMailbox();
     }
   }, [agent, activeTab, loadMailbox]);
+
+  useEffect(() => {
+    if (!isBulkMenuOpen) return;
+
+    const onDocumentMouseDown = (event: MouseEvent) => {
+      if (!bulkMenuRef.current?.contains(event.target as Node)) {
+        setIsBulkMenuOpen(false);
+      }
+    };
+
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsBulkMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", onDocumentMouseDown);
+    document.addEventListener("keydown", onDocumentKeyDown);
+
+    return () => {
+      document.removeEventListener("mousedown", onDocumentMouseDown);
+      document.removeEventListener("keydown", onDocumentKeyDown);
+    };
+  }, [isBulkMenuOpen]);
+
+  useEffect(() => {
+    if (!isBulkMenuOpen) return;
+
+    let cancelled = false;
+    setIsBulkEligibilityLoading(true);
+
+    fetchAgents(undefined, projectId)
+      .then((projectAgents) => {
+        if (cancelled) return;
+        const nonEphemeralAgents = projectAgents.filter((projectAgent) => !isEphemeralAgent(projectAgent));
+        setBulkPauseEligibleCount(nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "active" || projectAgent.state === "running").length);
+        setBulkResumeEligibleCount(nonEphemeralAgents.filter((projectAgent) => projectAgent.state === "paused").length);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBulkPauseEligibleCount(0);
+        setBulkResumeEligibleCount(0);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsBulkEligibilityLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isBulkMenuOpen, projectId]);
 
   // When falling back to latest-run logs (no taskId) and that run is active,
   // subscribe to the run-scoped SSE stream so the Logs tab tails updates.
@@ -460,6 +519,63 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
     }
   };
 
+  const handleBulkStateChange = async (targetState: "paused" | "active") => {
+    if (isBulkActionRunning) return;
+    setIsBulkMenuOpen(false);
+    setIsBulkActionRunning(true);
+
+    try {
+      const projectAgents = await fetchAgents(undefined, projectId);
+      const nonEphemeralAgents = projectAgents.filter((projectAgent) => !isEphemeralAgent(projectAgent));
+      const eligibleAgents = nonEphemeralAgents.filter((projectAgent) => (
+        targetState === "paused"
+          ? projectAgent.state === "active" || projectAgent.state === "running"
+          : projectAgent.state === "paused"
+      ));
+
+      const skippedCount = nonEphemeralAgents.length - eligibleAgents.length;
+      if (eligibleAgents.length === 0) {
+        addToast(`No agents eligible to ${targetState === "paused" ? "pause" : "resume"}`, "error");
+        return;
+      }
+
+      const confirmed = await confirm({
+        title: targetState === "paused" ? "Pause All Agents" : "Resume All Agents",
+        message: `${targetState === "paused" ? "Pause" : "Resume"} ${eligibleAgents.length} agent${eligibleAgents.length === 1 ? "" : "s"} in this project?`,
+        danger: targetState === "paused",
+      });
+      if (!confirmed) return;
+
+      const results = await Promise.allSettled(
+        eligibleAgents.map((projectAgent) => updateAgentState(projectAgent.id, targetState, projectId)),
+      );
+
+      const failedResults = results
+        .map((result, index) => ({ result, agent: eligibleAgents[index] }))
+        .filter((entry): entry is { result: PromiseRejectedResult; agent: Agent } => entry.result.status === "rejected");
+
+      const successCount = results.length - failedResults.length;
+      const failureCount = failedResults.length;
+      const baseSummary = `${targetState === "paused" ? "Paused" : "Resumed"} ${successCount} agent${successCount === 1 ? "" : "s"}; skipped ${skippedCount}`;
+
+      if (failureCount > 0) {
+        const failureSummary = failedResults
+          .slice(0, 3)
+          .map(({ agent, result }) => `${agent.name || agent.id}: ${getErrorMessage(result.reason)}`)
+          .join("; ");
+        addToast(`${baseSummary}; failed ${failureCount}${failureSummary ? ` (${failureSummary})` : ""}`, "error");
+      } else {
+        addToast(baseSummary, "success");
+      }
+
+      await handleSavedMutation();
+    } catch (err) {
+      addToast(`Failed to ${targetState === "paused" ? "pause" : "resume"} agents: ${getErrorMessage(err)}`, "error");
+    } finally {
+      setIsBulkActionRunning(false);
+    }
+  };
+
   const handleRunHeartbeat = async () => {
     if (isStartingRun) return;
     setIsStartingRun(true);
@@ -553,6 +669,8 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
   const stateStyle = STATE_COLORS[agent.state];
   const health = getHealthStatus();
   const detailShellClassName = inline ? "agent-detail-inline" : "agent-detail-modal";
+  const isPauseAllDisabled = isBulkEligibilityLoading || bulkPauseEligibleCount === 0;
+  const isResumeAllDisabled = isBulkEligibilityLoading || bulkResumeEligibleCount === 0;
 
   return (
     <div
@@ -684,6 +802,56 @@ export function AgentDetailView({ agentId, projectId, onClose, addToast, onChild
 
             {/* Utility actions: refresh + close */}
             <div className="agent-detail-utility-actions">
+              <div className="agent-detail-bulk-menu" ref={bulkMenuRef}>
+                <button
+                  type="button"
+                  className="btn-icon"
+                  onClick={() => setIsBulkMenuOpen((open) => !open)}
+                  aria-haspopup="menu"
+                  aria-expanded={isBulkMenuOpen}
+                  aria-label="Bulk agent actions"
+                  title="Bulk agent actions"
+                  disabled={isTransitioning || isBulkActionRunning}
+                >
+                  <MoreVertical size={16} />
+                </button>
+                {isBulkMenuOpen && (
+                  <div className="agent-detail-bulk-menu-popover" role="menu">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-detail-bulk-menu-item"
+                      onClick={() => void handleBulkStateChange("paused")}
+                      disabled={isPauseAllDisabled || isBulkActionRunning}
+                    >
+                      Pause All Agents
+                      <span className="agent-detail-bulk-menu-item-hint">
+                        {isBulkEligibilityLoading
+                          ? "Loading eligible agents..."
+                          : isPauseAllDisabled
+                            ? "No active agents eligible"
+                            : `Pause ${bulkPauseEligibleCount} active/running agent${bulkPauseEligibleCount === 1 ? "" : "s"}`}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-detail-bulk-menu-item"
+                      onClick={() => void handleBulkStateChange("active")}
+                      disabled={isResumeAllDisabled || isBulkActionRunning}
+                    >
+                      Resume All Agents
+                      <span className="agent-detail-bulk-menu-item-hint">
+                        {isBulkEligibilityLoading
+                          ? "Loading eligible agents..."
+                          : isResumeAllDisabled
+                            ? "No paused agents eligible"
+                            : `Resume ${bulkResumeEligibleCount} paused agent${bulkResumeEligibleCount === 1 ? "" : "s"}`}
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
               <button className="btn-icon" onClick={() => void loadAgent()} title="Refresh" aria-label="Refresh">
                 <RefreshCw size={16} />
               </button>

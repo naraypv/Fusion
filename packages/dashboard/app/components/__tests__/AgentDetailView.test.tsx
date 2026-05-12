@@ -1309,8 +1309,80 @@ describe("AgentDetailView", () => {
 
       const utilityContainer = headerActions?.querySelector(".agent-detail-utility-actions");
       expect(utilityContainer).toBeTruthy();
+      expect(utilityContainer?.querySelector('[title="Bulk agent actions"]')).toBeTruthy();
       expect(utilityContainer?.querySelector('[title="Refresh"]')).toBeTruthy();
       expect(utilityContainer?.querySelector('[title="Close"]')).toBeTruthy();
+    });
+  });
+
+  it("renders bulk lifecycle menu with state-aware eligibility hints", async () => {
+    const user = userEvent.setup();
+    mockFetchAgents.mockResolvedValueOnce([
+      { id: "agent-001", name: "Alpha", state: "active", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "running", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "paused", role: "executor", metadata: {} },
+    ] as any);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Pause All Agents")).toBeInTheDocument();
+      expect(screen.getByText("Resume All Agents")).toBeInTheDocument();
+      expect(screen.getByText("Pause 2 active/running agents")).toBeInTheDocument();
+      expect(screen.getByText("Resume 1 paused agent")).toBeInTheDocument();
+    });
+  });
+
+  it("bulk pause confirms, skips ineligible/system agents, and refreshes detail", async () => {
+    const user = userEvent.setup();
+    const addToast = vi.fn();
+    mockFetchAgents.mockResolvedValue([
+      { id: "agent-001", name: "Alpha", state: "active", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "running", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-004", name: "System", state: "active", role: "executor", metadata: { type: "spawned" } },
+    ] as any);
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={addToast} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Pause All Agents/i }));
+
+    await waitFor(() => {
+      expect(mockConfirm).toHaveBeenCalled();
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-001", "paused", undefined);
+      expect(mockUpdateAgentState).toHaveBeenCalledWith("agent-002", "paused", undefined);
+      expect(mockUpdateAgentState).not.toHaveBeenCalledWith("agent-003", "paused", undefined);
+      expect(mockUpdateAgentState).not.toHaveBeenCalledWith("agent-004", "paused", undefined);
+      expect(addToast).toHaveBeenCalledWith("Paused 2 agents; skipped 1", "success");
+    });
+
+    await waitFor(() => {
+      expect(mockFetchAgent).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("reports partial failures during bulk resume", async () => {
+    const user = userEvent.setup();
+    const addToast = vi.fn();
+    mockFetchAgents.mockResolvedValue([
+      { id: "agent-001", name: "Alpha", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-002", name: "Bravo", state: "paused", role: "executor", metadata: {} },
+      { id: "agent-003", name: "Charlie", state: "idle", role: "executor", metadata: {} },
+    ] as any);
+    mockUpdateAgentState
+      .mockResolvedValueOnce(createMockAgent({ state: "active" }))
+      .mockRejectedValueOnce(new Error("network"));
+
+    render(<AgentDetailView agentId="agent-001" onClose={vi.fn()} addToast={addToast} />);
+
+    await user.click(await screen.findByRole("button", { name: "Bulk agent actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Resume All Agents/i }));
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith(expect.stringContaining("Resumed 1 agent; skipped 1; failed 1"), "error");
     });
   });
 
