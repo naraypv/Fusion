@@ -173,6 +173,14 @@ export function normalizeMergeConflictStrategy(
 /** Policy for handling task execution when the selected node is unavailable/unhealthy. */
 export type UnavailableNodePolicy = "block" | "fallback-local";
 
+export interface ModelFallbackChainEntry {
+  provider?: string;
+  modelId?: string;
+  enabled?: boolean;
+  accountId?: string;
+  accountProvider?: string;
+}
+
 export interface ModelPreset {
   id: string;
   name: string;
@@ -1592,6 +1600,11 @@ export interface GlobalSettings {
    *  model fails due to transient provider-side issues such as rate limits or
    *  overloaded capacity. Must be set together with `fallbackProvider`. */
   fallbackModelId?: string;
+  /** Ordered global fallback chain. Up to 10 enabled entries are tried in
+   *  priority order after the primary model. */
+  modelFallbackChain?: ModelFallbackChainEntry[];
+  /** When true, route Fusion LLM calls through the DSPy declarative bridge. */
+  routeAllLlmCallsViaDspy?: boolean;
   /** Default thinking effort level for AI agent sessions.
    *  Controls how much reasoning effort the model uses — higher levels
    *  produce better results but cost more. When undefined, the engine
@@ -2007,6 +2020,11 @@ export interface ProjectSettings {
   unavailableNodePolicy?: UnavailableNodePolicy;
   /** Project-level research configuration overrides. */
   researchSettings?: ResearchProjectSettings;
+  /** Ordered project fallback chain. Up to 10 enabled entries override the
+   *  global chain for this project. */
+  projectModelFallbackChain?: ModelFallbackChainEntry[];
+  /** Project override for DSPy LLM routing. Undefined inherits the global toggle. */
+  projectRouteAllLlmCallsViaDspy?: boolean;
   /** Project-level scheduled eval configuration overrides. */
   evalSettings?: EvalProjectSettings;
   /** Enable scheduled evaluation batches for recently completed tasks. */

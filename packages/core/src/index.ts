@@ -11,6 +11,42 @@ export * from "./mesh-replication-protocol.js";
 export * from "./mesh-task-replication.js";
 export * from "./shared-mesh-state.js";
 export {
+  PLAN_FORMAT_VERSION,
+  PLAN_GOAL_STATUSES,
+  PLAN_STATUSES,
+  applyGoalTransition,
+  assertValidPlanArtifact,
+  canTransitionGoal,
+  getReadyGoals,
+  isPlanBinding,
+  isPlanGoalStatus,
+  isPlanStatus,
+  PlanStore,
+  validatePlanArtifact,
+  exportSlopJanitorGoalDirectory,
+  exportSlopJanitorPlan,
+  importSlopJanitorPlan,
+} from "./plans/index.js";
+export type {
+  ApplyGoalTransitionOptions,
+  ApplyGoalTransitionResult,
+  CreatePlanOptions,
+  PlanArtifact,
+  PlanBinding,
+  PlanGoal,
+  PlanGoalStatus,
+  PlanLedgerEvent,
+  PlanStoreOptions,
+  PlanStatus,
+  PlanTransitionError,
+  PlanTransitionErrorCode,
+  PlanValidation,
+  PlanValidationError,
+  PlanValidationErrorCode,
+  SlopJanitorExportOptions,
+  TransitionGoalResult,
+} from "./plans/index.js";
+export {
   BUILTIN_AGENT_PROMPTS,
   resolveAgentPrompt,
   getAvailableTemplates,
@@ -296,6 +332,25 @@ export {
 } from "./memory-backup.js";
 export type { MemoryBackupInfo, MemoryBackupOptions } from "./memory-backup.js";
 export {
+  MULTI_ACCOUNT_AUTH_VERSION,
+  MultiAccountAuthStore,
+  getFusionAccountsPath,
+  summarizeAccount,
+} from "./multi-account-auth.js";
+export type {
+  AccountAuthFile,
+  AccountCredentialKind,
+  AccountCredentialRecord,
+  AccountCredentialStatus,
+  AccountCredentialSummary,
+  AccountFailureState,
+  AccountSelectionOptions,
+  AddAccountResult,
+  AddCliHomeAccountOptions,
+  AddCredentialAccountOptions,
+  MarkAccountFailureOptions,
+} from "./multi-account-auth.js";
+export {
   exportSettings,
   importSettings,
   validateImportData,
@@ -348,9 +403,11 @@ export {
   resolveTaskPlanningModel,
   resolveTaskValidatorModel,
   resolveTitleSummarizerSettingsModel,
+  resolveModelFallbackChain,
+  resolveRouteAllLlmCallsViaDspy,
   resolveValidatorSettingsModel,
 } from "./model-resolution.js";
-export type { ResolvedModelSelection } from "./model-resolution.js";
+export type { ResolvedModelSelection, ResolvedModelFallbackEntry } from "./model-resolution.js";
 
 // ── Memory Compaction ─────────────────────────────────────────────────
 
