@@ -221,6 +221,25 @@ describe("executeHeartbeat", () => {
       expect(section).toContain("**stale**");
     });
 
+    it("buildReportsHealthSection preserves AgentStore method binding for direct-report lookups", async () => {
+      const now = new Date().toISOString();
+      const report = { id: "agent-004", name: "bound-report", state: "active", taskId: "FN-102", reportsTo: "agent-001", lastHeartbeatAt: now, updatedAt: now } as Agent;
+      const store = createStoreWithAgentForExec() as AgentStore & {
+        listAgents: ReturnType<typeof vi.fn>;
+        getAgentsByReportsTo: (agentId: string) => Promise<Agent[]>;
+      };
+      store.listAgents = vi.fn().mockResolvedValue([mockAgent, report]);
+      store.getAgentsByReportsTo = async function (agentId: string) {
+        const agents = await this.listAgents();
+        return agents.filter((candidate: Agent) => candidate.reportsTo === agentId);
+      };
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+      expect(section).toContain("bound-report");
+      expect(store.listAgents).toHaveBeenCalledTimes(1);
+    });
+
     it("executeHeartbeat includes reports health section when agent has reports", async () => {
       const store = createStoreWithAgentForExec({ taskId: "FN-001" });
       const now = new Date().toISOString();
@@ -2603,12 +2622,34 @@ describe("executeHeartbeat", () => {
         description: "Follow-up task",
         dependencies: undefined,
         column: "triage",
+        priority: undefined,
         source: {
           sourceType: "agent_heartbeat",
           sourceAgentId: "agent-001",
           sourceRunId: undefined,
         },
       }, expect.objectContaining({ settings: { autoSummarizeTitles: false } }));
+    });
+
+    it("forwards explicit priority when fn_task_create tool is called", async () => {
+      const store = createStoreWithAgentForExec();
+      let capturedCreateTool: any;
+      const mockSession = createMockAgentSession();
+      mockedCreateFnAgent.mockImplementation(async (opts: any) => {
+        capturedCreateTool = opts.customTools[0];
+        return { session: mockSession as any };
+      });
+
+      mockSession.prompt = vi.fn().mockImplementation(async () => {
+        await capturedCreateTool.execute("call-1", { description: "Follow-up task", priority: "high" });
+      });
+
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      await monitor.executeHeartbeat({ agentId: "agent-001", source: "on_demand" });
+
+      expect(mockTaskStore.createTask).toHaveBeenCalledWith(expect.objectContaining({
+        priority: "high",
+      }), expect.any(Object));
     });
   });
 

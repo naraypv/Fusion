@@ -24,6 +24,8 @@ export interface NtfyProviderConfig {
   dashboardHost?: string;
   /** Project identifier for deep links */
   projectId?: string;
+  /** Optional access token used for authenticated publishes */
+  ntfyAccessToken?: string;
   /** Events to enable (default: DEFAULT_NTFY_EVENTS) */
   events?: NtfyNotificationEvent[];
 }
@@ -208,6 +210,7 @@ export class NtfyNotificationProvider implements NotificationProvider {
 
     const response = await sendNtfyNotificationWithResult({
       ntfyBaseUrl: this.config.ntfyBaseUrl,
+      ntfyAccessToken: this.config.ntfyAccessToken,
       topic: this.config.topic,
       title: content.title,
       message: content.message,

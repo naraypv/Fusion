@@ -10,9 +10,9 @@
 
 import { DatabaseSync } from "./sqlite-adapter.js";
 import { isAbsolute, join } from "node:path";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_PROJECT_SETTINGS } from "./types.js";
 import type { PluginOnSchemaInit } from "./plugin-types.js";
 import type { SteeringComment, TaskComment } from "./types.js";
@@ -21,6 +21,25 @@ import type { SteeringComment, TaskComment } from "./types.js";
 
 /** A prepared SQL statement wrapping the node:sqlite StatementSync type. */
 export type Statement = ReturnType<DatabaseSync["prepare"]>;
+
+/** Result payload for explicit database compaction via `VACUUM`. */
+export interface VacuumResult {
+  beforeBytes: number;
+  afterBytes: number;
+  durationMs: number;
+}
+
+const DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
+const DEFAULT_SQLITE_LOCK_RECOVERY_WINDOW_MS = 1_000;
+const DEFAULT_SQLITE_LOCK_RECOVERY_DELAY_MS = 50;
+
+type TransactionMode = "deferred" | "immediate";
+type TableColumnsCache = Map<string, Set<string>>;
+
+type SchemaCompatibilityOptions = {
+  tableColumnsCache?: TableColumnsCache;
+  skipColumnReconciliation?: boolean;
+};
 
 // ── JSON Helpers ─────────────────────────────────────────────────────
 
@@ -58,6 +77,17 @@ export function fromJson<T>(json: string | null | undefined): T | undefined {
   } catch {
     return undefined;
   }
+}
+
+export function isSqliteLockError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /SQLITE_(?:BUSY|LOCKED)|database is locked|database table is locked/i.test(message);
+}
+
+export function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, ms);
 }
 
 // ── Runtime capability probes ────────────────────────────────────────
@@ -239,6 +269,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 -- Config table (single row with project settings)
+-- nextId is a deprecated legacy allocator counter retained read-only for one
+-- release so older databases/config consumers can still load it during the
+-- distributed_task_id_state transition.
 CREATE TABLE IF NOT EXISTS config (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   nextId INTEGER DEFAULT 1,
@@ -876,6 +909,19 @@ export function getSchemaCompatibilityTableSchemas(): Map<string, Map<string, st
   return tables;
 }
 
+function canonicalizeSchemaTables(tables: Map<string, Map<string, string>>): Record<string, Record<string, string>> {
+  return Object.fromEntries(
+    [...tables.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([tableName, columns]) => [
+        tableName,
+        Object.fromEntries(
+          [...columns.entries()].sort(([left], [right]) => left.localeCompare(right)),
+        ),
+      ]),
+  );
+}
+
 export const MIGRATION_ONLY_TABLE_SCHEMAS: Record<string, Record<string, string>> = {
   ai_sessions: {
     id: "TEXT PRIMARY KEY",
@@ -1072,6 +1118,33 @@ export const MIGRATION_ONLY_TABLE_SCHEMAS: Record<string, Record<string, string>
   },
 };
 
+/**
+ * Process-local fingerprint of the additive schema compatibility contract.
+ *
+ * The hash covers the current schema version plus the canonicalized column
+ * declarations from both SCHEMA_SQL and MIGRATION_ONLY_TABLE_SCHEMAS, so any
+ * schema edit that changes the compatibility surface automatically invalidates
+ * the persisted __meta cache on next init().
+ */
+export const SCHEMA_COMPAT_FINGERPRINT = createHash("sha1")
+  .update(
+    JSON.stringify({
+      schemaVersion: SCHEMA_VERSION,
+      schemaSqlTables: canonicalizeSchemaTables(SCHEMA_TABLE_SCHEMAS),
+      migrationOnlyTableSchemas: Object.fromEntries(
+        Object.entries(MIGRATION_ONLY_TABLE_SCHEMAS)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([tableName, columns]) => [
+            tableName,
+            Object.fromEntries(
+              Object.entries(columns).sort(([left], [right]) => left.localeCompare(right)),
+            ),
+          ]),
+      ),
+    }),
+  )
+  .digest("hex");
+
 // ── Database Class ───────────────────────────────────────────────────
 
 type SharedIntegrityCheckState = {
@@ -1096,9 +1169,14 @@ export class Database {
   private readonly _fts5Available: boolean;
   private integrityCheckScheduled = false;
   private closed = false;
+  private readonly busyTimeoutMs: number;
+  private readonly lockRecoveryWindowMs: number;
+  private readonly lockRecoveryDelayMs: number;
 
-
-  constructor(fusionDir: string, options?: { inMemory?: boolean }) {
+  constructor(
+    fusionDir: string,
+    options?: { inMemory?: boolean; busyTimeoutMs?: number; lockRecoveryWindowMs?: number; lockRecoveryDelayMs?: number },
+  ) {
     // In-memory mode is a test-only fast path that swaps the on-disk
     // SQLite file for SQLite's `:memory:` connection. Schema + data live
     // entirely in process RAM, eliminating per-test disk open/sync cost
@@ -1108,6 +1186,9 @@ export class Database {
     const inMemory = options?.inMemory === true;
     this.inMemory = inMemory;
     this.dbPath = inMemory ? ":memory:" : join(fusionDir, "fusion.db");
+    this.busyTimeoutMs = Math.max(0, options?.busyTimeoutMs ?? DEFAULT_SQLITE_BUSY_TIMEOUT_MS);
+    this.lockRecoveryWindowMs = Math.max(0, options?.lockRecoveryWindowMs ?? DEFAULT_SQLITE_LOCK_RECOVERY_WINDOW_MS);
+    this.lockRecoveryDelayMs = Math.max(1, options?.lockRecoveryDelayMs ?? DEFAULT_SQLITE_LOCK_RECOVERY_DELAY_MS);
 
     if (!inMemory && !isAbsolute(fusionDir)) {
       throw new Error(`[fusion] Database constructor requires an absolute fusionDir path, got: ${fusionDir}`);
@@ -1144,9 +1225,9 @@ export class Database {
     // and there's no other writer to coordinate with — so we skip WAL-only
     // tuning there.
     if (!inMemory) {
-      // Wait up to 5s for locks to clear before returning SQLITE_BUSY.
-      // Set this before other PRAGMAs so they also benefit from lock waiting.
-      this.db.exec("PRAGMA busy_timeout = 5000");
+      // Wait up to the configured timeout for locks to clear before returning
+      // SQLITE_BUSY. Set this before other PRAGMAs so they also benefit.
+      this.db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
       // Enable WAL mode for concurrent reader/writer access
       this.db.exec("PRAGMA journal_mode = WAL");
       // In WAL mode NORMAL is nearly as durable as FULL with much lower fsync cost.
@@ -1158,8 +1239,8 @@ export class Database {
       // Bound WAL growth between checkpoints/maintenance cycles.
       this.db.exec("PRAGMA journal_size_limit = 4194304");
     } else {
-      // Wait up to 5s for locks to clear before returning SQLITE_BUSY
-      this.db.exec("PRAGMA busy_timeout = 5000");
+      // Wait up to the configured timeout for locks to clear before returning SQLITE_BUSY.
+      this.db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
     }
     // Enable foreign key enforcement
     this.db.exec("PRAGMA foreign_keys = ON");
@@ -1299,6 +1380,50 @@ export class Database {
   }
 
   /**
+   * Run WAL truncation + VACUUM and report compaction stats.
+   *
+   * In-memory databases no-op and return zeroed stats. Disk-backed databases
+   * sample file size before/after compaction, run `wal_checkpoint(TRUNCATE)`,
+   * and then run `VACUUM` while the connection is in EXCLUSIVE locking mode to
+   * prevent concurrent writes from other connections during maintenance.
+   */
+  vacuum(): VacuumResult {
+    if (this.inMemory) {
+      return { beforeBytes: 0, afterBytes: 0, durationMs: 0 };
+    }
+
+    const beforeBytes = existsSync(this.dbPath) ? statSync(this.dbPath).size : 0;
+    const startedAt = Date.now();
+
+    this.db.exec("PRAGMA locking_mode=EXCLUSIVE");
+
+    try {
+      try {
+        this.walCheckpoint("TRUNCATE");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Database vacuum maintenance failed during WAL checkpoint (dbPath=${this.dbPath}): ${message}`);
+      }
+
+      try {
+        this.db.exec("VACUUM");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Database vacuum maintenance failed during VACUUM (dbPath=${this.dbPath}): ${message}`);
+      }
+
+      const afterBytes = existsSync(this.dbPath) ? statSync(this.dbPath).size : 0;
+      return {
+        beforeBytes,
+        afterBytes,
+        durationMs: Date.now() - startedAt,
+      };
+    } finally {
+      this.db.exec("PRAGMA locking_mode=NORMAL");
+    }
+  }
+
+  /**
    * Initialize the database: create tables if they don't exist
    * and seed meta values.
    */
@@ -1318,11 +1443,23 @@ export class Database {
     // Run schema migrations
     this.migrate();
 
+    const schemaCompatFingerprint = this.getMetaValue("schemaCompatFingerprint");
+    const skipColumnReconciliation = schemaCompatFingerprint === SCHEMA_COMPAT_FINGERPRINT;
+    const tableColumnsCache = skipColumnReconciliation ? undefined : new Map<string, Set<string>>();
+    const compatibilityOptions: SchemaCompatibilityOptions = {
+      tableColumnsCache,
+      skipColumnReconciliation,
+    };
+
     // Compatibility backfills that must run even when schemaVersion is current.
-    this.ensureSchemaCompatibility();
-    this.ensureRoutinesSchemaCompatibility();
-    this.ensureInsightRunsSchemaCompatibility();
-    this.ensureEvalTaskResultsSchemaCompatibility();
+    this.ensureSchemaCompatibility(compatibilityOptions);
+    this.ensureRoutinesSchemaCompatibility(compatibilityOptions);
+    this.ensureInsightRunsSchemaCompatibility(compatibilityOptions);
+    this.ensureEvalTaskResultsSchemaCompatibility(compatibilityOptions);
+
+    if (!skipColumnReconciliation) {
+      this.setMetaValue("schemaCompatFingerprint", SCHEMA_COMPAT_FINGERPRINT);
+    }
 
     // Seed config row idempotently with default settings
     const configNow = new Date().toISOString();
@@ -1343,21 +1480,29 @@ export class Database {
    * re-run even if a previous migration partially applied.
    */
   /**
-   * Applies unconditional column reconciliation for all known project DB tables.
+   * Reconciles additive columns for every known project DB table unless the
+   * persisted `schemaCompatFingerprint` already matches SCHEMA_COMPAT_FINGERPRINT.
    *
-   * FN-3879 introduced a tasks checkout-column self-heal, FN-3898 formalized it,
-   * and FN-3887 generalized the guardrail so migration-version drift no longer
-   * determines whether additive columns exist. Invariant: every column declared
-   * in SCHEMA_SQL or MIGRATION_ONLY_TABLE_SCHEMAS exists on any live table after
-   * this method returns, regardless of the persisted schemaVersion.
+   * The fingerprint is invalidated automatically by SCHEMA_VERSION changes and by
+   * edits to the canonicalized column declarations from SCHEMA_SQL or
+   * MIGRATION_ONLY_TABLE_SCHEMAS. When it is absent or stale, this method runs the
+   * full FN-3879/FN-3887/FN-3898 safety pass so every declared column exists on
+   * every live table after init() returns.
    */
-  private ensureSchemaCompatibility(): void {
+  private ensureSchemaCompatibility(options: SchemaCompatibilityOptions = {}): void {
+    if (options.skipColumnReconciliation) {
+      return;
+    }
+
     const knownTableSchemas = getSchemaCompatibilityTableSchemas();
+    const tableColumnsCache = options.tableColumnsCache;
 
     for (const [tableName, columns] of knownTableSchemas) {
       if (!this.hasTable(tableName)) continue;
+      const cachedColumns = this.getTableColumns(tableName, true, tableColumnsCache);
       for (const [columnName, columnDefinition] of columns) {
-        this.addColumnIfMissing(tableName, columnName, columnDefinition);
+        if (cachedColumns.has(columnName)) continue;
+        this.addColumnIfMissingCached(tableName, columnName, columnDefinition, tableColumnsCache);
       }
     }
   }
@@ -1369,9 +1514,14 @@ export class Database {
    * agent IDs from earlier table definitions. `RoutineStore.rowToRoutine()` and
    * backup routine sync expect a safe string value, so normalize to ''.
    */
-  private ensureRoutinesSchemaCompatibility(): void {
+  private ensureRoutinesSchemaCompatibility(options: SchemaCompatibilityOptions = {}): void {
     if (!this.hasTable("routines")) {
       return;
+    }
+
+    if (!options.skipColumnReconciliation) {
+      this.addColumnIfMissingCached("routines", "agentId", "TEXT DEFAULT ''", options.tableColumnsCache);
+      this.addColumnIfMissingCached("routines", "scope", "TEXT DEFAULT 'project'", options.tableColumnsCache);
     }
 
     this.db.exec("UPDATE routines SET agentId = '' WHERE agentId IS NULL");
@@ -1389,15 +1539,20 @@ export class Database {
    * remains focused on index creation that should run after the generic column
    * backfill pass.
    */
-  private ensureInsightRunsSchemaCompatibility(): void {
+  private ensureInsightRunsSchemaCompatibility(options: SchemaCompatibilityOptions = {}): void {
     if (!this.hasTable("project_insight_runs")) {
       return;
+    }
+
+    if (!options.skipColumnReconciliation) {
+      this.addColumnIfMissingCached("project_insight_runs", "lifecycle", "TEXT", options.tableColumnsCache);
+      this.addColumnIfMissingCached("project_insight_runs", "cancelledAt", "TEXT", options.tableColumnsCache);
     }
 
     this.db.exec(`CREATE INDEX IF NOT EXISTS idxInsightRunsProjectTriggerStatus ON project_insight_runs(projectId, trigger, status)`);
   }
 
-  private ensureEvalTaskResultsSchemaCompatibility(): void {
+  private ensureEvalTaskResultsSchemaCompatibility(_options: SchemaCompatibilityOptions = {}): void {
     if (!this.hasTable("eval_task_results")) {
       return;
     }
@@ -3030,13 +3185,29 @@ export class Database {
   }
 
   /**
+   * Read the declared columns for a table.
+   */
+  private getTableColumns(table: string, useCache = false, cache?: TableColumnsCache): Set<string> {
+    if (useCache && cache?.has(table)) {
+      return cache.get(table) ?? new Set<string>();
+    }
+
+    const columns = new Set(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name),
+    );
+
+    if (useCache && cache) {
+      cache.set(table, columns);
+    }
+
+    return columns;
+  }
+
+  /**
    * Check whether a table has a given column.
    */
   private hasColumn(table: string, column: string): boolean {
-    const cols = this.db
-      .prepare(`PRAGMA table_info(${table})`)
-      .all() as Array<{ name: string }>;
-    return cols.some((c) => c.name === column);
+    return this.getTableColumns(table).has(column);
   }
 
   /**
@@ -3045,6 +3216,27 @@ export class Database {
   private addColumnIfMissing(table: string, column: string, definition: string): void {
     if (!this.hasColumn(table, column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  /**
+   * Add a column using a per-init table-info cache when available.
+   */
+  private addColumnIfMissingCached(
+    table: string,
+    column: string,
+    definition: string,
+    cache?: TableColumnsCache,
+  ): void {
+    const columns = this.getTableColumns(table, Boolean(cache), cache);
+    if (columns.has(column)) {
+      return;
+    }
+
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    columns.add(column);
+    if (cache) {
+      cache.set(table, columns);
     }
   }
 
@@ -3174,27 +3366,71 @@ export class Database {
     this.db.close();
   }
 
+  private runWithLockRecovery(action: string, fn: () => void): void {
+    const deadline = Date.now() + this.lockRecoveryWindowMs;
+    let attempt = 0;
+
+    while (true) {
+      try {
+        fn();
+        return;
+      } catch (error) {
+        if (!isSqliteLockError(error)) {
+          throw error;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `SQLite ${action} failed after ${attempt + 1} attempt${attempt === 0 ? "" : "s"}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        const remainingMs = Math.max(0, deadline - Date.now());
+        const delayMs = Math.min(this.lockRecoveryDelayMs * Math.max(1, attempt + 1), remainingMs);
+        sleepSync(delayMs);
+        attempt += 1;
+      }
+    }
+  }
+
   /**
    * Execute a function inside a SQLite transaction.
    * Supports nested calls via SAVEPOINTs.
    * If the function throws, the transaction/savepoint is rolled back.
    * If the function returns normally, the transaction/savepoint is committed.
+   *
+   * Outermost transactions default to `BEGIN` (DEFERRED) so read-only callers
+   * avoid taking a writer lock until they actually mutate state.
+   * Use `transactionImmediate()` for write-heavy paths that should acquire the
+   * RESERVED lock before user code runs and fail/retry before the callback executes.
    */
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, options?: { mode?: TransactionMode }): T {
     const depth = this.transactionDepth++;
     const isOutermost = depth === 0;
     const savepointName = `sp_${depth}`;
+    const mode: TransactionMode = options?.mode ?? "deferred";
 
-    if (isOutermost) {
-      this.db.exec("BEGIN");
-    } else {
-      this.db.exec(`SAVEPOINT ${savepointName}`);
+    try {
+      if (isOutermost) {
+        if (mode === "immediate") {
+          this.runWithLockRecovery("BEGIN IMMEDIATE", () => {
+            this.db.exec("BEGIN IMMEDIATE");
+          });
+        } else {
+          this.db.exec("BEGIN");
+        }
+      } else {
+        this.db.exec(`SAVEPOINT ${savepointName}`);
+      }
+    } catch (error) {
+      this.transactionDepth--;
+      throw error;
     }
 
     try {
       const result = fn();
       if (isOutermost) {
-        this.db.exec("COMMIT");
+        this.runWithLockRecovery("COMMIT", () => {
+          this.db.exec("COMMIT");
+        });
       } else {
         this.db.exec(`RELEASE ${savepointName}`);
       }
@@ -3210,6 +3446,10 @@ export class Database {
     } finally {
       this.transactionDepth--;
     }
+  }
+
+  transactionImmediate<T>(fn: () => T): T {
+    return this.transaction(fn, { mode: "immediate" });
   }
 
   /**
@@ -3254,16 +3494,28 @@ export class Database {
     this.db.exec(sql);
   }
 
+  private getMetaValue(key: string): string | undefined {
+    const row = this.db.prepare("SELECT value FROM __meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  }
+
+  /**
+   * Persist a __meta value idempotently.
+   */
+  private setMetaValue(key: string, value: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO __meta (key, value) VALUES (?, ?)").run(key, value);
+  }
+
   /**
    * Get the last modification timestamp (epoch ms).
    * Returns 0 if the value is not set.
    */
   getLastModified(): number {
-    const row = this.db.prepare("SELECT value FROM __meta WHERE key = 'lastModified'").get() as
-      | { value: string }
-      | undefined;
-    if (!row) return 0;
-    return parseInt(row.value, 10) || 0;
+    const value = this.getMetaValue("lastModified");
+    if (!value) return 0;
+    return parseInt(value, 10) || 0;
   }
 
   /**
@@ -3284,11 +3536,9 @@ export class Database {
    * Get the schema version number.
    */
   getSchemaVersion(): number {
-    const row = this.db.prepare("SELECT value FROM __meta WHERE key = 'schemaVersion'").get() as
-      | { value: string }
-      | undefined;
-    if (!row) return 0;
-    return parseInt(row.value, 10) || 0;
+    const value = this.getMetaValue("schemaVersion");
+    if (!value) return 0;
+    return parseInt(value, 10) || 0;
   }
 
   /**

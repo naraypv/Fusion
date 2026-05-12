@@ -1850,16 +1850,31 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
       const storedServer = typeof settings.ntfyBaseUrl === "string" && settings.ntfyBaseUrl.trim()
         ? normalizeNtfyBaseUrl(settings.ntfyBaseUrl, "settings")
         : undefined;
+      const tokenOverride = req.body?.ntfyAccessToken;
+      if (tokenOverride !== undefined && tokenOverride !== null && typeof tokenOverride !== "string") {
+        throw badRequest("ntfy access token must be a string");
+      }
+      const requestToken = typeof tokenOverride === "string" && tokenOverride.trim()
+        ? tokenOverride.trim()
+        : undefined;
+      const storedToken = typeof settings.ntfyAccessToken === "string" && settings.ntfyAccessToken.trim()
+        ? settings.ntfyAccessToken.trim()
+        : undefined;
       const ntfyBaseUrl = requestOverride ?? storedServer ?? "https://ntfy.sh";
       const url = `${ntfyBaseUrl}/${topic}`;
+      const headers: Record<string, string> = {
+        "Title": "Fusion test notification",
+        "Priority": "default",
+        "Content-Type": "text/plain",
+      };
+      const ntfyAccessToken = requestToken ?? storedToken;
+      if (ntfyAccessToken) {
+        headers.Authorization = `Bearer ${ntfyAccessToken}`;
+      }
 
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          "Title": "Fusion test notification",
-          "Priority": "default",
-          "Content-Type": "text/plain",
-        },
+        headers,
         body: "Fusion test notification — your notifications are working!",
       });
 
@@ -1976,16 +1991,31 @@ export function registerSettingsMemoryRoutes(ctx: ApiRoutesContext, deps: Settin
         const storedServer = typeof settings.ntfyBaseUrl === "string" && settings.ntfyBaseUrl.trim()
           ? normalizeNtfyBaseUrl(settings.ntfyBaseUrl, "settings")
           : undefined;
+        const tokenOverride = config.ntfyAccessToken ?? body.ntfyAccessToken;
+        if (tokenOverride !== undefined && tokenOverride !== null && typeof tokenOverride !== "string") {
+          throw badRequest("ntfy access token must be a string");
+        }
+        const requestToken = typeof tokenOverride === "string" && tokenOverride.trim()
+          ? tokenOverride.trim()
+          : undefined;
+        const storedToken = typeof settings.ntfyAccessToken === "string" && settings.ntfyAccessToken.trim()
+          ? settings.ntfyAccessToken.trim()
+          : undefined;
         const ntfyBaseUrl = requestOverride ?? storedServer ?? "https://ntfy.sh";
         const url = `${ntfyBaseUrl}/${topic}`;
+        const headers: Record<string, string> = {
+          "Title": "Fusion test notification",
+          "Priority": "default",
+          "Content-Type": "text/plain",
+        };
+        const ntfyAccessToken = requestToken ?? storedToken;
+        if (ntfyAccessToken) {
+          headers.Authorization = `Bearer ${ntfyAccessToken}`;
+        }
 
         const response = await fetch(url, {
           method: "POST",
-          headers: {
-            "Title": "Fusion test notification",
-            "Priority": "default",
-            "Content-Type": "text/plain",
-          },
+          headers,
           body: "Fusion test notification — your notifications are working!",
         });
 

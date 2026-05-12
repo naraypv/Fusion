@@ -33,7 +33,12 @@ describe("api-node", () => {
 
   describe("fetchRemoteNodeHealth", () => {
     it("calls proxyApi with correct path and nodeId", async () => {
-      const mockHealth = { status: "online", version: "1.0.0", nodeId: "node_abc" };
+      const mockHealth = {
+        status: "online",
+        version: "1.0.0",
+        nodeId: "node_abc",
+        database: { healthy: true, isRunning: false, lastCheckedAt: null },
+      };
       mockProxyApi.mockResolvedValueOnce(mockHealth);
 
       const result = await fetchRemoteNodeHealth("node_abc");
@@ -44,7 +49,12 @@ describe("api-node", () => {
     });
 
     it("returns remote node health data", async () => {
-      const mockHealth = { status: "offline", version: "2.0.0", nodeId: "node_xyz" };
+      const mockHealth = {
+        status: "offline",
+        version: "2.0.0",
+        nodeId: "node_xyz",
+        database: { healthy: false, isRunning: true, lastCheckedAt: "2026-05-11T10:00:00.000Z" },
+      };
       mockProxyApi.mockResolvedValueOnce(mockHealth);
 
       const result = await fetchRemoteNodeHealth("node_xyz");
@@ -52,6 +62,11 @@ describe("api-node", () => {
       expect(result.status).toBe("offline");
       expect(result.version).toBe("2.0.0");
       expect(result.nodeId).toBe("node_xyz");
+      expect(result.database).toEqual({
+        healthy: false,
+        isRunning: true,
+        lastCheckedAt: "2026-05-11T10:00:00.000Z",
+      });
     });
   });
 

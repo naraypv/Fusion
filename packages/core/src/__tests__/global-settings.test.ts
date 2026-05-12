@@ -169,6 +169,7 @@ describe("GlobalSettingsStore", () => {
       // Defaults are filled in for missing fields
       expect(settings.ntfyEnabled).toBe(false);
       expect(settings.ntfyBaseUrl).toBeUndefined();
+      expect(settings.ntfyAccessToken).toBeUndefined();
       expect(settings.defaultProvider).toBeUndefined();
     });
 
@@ -258,6 +259,23 @@ describe("GlobalSettingsStore", () => {
       // Verify getSettings returns undefined
       const settings = await store.getSettings();
       expect(settings.ntfyTopic).toBeUndefined();
+    });
+
+    it("clearing ntfyAccessToken with null removes it from disk and returns undefined", async () => {
+      await store.init();
+      await store.updateSettings({ ntfyAccessToken: "secret-token" });
+
+      const raw = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8"));
+      expect(raw.ntfyAccessToken).toBe("secret-token");
+
+      // @ts-expect-error - null is intentionally used to clear field (null-as-delete)
+      await store.updateSettings({ ntfyAccessToken: null });
+
+      const rawAfter = JSON.parse(await readFile(join(dir, "settings.json"), "utf-8"));
+      expect(rawAfter.ntfyAccessToken).toBeUndefined();
+
+      const settings = await store.getSettings();
+      expect(settings.ntfyAccessToken).toBeUndefined();
     });
 
     it("clearing ntfyDashboardHost with null removes it from disk", async () => {

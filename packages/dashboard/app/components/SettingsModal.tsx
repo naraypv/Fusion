@@ -402,6 +402,7 @@ export function SettingsModal({
     worktreeInitCommand: "",
     ntfyEnabled: false,
     ntfyTopic: undefined,
+    ntfyAccessToken: undefined,
     webhookEnabled: false,
     webhookUrl: undefined,
     webhookFormat: "generic",
@@ -1222,6 +1223,7 @@ export function SettingsModal({
           ntfyEnabled: form.ntfyEnabled,
           ntfyTopic: form.ntfyTopic,
           ...(form.ntfyBaseUrl?.trim() ? { ntfyBaseUrl: form.ntfyBaseUrl.trim() } : {}),
+          ...(form.ntfyAccessToken?.trim() ? { ntfyAccessToken: form.ntfyAccessToken.trim() } : {}),
         }
         : providerId === "ntfy-message"
           ? { messageEventType: "message:agent-to-user" }
@@ -1251,7 +1253,17 @@ export function SettingsModal({
     } finally {
       setTestNotificationLoading((prev) => ({ ...prev, [providerId]: false }));
     }
-  }, [addToast, form.ntfyBaseUrl, form.ntfyEnabled, form.ntfyTopic, form.webhookEnabled, form.webhookFormat, form.webhookUrl, projectId]);
+  }, [
+    addToast,
+    form.ntfyAccessToken,
+    form.ntfyBaseUrl,
+    form.ntfyEnabled,
+    form.ntfyTopic,
+    form.webhookEnabled,
+    form.webhookFormat,
+    form.webhookUrl,
+    projectId,
+  ]);
 
   const handleBackupNow = useCallback(async () => {
     setBackupLoading(true);
@@ -3617,6 +3629,25 @@ export function SettingsModal({
               </details>
             </div>
             <div className="form-group">
+              <label htmlFor="workflowRevisionForkOnScopeMismatch" className="checkbox-label">
+                <input
+                  id="workflowRevisionForkOnScopeMismatch"
+                  type="checkbox"
+                  checked={form.workflowRevisionForkOnScopeMismatch !== false}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, workflowRevisionForkOnScopeMismatch: e.target.checked }))
+                  }
+                />
+                Fork scope-mismatched workflow revisions into follow-up tasks
+              </label>
+              <details className="settings-option-details">
+                <summary>More details</summary>
+                <small>
+                  When enabled, workflow revision feedback that explicitly names files outside the original task&apos;s declared File Scope is split into a dependent follow-up task instead of being appended to the current task&apos;s PROMPT.md.
+                </small>
+              </details>
+            </div>
+            <div className="form-group">
               <label htmlFor="verificationFixRetries">Verification auto-fix retries</label>
               <input
                 id="verificationFixRetries"
@@ -3884,6 +3915,26 @@ export function SettingsModal({
                   <em>Legacy <code>"smart"</code> and <code>"prefer-main"</code> values from older settings are migrated automatically.</em>
                 </small>
               </details>
+            </div>
+            <div className="form-group">
+              <label htmlFor="mergeStrategyOverlapBehavior">Smart Prefer Main Overlap Guard</label>
+              <select
+                id="mergeStrategyOverlapBehavior"
+                value={form.mergeStrategyOverlapBehavior ?? "flip-to-prefer-branch"}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    mergeStrategyOverlapBehavior: e.target.value as "flip-to-prefer-branch" | "warn-only" | "ignore",
+                  }))
+                }
+              >
+                <option value="flip-to-prefer-branch">Flip overlapping files to prefer the task branch (default)</option>
+                <option value="warn-only">Warn only — keep legacy main-wins fallback</option>
+                <option value="ignore">Ignore overlap detection — preserve legacy behavior</option>
+              </select>
+              <small>
+                When using smart-prefer-main, automatically prefer the branch side for files that main has recently modified to avoid silently discarding branch work.
+              </small>
             </div>
             <div className="form-group">
               <label htmlFor="pushAfterMerge" className="checkbox-label">
@@ -4876,6 +4927,21 @@ export function SettingsModal({
                         />
                         <small>
                           Leave blank to keep the default server: https://ntfy.sh. Custom servers must use http:// or https://.
+                        </small>
+                        <label htmlFor="ntfyAccessToken">Access token (optional)</label>
+                        <input
+                          id="ntfyAccessToken"
+                          type="password"
+                          autoComplete="off"
+                          placeholder="tk_..."
+                          value={form.ntfyAccessToken || ""}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            setForm((f) => ({ ...f, ntfyAccessToken: value || undefined }));
+                          }}
+                        />
+                        <small>
+                          Leave blank to publish without authentication. When set, Fusion sends an Authorization Bearer header with ntfy requests.
                         </small>
                       </div>
                     </details>

@@ -1009,6 +1009,95 @@ describe("ChatView", () => {
     expect(screen.getByLabelText("Copy failed")).toBeInTheDocument();
   });
 
+  it("renders assistant failure bubbles inline with detail affordances", async () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "__fn_agent__",
+        status: "active",
+        title: "Fusion Chat",
+        modelProvider: "anthropic",
+        modelId: "claude-sonnet-4-5",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [
+        {
+          id: "msg-failure",
+          sessionId: "session-001",
+          role: "assistant",
+          content: "Model request failed",
+          failureInfo: {
+            summary: "Model request failed",
+            errorClass: "ProviderError",
+            code: "E_MODEL",
+            detail: "ProviderError: Model request failed",
+            reference: { kind: "mailbox", id: "msg-42", label: "Mailbox message msg-42" },
+          },
+          createdAt: "2026-04-08T00:00:01.000Z",
+        },
+      ],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const messageBubble = screen.getByTestId("chat-message-msg-failure");
+    expect(messageBubble).toHaveClass("chat-message--failure");
+    expect(within(messageBubble).getByText("Claude Sonnet 4.5")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("Response failed")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("ProviderError")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("E_MODEL")).toBeInTheDocument();
+    expect(within(messageBubble).queryByTestId("chat-copy-response-msg-failure")).not.toBeInTheDocument();
+
+    await userEvent.click(within(messageBubble).getByText("Failure details"));
+
+    expect(within(messageBubble).getByText("ProviderError: Model request failed")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("Mailbox message msg-42")).toBeInTheDocument();
+    expect(within(messageBubble).getByRole("link", { name: "Open mailbox message" })).toHaveAttribute(
+      "href",
+      "/?view=mailbox&mailbox-message=msg-42#message-msg-42",
+    );
+    expect(messageBubble.querySelector(".status-dot.status-dot--error")).toBeInTheDocument();
+  });
+
+  it("renders a generic failure reference details affordance for non-mailbox references", async () => {
+    setupMockChat({
+      activeSession: {
+        id: "session-001",
+        agentId: "agent-001",
+        status: "active",
+        title: "Agent Chat",
+        createdAt: "2026-04-08T00:00:00.000Z",
+        updatedAt: "2026-04-08T00:00:00.000Z",
+      },
+      messages: [
+        {
+          id: "msg-run-failure",
+          sessionId: "session-001",
+          role: "assistant",
+          content: "Run failed",
+          failureInfo: {
+            summary: "Run failed",
+            reference: { kind: "agent-run", id: "run-42", label: "Agent run 42" },
+          },
+          createdAt: "2026-04-08T00:00:02.000Z",
+        },
+      ],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const messageBubble = screen.getByTestId("chat-message-msg-run-failure");
+    await userEvent.click(within(messageBubble).getByText("Failure details"));
+    await userEvent.click(within(messageBubble).getByText("View failure details"));
+
+    expect(within(messageBubble).getAllByText("Agent run 42")).toHaveLength(2);
+    expect(within(messageBubble).getByText("Kind")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("agent-run")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("ID")).toBeInTheDocument();
+    expect(within(messageBubble).getByText("run-42")).toBeInTheDocument();
+  });
+
   it("shows streaming copy action for provider chats", () => {
     setupMockChat({
       activeSession: {
@@ -2431,6 +2520,23 @@ describe("Chat Session Delete Button", () => {
   });
 });
 
+describe("ChatView CSS — failure bubble contracts", () => {
+  const css = loadAllAppCss();
+
+  it("uses shared error surface tokens for failure bubbles and detail affordances", () => {
+    const bubbleMatch = css.match(/\.chat-message--failure\s*\{([^}]*)\}/);
+    const badgeMatch = css.match(/\.chat-message-failure-badge\s*\{([^}]*)\}/);
+    const detailsMatch = css.match(/\.chat-message-failure-details\s*\{([^}]*)\}/);
+    const linkMatch = css.match(/\.chat-message-failure-reference-link\s*\{([^}]*)\}/);
+
+    expect(bubbleMatch?.[1]).toContain("background: var(--status-error-bg)");
+    expect(bubbleMatch?.[1]).toContain("border: var(--btn-border-width) solid var(--status-error-bg-deep)");
+    expect(badgeMatch?.[1]).toContain("background: var(--status-error-bg-deep)");
+    expect(detailsMatch?.[1]).toContain("background: var(--status-error-bg-deep)");
+    expect(linkMatch?.[1]).toContain("background: var(--status-error-bg-deep)");
+  });
+});
+
 describe("FN-3911 chat session list layout", () => {
   const css = loadAllAppCss();
 
@@ -2489,16 +2595,23 @@ describe("ChatView CSS — mobile thread switcher", () => {
 
   it("includes mobile session switcher trigger and dropdown tokenized contracts", () => {
     const triggerMatch = css.match(/\.chat-mobile-session-trigger\s*\{([^}]*)\}/);
+    const triggerIconMatch = css.match(/\.chat-mobile-session-trigger\s*>\s*svg\s*\{([^}]*)\}/);
     const dropdownMatch = css.match(/\.chat-mobile-session-dropdown\s*\{([^}]*)\}/);
     const optionMatch = css.match(/\.chat-mobile-session-option\s*\{([^}]*)\}/);
     const optionTitleMatch = css.match(/\.chat-mobile-session-option-title\s*\{([^}]*)\}/);
     expect(triggerMatch).toBeTruthy();
+    expect(triggerIconMatch).toBeTruthy();
     expect(dropdownMatch).toBeTruthy();
     expect(optionMatch).toBeTruthy();
     expect(optionTitleMatch).toBeTruthy();
-    expect(triggerMatch?.[1]).toContain("min-height: calc(var(--space-lg) * 2)");
+    expect(triggerMatch?.[1]).toContain("min-height: calc(var(--space-lg) * 2 + var(--space-xs))");
     expect(triggerMatch?.[1]).toContain("min-width: 0");
+    expect(triggerMatch?.[1]).toContain("padding: var(--space-xs) var(--space-sm)");
+    expect(triggerMatch?.[1]).toContain("font: inherit");
     expect(triggerMatch?.[1]).toContain("line-height: normal");
+    expect(triggerMatch?.[1]).toContain("text-align: left");
+    expect(triggerIconMatch?.[1]).toContain("width: var(--icon-size-md)");
+    expect(triggerIconMatch?.[1]).toContain("height: var(--icon-size-md)");
     expect(dropdownMatch?.[1]).toContain("background: var(--surface)");
     expect(dropdownMatch?.[1]).toContain("border: 1px solid var(--border)");
     expect(optionMatch?.[1]).toContain("min-height: calc(var(--space-lg) * 2.25)");
@@ -3102,7 +3215,12 @@ describe("ChatView mobile behavior", () => {
 
       render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
 
-      await userEvent.click(screen.getByTestId("chat-mobile-session-trigger"));
+      const trigger = screen.getByTestId("chat-mobile-session-trigger");
+      expect(trigger).toHaveClass("btn", "chat-mobile-session-trigger");
+      expect(trigger).not.toHaveClass("btn-icon");
+      expect(trigger).toHaveTextContent("Test Chat");
+
+      await userEvent.click(trigger);
       expect(screen.getByTestId("chat-mobile-session-dropdown")).toBeInTheDocument();
 
       await userEvent.click(screen.getByTestId("chat-mobile-session-option-session-002"));
@@ -3849,8 +3967,12 @@ describe("ChatView mobile CSS contract", () => {
     expect(mobileRuleContains(".chat-sidebar-header", "display: none")).toBe(true);
   });
 
-  it("mobile .chat-sidebar-search is hidden", () => {
-    expect(mobileRuleContains(".chat-sidebar-search", "display: none")).toBe(true);
+  it("mobile .chat-sidebar-search remains visible (FN-4120)", () => {
+    expect(mobileRuleNotContains(".chat-sidebar-search", "display: none")).toBe(true);
+  });
+
+  it("mobile .chat-sidebar-search keeps a token-based touch target (FN-4120)", () => {
+    expect(mobileRuleContains(".chat-sidebar-search", "min-height: calc(var(--space-2xl) + var(--space-xs))")).toBe(true);
   });
 
   it("mobile .chat-sidebar-list has flex: 1 and overflow-y: auto for scrolling", () => {

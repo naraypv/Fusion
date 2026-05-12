@@ -176,6 +176,7 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("built fn pi extension integr
 
     expect(created.details.taskId).toMatch(/^[A-Z]+-\d+$/);
     expect(created.details.column).toBe("triage");
+    expect(created.details.priority).toBe("normal");
 
     const listTool = api.tools.get("fn_task_list")!;
     const listed = await listTool.execute("list-1", {}, undefined, undefined, makeCtx(tmpDir));
@@ -186,6 +187,17 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("built fn pi extension integr
     await store.init();
     const persisted = await store.getTask(created.details.taskId);
     expect(persisted?.description).toBe("Ship the packed CLI contract");
+
+    const urgent = await createTool.execute(
+      "create-2",
+      { description: "Needs urgency", priority: "high" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+    expect(urgent.details.priority).toBe("high");
+    const urgentPersisted = await store.getTask(urgent.details.taskId);
+    expect(urgentPersisted?.priority).toBe("high");
   });
 
   it("runs provisioning tools through the built extension", async () => {
@@ -244,5 +256,24 @@ describe.skipIf(!SHOULD_RUN_EXTENSION_INTEGRATION)("built fn pi extension integr
     );
     expect(rejected.isError).toBe(true);
     expect(rejected.content[0].text).toContain("ephemeral/runtime agent");
+  });
+
+  it("returns explicit error when fn_delegate_task hits task-id collision", async () => {
+    const agent = await seedAgent(tmpDir, { name: "release-agent" });
+    const delegateTool = api.tools.get("fn_delegate_task")!;
+    const createSpy = vi.spyOn(TaskStore.prototype, "createTask").mockRejectedValueOnce(new Error("Task ID already exists: FN-001"));
+
+    const result = await delegateTool.execute(
+      "delegate-collision",
+      { agent_id: agent.id, description: "collision task" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Task ID already exists: FN-001");
+    expect(result.details.error).toContain("Task ID already exists: FN-001");
+    createSpy.mockRestore();
   });
 });

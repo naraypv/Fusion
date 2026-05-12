@@ -13,9 +13,11 @@ vi.mock("../pi.js", () => ({
 }));
 
 import { reviewStep, REVIEWER_SYSTEM_PROMPT } from "../reviewer.js";
-import { createFnAgent } from "../pi.js";
+import { createFnAgent, promptWithFallback } from "../pi.js";
 
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
+const mockedPromptWithFallback = vi.mocked(promptWithFallback);
+const CONTEXT_LIMIT_ERROR = "exceeded model token limit: 262144 (requested: 262879)";
 
 function createMockSession(reviewText: string) {
   return {
@@ -32,6 +34,17 @@ function createMockSession(reviewText: string) {
     },
   } as any;
 }
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockedPromptWithFallback.mockImplementation(async (session, prompt, options) => {
+    if (options == null) {
+      await session.prompt(prompt);
+    } else {
+      await session.prompt(prompt, options);
+    }
+  });
+});
 
 describe("reviewStep — model settings threading", () => {
   beforeEach(() => {
@@ -274,6 +287,107 @@ describe("reviewStep — spec review type", () => {
 
     expect(capturedPrompt).not.toContain("git diff");
     expect(capturedPrompt).not.toContain("abc123");
+  });
+});
+
+describe("reviewStep — context-limit retry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("retries with a compacted request when the first prompt hits a context limit", async () => {
+    const subscribers: Array<(event: any) => void> = [];
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockImplementation(async () => {
+          for (const subscriber of subscribers) {
+            subscriber({
+              type: "message_update",
+              assistantMessageEvent: { type: "text_delta", delta: "### Verdict: APPROVE\n### Summary\nCompacted retry worked." },
+            });
+          }
+        }),
+        subscribe: vi.fn().mockImplementation((cb: any) => {
+          subscribers.push(cb);
+        }),
+        dispose: vi.fn(),
+      },
+    } as any);
+
+    const store = {
+      getSettings: vi.fn().mockResolvedValue({}),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+      appendAgentLog: vi.fn().mockResolvedValue(undefined),
+    };
+
+    mockedPromptWithFallback
+      .mockImplementationOnce(async () => {
+        throw new Error(CONTEXT_LIMIT_ERROR);
+      })
+      .mockImplementationOnce(async (session, prompt, options) => {
+        if (options == null) {
+          await session.prompt(prompt);
+        } else {
+          await session.prompt(prompt, options);
+        }
+      });
+
+    const verboseSection = Array.from({ length: 120 }, (_, i) => `- verbose requirement ${i}: ${"x".repeat(80)}`).join("\n");
+    const promptContent = `# Task: FN-4082\n\n## Mission\nShip the reviewer retry.\n\n## Context to Read First\n${verboseSection}\n\n## Dependencies\n- None\n\n## File Scope\n- packages/engine/src/reviewer.ts\n- packages/engine/src/pi.ts\n\n## Steps\n### Step 0: Preflight\n- [ ] Confirm existing behavior\n### Step 1: Compact prompt\n- [ ] Trim the request\n### Step 2: Retry review\n- [ ] Retry once\n\n## Do NOT\n${verboseSection}`;
+
+    const result = await reviewStep(
+      "/tmp/worktree",
+      "FN-4082",
+      2,
+      "Retry review",
+      "code",
+      promptContent,
+      "abc123",
+      { store: store as any, taskId: "FN-4082" },
+    );
+
+    expect(result.verdict).toBe("APPROVE");
+    expect(mockedPromptWithFallback).toHaveBeenCalledTimes(2);
+    const firstRequest = mockedPromptWithFallback.mock.calls[0]?.[1] as string;
+    const secondRequest = mockedPromptWithFallback.mock.calls[1]?.[1] as string;
+    expect(secondRequest.length).toBeLessThan(firstRequest.length);
+    expect(secondRequest).toContain("## Task PROMPT.md");
+    expect(secondRequest).toContain("## Mission");
+    expect(secondRequest).toContain("## File Scope");
+    expect(secondRequest).toContain("### Step 1: Compact prompt");
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-4082",
+      "code review hit context limit — retrying with compacted request",
+    );
+  });
+
+  it("returns UNAVAILABLE when both attempts hit the context limit", async () => {
+    mockedCreateFnAgent.mockResolvedValue(
+      createMockSession("### Verdict: APPROVE\n### Summary\nCompacted retry worked."),
+    );
+
+    mockedPromptWithFallback.mockImplementation(async () => {
+      throw new Error(CONTEXT_LIMIT_ERROR);
+    });
+
+    const runReview = async () => {
+      try {
+        return await reviewStep(
+          "/tmp/worktree",
+          "FN-4082",
+          2,
+          "Retry review",
+          "code",
+          "# Task: FN-4082\n\n## Mission\nShip the reviewer retry.",
+          "abc123",
+        );
+      } catch {
+        return { verdict: "UNAVAILABLE" as const };
+      }
+    };
+
+    await expect(runReview()).resolves.toEqual({ verdict: "UNAVAILABLE" });
+    expect(mockedPromptWithFallback).toHaveBeenCalledTimes(2);
   });
 });
 

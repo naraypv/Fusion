@@ -12,6 +12,11 @@ export interface RemoteNodeHealth {
   status: string;
   version: string;
   nodeId: string;
+  database: {
+    healthy: boolean;
+    lastCheckedAt: string | null;
+    isRunning: boolean;
+  };
 }
 
 /** Fetch health information from a remote node */

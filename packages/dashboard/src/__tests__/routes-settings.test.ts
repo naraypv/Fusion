@@ -1659,6 +1659,53 @@ describe("POST /settings/test-ntfy", () => {
     expect(url).toBe("https://ntfy.saved.example/my-topic");
   });
 
+  it("sends Authorization header from saved ntfy access token", async () => {
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "my-topic",
+      ntfyAccessToken: "saved-token",
+    });
+
+    const res = await REQUEST(buildApp(), "POST", "/api/settings/test-ntfy");
+
+    expect(res.status).toBe(200);
+    const options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(options.headers).toHaveProperty("Authorization", "Bearer saved-token");
+  });
+
+  it("prefers request ntfy access token override and ignores blank overrides", async () => {
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "my-topic",
+      ntfyAccessToken: "saved-token",
+    });
+
+    const overrideRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-ntfy",
+      JSON.stringify({ ntfyAccessToken: "override-token" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(overrideRes.status).toBe(200);
+    let options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(options.headers).toHaveProperty("Authorization", "Bearer override-token");
+
+    fetchSpy.mockClear();
+    const blankRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-ntfy",
+      JSON.stringify({ ntfyAccessToken: "   " }),
+      { "content-type": "application/json" },
+    );
+
+    expect(blankRes.status).toBe(200);
+    options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(options.headers).toHaveProperty("Authorization", "Bearer saved-token");
+  });
+
   it("returns 400 when ntfy is not enabled", async () => {
     (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       ntfyEnabled: false,
@@ -1842,6 +1889,59 @@ describe("POST /settings/test-notification", () => {
 
     expect(res.status).toBe(200);
     expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://ntfy.override.example/my-topic");
+  });
+
+  it("ntfy provider sends Authorization header from saved or override token", async () => {
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "my-topic",
+      ntfyAccessToken: "saved-token",
+    });
+
+    const savedRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-notification",
+      JSON.stringify({ providerId: "ntfy" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(savedRes.status).toBe(200);
+    let options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(options.headers).toHaveProperty("Authorization", "Bearer saved-token");
+
+    fetchSpy.mockClear();
+    const overrideRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-notification",
+      JSON.stringify({ providerId: "ntfy", ntfyAccessToken: "override-token" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(overrideRes.status).toBe(200);
+    options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect(options.headers).toHaveProperty("Authorization", "Bearer override-token");
+  });
+
+  it("ntfy provider omits Authorization header when no token is configured", async () => {
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "my-topic",
+      ntfyAccessToken: "   ",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-notification",
+      JSON.stringify({ providerId: "ntfy", ntfyAccessToken: "   " }),
+      { "content-type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    const options = fetchSpy.mock.calls[0]?.[1] as RequestInit;
+    expect((options.headers as Record<string, string>).Authorization).toBeUndefined();
   });
 
   it("ntfy provider returns 400 when ntfy not enabled", async () => {

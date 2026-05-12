@@ -4,8 +4,25 @@
 
 - `distributed_task_id_state` is the authoritative local task-ID allocator state. `nextSequence` is the active high-water mark used for local ID reservations.
 - `distributed_task_id_reservations` tracks reserve/commit/abort lifecycle entries. Aborted/expired reservations are burned and never reissued.
-- `config.nextId` is retained only as a legacy compatibility field and optional seed source; runtime task creation no longer mutates it as allocator truth.
-- Startup allocator reconciliation bumps each active prefix sequence to `max(current nextSequence, max(existing task suffix)+1)` across live + archived tasks to self-heal stale allocator drift.
+- `config.nextId` is retained only as a deprecated legacy compatibility field and optional one-time seed source. Fusion still reads it during reconciliation, but runtime task creation and settings writes no longer mutate it.
+- Startup/store-open allocator reconciliation bumps each active prefix sequence to `max(current nextSequence, max(tasks suffix)+1, max(archivedTasks suffix)+1, max(reservation sequence)+1)` so stale allocator rows self-heal before local task creation resumes.
+- Create-class task persistence is intentionally non-destructive: new tasks use plain `INSERT` semantics, while `ON CONFLICT(id) DO UPDATE` remains update-only. If counters drift and a reserved ID still collides, the create fails and the existing SQLite row / task directory stays intact.
+
+## SQLite write-path lock recovery (FN-4042 / FN-4083)
+
+- Every disk-backed SQLite connection that Fusion opens for project storage (`fusion.db`), the central registry (`fusion-central.db`), archives (`archive.db`), and worktree hydration explicitly sets `PRAGMA busy_timeout = 5000` and `PRAGMA journal_mode = WAL` at connection open time before write work begins.
+- Project database transactions now distinguish read and write intent:
+  - `Database.transaction()` uses `BEGIN` (DEFERRED) for outermost transactions so read-only callers do not reserve the writer lock up front.
+  - `Database.transactionImmediate()` uses `BEGIN IMMEDIATE` for write-heavy paths that must detect writer contention before user code runs.
+- The shared task mutation path `atomicWriteTaskJsonWithAudit()` uses `transactionImmediate()`, so the task-row upsert and matching `runAuditEvents` insert still commit or roll back together, while lock contention is detected before the callback mutates in-memory state.
+- `CentralDatabase.transaction()` remains `BEGIN IMMEDIATE`-based because its current callers are write-oriented coordination updates; nested transactions still use SQLite `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` semantics in both databases.
+- Recovery is intentionally bounded: transient `SQLITE_BUSY` / `SQLITE_LOCKED` failures on outermost `BEGIN IMMEDIATE` and `COMMIT` are retried for a short additional window with small synchronous backoff sleeps. If the lock does not clear, the original write still fails loudly.
+- Concurrent-write guarantees are layered:
+  - per-task mutations inside one engine process are serialized by `TaskStore.withTaskLock()`
+  - cross-task writes rely on WAL mode plus `busy_timeout`
+  - write-heavy transactional hot paths acquire `BEGIN IMMEDIATE` before mutating state
+  - compatibility `task.json` writes still happen only after the SQLite transaction succeeds
+- Direct `recordRunAuditEvent()` writes continue to execute inside the shared transaction helper so they benefit from the same lock recovery and do not duplicate rows during transient contention.
 
 ## 1) Summary
 
@@ -77,6 +94,8 @@ API endpoints reviewed:
 | `defaultThinkingLevel` | Global | `GET/PUT /api/settings/global` | Default reasoning effort |
 | `ntfyEnabled` | Global | `GET/PUT /api/settings/global` | Notifications enabled |
 | `ntfyTopic` | Global | `GET/PUT /api/settings/global` | Ntfy topic |
+| `ntfyBaseUrl` | Global | `GET/PUT /api/settings/global` | Custom ntfy server base URL override |
+| `ntfyAccessToken` | Global | `GET/PUT /api/settings/global` | Access token for authenticated ntfy publishes |
 | `ntfyEvents` | Global | `GET/PUT /api/settings/global` | Notification event filters |
 | `ntfyDashboardHost` | Global | `GET/PUT /api/settings/global` | Host for deep links |
 | `defaultProjectId` | Global | `GET/PUT /api/settings/global` | CLI default project |
@@ -229,9 +248,12 @@ The `tasks.githubTracking` JSON column stores per-task GitHub tracking state (`e
 
 ### Schema self-heal on init
 
-`Database.init()` now runs an unconditional schema-compatibility reconciliation pass after versioned migrations. The pass unions table definitions from `SCHEMA_SQL` plus `MIGRATION_ONLY_TABLE_SCHEMAS`, then backfills missing columns with `addColumnIfMissing()` for tables that already exist.
+`Database.init()` runs versioned migrations first, then checks `__meta.schemaCompatFingerprint` against a process-local fingerprint derived from `SCHEMA_VERSION` plus the canonicalized table declarations from `SCHEMA_SQL` and `MIGRATION_ONLY_TABLE_SCHEMAS`.
 
-Invariant: after init, every declared column for covered tables exists regardless of `__meta.schemaVersion`, preventing legacy drift from causing `no such column` regressions on newly added fields.
+- **Fingerprint match:** skip the expensive column-reconciliation walk, but still run the cheap idempotent side effects that must always happen on open (for example `CREATE INDEX IF NOT EXISTS ...` and routines NULL backfills).
+- **Fingerprint absent or mismatched:** run the full schema-compatibility reconciliation pass, unioning table definitions from `SCHEMA_SQL` plus `MIGRATION_ONLY_TABLE_SCHEMAS` and backfilling missing columns on tables that already exist, then persist the new fingerprint.
+
+Invariant: after init, every declared column for covered tables exists regardless of `__meta.schemaVersion` whenever the fingerprint is stale or missing, preventing legacy drift from causing `no such column` regressions on newly added fields while keeping unchanged-schema opens fast.
 
 ---
 

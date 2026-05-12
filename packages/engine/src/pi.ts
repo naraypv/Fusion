@@ -418,6 +418,7 @@ const MAX_COMPACTED_PROMPT_MEMORY_CHARS = 8_000;
 const MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS = 1_200;
 const MAX_COMPACTED_ATTACHMENTS_CHARS = 4_000;
 const MAX_COMPACTED_EXISTING_SPEC_CHARS = 4_000;
+const MAX_COMPACTED_TASK_PROMPT_CHARS = MAX_COMPACTED_EXISTING_SPEC_CHARS;
 const MAX_COMPACTED_USER_COMMENTS_CHARS = 2_000;
 
 function compactMarkdownMemorySection(sectionBody: string): string {
@@ -545,6 +546,83 @@ function compactExistingSpecificationSectionBody(body: string): string {
   return `${head}\n\n_... existing specification middle trimmed ..._\n\n${tail}`;
 }
 
+function extractMarkdownSection(document: string, headingName: string): string {
+  const heading = `## ${headingName}`;
+  const start = document.indexOf(heading);
+  if (start === -1) {
+    return "";
+  }
+
+  const afterHeading = start + heading.length;
+  const nextH2 = document.indexOf("\n## ", afterHeading);
+  const nextH1 = document.indexOf("\n# ", afterHeading);
+  const endCandidates = [nextH2, nextH1].filter((value) => value !== -1);
+  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : document.length;
+
+  return document.slice(start, end).trim();
+}
+
+function compactTaskPromptStepsSection(section: string): string {
+  const stepTitles = Array.from(section.matchAll(/^### Step \d+:.*$/gm), (match) => match[0].trim());
+  if (stepTitles.length === 0) {
+    return section.trim();
+  }
+
+  return [
+    "## Steps",
+    ...stepTitles,
+    "",
+    "_... step checklist details trimmed for context limits ..._",
+  ].join("\n").trim();
+}
+
+function truncateCompactedSection(section: string, maxChars: number, label: string): string {
+  const trimmed = section.trim();
+  if (!trimmed || trimmed.length <= maxChars) {
+    return trimmed;
+  }
+
+  const marker = `_... ${label} trimmed for context limits ..._`;
+  const headBudget = Math.max(200, maxChars - marker.length - 2);
+  return [
+    `${trimmed.slice(0, headBudget).trimEnd()}…`,
+    "",
+    marker,
+  ].join("\n").trim();
+}
+
+function compactTaskPromptSectionBody(body: string): string {
+  const trimmed = body.trim();
+  if (trimmed.length <= MAX_COMPACTED_TASK_PROMPT_CHARS) {
+    return trimmed;
+  }
+
+  const fencedMatch = /^```markdown\s*\n([\s\S]*?)\n```$/m.exec(trimmed);
+  const promptContent = fencedMatch ? fencedMatch[1].trim() : trimmed;
+  const firstSectionIndex = promptContent.indexOf("\n## ");
+  const preamble = (firstSectionIndex === -1 ? promptContent : promptContent.slice(0, firstSectionIndex)).trim();
+  const missionSection = extractMarkdownSection(promptContent, "Mission");
+  const dependenciesSection = extractMarkdownSection(promptContent, "Dependencies");
+  const fileScopeSection = extractMarkdownSection(promptContent, "File Scope");
+  const stepsSection = compactTaskPromptStepsSection(extractMarkdownSection(promptContent, "Steps"));
+
+  const compactedContent = [
+    truncateCompactedSection(preamble, 400, "task header"),
+    truncateCompactedSection(missionSection, 900, "mission"),
+    truncateCompactedSection(dependenciesSection, 500, "dependencies"),
+    truncateCompactedSection(fileScopeSection, 1_000, "file scope"),
+    truncateCompactedSection(stepsSection, 1_200, "steps outline"),
+    "_... remaining PROMPT.md sections trimmed for context limits ..._",
+  ].filter(Boolean).join("\n\n").trim();
+
+  const narrowedContent = compactedContent.length <= MAX_COMPACTED_TASK_PROMPT_CHARS
+    ? compactedContent
+    : compactExistingSpecificationSectionBody(compactedContent);
+  const finalContent = fencedMatch ? `\`\`\`markdown\n${narrowedContent}\n\`\`\`` : narrowedContent;
+
+  return finalContent.length < trimmed.length ? finalContent : compactExistingSpecificationSectionBody(trimmed);
+}
+
 function compactUserCommentsSectionBody(body: string): string {
   const trimmed = body.trim();
   if (trimmed.length <= MAX_COMPACTED_USER_COMMENTS_CHARS) {
@@ -581,7 +659,7 @@ function compactUserCommentsSectionBody(body: string): string {
 }
 
 function compactLargePromptSections(prompt: string): string | null {
-  const sectionPattern = /(^|\n)(## (?:Subtask Consideration|Subtask Breakdown Requested|Attachments|Existing Specification|User Comments)\n)([\s\S]*?)(?=\n## [^#]|\n# [^#]|$)/g;
+  const sectionPattern = /(^|\n)(## (?:Subtask Consideration|Subtask Breakdown Requested|Attachments|Existing Specification|Task PROMPT\.md|User Comments)\n)((?:\n*```markdown[\s\S]*?\n```|[\s\S]*?))(?=\n## [^#]|\n# [^#]|$)/g;
   let changed = false;
 
   const compactedPrompt = prompt.replace(sectionPattern, (match, prefix: string, heading: string, body: string) => {
@@ -593,6 +671,7 @@ function compactLargePromptSections(prompt: string): string | null {
       "Subtask Breakdown Requested": MAX_COMPACTED_SUBTASK_GUIDANCE_CHARS,
       Attachments: MAX_COMPACTED_ATTACHMENTS_CHARS,
       "Existing Specification": MAX_COMPACTED_EXISTING_SPEC_CHARS,
+      "Task PROMPT.md": MAX_COMPACTED_TASK_PROMPT_CHARS,
       "User Comments": MAX_COMPACTED_USER_COMMENTS_CHARS,
     };
 
@@ -608,6 +687,8 @@ function compactLargePromptSections(prompt: string): string | null {
       compactedBody = compactAttachmentSectionBody(trimmedBody);
     } else if (headingName === "Existing Specification") {
       compactedBody = compactExistingSpecificationSectionBody(trimmedBody);
+    } else if (headingName === "Task PROMPT.md") {
+      compactedBody = compactTaskPromptSectionBody(trimmedBody);
     } else if (headingName === "User Comments") {
       compactedBody = compactUserCommentsSectionBody(trimmedBody);
     }

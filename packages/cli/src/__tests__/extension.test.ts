@@ -269,6 +269,25 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       expect(result.content[0].text).toContain("Fix the login button");
       expect(result.content[0].text).toContain("triage");
       expect(result.details.column).toBe("triage");
+      expect(result.details.priority).toBe("normal");
+    });
+
+    it("creates a task with explicit priority", async () => {
+      const tool = api.tools.get("fn_task_create")!;
+      const result = await tool.execute(
+        "call-priority",
+        { description: "Urgent task", priority: "urgent" },
+        undefined,
+        undefined,
+        makeCtx(tmpDir),
+      );
+
+      expect(result.details.priority).toBe("urgent");
+      expect(result.content[0].text).toContain("Priority: urgent");
+
+      const showTool = api.tools.get("fn_task_show")!;
+      const show = await showTool.execute("s-priority", { id: result.details.taskId }, undefined, undefined, makeCtx(tmpDir));
+      expect(show.details.task.priority).toBe("urgent");
     });
 
     it("creates a task with dependencies", async () => {
@@ -1474,6 +1493,24 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
     expect(result.content[0].text).toContain(ephemeralId);
   });
 
+  it("returns explicit collision error when fn_task_create hits an existing task id", async () => {
+    const createSpy = vi.spyOn(TaskStore.prototype, "createTask").mockRejectedValueOnce(new Error("Task ID already exists: FN-001"));
+    const createTool = api.tools.get("fn_task_create")!;
+
+    const result = await createTool.execute(
+      "create-collision",
+      { description: "collision task" },
+      undefined,
+      undefined,
+      makeCtx(tmpDir),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Task ID already exists: FN-001");
+    expect(result.details.error).toContain("Task ID already exists: FN-001");
+    createSpy.mockRestore();
+  });
+
   it("fn_task_create allows durable engineer assignment for implementation tasks", async () => {
     const agentStore = new AgentStore({ rootDir: join(tmpDir, ".fusion") });
     await agentStore.init();
@@ -1745,6 +1782,35 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       expect(updated?.steps[1].status).toBe("in-progress");
     });
 
+    it("moves zero-step execution-failed in-review task to todo and clears failure state", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      const task = await store.createTask({
+        title: "zero-step execution-failed task",
+        description: "test",
+        column: "todo",
+      });
+      await writeFile(join(tmpDir, ".fusion", "tasks", task.id, "PROMPT.md"), "# zero-step execution-failed task\n\nNo steps yet.\n");
+      await store.updateTask(task.id, { steps: [] });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, { status: "failed", error: "executor crashed", mergeRetries: 0, steps: [] });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-zero-step-exec", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("todo");
+
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("todo");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.steps).toEqual([]);
+      expect(updated?.mergeRetries).toBe(0);
+    });
+
     it("keeps merge-failed in-review task (all steps done) in in-review and resets merge state", async () => {
       const store = new TaskStore(tmpDir);
       await store.init();
@@ -1774,6 +1840,35 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
       expect(updated?.column).toBe("in-review");
       expect(updated?.status).toBeFalsy();
       expect(updated?.error).toBeFalsy();
+      expect(updated?.mergeRetries).toBe(0);
+    });
+
+    it("keeps zero-step merge-failed in-review task with prior merge attempts in-review and resets merge state", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+
+      const task = await store.createTask({
+        title: "zero-step merge-failed task",
+        description: "test",
+        column: "todo",
+      });
+      await writeFile(join(tmpDir, ".fusion", "tasks", task.id, "PROMPT.md"), "# zero-step merge-failed task\n\nNo steps yet.\n");
+      await store.updateTask(task.id, { steps: [] });
+      await store.moveTask(task.id, "in-progress");
+      await store.moveTask(task.id, "in-review");
+      await store.updateTask(task.id, { status: "failed", error: "merge conflict", mergeRetries: 2, steps: [] });
+
+      const retryTool = api.tools.get("fn_task_retry")!;
+      const result = await retryTool.execute("retry-zero-step-merge", { id: task.id }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.isError).toBeFalsy();
+      expect(result.details.newColumn).toBe("in-review");
+
+      const updated = await store.getTask(task.id);
+      expect(updated?.column).toBe("in-review");
+      expect(updated?.status).toBeFalsy();
+      expect(updated?.error).toBeFalsy();
+      expect(updated?.steps).toEqual([]);
       expect(updated?.mergeRetries).toBe(0);
     });
   });

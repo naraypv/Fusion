@@ -47,6 +47,20 @@ describe("compactLargePromptSections", () => {
     expect(out).toContain("existing specification middle trimmed");
   });
 
+  it("shortens Task PROMPT.md while preserving mission, file scope, and steps outline", () => {
+    const verboseSection = Array.from({ length: 120 }, (_, i) => `- verbose requirement ${i}: ${"x".repeat(80)}`).join("\n");
+    const prompt = `## Task PROMPT.md\n\n\`\`\`markdown\n# Task: FN-4082\n\n## Mission\nShip a focused reviewer fallback.\n\n## Context to Read First\n${verboseSection}\n\n## File Scope\n- packages/engine/src/reviewer.ts\n- packages/engine/src/pi.ts\n\n## Steps\n### Step 0: Preflight\n- [ ] Confirm behavior\n### Step 1: Compact prompt\n- [ ] Trim verbose sections\n### Step 2: Retry reviewer\n- [ ] Retry once on context limit\n\n## Do NOT\n${verboseSection}\n\`\`\``;
+    const out = __testOnlyPromptCompaction.compactLargePromptSections(prompt);
+    expect(out).toContain("## Task PROMPT.md");
+    expect(out).toContain("```markdown");
+    expect(out).toContain("## Mission");
+    expect(out).toContain("## File Scope");
+    expect(out).toContain("### Step 1: Compact prompt");
+    expect(out).toContain("step checklist details trimmed");
+    expect(out).toContain("remaining PROMPT.md sections trimmed");
+    expect(out?.length).toBeLessThan(prompt.length);
+  });
+
   it("collapses older User Comments while keeping latest", () => {
     const comments = Array.from({ length: 40 }, (_, i) => `- **[2026-05-${String(i + 1).padStart(2, "0")}]** ${"x".repeat(120)}`).join("\n");
     const prompt = `## User Comments\n\n${comments}`;

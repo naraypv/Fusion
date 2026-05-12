@@ -136,7 +136,12 @@ describe("NotificationService", () => {
     await service.start();
 
     expect(initSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ topic: "demo", projectId: "p1", ntfyBaseUrl: "https://n" }),
+      expect.objectContaining({
+        topic: "demo",
+        projectId: "p1",
+        ntfyBaseUrl: "https://n",
+        ntfyAccessToken: undefined,
+      }),
     );
     initSpy.mockRestore();
   });
@@ -147,6 +152,48 @@ describe("NotificationService", () => {
     const service = new NotificationService(store as any);
     await service.start();
     expect(initSpy).not.toHaveBeenCalled();
+    initSpy.mockRestore();
+  });
+
+  it("reconfigures the ntfy provider when the access token changes without logging the token", async () => {
+    const store = createStore({
+      ntfyEnabled: true,
+      ntfyTopic: "demo",
+      ntfyAccessToken: "old-token",
+    });
+    const initSpy = vi.spyOn(NtfyNotificationProvider.prototype, "initialize");
+
+    const service = new NotificationService(store as any, { projectId: "p1" });
+    await service.start();
+
+    store.emit("settings:updated", {
+      settings: {
+        ntfyEnabled: true,
+        ntfyTopic: "demo",
+        ntfyAccessToken: "new-token",
+      } as Settings,
+      previous: {
+        ntfyEnabled: true,
+        ntfyTopic: "demo",
+        ntfyAccessToken: "old-token",
+      } as Settings,
+    });
+
+    await vi.waitFor(() => {
+      expect(initSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          topic: "demo",
+          projectId: "p1",
+          ntfyAccessToken: "new-token",
+        }),
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(schedulerLog.log).toHaveBeenCalledWith("NotificationService ntfy access token updated");
+    });
+    expect(schedulerLog.log).not.toHaveBeenCalledWith(expect.stringContaining("new-token"));
+    expect(schedulerLog.log).not.toHaveBeenCalledWith(expect.stringContaining("old-token"));
     initSpy.mockRestore();
   });
 

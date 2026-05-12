@@ -35,6 +35,7 @@ import {
   buildTaskLineageTrailer,
   getTaskMergeBlocker,
   normalizeMergeConflictStrategy,
+  normalizeMergeStrategyOverlapBehavior,
   resolveTaskMergeTarget,
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
@@ -72,6 +73,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from "./run-audit.js";
 import { createWebFetchTool } from "./agent-tools.js";
+import { auditSquashMerge, MERGER_MAIN_OVERLAP_LOOKBACK_COMMITS, type SquashAuditFindings } from "./merger-squash-audit.js";
+import { detectMergeOverlap, restoreBranchWinsFiles } from "./merger-overlap-guard.js";
 
 /** Conflict type classification for merge conflict resolution */
 export type ConflictType =
@@ -474,6 +477,17 @@ export class MergeAbortedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MergeAbortedError";
+  }
+}
+
+export class SquashAuditError extends Error {
+  constructor(
+    taskId: string,
+    public readonly squashSha: string,
+    public readonly findings: SquashAuditFindings,
+  ) {
+    super(buildSquashAuditBlockingMessage(taskId, squashSha, findings));
+    this.name = "SquashAuditError";
   }
 }
 
@@ -4151,6 +4165,46 @@ function quoteArg(value: string): string {
   return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
+function shouldRunPostSquashAudit(result: MergeResult, mergeWasEmpty: boolean, isEmptyCommit: boolean, commitSha?: string): boolean {
+  if (mergeWasEmpty || isEmptyCommit || !commitSha) {
+    return false;
+  }
+  return (result.autoResolvedCount ?? 0) > 0 || result.attemptsMade === 3;
+}
+
+function buildSquashAuditBlockingMessage(taskId: string, squashSha: string, findings: SquashAuditFindings): string {
+  const riskParts: string[] = [];
+  if (findings.duplicateSubjects.length > 0) {
+    riskParts.push(`${findings.duplicateSubjects.length} duplicate-subject risk${findings.duplicateSubjects.length === 1 ? "" : "s"}`);
+  }
+  if (findings.touchedFileOverlaps.length > 0) {
+    riskParts.push(`${findings.touchedFileOverlaps.length} touched-file overlap risk${findings.touchedFileOverlaps.length === 1 ? "" : "s"}`);
+  }
+  const summary = riskParts.length > 0 ? riskParts.join(", ") : `${findings.issueCount} audit finding(s)`;
+  return `${taskId}: post-squash audit blocked auto-completion for ${squashSha.slice(0, 8)} (${summary})`;
+}
+
+function formatSquashAuditAgentLog(findings: SquashAuditFindings): string {
+  const lines: string[] = [];
+  if (findings.duplicateSubjects.length > 0) {
+    lines.push("Duplicate-subject risks:");
+    for (const duplicate of findings.duplicateSubjects) {
+      lines.push(`- ${duplicate.subject}`);
+    }
+  }
+  if (findings.touchedFileOverlaps.length > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push("Touched-file overlap risks:");
+    for (const overlap of findings.touchedFileOverlaps) {
+      lines.push(`- ${overlap.file}`);
+      for (const commit of overlap.recentMainCommits) {
+        lines.push(`  - ${commit.sha} ${commit.subject}`);
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
 /**
  * Resolve a non-empty commit body for fallback merge commits. Used by sites
  * that would otherwise emit `-m ""` when the branch's commit log is empty
@@ -4952,6 +5006,9 @@ export async function aiMergeTask(
   const mergeConflictStrategy: CanonicalMergeConflictStrategy = normalizeMergeConflictStrategy(
     settings.mergeConflictStrategy,
   );
+  const mergeStrategyOverlapBehavior = normalizeMergeStrategyOverlapBehavior(
+    settings.mergeStrategyOverlapBehavior,
+  );
 
   // Pre-merge sync: for the smart strategies, opportunistically fast-forward
   // local main from origin so a freshly-pushed sibling commit isn't clobbered
@@ -5505,6 +5562,38 @@ export async function aiMergeTask(
     baseBranch: task.baseBranch,
     baseCommitSha: task.baseCommitSha,
   });
+  const preferBranchOnOverlapFiles = new Set<string>();
+  if (
+    mergeConflictStrategy === "smart-prefer-main"
+    && mergeStrategyOverlapBehavior !== "ignore"
+  ) {
+    const overlap = await detectMergeOverlap({
+      rootDir,
+      branch,
+      baseRef: diffBaseRef,
+      mergeTargetBranch: mergeTarget.branch,
+      lookback: MERGER_MAIN_OVERLAP_LOOKBACK_COMMITS,
+    });
+
+    if (overlap.overlappingFiles.length > 0) {
+      const overlapSummary = formatMergeOverlapSummary(
+        overlap.overlappingFiles,
+        overlap.recentMainCommitsByFile,
+      );
+      const overlapMessage =
+        `Overlap guard detected ${overlap.overlappingFiles.length} recent-main overlap file(s) ` +
+        `for smart-prefer-main (${mergeStrategyOverlapBehavior}): ${overlapSummary}`;
+      mergerLog.warn(`${taskId}: ${overlapMessage}`);
+      await store.appendAgentLog(taskId, overlapMessage, "text", undefined, "merger");
+      await store.logEntry(taskId, overlapMessage);
+
+      if (mergeStrategyOverlapBehavior === "flip-to-prefer-branch") {
+        for (const file of overlap.overlappingFiles) {
+          preferBranchOnOverlapFiles.add(file);
+        }
+      }
+    }
+  }
   const contextDiffRange = diffBaseRef ? `${diffBaseRef}..${branch}` : `HEAD..${branch}`;
 
   let commitLog = "";
@@ -5589,7 +5678,9 @@ export async function aiMergeTask(
       ? "Attempt 1: AI merge"
       : attemptNum === 2
         ? "Attempt 2: auto-resolve known conflicts, then AI"
-        : `Attempt 3: ${mergeConflictStrategy === "smart-prefer-main" ? "-X ours" : "-X theirs"} fallback`;
+        : mergeConflictStrategy === "smart-prefer-main" && preferBranchOnOverlapFiles.size > 0
+          ? `Attempt 3: overlap-aware -X ours fallback (${preferBranchOnOverlapFiles.size} branch-protected file${preferBranchOnOverlapFiles.size === 1 ? "" : "s"})`
+          : `Attempt 3: ${mergeConflictStrategy === "smart-prefer-main" ? "-X ours" : "-X theirs"} fallback`;
     await store.appendAgentLog(
       taskId,
       `Starting merge ${attemptLabel}`,
@@ -5638,12 +5729,17 @@ export async function aiMergeTask(
         testSource: effectiveTestSource,
         buildSource: effectiveBuildSource,
         preMergeRebaseFallthrough,
+        attempt3BranchWinsFiles: preferBranchOnOverlapFiles,
       }, aiTracker);
 
       if (success) {
         result.attemptsMade = attemptNum;
         result.resolutionStrategy = getResolutionStrategy(attemptNum, smartConflictResolution, mergeConflictStrategy);
-        result.resolutionMethod = getResolutionMethod(result.resolutionStrategy, result.autoResolvedCount, aiTracker.aiWasInvoked);
+        if (attemptNum === 3 && mergeConflictStrategy === "smart-prefer-main" && preferBranchOnOverlapFiles.size > 0) {
+          result.resolutionMethod = "mixed";
+        } else {
+          result.resolutionMethod = getResolutionMethod(result.resolutionStrategy, result.autoResolvedCount, aiTracker.aiWasInvoked);
+        }
         result.merged = true;
         return true;
       }
@@ -6075,6 +6171,27 @@ export async function aiMergeTask(
     // attemptWithSideStrategy return true without committing when nothing
     // was staged. The recorded HEAD then has nothing to do with this task.
     const recordedSha = (isEmptyCommit || mergeWasEmpty) ? undefined : commitSha;
+
+    const auditSha = recordedSha;
+    if (auditSha && shouldRunPostSquashAudit(result, mergeWasEmpty, isEmptyCommit, auditSha)) {
+      const auditFindings = await auditSquashMerge({
+        rootDir,
+        squashSha: auditSha,
+      });
+      if (!auditFindings.clean) {
+        const auditError = new SquashAuditError(taskId, auditSha, auditFindings);
+        await store.appendAgentLog(
+          taskId,
+          auditError.message,
+          "tool_error",
+          formatSquashAuditAgentLog(auditFindings),
+          "merger",
+        );
+        await store.updateTask(taskId, { status: null });
+        throw auditError;
+      }
+      await store.appendAgentLog(taskId, "post-squash audit clean", "text", undefined, "merger");
+    }
     if (isEmptyCommit) {
       mergerLog.warn(
         `${taskId}: local squash produced an empty commit (${commitSha?.slice(0, 8)}) — branch likely contained dupes of main. Skipping commitSha; recovery will backfill when real commit lands.`,
@@ -6148,6 +6265,9 @@ export async function aiMergeTask(
       "merger",
     );
   } catch (err: any) {
+    if (err instanceof SquashAuditError || err?.name === "SquashAuditError") {
+      throw err;
+    }
     mergerLog.warn(`${taskId}: failed to collect/store merge details: ${err.message}`);
   }
 
@@ -6509,6 +6629,10 @@ interface MergeAttemptParams {
    *  suppress the unsafe `-X ours` Attempt 3. Carries the original rebase
    *  failure message for diagnostic context. */
   preMergeRebaseFallthrough?: string;
+  /** Under smart-prefer-main overlap protection, these files are restored from
+   *  the task branch after the default `-X ours` squash so overlapping files
+   *  keep the branch's hardening while non-overlapping files still prefer main. */
+  attempt3BranchWinsFiles?: Set<string>;
 }
 
 /** Mutable flags carried through the merge cascade. */
@@ -6556,6 +6680,13 @@ async function executeMergeAttempt(
   // before reaching here — only the two smart variants legitimately run attempt 3.
   if (attemptNum === 3) {
     if (params.mergeConflictStrategy === "smart-prefer-main") {
+      if (params.attempt3BranchWinsFiles && params.attempt3BranchWinsFiles.size > 0) {
+        return attemptWithMixedSideStrategy(
+          params,
+          { defaultSide: "ours", branchWinsFiles: params.attempt3BranchWinsFiles },
+          aiTracker,
+        );
+      }
       return attemptWithSideStrategy(params, "ours", aiTracker);
     }
     return attemptWithSideStrategy(params, "theirs", aiTracker);
@@ -6946,7 +7077,7 @@ async function attemptWithSideStrategy(
   side: "theirs" | "ours" = "theirs",
   aiTracker?: AiInvocationTracker,
 ): Promise<boolean> {
-  const { rootDir, branch, commitLog, diffStat, aiSummary, aiSubject, includeTaskId, sourceIssueRef, taskId, store, settings, testCommand, buildCommand, testSource, buildSource } = params;
+  const { rootDir, branch, taskId } = params;
 
   mergerLog.log(`${taskId}: attempting merge with -X ${side} strategy`);
 
@@ -6967,66 +7098,71 @@ async function attemptWithSideStrategy(
       return false;
     }
 
-    // Check if there's anything staged
-    const staged = execSyncText("git diff --cached --quiet 2>&1; echo $?", {
+    return finalizeSideStrategyAttempt(params, side, aiTracker);
+  } catch (error) {
+    if (error instanceof Error && error.name === "MergeAbortedError") {
+      throw error;
+    }
+    mergerLog.error(`${taskId}: -X ${side} merge failed: ${error}`);
+    return false;
+  }
+}
+
+async function attemptWithMixedSideStrategy(
+  params: MergeAttemptParams,
+  strategy: { defaultSide: "ours" | "theirs"; branchWinsFiles: Set<string> },
+  aiTracker?: AiInvocationTracker,
+): Promise<boolean> {
+  const { rootDir, branch, taskId } = params;
+  mergerLog.log(
+    `${taskId}: attempting overlap-aware merge with -X ${strategy.defaultSide} and branch restoration for ${strategy.branchWinsFiles.size} file(s)`,
+  );
+
+  try {
+    throwIfAborted(params.options.signal, taskId);
+    await execAsync(`git merge -X ${strategy.defaultSide} --squash "${branch}"`, {
+      cwd: rootDir,
+    });
+
+    const conflictedOutput = execSyncText("git diff --name-only --diff-filter=U", {
       cwd: rootDir,
       encoding: "utf-8",
     }).trim();
-
-    if (staged === "0") {
-      // Nothing staged - already merged. Mark empty so the metadata block
-      // doesn't record pre-merge HEAD as this task's commitSha.
-      if (aiTracker) aiTracker.mergeWasEmpty = true;
-      // Run deterministic verification even when nothing is staged
-      if (testCommand || buildCommand) {
-        throwIfAborted(params.options.signal, taskId);
-        await runDeterministicVerification(
-          store,
-          rootDir,
-          taskId,
-          testCommand,
-          buildCommand,
-          testSource,
-          buildSource,
-          params.options.signal,
-        );
-      }
-      return true;
+    if (conflictedOutput.length > 0) {
+      mergerLog.warn(`${taskId}: overlap-aware merge left unresolved conflicts: ${conflictedOutput}`);
+      return false;
     }
 
-    // Commit with fallback message. Body cascade: branch's commit log →
-    // AI summary of diff stat → diff stat itself → synthetic placeholder.
-    // Guarantees the merge commit carries a non-empty body that downstream
-    // consumers (release notes, dashboard summaries) can rely on.
-    throwIfAborted(params.options.signal, taskId);
-    const safeBody = await resolveSafeCommitBody({
+    await restoreBranchWinsFiles({
       rootDir,
-      taskId,
       branch,
-      commitLog,
-      diffStat,
-      settings: settings as Settings,
-      signal: params.options.signal,
+      files: strategy.branchWinsFiles,
     });
-    const authorArg = getCommitAuthorArg(settings);
-    const trailerArg = buildTaskTrailerArgs(taskId);
-    const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
-    const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
-      taskId,
-      branch,
-      commitLog,
-      diffStat,
-      includeTaskId,
-      aiSummary: aiSummary?.trim().length ? aiSummary : safeBody,
-      aiSubject,
-    });
-    await execAsync(
-      `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
-      { cwd: rootDir },
-    );
-    mergerLog.log(`${taskId}: committed with -X ${side} auto-resolution`);
 
-    // Run deterministic verification after committing
+    return finalizeSideStrategyAttempt(params, strategy.defaultSide, aiTracker);
+  } catch (error) {
+    if (error instanceof Error && error.name === "MergeAbortedError") {
+      throw error;
+    }
+    mergerLog.error(`${taskId}: overlap-aware merge failed: ${error}`);
+    return false;
+  }
+}
+
+async function finalizeSideStrategyAttempt(
+  params: MergeAttemptParams,
+  side: "theirs" | "ours",
+  aiTracker?: AiInvocationTracker,
+): Promise<boolean> {
+  const { rootDir, branch, commitLog, diffStat, aiSummary, aiSubject, includeTaskId, sourceIssueRef, taskId, store, settings, testCommand, buildCommand, testSource, buildSource } = params;
+
+  const staged = execSyncText("git diff --cached --quiet 2>&1; echo $?", {
+    cwd: rootDir,
+    encoding: "utf-8",
+  }).trim();
+
+  if (staged === "0") {
+    if (aiTracker) aiTracker.mergeWasEmpty = true;
     if (testCommand || buildCommand) {
       throwIfAborted(params.options.signal, taskId);
       await runDeterministicVerification(
@@ -7040,15 +7176,63 @@ async function attemptWithSideStrategy(
         params.options.signal,
       );
     }
-
     return true;
-  } catch (error) {
-    if (error instanceof Error && error.name === "MergeAbortedError") {
-      throw error;
-    }
-    mergerLog.error(`${taskId}: -X ${side} merge failed: ${error}`);
-    return false;
   }
+
+  throwIfAborted(params.options.signal, taskId);
+  const safeBody = await resolveSafeCommitBody({
+    rootDir,
+    taskId,
+    branch,
+    commitLog,
+    diffStat,
+    settings: settings as Settings,
+    signal: params.options.signal,
+  });
+  const authorArg = getCommitAuthorArg(settings);
+  const trailerArg = buildTaskTrailerArgs(taskId);
+  const issueRefBodyArg = sourceIssueRef ? ` -m "Ref: ${sourceIssueRef}"` : "";
+  const { subjectArg, bodyArg } = await buildDeterministicMergeMessage({
+    taskId,
+    branch,
+    commitLog,
+    diffStat,
+    includeTaskId,
+    aiSummary: aiSummary?.trim().length ? aiSummary : safeBody,
+    aiSubject,
+  });
+  await execAsync(
+    `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
+    { cwd: rootDir },
+  );
+  mergerLog.log(`${taskId}: committed with -X ${side} auto-resolution`);
+
+  if (testCommand || buildCommand) {
+    throwIfAborted(params.options.signal, taskId);
+    await runDeterministicVerification(
+      store,
+      rootDir,
+      taskId,
+      testCommand,
+      buildCommand,
+      testSource,
+      buildSource,
+      params.options.signal,
+    );
+  }
+
+  return true;
+}
+
+function formatMergeOverlapSummary(files: string[], recentMainCommitsByFile: Map<string, string[]>): string {
+  const displayedFiles = files.slice(0, 8).map((file) => {
+    const shas = (recentMainCommitsByFile.get(file) ?? []).slice(0, 3).map((sha) => sha.slice(0, 8));
+    const extraCommits = (recentMainCommitsByFile.get(file)?.length ?? 0) - shas.length;
+    const commitSummary = shas.join(", ") + (extraCommits > 0 ? `, +${extraCommits} more` : "");
+    return `${file} [${commitSummary}]`;
+  });
+  const extraFiles = files.length - displayedFiles.length;
+  return displayedFiles.join("; ") + (extraFiles > 0 ? `; +${extraFiles} more file(s)` : "");
 }
 
 interface AiAgentParams {

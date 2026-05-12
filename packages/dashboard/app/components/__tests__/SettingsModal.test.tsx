@@ -175,12 +175,14 @@ const defaultSettings = {
   pushAfterMerge: false,
   pushRemote: "origin",
   verificationFixRetries: 2,
+  workflowRevisionForkOnScopeMismatch: true,
   recycleWorktrees: false,
   worktreeNaming: "random",
   includeTaskIdInCommit: true,
   worktreeInitCommand: "",
   ntfyEnabled: false,
   ntfyTopic: undefined,
+  ntfyAccessToken: undefined,
   webhookEnabled: false,
   webhookUrl: undefined,
   webhookFormat: undefined,
@@ -1967,6 +1969,34 @@ describe("SettingsModal", () => {
       expect(screen.getByText(/When enabled, tasks that pass review are automatically merged/i)).toBeVisible();
     });
 
+    it("loads workflow revision fork checkbox from project settings", async () => {
+      renderModal({ initialSection: "merge" });
+      await waitForSettingsModalReady();
+
+      const checkbox = screen.getByRole("checkbox", {
+        name: /fork scope-mismatched workflow revisions into follow-up tasks/i,
+      });
+      expect(checkbox).toBeChecked();
+    });
+
+    it("saves workflow revision fork checkbox changes", async () => {
+      renderModal({ initialSection: "merge" });
+      await waitForSettingsModalReady();
+
+      const checkbox = screen.getByRole("checkbox", {
+        name: /fork scope-mismatched workflow revisions into follow-up tasks/i,
+      });
+      await userEvent.click(checkbox);
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
+      });
+
+      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+      expect(payload.workflowRevisionForkOnScopeMismatch).toBe(false);
+    });
+
     it("shows Push Remote input when push-after-merge is enabled", async () => {
       renderModal();
 
@@ -2965,6 +2995,9 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("Dashboard Hostname")).toBeInTheDocument();
       expect(screen.getByText("Notify on events")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /Test notification/ })).toBeInTheDocument();
+
+      await userEvent.click(screen.getByText("Advanced"));
+      expect(screen.getByLabelText("Access token (optional)")).toBeInTheDocument();
     });
 
     it("shows fallback, dreams, and mailbox message events for both providers", async () => {
@@ -3019,14 +3052,42 @@ describe("SettingsModal", () => {
       renderModal();
       await waitForSettingsModalReady();
       await openNotificationsSection();
+      await userEvent.click(screen.getByText("Advanced"));
+      await userEvent.type(screen.getByLabelText("Access token (optional)"), "secret-token");
 
       await userEvent.click(screen.getByRole("button", { name: /Test notification/ }));
 
       await waitFor(() => {
         expect(mockTestNotification).toHaveBeenCalledWith(
           "ntfy",
-          expect.objectContaining({ ntfyEnabled: true, ntfyTopic: "test-topic" }),
+          expect.objectContaining({
+            ntfyEnabled: true,
+            ntfyTopic: "test-topic",
+            ntfyAccessToken: "secret-token",
+          }),
           undefined,
+        );
+      });
+    });
+
+    it("clears a saved ntfy access token via global null-as-delete semantics", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        ntfyEnabled: true,
+        ntfyTopic: "test-topic",
+        ntfyAccessToken: "saved-token",
+      });
+      renderModal();
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+      await userEvent.click(screen.getByText("Advanced"));
+      const tokenInput = screen.getByLabelText("Access token (optional)");
+      await userEvent.clear(tokenInput);
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
+          expect.objectContaining({ ntfyAccessToken: null }),
         );
       });
     });

@@ -15,11 +15,21 @@ function isNoTaskDoneFailure(task: Task): boolean {
     && task.error.toLowerCase().includes("without calling fn_task_done");
 }
 
+const MISSING_WORKTREE_SESSION_PREFIX = "Refusing to start coding agent in missing worktree:";
+
 export function isMissingWorktreeSessionStartFailure(error: unknown): boolean {
   if (typeof error !== "string") {
     return false;
   }
-  return error.includes("Refusing to start coding agent in missing worktree:");
+  return error.includes(MISSING_WORKTREE_SESSION_PREFIX);
+}
+
+export function extractMissingWorktreePathFromSessionStartFailure(error: unknown): string | null {
+  if (typeof error !== "string") return null;
+  const idx = error.indexOf(MISSING_WORKTREE_SESSION_PREFIX);
+  if (idx < 0) return null;
+  const pathPart = error.slice(idx + MISSING_WORKTREE_SESSION_PREFIX.length).trim();
+  return pathPart.length > 0 ? pathPart : null;
 }
 
 export function isRecoverableMissingWorktreeReviewFailure(task: Task): boolean {

@@ -271,7 +271,12 @@ Intentional exclusions from shared snapshots:
 - `ChatManager.sendMessage()` updates that snapshot during streaming (debounced) and clears it on done/error/cancel so stale partial state does not survive completion.
 - When the active session is still generating after reload/reconnect (`isGenerating: true`), `useChat`/`useQuickChat` hydrate the UI from `inFlightGeneration` immediately, then reconnect `/api/chat/sessions/:id/stream` with `Last-Event-ID = replayFromEventId` to avoid re-appending already-known deltas.
 - Chat message submission uses SSE streaming responses from dashboard chat routes.
+- Direct-chat terminal failures now persist as a distinct assistant message with `metadata.failureInfo` (`summary`, optional `errorClass`, optional `code`, optional `detail`, optional reference metadata) so the chat thread remains the durable primary failure surface after reload/reconnect.
+- `ChatManager.sendMessage()` preserves any interrupted partial assistant output as its own message, then appends a separate persisted failure bubble instead of overwriting the partial reply.
 - Main-chat optimistic user sends are reconciled against persisted SSE user echoes by content + temp-id replacement, so one user send cannot survive as a duplicate history entry after stream completion.
+- `useChat.loadMessages()`/session restore map persisted `metadata.failureInfo` back into `ChatMessageInfo.failureInfo`, and live stream failures append the same assistant-style bubble client-side unless the error is classified as a tab-suspension false positive.
+- `ChatView` renders failure bubbles inline with shared error-surface tokens; mailbox references deep-link into the mailbox view, while other failure references keep an inline "View failure details" affordance so reload/reconnect does not strand users in agent logs.
+- `ChatView` renders those failure bubbles with inline assistant attribution even for model-only `__fn_agent__` chats, so provider/model failures still read as a response from the active model instead of an anonymous system alert.
 - `streamChatResponse()` must flush trailing buffered SSE data on EOF even without a final newline, so terminal `done`/`error` events are not dropped at chunk boundaries.
 - Chat generation ownership is isolated by `generationId` (`ChatManager.beginGeneration` + `ChatStreamManager` subscription filters + route preallocation), preventing stale generation terminal events from leaking into a newer active request.
 
@@ -669,12 +674,15 @@ A lease is recoverable only when there is **no active local executor session for
   - Reserve/commit/abort execute under a process-local lock and a single SQLite transaction. Lazy reservation expiry cleanup runs inside those same transactions.
   - Default reservation TTL is `15 * 60 * 1000` ms (15 minutes). Expired/aborted reservations are **burned IDs** and are never reissued.
   - `committedClusterTaskCount` from allocator state is the only authoritative cluster-wide committed-task count. Local task-row counts and ID suffix math are not authoritative.
+  - Store open reconciles every known prefix in `distributed_task_id_state` to `max(current nextSequence, max(tasks suffix)+1, max(archivedTasks suffix)+1, max(reservation sequence)+1)`. This self-heals stale counters before ordinary task creation resumes.
   - Mesh allocator write routes (`/api/mesh/task-ids/reserve|commit|abort`) return `503` when the coordinator node is unreachable; they never fall back to local-only cluster ID issuance.
 - Cluster task creation now uses a strong-write reserve → create → replicate → commit/abort sequence.
   - Ordinary local task creation (`TaskStore.createTask()`, duplicate, and refine flows) now allocates IDs through the same distributed reserve/commit/abort lifecycle owned by `TaskStore`.
   - `POST /api/tasks` uses the store-owned allocator path for local creates rather than maintaining a separate route-local allocator implementation.
   - `POST /api/tasks` reserves a distributed ID, creates the authoritative local task with that reserved ID, then POSTs authenticated replication payloads to peer nodes.
-  - Creation self-heals stale ID overlap state: if a reserved `FN-*` collides with an existing task (`Task ID already exists...` or replicated-create collision), the route aborts that reservation, cleans up partial local state, reserves the next ID, and retries up to a bounded limit.
+  - All create-class writes now use conflict-raising inserts, not SQLite `ON CONFLICT ... DO UPDATE`. Existing task rows and `.fusion/tasks/{id}` contents always win over stale counters or colliding reservations.
+  - Local create paths perform a final active+archived existence check immediately before insert. If a reserved `FN-*` still collides, the reservation is aborted/burned and the create fails loudly instead of rewriting the existing task.
+  - Creation self-heals stale overlap state at the route layer: if a reserved `FN-*` collides with an existing task (`Task ID already exists...` or replicated-create collision), the route aborts that reservation, cleans up partial local state, reserves the next ID, and retries up to a bounded limit.
   - Replica apply uses `TaskStore.applyReplicatedTaskCreate(...)`, which is idempotent by task ID: replaying the same payload returns the existing task without creating duplicates.
   - If an incoming replicated payload conflicts with a different existing task record for the same ID, the apply path returns a deterministic collision error instead of overwriting data.
   - Any replication/coordinator failure aborts the reservation and returns write failure (`503`), so this path does not report success for local-only partial writes.
@@ -771,6 +779,7 @@ Key server capabilities:
 - **Chat streaming**: `/api/chat/sessions/:id/messages` (`routes.ts` + `chat.ts`)
   - Streams assistant responses as SSE events for chat sessions
   - `done` events include the authoritative persisted assistant message snapshot (`message`) so clients can render final output even when incremental `text` deltas are absent
+  - `error` events now allow either the legacy string payload or a structured failure payload matching persisted `metadata.failureInfo`; direct-chat clients normalize both shapes and render failures inline in the thread
 - **Chat session queries**: `/api/chat/sessions` (`routes.ts`)
   - Existing list behavior is unchanged (`status=active|archived|all` returns an array)
   - Quick Chat resume uses targeted lookup params: `agentId`, optional `modelProvider` + `modelId`, plus `resume=1`
@@ -847,9 +856,9 @@ A `prefetchLazyViews()` function runs once on mount via `requestIdleCallback` to
 ### Health and monitoring endpoints
 - **Health check**: `GET /api/health`
   - Returns liveness status for load balancers and monitoring
-  - Response: `{ status: "ok" | "degraded", version: string, uptime: number, database: { corruptionDetected: boolean, integrityCheckPending: boolean, integrityCheckLastRunAt: string | null } }`
+  - Response: `{ status: "ok" | "degraded", version: string, uptime: number, database: { healthy: boolean, isRunning: boolean, lastCheckedAt: string | null } }`
   - Startup does not block on full `PRAGMA integrity_check(100)`; Fusion schedules it in the background shortly after boot.
-  - Background integrity checks are deduplicated process-wide per on-disk SQLite path: multiple `Database` instances sharing the same `fusion.db` join one shared run, and each instance still updates `database.integrityCheckPending`, `database.integrityCheckLastRunAt`, and `database.corruptionDetected` from the shared result.
+  - Background integrity checks are deduplicated process-wide per on-disk SQLite path: multiple `Database` instances sharing the same `fusion.db` join one shared run, and each instance still updates the underlying integrity state (`integrityCheckPending`, `integrityCheckLastRunAt`, `corruptionDetected`) that maps to `database.isRunning`, `database.lastCheckedAt`, and `database.healthy`.
   - No authentication required
 
 ### Custom Provider endpoints
@@ -1318,7 +1327,7 @@ Fusion attempts GitHub issue creation when per-task tracking is explicitly enabl
 
 When Fusion does create a tracking issue, it formats the title as `[FN-XXXX] Task title` and sends a short plain-text body prefixed with `Fusion task: FN-XXXX`. The body is a bounded summary snippet (not full task prompt content), and Fusion does not include any hyperlink back to the local dashboard. Manual unlink requests (`githubTracking.issue: null`) do not recreate an issue in that same PATCH request, and disable updates do not create issues. Auth resolution remains strict-mode (`token` vs `gh-cli`) but now defensively accepts merged settings shapes where auth keys may appear in global-merged payloads.
 
-When a tracked task later moves to `in-progress` or `done`, Fusion posts one short lifecycle comment on the linked tracking issue. These comments include the Fusion task ID as plain text (`Fusion task: FN-XXXX`) and never link back to the Fusion app. No comment is posted for any other transition.
+When a tracked task later moves to `in-progress` or `done`, Fusion posts one short lifecycle comment on the linked tracking issue. These comments always include the Fusion task ID as plain text (`Fusion task: FN-XXXX`) and never link back to the Fusion app. The `in-progress` comment stays plain-text; the `done` comment can additionally include GitHub commit/PR markdown links plus branch, file-change, and merge-timestamp details when that merge context is available on the task. No comment is posted for any other transition.
 
 When a tracked task transitions into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`. When a task transitions out of `done` into any active column (`triage`, `todo`, `in-progress`, `in-review`), Fusion reopens it with `state_reason: reopened`. Moves from `done` to `archived` leave the issue closed. Tasks without `githubTracking.enabled` or without a linked issue are unaffected, and GitHub failures are logged to task activity without blocking the move.
 

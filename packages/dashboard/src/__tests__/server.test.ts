@@ -69,9 +69,9 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
       prepare: vi.fn().mockReturnValue({ run: vi.fn().mockReturnValue({ changes: 0 }), get: vi.fn(), all: vi.fn().mockReturnValue([]) }),
     }),
     getDatabaseHealth: vi.fn().mockReturnValue({
-      corruptionDetected: false,
-      integrityCheckPending: false,
-      integrityCheckLastRunAt: null,
+      healthy: true,
+      isRunning: false,
+      lastCheckedAt: null,
     }),
     getMissionStore: vi.fn().mockReturnValue({
       listMissions: vi.fn().mockReturnValue([]),
@@ -313,9 +313,9 @@ describe("createServer health and headless mode", () => {
       version: CLI_PACKAGE_VERSION,
       uptime: expect.any(Number),
       database: {
-        corruptionDetected: false,
-        integrityCheckPending: false,
-        integrityCheckLastRunAt: null,
+        healthy: true,
+        isRunning: false,
+        lastCheckedAt: null,
       },
     });
   });
@@ -323,9 +323,9 @@ describe("createServer health and headless mode", () => {
   it("reports degraded status when database corruption is detected", async () => {
     const store = createMockStore({
       getDatabaseHealth: vi.fn().mockReturnValue({
-        corruptionDetected: true,
-        integrityCheckPending: false,
-        integrityCheckLastRunAt: "2026-05-11T10:00:00.000Z",
+        healthy: false,
+        isRunning: false,
+        lastCheckedAt: new Date("2026-05-11T10:00:00.000Z"),
       }),
     });
     const app = createServer(store);
@@ -338,9 +338,9 @@ describe("createServer health and headless mode", () => {
       version: CLI_PACKAGE_VERSION,
       uptime: expect.any(Number),
       database: {
-        corruptionDetected: true,
-        integrityCheckPending: false,
-        integrityCheckLastRunAt: "2026-05-11T10:00:00.000Z",
+        healthy: false,
+        isRunning: false,
+        lastCheckedAt: "2026-05-11T10:00:00.000Z",
       },
     });
   });

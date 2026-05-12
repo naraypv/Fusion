@@ -2,6 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { vi } from "vitest";
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -44,6 +45,7 @@ export function createTaskStoreTestHarness() {
     globalDir: () => globalDir,
     store: () => store,
     beforeEach: async () => {
+      vi.useRealTimers();
       rootDir = makeTmpDir();
       globalDir = makeTmpDir();
       store = new TaskStore(rootDir, globalDir, { inMemoryDb: true });
@@ -52,9 +54,10 @@ export function createTaskStoreTestHarness() {
     afterEach: async () => {
       vi.useRealTimers();
       store.stopWatching();
-      // Yield one microtask tick without relying on process.nextTick,
-      // which can be faked in timer-heavy suites and hang teardown.
-      await Promise.resolve();
+      // Yield one real event-loop turn so fs.watch cleanup settles before
+      // close()/rm() run. Promise.resolve() is only a microtask and has proven
+      // too weak for some full-suite watcher teardowns.
+      await delay(0);
       store.close();
       await rm(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
       await rm(globalDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

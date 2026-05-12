@@ -1058,7 +1058,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   app.get("/api/health", (_req, res) => {
     const database = store.getDatabaseHealth();
     res.json({
-      status: database.corruptionDetected ? "degraded" : "ok",
+      status: database.healthy ? "ok" : "degraded",
       version: cliPackageVersion,
       uptime: Math.floor(process.uptime()),
       database,

@@ -11,6 +11,7 @@
 import type { TaskStore, TaskComment, AgentPromptsConfig, Settings } from "@fusion/core";
 import { buildReviewerMemoryInstructions, resolveAgentPrompt, resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
 import { describeModel, promptWithFallback } from "./pi.js";
+import { isContextLimitError } from "./context-limit-detector.js";
 import { createResolvedAgentSession, extractRuntimeHint } from "./agent-session-helpers.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { AgentLogger } from "./agent-logger.js";
@@ -340,12 +341,10 @@ export async function reviewStep(
     };
   }
 
-  // Build the review request
   const request = buildReviewRequest(
     taskId, stepNumber, stepName, reviewType, promptContent, cwd, baseline, options.userComments,
   );
 
-  // Create AgentLogger for reviewer if store is available
   const agentLogger = options.store && options.taskId
     ? new AgentLogger({
         store: options.store,
@@ -359,12 +358,6 @@ export async function reviewStep(
       })
     : null;
 
-  // Resolve validator model settings using canonical lane hierarchy:
-  // 1. Task-level validator override pair (taskValidatorProvider + taskValidatorModelId)
-  // 2. Project-level validator override pair (projectValidatorProvider + projectValidatorModelId)
-  // 3. Global validator lane pair (globalValidatorProvider + globalValidatorModelId)
-  // 4. Project default override pair (projectDefaultOverrideProvider + projectDefaultOverrideModelId)
-  // 5. Execution default pair (defaultProvider + defaultModelId)
   const validatorProvider = options.taskValidatorProvider && options.taskValidatorModelId
     ? options.taskValidatorProvider
     : (options.projectValidatorProvider && options.projectValidatorModelId
@@ -384,9 +377,6 @@ export async function reviewStep(
                 ? options.projectDefaultOverrideModelId
                 : options.defaultModelId)));
 
-  // Resolve validator fallback using lane hierarchy:
-  // 1. Project-level validator fallback (projectValidatorFallbackProvider + projectValidatorFallbackModelId)
-  // 2. Execution fallback (fallbackProvider + fallbackModelId)
   const validatorFallbackProvider = options.projectValidatorFallbackProvider && options.projectValidatorFallbackModelId
     ? options.projectValidatorFallbackProvider
     : options.fallbackProvider;
@@ -396,7 +386,6 @@ export async function reviewStep(
   const validatorFallbackChain = options.settings ? resolveModelFallbackChain(options.settings) : options.modelFallbackChain;
   const routeViaDspy = options.settings ? resolveRouteAllLlmCallsViaDspy(options.settings) : options.routeViaDspy;
 
-  // Resolve per-agent custom instructions for the reviewer role
   let reviewerInstructions = "";
   if (options.agentStore && options.rootDir) {
     try {
@@ -412,18 +401,10 @@ export async function reviewStep(
     }
   }
   const reviewerBasePrompt = resolveAgentPrompt("reviewer", options.agentPrompts) || REVIEWER_SYSTEM_PROMPT;
-  // Memory goes in the dynamic layer (not concatenated onto basePrompt) so the
-  // stable prefix is byte-identical across sessions even if memory changes.
-  // The leading "\n" separator is no longer needed — buildPromptLayers handles
-  // section joining with "\n\n".
   const memorySection = options.rootDir && options.settings?.memoryEnabled !== false
     ? buildReviewerMemoryInstructions(options.rootDir, options.settings)
     : "";
 
-  // Build structured layers for cross-session prompt caching.
-  // The stable layer (base prompt only) is byte-identical across all
-  // reviewer sessions in this task, enabling cache hits. Memory goes
-  // into the dynamic layer because it can change between sessions.
   const reviewerPluginContributions = buildPluginPromptSection(
     "reviewer",
     options.pluginRunner,
@@ -438,12 +419,8 @@ export async function reviewStep(
     memorySection,
     pluginContributions: reviewerPluginContributions,
   });
-
-  // Collapsed string for backward compatibility with runtimes that don't
-  // support layers (plugin runtimes, older pi versions).
   const reviewerSystemPromptFinal = collapsePromptLayers(layers);
 
-  // Build skill selection context (assigned agent skills take precedence over role fallback)
   let skillContext = undefined;
   if (options.agentStore && options.rootDir) {
     try {
@@ -459,7 +436,6 @@ export async function reviewStep(
     }
   }
 
-  // Spawn a reviewer agent with read-only tools
   const assignedAgentId = options.task?.assignedAgentId ?? null;
   const agentStore = options.agentStore;
   const memoryAgent =
@@ -487,26 +463,42 @@ export async function reviewStep(
         } : undefined),
       ]
     : undefined;
-  // Sentinel error used by the beforeCreateSession hook to cancel session
-  // creation when a pause is detected after runtime resolution but before
-  // the LLM session is actually spawned. Caught locally and converted to an
-  // UNAVAILABLE verdict.
   class ReviewerPauseAbortError extends Error {
     constructor(public readonly reason: string) {
       super(`reviewer aborted: ${reason}`);
     }
   }
 
-  // Reviewers run within the parent agent's slot accounting via
-  // semaphore.runNested at the call site. The session spawn itself includes
-  // a last-chance pause check (beforeSpawnSession) that the runtime fires
-  // immediately before the underlying LLM session is instantiated — past
-  // every awaited setup step inside the runtime (provider registration,
-  // resource loading, etc.). This closes the TOCTOU window where a pause
-  // flipped during the setup chain.
-  let session: import("@mariozechner/pi-coding-agent").AgentSession;
-  try {
-    ({ session } = await createResolvedAgentSession({
+  const activeSessions = new Set<import("@mariozechner/pi-coding-agent").AgentSession>();
+  let reviewText = "";
+
+  const endSession = (session: import("@mariozechner/pi-coding-agent").AgentSession) => {
+    if (!activeSessions.delete(session)) {
+      return;
+    }
+    session.dispose();
+    options.onSessionEnded?.(session);
+  };
+
+  const buildPauseUnavailableResult = async (reason: string): Promise<ReviewResult> => {
+    reviewerLog.log(
+      `${taskId}: ${reviewType} review for Step ${stepNumber} aborted before spawn — ${reason} active`,
+    );
+    if (options.store && options.taskId) {
+      await options.store.logEntry(
+        options.taskId,
+        `${reviewType} review aborted before spawn — ${reason} active`,
+      ).catch(() => undefined);
+    }
+    return {
+      verdict: "UNAVAILABLE",
+      review: `${reason} active — reviewer not spawned. Stop calling fn_review_* and exit cleanly; the parent task will resume after unpause.`,
+      summary: `Skipped: ${reason}`,
+    };
+  };
+
+  const createReviewerSession = async (): Promise<import("@mariozechner/pi-coding-agent").AgentSession> => {
+    const { session } = await createResolvedAgentSession({
       sessionPurpose: "reviewer",
       runtimeHint: extractRuntimeHint(memoryAgent?.runtimeConfig),
       pluginRunner: options.pluginRunner,
@@ -526,7 +518,6 @@ export async function reviewStep(
       modelFallbackChain: validatorFallbackChain,
       routeViaDspy,
       defaultThinkingLevel: options.defaultThinkingLevel,
-      // Skill selection: use assigned agent skills if available, otherwise role fallback
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
       taskId: options.taskId,
       taskTitle: options.taskTitle,
@@ -543,8 +534,6 @@ export async function reviewStep(
         try {
           finalSettings = await options.store.getSettings();
         } catch {
-          // Treat a transient store failure as "not paused" — better to
-          // proceed than to block reviews on a flaky read.
           return;
         }
         if (finalSettings?.globalPause || finalSettings?.enginePaused) {
@@ -552,66 +541,163 @@ export async function reviewStep(
           throw new ReviewerPauseAbortError(reason);
         }
       },
-    }));
+    });
+
+    const reviewerModelDesc = describeModel(session);
+    const reviewerModelMarker = `Reviewer using model: ${reviewerModelDesc}`;
+    reviewerLog.log(`${taskId}: reviewer using model ${reviewerModelDesc}`);
+    if (options.store && options.taskId) {
+      await options.store.logEntry(options.taskId, reviewerModelMarker);
+      await options.store.appendAgentLog(options.taskId, reviewerModelMarker, "text", undefined, "reviewer").catch(() => undefined);
+    }
+
+    activeSessions.add(session);
+    options.onSessionCreated?.(session);
+    session.subscribe((event) => {
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        reviewText += event.assistantMessageEvent.delta;
+      }
+    });
+
+    return session;
+  };
+
+  const runReviewPrompt = async (
+    session: import("@mariozechner/pi-coding-agent").AgentSession,
+    prompt: string,
+  ): Promise<void> => {
+    await promptWithFallback(session, prompt);
+    checkSessionError(session);
+  };
+
+  let session: import("@mariozechner/pi-coding-agent").AgentSession;
+  try {
+    session = await createReviewerSession();
   } catch (err) {
     if (err instanceof ReviewerPauseAbortError) {
-      reviewerLog.log(
-        `${taskId}: ${reviewType} review for Step ${stepNumber} aborted before spawn — ${err.reason} active`,
-      );
-      if (options.store && options.taskId) {
-        await options.store.logEntry(
-          options.taskId,
-          `${reviewType} review aborted before spawn — ${err.reason} active`,
-        ).catch(() => undefined);
-      }
-      return {
-        verdict: "UNAVAILABLE",
-        review: `${err.reason} active — reviewer not spawned. Stop calling fn_review_* and exit cleanly; the parent task will resume after unpause.`,
-        summary: `Skipped: ${err.reason}`,
-      };
+      return buildPauseUnavailableResult(err.reason);
     }
     throw err;
   }
 
-  const reviewerModelDesc = describeModel(session);
-  const reviewerModelMarker = `Reviewer using model: ${reviewerModelDesc}`;
-  reviewerLog.log(`${taskId}: reviewer using model ${reviewerModelDesc}`);
-  if (options.store && options.taskId) {
-    await options.store.logEntry(options.taskId, reviewerModelMarker);
-    await options.store.appendAgentLog(options.taskId, reviewerModelMarker, "text", undefined, "reviewer").catch(() => undefined);
-  }
-
-  // Notify the caller so it can track this session in a per-task subagent map.
-  // If the parent task is later moved out of in-progress, paused, or the engine
-  // is globally paused, the caller will dispose this session — preventing the
-  // reviewer from outliving its parent task.
-  options.onSessionCreated?.(session);
-
-  let reviewText = "";
-
-  // Capture the reviewer's full text output (still needed for verdict extraction)
-  session.subscribe((event) => {
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      reviewText += event.assistantMessageEvent.delta;
-    }
-  });
-
   try {
-    await promptWithFallback(session, request);
+    try {
+      await runReviewPrompt(session, request);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (!isContextLimitError(errorMessage)) {
+        throw err;
+      }
 
-    // Re-raise errors that pi-coding-agent swallowed after exhausting retries.
-    // The caller (executor's createReviewStepTool) catches errors and returns
-    // UNAVAILABLE, so the thrown error will be handled there.
-    checkSessionError(session);
+      const retryLogMessage = reviewType === "code"
+        ? "code review hit context limit — retrying with compacted request"
+        : `${reviewType} review hit context limit — retrying with compacted request`;
+      reviewerLog.warn(`${taskId}: ${retryLogMessage}`);
+      if (options.store && options.taskId) {
+        await options.store.logEntry(options.taskId, retryLogMessage).catch(() => undefined);
+      }
+
+      reviewText = "";
+      const reducedRequest = buildReducedReviewRequest(
+        taskId, stepNumber, stepName, reviewType, promptContent, cwd, baseline,
+      );
+
+      try {
+        await runReviewPrompt(session, reducedRequest);
+      } catch (retryErr: unknown) {
+        if (!isReviewerSessionReuseError(retryErr)) {
+          throw retryErr;
+        }
+
+        endSession(session);
+        try {
+          session = await createReviewerSession();
+        } catch (recreateErr) {
+          if (recreateErr instanceof ReviewerPauseAbortError) {
+            return buildPauseUnavailableResult(recreateErr.reason);
+          }
+          throw recreateErr;
+        }
+        await runReviewPrompt(session, reducedRequest);
+      }
+    }
   } finally {
-    if (agentLogger) await agentLogger.flush();
-    session.dispose();
-    options.onSessionEnded?.(session);
+    if (agentLogger) {
+      await agentLogger.flush();
+    }
+    for (const activeSession of [...activeSessions]) {
+      endSession(activeSession);
+    }
   }
 
   const verdict = extractVerdict(reviewText);
   const summary = extractSummary(reviewText);
   return { verdict, review: reviewText, summary };
+}
+
+function isReviewerSessionReuseError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /prompt is in progress|session (?:is )?(?:closed|disposed|ended)|conversation already active/i.test(message);
+}
+
+function extractPromptSection(promptContent: string, sectionName: string): string {
+  const heading = `## ${sectionName}`;
+  const start = promptContent.indexOf(heading);
+  if (start === -1) {
+    return "";
+  }
+
+  const afterHeading = start + heading.length;
+  const nextH2 = promptContent.indexOf("\n## ", afterHeading);
+  const nextH1 = promptContent.indexOf("\n# ", afterHeading);
+  const endCandidates = [nextH2, nextH1].filter((value) => value !== -1);
+  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : promptContent.length;
+  return promptContent.slice(start, end).trim();
+}
+
+function summarizePromptSteps(promptContent: string): string {
+  const stepTitles = Array.from(promptContent.matchAll(/^### Step \d+:.*$/gm), (match) => match[0].trim());
+  if (stepTitles.length === 0) {
+    return "";
+  }
+
+  return ["## Steps", ...stepTitles].join("\n");
+}
+
+function buildReducedTaskPromptSummary(promptContent: string): string {
+  const firstSectionIndex = promptContent.indexOf("\n## ");
+  const header = (firstSectionIndex === -1 ? promptContent : promptContent.slice(0, firstSectionIndex)).trim();
+  const sections = [
+    header,
+    extractPromptSection(promptContent, "Mission"),
+    extractPromptSection(promptContent, "Dependencies"),
+    extractPromptSection(promptContent, "File Scope"),
+    summarizePromptSteps(promptContent),
+    "_... additional PROMPT.md sections omitted after context-limit retry ..._",
+  ].filter(Boolean);
+
+  return sections.join("\n\n").trim();
+}
+
+function buildReducedReviewRequest(
+  taskId: string,
+  stepNumber: number,
+  stepName: string,
+  reviewType: ReviewType,
+  promptContent: string,
+  cwd: string,
+  baseline?: string,
+): string {
+  return buildReviewRequest(
+    taskId,
+    stepNumber,
+    stepName,
+    reviewType,
+    buildReducedTaskPromptSummary(promptContent),
+    cwd,
+    baseline,
+    undefined,
+  );
 }
 
 function buildReviewRequest(

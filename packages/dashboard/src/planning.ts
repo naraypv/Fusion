@@ -16,6 +16,7 @@ import type {
   PlanningQuestion,
   PlanningSummary,
   PlanningResponse,
+  TaskPriority,
   TaskStore,
   NtfyNotificationEvent,
 } from "@fusion/core";
@@ -2213,6 +2214,7 @@ export function getSummary(sessionId: string): PlanningSummary | undefined {
 /**
  * Generate subtasks from a completed planning summary.
  * Uses the planning session's summary to create a SubtaskItem[] for multi-task creation.
+ * Always appends a final end-to-end verification subtask, regardless of deliverable count.
  *
  * @param sessionId - The planning session ID
  * @returns Array of SubtaskItem with titles derived from keyDeliverables, or fallback
@@ -2234,6 +2236,19 @@ function buildPlanningSubtaskDescription(input: {
   return `${input.taskGuidance}\n\n${contextSections.join("\n\n")}`;
 }
 
+export interface PlanningSubtaskDraft {
+  id: string;
+  title?: string;
+  description?: string;
+  suggestedSize?: "S" | "M" | "L";
+  priority?: TaskPriority;
+  dependsOn?: string[];
+}
+
+/**
+ * Generate planning subtasks from a completed planning summary.
+ * Always appends a final end-to-end verification subtask, regardless of deliverable count.
+ */
 export function generateSubtasksFromPlanning(sessionId: string): SubtaskItem[] {
   const session = sessions.get(sessionId);
   if (!session) return [];
@@ -2242,9 +2257,9 @@ export function generateSubtasksFromPlanning(sessionId: string): SubtaskItem[] {
   const { summary } = session;
   const qaSection = formatInterviewQA(session.history);
 
-  // If key deliverables exist, create one subtask per deliverable
+  // If key deliverables exist, create one subtask per deliverable plus a final verification subtask.
   if (summary.keyDeliverables.length > 0) {
-    return summary.keyDeliverables.map((deliverable, index) => {
+    const deliverableSubtasks = summary.keyDeliverables.map((deliverable, index) => {
       const id = `subtask-${index + 1}`;
       const dependsOn = index > 0 ? [`subtask-${index}`] : [] as string[];
       return {
@@ -2260,6 +2275,21 @@ export function generateSubtasksFromPlanning(sessionId: string): SubtaskItem[] {
         dependsOn,
       };
     });
+
+    deliverableSubtasks.push({
+      id: `subtask-${summary.keyDeliverables.length + 1}`,
+      title: "Verify end-to-end",
+      description: buildPlanningSubtaskDescription({
+        taskGuidance: "Verify the full plan end-to-end now that all deliverables are implemented. Exercise the integrated behavior described in the plan, confirm acceptance criteria hold, run the project test suite, and capture any follow-ups as new tasks rather than expanding scope.",
+        summaryDescription: summary.description,
+        qaSection,
+      }),
+      suggestedSize: "S",
+      priority: summary.priority ?? DEFAULT_TASK_PRIORITY,
+      dependsOn: [`subtask-${summary.keyDeliverables.length}`],
+    });
+
+    return deliverableSubtasks;
   }
 
   // Fallback: 3 subtasks
@@ -2292,7 +2322,7 @@ export function generateSubtasksFromPlanning(sessionId: string): SubtaskItem[] {
       id: "subtask-3",
       title: "Verify and polish",
       description: buildPlanningSubtaskDescription({
-        taskGuidance: "Verify the implementation end-to-end, then polish quality items like tests, docs, and edge-case handling.",
+        taskGuidance: "Verify the implementation end-to-end, then polish quality items like tests, docs, and edge-case handling before closing out the plan.",
         summaryDescription: summary.description,
         qaSection,
       }),
@@ -2301,6 +2331,51 @@ export function generateSubtasksFromPlanning(sessionId: string): SubtaskItem[] {
       dependsOn: ["subtask-2"],
     },
   ];
+}
+
+export function mergePlanningSubtaskDrafts(
+  sessionId: string,
+  drafts: PlanningSubtaskDraft[],
+): SubtaskItem[] {
+  const generatedSubtasks = generateSubtasksFromPlanning(sessionId);
+  const generatedById = new Map(generatedSubtasks.map((subtask) => [subtask.id, subtask]));
+
+  return drafts.map((draft) => {
+    const generated = generatedById.get(draft.id);
+    const normalizedDependsOn = Array.isArray(draft.dependsOn)
+      ? draft.dependsOn.filter((dependency): dependency is string => typeof dependency === "string")
+      : undefined;
+
+    if (!generated) {
+      const title = typeof draft.title === "string" ? draft.title.trim() : "";
+      if (!title) {
+        throw new Error(`Client-added subtask must have a title: ${draft.id}`);
+      }
+
+      const description = typeof draft.description === "string" ? draft.description : title;
+      return {
+        id: draft.id,
+        title,
+        description,
+        suggestedSize: draft.suggestedSize === "S" || draft.suggestedSize === "M" || draft.suggestedSize === "L"
+          ? draft.suggestedSize
+          : "M",
+        priority: draft.priority ?? DEFAULT_TASK_PRIORITY,
+        dependsOn: normalizedDependsOn ?? [],
+      };
+    }
+
+    return {
+      id: generated.id,
+      title: typeof draft.title === "string" ? draft.title : generated.title,
+      description: typeof draft.description === "string" ? draft.description : generated.description,
+      suggestedSize: draft.suggestedSize === "S" || draft.suggestedSize === "M" || draft.suggestedSize === "L"
+        ? draft.suggestedSize
+        : generated.suggestedSize,
+      priority: draft.priority ?? generated.priority ?? DEFAULT_TASK_PRIORITY,
+      dependsOn: normalizedDependsOn ?? generated.dependsOn,
+    };
+  });
 }
 
 /**

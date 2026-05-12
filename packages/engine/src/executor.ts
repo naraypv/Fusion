@@ -149,9 +149,154 @@ export function determineRevisionResetStart(
   }
   return firstCandidate;
 }
+
+export interface WorkflowRevisionFeedbackPartition {
+  inScopeFeedback: string;
+  outOfScopeFeedback: string;
+  inScopeSegments: string[];
+  outOfScopeSegments: string[];
+  detectedPaths: string[];
+}
+
 const WORKFLOW_SCRIPT_OUTPUT_MAX_CHARS = 4_000;
+const WORKFLOW_FEEDBACK_PATH_REGEX = /`([^`\n]+)`|(?<![A-Za-z0-9_.-])((?:\.\.?\/)?(?:@?[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?)/g;
+
+function normalizeWorkflowScopePath(pathValue: string): string {
+  return pathValue
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\/+/g, "/")
+    .replace(/\/$/, "");
+}
+
+function stripTrailingPathPunctuation(pathValue: string): string {
+  return pathValue.replace(/[),.:;!?]+$/g, "");
+}
+
+export function extractReferencedPathsFromWorkflowFeedback(feedback: string): string[] {
+  const extracted: string[] = [];
+  const seen = new Set<string>();
+  for (const match of feedback.matchAll(WORKFLOW_FEEDBACK_PATH_REGEX)) {
+    const candidate = stripTrailingPathPunctuation(match[1] ?? match[2] ?? "");
+    const normalized = normalizeWorkflowScopePath(candidate);
+    if (!normalized.includes("/") || !normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    extracted.push(normalized);
+  }
+  return extracted;
+}
+
+export function workflowPathMatchesDeclaredScope(filePath: string, scopePatterns: readonly string[]): boolean {
+  const normalizedPath = normalizeWorkflowScopePath(filePath);
+  for (const rawPattern of scopePatterns) {
+    const pattern = normalizeWorkflowScopePath(rawPattern);
+    if (!pattern) continue;
+    if (/\/\*+$/.test(pattern)) {
+      const directory = pattern.replace(/\/\*+$/, "");
+      if (normalizedPath === directory || normalizedPath.startsWith(`${directory}/`)) return true;
+      continue;
+    }
+    if (pattern.endsWith("/")) {
+      if (normalizedPath.startsWith(pattern)) return true;
+      continue;
+    }
+    if (normalizedPath === pattern) return true;
+  }
+  return false;
+}
+
+export function partitionWorkflowRevisionFeedback(
+  feedback: string,
+  declaredFileScope: readonly string[],
+): WorkflowRevisionFeedbackPartition {
+  const trimmedFeedback = feedback.trim();
+  if (!trimmedFeedback || declaredFileScope.length === 0) {
+    return {
+      inScopeFeedback: trimmedFeedback,
+      outOfScopeFeedback: "",
+      inScopeSegments: trimmedFeedback ? [trimmedFeedback] : [],
+      outOfScopeSegments: [],
+      detectedPaths: extractReferencedPathsFromWorkflowFeedback(trimmedFeedback),
+    };
+  }
+
+  const segments = trimmedFeedback.split(/\n\s*\n/).map((segment) => segment.trim()).filter(Boolean);
+  const allDetectedPaths = extractReferencedPathsFromWorkflowFeedback(trimmedFeedback);
+  if (allDetectedPaths.length === 0) {
+    return {
+      inScopeFeedback: trimmedFeedback,
+      outOfScopeFeedback: "",
+      inScopeSegments: trimmedFeedback ? [trimmedFeedback] : [],
+      outOfScopeSegments: [],
+      detectedPaths: [],
+    };
+  }
+
+  const inScopeSegments: string[] = [];
+  const outOfScopeSegments: string[] = [];
+  for (const segment of segments) {
+    const segmentPaths = extractReferencedPathsFromWorkflowFeedback(segment);
+    if (segmentPaths.length === 0) {
+      inScopeSegments.push(segment);
+      continue;
+    }
+
+    const hasOutOfScopePath = segmentPaths.some((path) => !workflowPathMatchesDeclaredScope(path, declaredFileScope));
+    if (hasOutOfScopePath) {
+      outOfScopeSegments.push(segment);
+    } else {
+      inScopeSegments.push(segment);
+    }
+  }
+
+  return {
+    inScopeFeedback: inScopeSegments.join("\n\n"),
+    outOfScopeFeedback: outOfScopeSegments.join("\n\n"),
+    inScopeSegments,
+    outOfScopeSegments,
+    detectedPaths: allDetectedPaths,
+  };
+}
 
 class NonRetryableWorktreeError extends Error {}
+
+const SESSION_WORKTREE_PATH_REGEX = /([A-Za-z]:)?[^"'\s]*\.worktrees[\\/][^"'\s]+/g;
+
+function normalizeWorktreePath(pathValue: string): string {
+  return resolvePath(pathValue).replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+async function extractPersistedSessionWorktreePath(sessionFile: string): Promise<string | null> {
+  try {
+    const content = await readFile(sessionFile, "utf-8");
+    const matches = content.match(SESSION_WORKTREE_PATH_REGEX) ?? [];
+    if (matches.length === 0) return null;
+
+    const normalizedCounts = new Map<string, number>();
+    for (const match of matches) {
+      const normalized = normalizeWorktreePath(match);
+      normalizedCounts.set(normalized, (normalizedCounts.get(normalized) ?? 0) + 1);
+    }
+
+    let best: { path: string; count: number } | null = null;
+    for (const [path, count] of normalizedCounts.entries()) {
+      if (!best || count > best.count) best = { path, count };
+    }
+    return best?.path ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isSessionWorktreeCompatible(
+  persistedWorktreePath: string | null,
+  currentWorktreePath: string,
+): boolean {
+  if (!persistedWorktreePath) return true;
+  return persistedWorktreePath === normalizeWorktreePath(currentWorktreePath);
+}
 
 function truncateWorkflowScriptOutput(output: string): string {
   if (output.length <= WORKFLOW_SCRIPT_OUTPUT_MAX_CHARS) return output;
@@ -2864,17 +3009,20 @@ export class TaskExecutor {
               if (!workflowResult.allPassed) {
                 // Check if revision was requested
                 if (workflowResult.revisionRequested) {
-                  await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName);
+                  const rerunScheduled = await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName, settings);
+                  if (rerunScheduled) {
+                    return;
+                  }
+                } else {
+                  // Try to fix workflow step failures with retries
+                  const retried = await this.handleWorkflowStepFailure(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown");
+                  if (retried) {
+                    return; // Retry scheduled
+                  }
+                  // Retries exhausted - send back to in-progress for remediation
+                  await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed");
                   return;
                 }
-                // Try to fix workflow step failures with retries
-                const retried = await this.handleWorkflowStepFailure(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown");
-                if (retried) {
-                  return; // Retry scheduled
-                }
-                // Retries exhausted - send back to in-progress for remediation
-                await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed");
-                return;
               }
             } else {
               executorLog.log(`${task.id}: fast mode — skipping pre-merge workflow steps`);
@@ -3187,8 +3335,26 @@ export class TaskExecutor {
 
         // Determine whether we're resuming a previous session (pause/resume)
         // or starting fresh. Use file-based sessions so conversation state
-        // persists across pause/unpause cycles.
-        const isResuming = !!task.sessionFile && existsSync(task.sessionFile);
+        // persists across pause/unpause cycles. Resume is allowed only when
+        // persisted session metadata still matches the task's live worktree.
+        let isResuming = !!task.sessionFile && existsSync(task.sessionFile);
+        if (isResuming) {
+          const persistedWorktreePath = await extractPersistedSessionWorktreePath(task.sessionFile!);
+          if (!isSessionWorktreeCompatible(persistedWorktreePath, worktreePath)) {
+            executorLog.warn(
+              `${task.id}: stale sessionFile worktree mismatch (session=${persistedWorktreePath}, task=${worktreePath}); starting fresh session`,
+            );
+            await this.store.logEntry(
+              task.id,
+              `Detected stale persisted session metadata (worktree mismatch: ${persistedWorktreePath} vs ${worktreePath}) — discarded resume state and started fresh session`,
+              undefined,
+              this.currentRunContext,
+            );
+            await this.store.updateTask(task.id, { sessionFile: null });
+            isResuming = false;
+          }
+        }
+
         const sessionManager = isResuming
           ? SessionManager.open(task.sessionFile!)
           : SessionManager.create(worktreePath);
@@ -3486,17 +3652,20 @@ export class TaskExecutor {
               if (!workflowResult.allPassed) {
                 // Check if revision was requested
                 if (workflowResult.revisionRequested) {
-                  await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName);
+                  const rerunScheduled = await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName, settings);
+                  if (rerunScheduled) {
+                    return;
+                  }
+                } else {
+                  // Try to fix workflow step failures with retries
+                  const retried = await this.handleWorkflowStepFailure(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown");
+                  if (retried) {
+                    return; // Retry scheduled
+                  }
+                  // Retries exhausted - send back to in-progress for remediation
+                  await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed");
                   return;
                 }
-                // Try to fix workflow step failures with retries
-                const retried = await this.handleWorkflowStepFailure(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown");
-                if (retried) {
-                  return; // Retry scheduled
-                }
-                // Retries exhausted - send back to in-progress for remediation
-                await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed");
-                return;
               }
             } else {
               executorLog.log(`${task.id}: fast mode — skipping pre-merge workflow steps`);
@@ -3677,11 +3846,14 @@ export class TaskExecutor {
                 }
                 if (!workflowResult.allPassed) {
                   if (workflowResult.revisionRequested) {
-                    await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName);
+                    const rerunScheduled = await this.handleWorkflowRevisionRequest(task, worktreePath, workflowResult.feedback, workflowResult.stepName, settings);
+                    if (rerunScheduled) {
+                      return;
+                    }
+                  } else {
+                    await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed on retry");
                     return;
                   }
-                  await this.sendTaskBackForFix(task, worktreePath, workflowResult.feedback, workflowResult.stepName || "Unknown", "Workflow step failed on retry");
-                  return;
                 }
               } else {
                 executorLog.log(`${task.id}: fast mode — skipping pre-merge workflow steps`);
@@ -4385,9 +4557,22 @@ export class TaskExecutor {
             await store.updateStep(taskId, i, "done");
           }
         }
-        // Save summary if provided
-        if (params.summary) {
-          await store.updateTask(taskId, { summary: params.summary });
+        // FN-4106: preserve the original completion summary on workflow-step reruns.
+        const newSummary = params.summary?.trim();
+        if (newSummary) {
+          const currentTask = await store.getTask(taskId);
+          const existingSummary = currentTask.summary?.trim();
+          const hasRunWorkflowSteps = (currentTask.workflowStepResults?.length ?? 0) > 0;
+          const rerunSuffix = `---\nRerun after workflow step revision:\n${newSummary}`;
+
+          if (existingSummary && hasRunWorkflowSteps && !existingSummary.endsWith(rerunSuffix)) {
+            await store.updateTask(taskId, {
+              summary: `${currentTask.summary}\n\n${rerunSuffix}`,
+            });
+            await store.logEntry(taskId, "fn_task_done summary appended to existing summary (workflow-step rerun)");
+          } else if (!existingSummary || !hasRunWorkflowSteps) {
+            await store.updateTask(taskId, { summary: params.summary });
+          }
         }
         const settings = await store.getSettings();
         const hardPauseActive = Boolean(task.paused || settings.globalPause);
@@ -4728,9 +4913,39 @@ export class TaskExecutor {
     worktreePath: string,
     feedback: string,
     stepName: string,
-  ): Promise<void> {
+    settings: Settings,
+  ): Promise<boolean> {
     executorLog.log(`${task.id}: workflow revision requested by step "${stepName}"`);
     this.clearCompletedTaskWatchdog(task.id);
+
+    const shouldForkOnScopeMismatch = settings.workflowRevisionForkOnScopeMismatch !== false;
+    let inScopeFeedback = feedback.trim();
+    let outOfScopeFeedback = "";
+    let followUpTaskId: string | undefined;
+
+    if (shouldForkOnScopeMismatch) {
+      const declaredFileScope = await this.store.parseFileScopeFromPrompt(task.id).catch(() => [] as string[]);
+      const partition = partitionWorkflowRevisionFeedback(feedback, declaredFileScope);
+      inScopeFeedback = partition.inScopeFeedback;
+      outOfScopeFeedback = partition.outOfScopeFeedback;
+
+      if (outOfScopeFeedback) {
+        const followUpTask = await this.createWorkflowRevisionFollowUpTask(task, stepName, outOfScopeFeedback);
+        followUpTaskId = followUpTask.id;
+      }
+    }
+
+    if (!inScopeFeedback) {
+      await this.store.logEntry(
+        task.id,
+        followUpTaskId
+          ? `Workflow step "${stepName}" requested revision — feedback forked to follow-up ${followUpTaskId}; original task left unchanged`
+          : `Workflow step "${stepName}" requested revision — no in-scope feedback detected`,
+        outOfScopeFeedback || feedback,
+        this.currentRunContext,
+      );
+      return false;
+    }
 
     const updatedTask = await this.store.getTask(task.id);
     const reopen = await this.reopenLastStepForRevision(task.id, updatedTask);
@@ -4738,28 +4953,59 @@ export class TaskExecutor {
       ? `re-opening Step ${reopen.index + 1} ("${reopen.name}") for in-place fix`
       : "no step to re-open (none were completed)";
 
-    await this.store.logEntry(
-      task.id,
-      `Workflow step "${stepName}" requested revision — ${reopenSummary}`,
-      feedback,
-    );
+    const logMessage = followUpTaskId
+      ? `Workflow step "${stepName}" requested revision — split feedback: appended in-scope guidance and forked out-of-scope work to ${followUpTaskId}; ${reopenSummary}`
+      : `Workflow step "${stepName}" requested revision — feedback appended to original task; ${reopenSummary}`;
+    await this.store.logEntry(task.id, logMessage, inScopeFeedback, this.currentRunContext);
 
-    await this.injectWorkflowRevisionInstructions(task, feedback);
+    await this.injectWorkflowRevisionInstructions(task, inScopeFeedback);
 
     await this.store.updateTask(task.id, {
       status: null,
       sessionFile: null,
     });
 
-    // 4. Schedule fresh execution after guard unwinds
-    // This prevents the race condition where the scheduler re-dispatches
-    // while the old execution guard is still set.
     executorLog.log(`${task.id}: scheduling fresh execution after revision request`);
     this.scheduleWorkflowRerun(
       task.id,
       worktreePath,
       `${task.id}: revision rerun scheduled — moved to todo then in-progress`,
     );
+    return true;
+  }
+
+  private async createWorkflowRevisionFollowUpTask(
+    task: Task,
+    stepName: string,
+    feedback: string,
+  ): Promise<Task> {
+    const title = `${task.id}: workflow follow-up from ${stepName}`;
+    const description = [
+      `Follow-up work forked from workflow revision feedback on ${task.id}.`,
+      "",
+      `Original task: ${task.id}${task.title ? ` — ${task.title}` : ""}`,
+      `Workflow step: ${stepName}`,
+      "",
+      "This feedback referenced files outside the original task's declared File Scope, so it was forked into a follow-up task instead of mutating the original PROMPT.md.",
+      "",
+      "## Out-of-Scope Workflow Revision Feedback",
+      "",
+      feedback,
+    ].join("\n");
+
+    return this.store.createTask({
+      title,
+      description,
+      dependencies: [task.id],
+      source: {
+        sourceType: "workflow_step",
+        sourceParentTaskId: task.id,
+        sourceMetadata: {
+          workflowStepName: stepName,
+          routing: "scope-mismatch-fork",
+        },
+      },
+    });
   }
 
   /**

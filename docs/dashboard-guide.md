@@ -302,6 +302,9 @@ Features:
 - Switch between **List**, **Board**, and **Org chart** layouts
 - Filter by role/state, include/exclude system agents, and inspect health/status
 - Start, pause, stop, and trigger agent runs from the view and from detail panels
+- In **Agent detail**, use the kebab **Bulk agent actions** button in the header utility cluster (next to **Refresh** and **Close**) to run project-wide lifecycle transitions for non-ephemeral agents in the current project — **Pause All Agents** targets agents in the `active` or `running` state, while **Resume All Agents** targets agents in the `paused` state only
+- Bulk menu items stay disabled when nothing is eligible and show an inline hint (`Loading eligible agents...`, `No active agents eligible`, `No paused agents eligible`, or the current eligible count such as `Pause 2 active/running agents`)
+- Bulk lifecycle flow: open **Bulk agent actions**, review the eligibility hint, confirm the modal, then use the success or partial-failure toast to verify paused/resumed counts plus skipped/failed agents
 - Open agent detail tabs for runs, logs, read-only mail (agent inbox/outbox), settings/config, tasks, memory, and chain-of-command relationships
 - Error indicator on agent list cards when an agent is in the `error` state and has a captured error (`lastError`); select it to open **Agent Error Details**
 - Run-level error indicator in **Agent detail → Runs** when a run has captured stderr; select it to open the same **Agent Error Details** modal
@@ -427,7 +430,7 @@ Inspect task definition, logs, review feedback, comments, documents, workflow ou
 - The priority chip in task metadata is an inline picker: you can change priority directly without entering full edit mode.
 - Execution mode has a read-mode inline lightning-bolt toggle for Fast mode on/off without opening the full edit form.
 - These two metadata controls share matched sizing/alignment in read mode (including mobile wrapping) so they behave like a single polished control group.
-- Task metadata also shows compact `Created` / `Updated` timestamps: recent values render as relative time (`just now`, `Xm`, `Xh`, `Xd`) and older values switch to short month/day dates; on desktop these stay grouped on one row, with a mobile-stacked layout for readability.
+- Task metadata also shows compact `Created` / `Updated` timestamps: recent values render as relative time (`just now`, `Xm`, `Xh`, `Xd`) and older values switch to short month/day dates; these stay grouped on one row across desktop and mobile widths for a compact metadata layout.
 - Eligible existing tasks (triage, todo, in-progress, in-review) expose a **GitHub tracking** section directly in Task Detail, even when tracking is currently disabled.
 - The GitHub tracking section now defaults to a compact summary row; use the disclosure arrow to expand linked-issue details plus tracking edit controls.
 - In shared task edit/create forms, GitHub Tracking appears at the bottom of **More options**, after **Workflow Steps**.

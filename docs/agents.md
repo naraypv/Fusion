@@ -286,7 +286,8 @@ The agents surface provides:
 - Agent import can also be launched from the selected **Agent Detail** header; this entry opens the import modal directly in the companies.sh browse flow so operators can discover and import packages without leaving the detail context
 - Detail/config panels
 - Agent Detail includes a **Mail** tab for inspecting that agent’s inbox/outbox; selecting a message opens full details, and selecting an unread inbox message marks it read
-- Split-view synchronization: successful saves and lifecycle actions from the right-side Agent Detail pane immediately refresh the left-side list/selection state (no wait for background polling)
+- Agent Detail header utility actions now include a project-scoped **Bulk agent actions** menu for pause/resume lifecycle transitions; see [Agent Detail bulk lifecycle actions](#agent-detail-bulk-lifecycle-actions)
+- Split-view synchronization: successful saves plus single-agent and bulk lifecycle actions from the right-side Agent Detail pane immediately refresh the left-side list/selection state (no wait for background polling)
 - A per-agent **Token Usage** panel that summarizes cumulative token consumption for the currently displayed agents
 - Run history
 - Task assignment context
@@ -316,6 +317,36 @@ For the current filtered/visible agent set, the panel shows:
 - Per-agent rows sorted by descending combined token usage
 
 If either token field is missing for an agent, the dashboard treats it as `0` so the panel stays stable and never crashes on partial/migrating data.
+
+### Agent Detail bulk lifecycle actions
+
+The **Agent Detail** header includes a kebab-menu button in the utility actions cluster (`Bulk agent actions`), beside refresh/close controls. This menu runs **project-scoped** lifecycle changes from the detail view: it fetches agents for the current project and then calls the same per-agent lifecycle API (`POST /api/agents/:id/state`) used by the single-agent header buttons.
+
+Current bulk transitions are intentionally limited to the two shipped actions:
+
+- **Pause All Agents** — targets only **non-ephemeral** agents currently in `active` or `running` state
+- **Resume All Agents** — targets only **non-ephemeral** agents currently in `paused` state
+
+Eligibility and UI behavior:
+
+- Ephemeral/system agents are excluded entirely from bulk lifecycle actions
+- Agents already outside the target lifecycle state are skipped rather than force-transitioned
+- Each menu item shows a live eligibility hint after opening the menu, such as `Pause 2 active/running agents` or `Resume 1 paused agent`
+- If no agents are currently eligible, the corresponding menu item is disabled and its hint changes to `No active agents eligible` or `No paused agents eligible`
+- While eligibility is loading, the hint reads `Loading eligible agents...`
+
+Operator flow and outcomes:
+
+1. Open **Bulk agent actions** from any Agent Detail header
+2. Review the eligibility hint for the desired action
+3. Confirm the project-wide action in the confirmation dialog (`Pause/Resume N agents in this project?`)
+4. Expect toast feedback after execution plus an Agent Detail refresh/split-view sync
+
+Toast/reporting behavior mirrors the shipped implementation:
+
+- Full success reports a success toast such as `Paused 2 agents; skipped 1`
+- Partial failure reports an error toast summarizing successes, skipped agents, and failed agents (including up to three per-agent failure details)
+- If no agents are eligible at execution time, the dashboard reports `No agents eligible to pause` or `No agents eligible to resume`
 
 ### Agent Deletion Controls
 
@@ -730,6 +761,8 @@ The shipped default `HEARTBEAT_PROCEDURE` (in `packages/engine/src/agent-heartbe
 
 When the bound task is `executor-class` or `blocked`, the default procedure directs the run to pivot toward coordination levers (in-progress risk scan, stale in-review queue, idle direct reports, strategic memory themes) rather than trying to advance implementation from heartbeat. When the task is `coordination-class`, the heartbeat can engage directly with the bound task.
 
+The manager-facing reports health block in that prompt is populated from `AgentStore.getAgentsByReportsTo(agent.id)`. Engine code must call that store method with its `AgentStore` instance binding intact because some implementations resolve direct reports through `this.listAgents()`. If the section disappears unexpectedly, look for logs like `Failed to load reports ... Cannot read properties of undefined (reading 'listAgents')`, which indicate an unbound method call regressed.
+
 This behavior is inherited by new non-ephemeral agents because agent creation seeds a per-agent `HEARTBEAT.md` file from the built-in default. If an agent sets `heartbeatProcedurePath`, that markdown file fully replaces the built-in default at runtime.
 
 For pre-existing agents, use `POST /api/agents/:id/upgrade-heartbeat-procedure` (also exposed as **Upgrade to Default Heartbeat Procedure** in the agent detail Config tab) to re-seed from the current built-in constant. When the built-in default changes, running this upgrade propagates the new default to existing agents; direct operator edits to an agent’s existing procedure file are preserved unless this upgrade is run (the upgrade overwrites the per-agent file).
@@ -884,6 +917,7 @@ Create a new task and assign it to a specific agent for execution. The task goes
 - `"ERROR: Agent {agent_id} not found"`
 - `"ERROR: Cannot delegate to ephemeral/runtime agent {agent_id}"`
 - `"ERROR: Agent {agent_id} has role \"...\"; implementation task <new> requires an \"executor\"-role agent by default, with durable \"engineer\" supported only for explicit routing. Pass override=true to bypass."`
+- `"ERROR: Task ID already exists: {id}"` (allocator collision; request fails without mutating the existing task)
 
 ### `agent_create`
 

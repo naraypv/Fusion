@@ -457,7 +457,7 @@ describe("AgentsView", () => {
       });
     });
 
-    it("keeps New Agent directly accessible while controls live in popup", async () => {
+    it("keeps New Agent directly accessible on desktop while controls live in popup", async () => {
       render(<AgentsView addToast={mockAddToast} />);
 
       expect(screen.getByRole("button", { name: "New Agent" })).toBeTruthy();
@@ -466,9 +466,21 @@ describe("AgentsView", () => {
       await openControlsPanel();
       expect(screen.getByLabelText("Filter agents by state")).toBeTruthy();
       expect(screen.getByLabelText("Show system agents")).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Import" })).toBeTruthy();
+      expect(screen.getAllByRole("button", { name: "Import" }).length).toBeGreaterThan(0);
       expect(screen.getByRole("slider", { name: "Heartbeat Speed" })).toBeTruthy();
       expect(screen.getByLabelText("Heartbeat speed preset")).toBeTruthy();
+    });
+
+    it("moves import and new-agent actions into the controls popup on mobile", async () => {
+      mockViewportMode.mockReturnValue("mobile");
+      render(<AgentsView addToast={mockAddToast} />);
+
+      expect(screen.queryByRole("button", { name: "Import" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "New Agent" })).toBeNull();
+
+      await openControlsPanel();
+      expect(screen.getByRole("button", { name: "Import" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "New Agent" })).toBeTruthy();
     });
 
     it("closes controls popup on Escape and outside click", async () => {
@@ -651,18 +663,36 @@ describe("AgentsView", () => {
       expect(screen.getAllByText("Details").length).toBeGreaterThanOrEqual(4);
     });
 
-    it("keeps a visible icon affordance on View Details buttons when labels are compacted", async () => {
-      render(<AgentsView addToast={mockAddToast} />);
+    it("keeps a visible icon affordance on split-sidebar action buttons when labels are compacted", async () => {
+      const { container } = render(<AgentsView addToast={mockAddToast} />);
 
-      const detailsButton = await screen.findByRole("button", { name: "View details for Test Agent 1" });
+      const sidebarCard = await waitFor(() => {
+        const card = container.querySelector(".agents-split-sidebar .agent-card");
+        expect(card).toBeTruthy();
+        return card as HTMLElement;
+      });
+      const actions = sidebarCard.querySelector(".agent-card-actions");
+      const primaryGroup = sidebarCard.querySelector(".agent-card-actions-group--primary");
+      const secondaryGroup = sidebarCard.querySelector(".agent-card-actions-group--secondary");
+      const detailsButton = within(sidebarCard).getByRole("button", { name: "View details for Test Agent 1" });
+
+      expect(actions).toBeTruthy();
+      expect(primaryGroup).toBeTruthy();
+      expect(secondaryGroup).toBeTruthy();
+      expect(primaryGroup?.querySelector("button")).toBeTruthy();
+      expect(secondaryGroup?.contains(detailsButton)).toBe(true);
       expect(detailsButton.querySelector("svg")).toBeTruthy();
+      expect(sidebarCard.querySelectorAll(".agent-card-action-label").length).toBeGreaterThan(0);
     });
 
-    it("hides split-sidebar action labels only within an agent-card-actions container query", () => {
+    it("uses a grid-and-wrap containment contract for split-sidebar action rows", () => {
       const css = loadAllAppCss();
 
+      expect(css).toMatch(/\.agent-card-actions\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*\}/);
+      expect(css).toMatch(/\.agent-card-actions-group\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;[^}]*min-width:\s*0;[^}]*\}/);
       expect(css).not.toContain(".agents-split-sidebar .agent-card-actions .agent-card-action-label {\n  display: none;\n}");
       expect(css).toContain("@container agent-card-actions (max-width: calc(var(--space-2xl) * 9))");
+      expect(css).toContain(".agents-split-sidebar .agent-card-actions {\n    grid-template-columns: minmax(0, 1fr);\n  }");
       expect(css).toContain(".agents-split-sidebar .agent-card-actions .agent-card-action-label {\n    display: none;\n  }");
     });
 
@@ -1377,6 +1407,18 @@ describe("AgentsView", () => {
       expect(css).toContain("left: var(--org-chart-first-child-center-offset)");
       expect(css).toContain("right: var(--org-chart-last-child-center-offset)");
       expect(css).toContain(".org-chart-children > .org-chart-node::before");
+    });
+
+    it("keeps a compact mobile Agents label visible, anchors the controls popup to the action row, and expands view toggles to 36px touch targets", () => {
+      const css = loadAllAppCss();
+      expect(css).toContain(".agents-view-primary-actions {\n  position: relative;");
+      expect(css).toContain(".agent-controls-panel {\n  position: absolute;\n  top: calc(100% + var(--space-sm));\n  right: 0;");
+      expect(css).toContain(".agents-view-title h2 {\n    display: block;\n    font-size: var(--space-md);");
+      expect(css).toContain(".agent-controls-mobile-actions {");
+      expect(css).toContain(".agent-controls-mobile-actions .btn {");
+      expect(css).toContain(".agents-view-controls .view-toggle .view-toggle-btn {");
+      expect(css).toContain("min-width: calc(var(--space-lg) * 2 + var(--space-xs));");
+      expect(css).toContain("min-height: calc(var(--space-lg) * 2 + var(--space-xs));");
     });
 
     it("switches org chart to vertical layout mode when estimated width exceeds viewport", async () => {

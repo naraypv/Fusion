@@ -8,6 +8,7 @@ import {
   validateNodeOverrideChange,
   type Task,
   type InsightCategory,
+  type TaskPriority,
   type InsightStatus,
   type InsightRunStatus,
   type InsightRunTrigger,
@@ -19,6 +20,7 @@ import {
   canAgentTakeImplementationTaskForExplicitRouting,
   formatRoleMismatchReason,
   resolveAgentProvisioningPolicy,
+  TASK_PRIORITIES,
 } from "@fusion/core";
 import {
   getGhErrorMessage,
@@ -406,6 +408,9 @@ export default function kbExtension(pi: ExtensionAPI) {
           description: "Agent ID to assign this task to (e.g. 'agent-abc123')",
         }),
       ),
+      priority: Type.Optional(
+        StringEnum([...TASK_PRIORITIES], { description: "Task priority (low, normal, high, urgent)" }) as unknown as TSchema,
+      ),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -425,41 +430,55 @@ export default function kbExtension(pi: ExtensionAPI) {
         }
       }
 
-      const task = await store.createTask({
-        description: params.description.trim(),
-        dependencies: params.depends,
-        assignedAgentId: normalizedAgentId === null ? undefined : normalizedAgentId,
-        source: { sourceType: "api" },
-      });
+      try {
+        const task = await store.createTask({
+          description: params.description.trim(),
+          dependencies: params.depends,
+          assignedAgentId: normalizedAgentId === null ? undefined : normalizedAgentId,
+          priority: params.priority as TaskPriority | undefined,
+          source: { sourceType: "api" },
+        });
 
-      const label =
-        task.description.length > 80
-          ? task.description.slice(0, 80) + "…"
-          : task.description;
+        const label =
+          task.description.length > 80
+            ? task.description.slice(0, 80) + "…"
+            : task.description;
 
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Created ${task.id}: ${label}\n` +
-              `Column: triage\n` +
-              (task.dependencies.length
-                ? `Dependencies: ${task.dependencies.join(", ")}\n`
-                : "") +
-              (task.assignedAgentId
-                ? `Assigned to: ${task.assignedAgentId}\n`
-                : "") +
-              `Path: .fusion/tasks/${task.id}/`,
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Created ${task.id}: ${label}\n` +
+                `Column: triage\n` +
+                (task.dependencies.length
+                  ? `Dependencies: ${task.dependencies.join(", ")}\n`
+                  : "") +
+                (task.assignedAgentId
+                  ? `Assigned to: ${task.assignedAgentId}\n`
+                  : "") +
+                `Priority: ${task.priority}\n` +
+                `Path: .fusion/tasks/${task.id}/`,
+            },
+          ],
+          details: {
+            taskId: task.id,
+            column: task.column,
+            dependencies: task.dependencies,
+            assignedAgentId: task.assignedAgentId,
+            priority: task.priority,
           },
-        ],
-        details: {
-          taskId: task.id,
-          column: task.column,
-          dependencies: task.dependencies,
-          assignedAgentId: task.assignedAgentId,
-        },
-      };
+        };
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Task ID already exists:")) {
+          return {
+            content: [{ type: "text", text: `ERROR: ${error.message}` }],
+            isError: true,
+            details: { error: error.message },
+          };
+        }
+        throw error;
+      }
     },
   });
 
@@ -865,11 +884,15 @@ export default function kbExtension(pi: ExtensionAPI) {
       
       // In-review retry: distinguish between execution failures and merge failures.
       if (task.column === 'in-review') {
-        const hasIncompleteSteps =
-          task.steps.length > 0 &&
-          task.steps.some((s: { status: string }) => s.status === "pending" || s.status === "in-progress");
+        const hasIncompleteSteps = task.steps.some(
+          (s: { status: string }) => s.status === "pending" || s.status === "in-progress",
+        );
+        // FN-4130 / PR #59 follow-up: zero-step review failures with no merge attempts
+        // (`mergeRetries ?? 0 === 0`) failed during execution, not merge finalization.
+        const isExecutionFailureInReview =
+          hasIncompleteSteps || (task.steps.length === 0 && (task.mergeRetries ?? 0) === 0);
 
-        if (hasIncompleteSteps) {
+        if (isExecutionFailureInReview) {
           await store.updateTask(params.id, { status: null, error: null, stuckKillCount: 0 });
           await store.logEntry(params.id, "Retry requested via Fusion extension (execution failure in-review → todo, preserving progress)");
           await store.moveTask(params.id, "todo", { preserveProgress: true });
@@ -2763,28 +2786,39 @@ export default function kbExtension(pi: ExtensionAPI) {
       await agentStore.init();
       const agent = await agentStore.getAgent(params.agent_id);
 
-      // Create task assigned to the target agent
-      const store = await getStore(ctx.cwd);
-      const task = await store.createTask({
-        description: params.description,
-        dependencies: params.dependencies,
-        column: "todo",
-        assignedAgentId: params.agent_id,
-        source: {
-          sourceType: "api",
-          ...(params.override === true ? { sourceMetadata: { executorRoleOverride: true } } : {}),
-        },
-      });
+      try {
+        // Create task assigned to the target agent
+        const store = await getStore(ctx.cwd);
+        const task = await store.createTask({
+          description: params.description,
+          dependencies: params.dependencies,
+          column: "todo",
+          assignedAgentId: params.agent_id,
+          source: {
+            sourceType: "api",
+            ...(params.override === true ? { sourceMetadata: { executorRoleOverride: true } } : {}),
+          },
+        });
 
-      const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Delegated to ${agent!.name} (${agent!.id}): Created ${task.id}${deps}. ` +
-            `The task will be picked up by ${agent!.name} on their next heartbeat cycle.`,
-        }],
-        details: { taskId: task.id, agentId: agent!.id, agentName: agent!.name },
-      };
+        const deps = task.dependencies.length ? ` (depends on: ${task.dependencies.join(", ")})` : "";
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Delegated to ${agent!.name} (${agent!.id}): Created ${task.id}${deps}. ` +
+              `The task will be picked up by ${agent!.name} on their next heartbeat cycle.`,
+          }],
+          details: { taskId: task.id, agentId: agent!.id, agentName: agent!.name },
+        };
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Task ID already exists:")) {
+          return {
+            content: [{ type: "text", text: `ERROR: ${error.message}` }],
+            isError: true,
+            details: { error: error.message },
+          };
+        }
+        throw error;
+      }
     },
   });
 

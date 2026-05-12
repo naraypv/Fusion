@@ -170,6 +170,23 @@ export function normalizeMergeConflictStrategy(
       return value;
   }
 }
+
+export const MERGE_STRATEGY_OVERLAP_BEHAVIORS = [
+  "flip-to-prefer-branch",
+  "warn-only",
+  "ignore",
+] as const;
+
+export type MergeStrategyOverlapBehavior = (typeof MERGE_STRATEGY_OVERLAP_BEHAVIORS)[number];
+
+export function normalizeMergeStrategyOverlapBehavior(
+  value: unknown,
+): MergeStrategyOverlapBehavior {
+  return typeof value === "string"
+    && (MERGE_STRATEGY_OVERLAP_BEHAVIORS as readonly string[]).includes(value)
+    ? value as MergeStrategyOverlapBehavior
+    : "flip-to-prefer-branch";
+}
 /** Policy for handling task execution when the selected node is unavailable/unhealthy. */
 export type UnavailableNodePolicy = "block" | "fallback-local";
 
@@ -1621,6 +1638,10 @@ export interface GlobalSettings {
    *  Must be an http:// or https:// URL. When omitted, notifications default to
    *  https://ntfy.sh. Example: "https://ntfy.internal.example" */
   ntfyBaseUrl?: string;
+  /** Optional ntfy access token used for authenticated publishes.
+   *  When set, Fusion sends `Authorization: Bearer <token>` with ntfy requests.
+   *  Leave undefined to publish without authentication. */
+  ntfyAccessToken?: string;
   /** List of notification events to send via ntfy.sh.
    *  When ntfyEnabled is true, only events in this list will trigger notifications.
    *  If undefined or empty when ntfyEnabled is true, all events are sent (backward compatible).
@@ -2186,11 +2207,19 @@ export interface ProjectSettings {
   /** Strategy used when a merge conflict can't be resolved by AI. See
    *  {@link MergeConflictStrategy}. Default: "smart". */
   mergeConflictStrategy?: MergeConflictStrategy;
+  /** Controls overlap protection when `mergeConflictStrategy="smart-prefer-main"`
+   *  reaches its Attempt 3 fallback. Default: "flip-to-prefer-branch". */
+  mergeStrategyOverlapBehavior?: MergeStrategyOverlapBehavior;
   /** Wall-clock timeout (ms) for a single pre-merge workflow step's AI call.
    *  When a step exceeds this, the session is aborted and the executor is
    *  given one shot to retry with the configured fallback model before the
    *  step is reported as failed. Default: 360_000 (6 minutes). */
   workflowStepTimeoutMs?: number;
+  /** When true (default), workflow revision feedback that explicitly names files
+   *  outside the task's declared File Scope is forked into a dependent follow-up
+   *  task instead of being appended to the original PROMPT.md. Set to false to
+   *  preserve the legacy append-and-rerun behavior. */
+  workflowRevisionForkOnScopeMismatch?: boolean;
   /** When true, out-of-scope file changes block merge instead of just logging warnings.
    *  Useful for teams that want strict enforcement of declared File Scope.
    *  Default: false (soft guardrail — warnings only). */

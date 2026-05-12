@@ -152,6 +152,7 @@ export class NotificationService {
       settings.ntfyEnabled !== previous.ntfyEnabled ||
       settings.ntfyTopic !== previous.ntfyTopic ||
       settings.ntfyBaseUrl !== previous.ntfyBaseUrl ||
+      settings.ntfyAccessToken !== previous.ntfyAccessToken ||
       settings.ntfyDashboardHost !== previous.ntfyDashboardHost ||
       JSON.stringify(settings.ntfyEvents) !== JSON.stringify(previous.ntfyEvents)
     ) {
@@ -168,6 +169,8 @@ export class NotificationService {
         schedulerLog.log("NotificationService ntfy topic updated");
       } else if (settings.ntfyBaseUrl !== previous.ntfyBaseUrl) {
         schedulerLog.log("NotificationService ntfy base URL updated");
+      } else if (settings.ntfyAccessToken !== previous.ntfyAccessToken) {
+        schedulerLog.log("NotificationService ntfy access token updated");
       } else if (settings.ntfyDashboardHost !== previous.ntfyDashboardHost) {
         schedulerLog.log("NotificationService ntfy dashboard host updated");
       } else if (JSON.stringify(settings.ntfyEvents) !== JSON.stringify(previous.ntfyEvents)) {
@@ -206,6 +209,7 @@ export class NotificationService {
     await this.ntfyProvider.initialize?.({
       topic: settings.ntfyTopic,
       ntfyBaseUrl: settings.ntfyBaseUrl ?? this.options.ntfyBaseUrl,
+      ntfyAccessToken: settings.ntfyAccessToken,
       dashboardHost: settings.ntfyDashboardHost,
       events: settings.ntfyEvents ?? [...DEFAULT_NTFY_EVENTS],
       projectId: this.options.projectId,

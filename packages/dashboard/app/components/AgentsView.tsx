@@ -799,126 +799,157 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
             >
               <RefreshCw size={16} className={isLoading ? "spin" : undefined} />
             </button>
-            <button
-              className="btn btn-sm agent-import-trigger"
-              onClick={() => {
-                setIsImporting(true);
-                setIsControlsPanelOpen(false);
-              }}
-              aria-label="Import"
-              title="Import"
-            >
-              <Upload size={16} />
-              Import
-            </button>
-            <button
-              className="btn btn-task-create btn-sm"
-              onClick={() => {
-                handleOpenNewAgent();
-                setIsControlsPanelOpen(false);
-              }}
-              aria-label="New Agent"
-              title="New Agent"
-            >
-              <Plus size={16} />
-              New Agent
-            </button>
+            {!isMobileViewport && (
+              <>
+                <button
+                  className="btn btn-sm agent-import-trigger"
+                  onClick={() => {
+                    setIsImporting(true);
+                    setIsControlsPanelOpen(false);
+                  }}
+                  aria-label="Import"
+                  title="Import"
+                >
+                  <Upload size={16} />
+                  Import
+                </button>
+                <button
+                  className="btn btn-task-create btn-sm"
+                  onClick={() => {
+                    handleOpenNewAgent();
+                    setIsControlsPanelOpen(false);
+                  }}
+                  aria-label="New Agent"
+                  title="New Agent"
+                >
+                  <Plus size={16} />
+                  New Agent
+                </button>
+              </>
+            )}
+            {isControlsPanelOpen && (
+              <div
+                ref={controlsPanelRef}
+                id={controlsPanelId}
+                className="agent-controls-panel agent-controls-panel--scrollable"
+                role="dialog"
+                aria-label="Agent controls"
+                aria-modal="false"
+              >
+                <div className="agent-controls">
+                  <div className="agent-controls-filters">
+                    <div className="agent-state-filter">
+                      <Filter size={14} />
+                      <select
+                        className="agent-state-filter-select"
+                        value={filterState}
+                        onChange={(e) => setFilterState(e.target.value as AgentState | "all")}
+                        aria-label="Filter agents by state"
+                      >
+                        <option value="all">All States</option>
+                        <option value="idle">Idle</option>
+                        <option value="active">Active</option>
+                        <option value="running">Running</option>
+                        <option value="paused">Paused</option>
+                        <option value="error">Error</option>
+                      </select>
+                    </div>
+
+                    <label className="checkbox-label agent-system-filter">
+                      <input
+                        type="checkbox"
+                        checked={showSystemAgents}
+                        onChange={(e) => setShowSystemAgents(e.target.checked)}
+                        aria-label="Show system agents"
+                      />
+                      Show system agents
+                    </label>
+                  </div>
+                </div>
+
+                {isMobileViewport && (
+                  <div className="agent-controls-mobile-actions">
+                    <button
+                      className="btn btn-sm agent-import-trigger"
+                      onClick={() => {
+                        setIsImporting(true);
+                        setIsControlsPanelOpen(false);
+                      }}
+                      aria-label="Import"
+                      title="Import"
+                    >
+                      <Upload size={16} />
+                      Import
+                    </button>
+                    <button
+                      className="btn btn-task-create btn-sm"
+                      onClick={() => {
+                        handleOpenNewAgent();
+                        setIsControlsPanelOpen(false);
+                      }}
+                      aria-label="New Agent"
+                      title="New Agent"
+                    >
+                      <Plus size={16} />
+                      New Agent
+                    </button>
+                  </div>
+                )}
+
+                <div className="agent-global-controls agent-controls-actions">
+                  <div className="heartbeat-multiplier-group">
+                    <div className="heartbeat-multiplier-controls">
+                      <label htmlFor="globalHeartbeatMultiplier" className="heartbeat-multiplier-label">
+                        Heartbeat Speed
+                      </label>
+                      <input
+                        id="globalHeartbeatMultiplier"
+                        className="heartbeat-multiplier-slider touch-target"
+                        type="range"
+                        min={0.1}
+                        max={10}
+                        step={0.1}
+                        value={heartbeatMultiplier}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          void handleHeartbeatMultiplierChange(Number.isFinite(val) && val > 0 ? val : 1);
+                        }}
+                        disabled={isSavingMultiplier}
+                      />
+                      <span className="heartbeat-multiplier-value">×{heartbeatMultiplier.toFixed(1)}</span>
+                      <select
+                        className="heartbeat-multiplier-preset"
+                        value={String(
+                          HEARTBEAT_MULTIPLIER_PRESETS.reduce((closest, candidate) => {
+                            return Math.abs(candidate - heartbeatMultiplier) < Math.abs(closest - heartbeatMultiplier) ? candidate : closest;
+                          }, HEARTBEAT_MULTIPLIER_PRESETS[0])
+                        )}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          void handleHeartbeatMultiplierChange(Number.isFinite(val) && val > 0 ? val : 1);
+                        }}
+                        disabled={isSavingMultiplier}
+                        aria-label="Heartbeat speed preset"
+                      >
+                        {HEARTBEAT_MULTIPLIER_PRESETS.map((multiplier) => (
+                          <option key={multiplier} value={String(multiplier)}>
+                            ×{multiplier}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <small className="text-secondary">
+                      Scales all agent heartbeat intervals. ×0.5 = twice as fast, ×2.0 = twice as slow. Default: ×1.0
+                    </small>
+                  </div>
+                </div>
+
+                <AgentTokenStatsPanel agents={displayAgents} />
+              </div>
+            )}
           </div>
         </div>
       </div>
-
-      {isControlsPanelOpen && (
-        <div
-          ref={controlsPanelRef}
-          id={controlsPanelId}
-          className="agent-controls-panel agent-controls-panel--scrollable"
-          role="dialog"
-          aria-label="Agent controls"
-          aria-modal="false"
-        >
-          <div className="agent-controls">
-            <div className="agent-controls-filters">
-              <div className="agent-state-filter">
-                <Filter size={14} />
-                <select
-                  className="agent-state-filter-select"
-                  value={filterState}
-                  onChange={(e) => setFilterState(e.target.value as AgentState | "all")}
-                  aria-label="Filter agents by state"
-                >
-                  <option value="all">All States</option>
-                  <option value="idle">Idle</option>
-                  <option value="active">Active</option>
-                  <option value="running">Running</option>
-                  <option value="paused">Paused</option>
-                  <option value="error">Error</option>
-                </select>
-              </div>
-
-              <label className="checkbox-label agent-system-filter">
-                <input
-                  type="checkbox"
-                  checked={showSystemAgents}
-                  onChange={(e) => setShowSystemAgents(e.target.checked)}
-                  aria-label="Show system agents"
-                />
-                Show system agents
-              </label>
-            </div>
-
-          </div>
-
-          <div className="agent-global-controls agent-controls-actions">
-            <div className="heartbeat-multiplier-group">
-              <div className="heartbeat-multiplier-controls">
-                <label htmlFor="globalHeartbeatMultiplier" className="heartbeat-multiplier-label">
-                  Heartbeat Speed
-                </label>
-                <input
-                  id="globalHeartbeatMultiplier"
-                  className="heartbeat-multiplier-slider touch-target"
-                  type="range"
-                  min={0.1}
-                  max={10}
-                  step={0.1}
-                  value={heartbeatMultiplier}
-                  onChange={(e) => {
-                    const val = Number(e.target.value);
-                    void handleHeartbeatMultiplierChange(Number.isFinite(val) && val > 0 ? val : 1);
-                  }}
-                  disabled={isSavingMultiplier}
-                />
-                <span className="heartbeat-multiplier-value">×{heartbeatMultiplier.toFixed(1)}</span>
-                <select
-                  className="heartbeat-multiplier-preset"
-                  value={String(
-                    HEARTBEAT_MULTIPLIER_PRESETS.reduce((closest, candidate) => {
-                      return Math.abs(candidate - heartbeatMultiplier) < Math.abs(closest - heartbeatMultiplier) ? candidate : closest;
-                    }, HEARTBEAT_MULTIPLIER_PRESETS[0])
-                  )}
-                  onChange={(e) => {
-                    const val = Number(e.target.value);
-                    void handleHeartbeatMultiplierChange(Number.isFinite(val) && val > 0 ? val : 1);
-                  }}
-                  disabled={isSavingMultiplier}
-                  aria-label="Heartbeat speed preset"
-                >
-                  {HEARTBEAT_MULTIPLIER_PRESETS.map((multiplier) => (
-                    <option key={multiplier} value={String(multiplier)}>
-                      ×{multiplier}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <small className="text-secondary">
-                Scales all agent heartbeat intervals. ×0.5 = twice as fast, ×2.0 = twice as slow. Default: ×1.0
-              </small>
-            </div>
-          </div>
-
-          <AgentTokenStatsPanel agents={displayAgents} />
-        </div>
-      )}
 
       <NewAgentDialog
         isOpen={isCreating}
@@ -1368,94 +1399,98 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                   </div>
 
                   <div className="agent-card-actions">
-                    {agent.state === "idle" && (
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => void handleStateChange(agent.id, "active")}
-                        disabled={transitioningAgentIds.has(agent.id)}
-                        title="Activate"
-                      >
-                        <Play size={14} /> <span className="agent-card-action-label">Start</span>
-                      </button>
-                    )}
-                    {agent.state === "active" && (
-                      <>
+                    <div className="agent-card-actions-group agent-card-actions-group--primary">
+                      {agent.state === "idle" && (
                         <button
                           className="btn btn-sm"
-                          onClick={() => void handleRunHeartbeat(agent.id, agent.name)}
+                          onClick={() => void handleStateChange(agent.id, "active")}
                           disabled={transitioningAgentIds.has(agent.id)}
-                          title="Run Now"
-                          aria-label={`Run now for ${agent.name}`}
+                          title="Activate"
                         >
-                          <Activity size={14} /> <span className="agent-card-action-label">Run Now</span>
+                          <Play size={14} /> <span className="agent-card-action-label">Start</span>
                         </button>
+                      )}
+                      {agent.state === "active" && (
+                        <>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => void handleRunHeartbeat(agent.id, agent.name)}
+                            disabled={transitioningAgentIds.has(agent.id)}
+                            title="Run Now"
+                            aria-label={`Run now for ${agent.name}`}
+                          >
+                            <Activity size={14} /> <span className="agent-card-action-label">Run Now</span>
+                          </button>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => void handleStateChange(agent.id, "paused")}
+                            disabled={transitioningAgentIds.has(agent.id)}
+                            title="Pause"
+                          >
+                            <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
+                          </button>
+                        </>
+                      )}
+                      {agent.state === "paused" && (
                         <button
                           className="btn btn-sm"
-                          onClick={() => void handleStateChange(agent.id, "paused")}
+                          onClick={() => void handleStateChange(agent.id, "active")}
                           disabled={transitioningAgentIds.has(agent.id)}
-                          title="Pause"
+                          title="Resume"
                         >
-                          <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
+                          <Play size={14} /> <span className="agent-card-action-label">Resume</span>
                         </button>
-                      </>
-                    )}
-                    {agent.state === "paused" && (
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => void handleStateChange(agent.id, "active")}
-                        disabled={transitioningAgentIds.has(agent.id)}
-                        title="Resume"
-                      >
-                        <Play size={14} /> <span className="agent-card-action-label">Resume</span>
-                      </button>
-                    )}
-                    {agent.state === "running" && (
-                      <>
+                      )}
+                      {agent.state === "running" && (
+                        <>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => openAgentDetail(agent.id, { initialTab: "runs", initialRunId: null, preferActiveRun: true })}
+                            title="View live run details"
+                            aria-label={`View live run details for ${agent.name}`}
+                          >
+                            <Activity size={14} /> <span className="agent-card-action-label">Running</span>
+                          </button>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => void handleStateChange(agent.id, "paused")}
+                            disabled={transitioningAgentIds.has(agent.id)}
+                            title="Pause"
+                          >
+                            <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
+                          </button>
+                        </>
+                      )}
+                      {agent.state === "error" && (
                         <button
                           className="btn btn-sm"
-                          onClick={() => openAgentDetail(agent.id, { initialTab: "runs", initialRunId: null, preferActiveRun: true })}
-                          title="View live run details"
-                          aria-label={`View live run details for ${agent.name}`}
-                        >
-                          <Activity size={14} /> <span className="agent-card-action-label">Running</span>
-                        </button>
-                        <button
-                          className="btn btn-sm"
-                          onClick={() => void handleStateChange(agent.id, "paused")}
+                          onClick={() => void handleStateChange(agent.id, "active")}
                           disabled={transitioningAgentIds.has(agent.id)}
-                          title="Pause"
+                          title="Retry"
                         >
-                          <Pause size={14} /> <span className="agent-card-action-label">Pause</span>
+                          <Play size={14} /> <span className="agent-card-action-label">Retry</span>
                         </button>
-                      </>
-                    )}
-                    {agent.state === "error" && (
+                      )}
+                    </div>
+                    <div className="agent-card-actions-group agent-card-actions-group--secondary">
                       <button
-                        className="btn btn-sm"
-                        onClick={() => void handleStateChange(agent.id, "active")}
-                        disabled={transitioningAgentIds.has(agent.id)}
-                        title="Retry"
+                        className="btn btn-sm agent-card-details-btn"
+                        onClick={() => openAgentDetail(agent.id)}
+                        title={`View details for ${agent.name}`}
+                        aria-label={`View details for ${agent.name}`}
                       >
-                        <Play size={14} /> <span className="agent-card-action-label">Retry</span>
+                        <Info size={14} /> <span className="agent-card-action-label">Details</span>
                       </button>
-                    )}
-                    <button
-                      className="btn btn-sm agent-card-details-btn"
-                      onClick={() => openAgentDetail(agent.id)}
-                      title={`View details for ${agent.name}`}
-                      aria-label={`View details for ${agent.name}`}
-                    >
-                      <Info size={14} /> <span className="agent-card-action-label">Details</span>
-                    </button>
-                    {(agent.state === "idle" || agent.state === "paused") && (
-                      <button
-                        className="btn btn-sm btn-danger"
-                        onClick={() => void handleDelete(agent.id, agent.name)}
-                        title="Delete"
-                      >
-                        <Trash2 size={14} /> <span className="agent-card-action-label">Delete</span>
-                      </button>
-                    )}
+                      {(agent.state === "idle" || agent.state === "paused") && (
+                        <button
+                          className="btn btn-sm btn-danger"
+                          onClick={() => void handleDelete(agent.id, agent.name)}
+                          title="Delete"
+                        >
+                          <Trash2 size={14} /> <span className="agent-card-action-label">Delete</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               );

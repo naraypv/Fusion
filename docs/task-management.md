@@ -25,6 +25,7 @@ Use the 💡 button to open planning mode:
 - Summary view includes a **Priority** selector (`low`, `normal`, `high`, `urgent`) so single-task creation can set priority before task creation
 - Break-into-tasks mode includes per-subtask **Priority** selectors (`low`, `normal`, `high`, `urgent`) so each generated task can be prioritized before creation
 - Break-into-tasks descriptions are structured with subtask-specific guidance first, then a separate larger-plan context section (plus `## Planning Interview Context` when interview history exists)
+- Final multi-task creation now uses a compact request payload: unchanged generated subtask descriptions stay server-side, while any edits to title, description, size, priority, and dependencies are preserved when tasks are created
 - Sessions persist when the modal is closed — resume from the sidebar list at any time; reasoning context is restored automatically
 - Back navigation rewinds the server-side planning session to the previous answered question so you can revise earlier answers and continue from the corrected turn
 - On the summary screen, **Refine Further** continues through the backend planning session (including resumed completed sessions) and waits for a real follow-up question or updated summary; it does not switch to an empty question view
@@ -92,9 +93,11 @@ Fusion task columns:
 3. **in-progress** — executor active in isolated worktree
 4. **in-review** — implementation complete; awaiting finalization
    - If merge/finalization hits a terminal error, tasks can remain in `in-review` with `status: "failed"` for explicit follow-up. This state is intentionally preserved by recovery (not auto-bounced to `todo`).
-   - Retry behavior splits by step completion: `in-review` tasks with incomplete steps (`pending`/`in-progress`) are treated as execution failures and retried back to `todo` with `preserveProgress: true`; `in-review` tasks with all steps `done` are treated as merge/finalization failures and stay in `in-review` with merge retry state reset.
+   - Retry behavior splits by execution-vs-merge signals: `in-review` tasks with incomplete steps (`pending`/`in-progress`) are treated as execution failures and retried back to `todo` with `preserveProgress: true`; zero-step `in-review` tasks use `mergeRetries` as the tie-breaker (`mergeRetries === 0` or undefined → execution failure path back to `todo`, `mergeRetries > 0` → merge/finalization retry in `in-review` with merge retry state reset); tasks whose steps are all terminal (`done`/`skipped`/`failed`) also stay on the merge/finalization retry path.
+   - Persisted executor session state is resumed only when it still matches the task's current worktree context. If a retry fails with `Refusing to start coding agent in missing worktree: ...` and the persisted session points at stale worktree metadata, recovery clears stale session pointers and retries fresh so review retries do not reopen deleted worktree paths.
    - Merge-confirmed tasks still respect `getTaskMergeBlocker()` before the final `in-review` → `done` move. If merge is confirmed but a blocker remains (for example, incomplete steps), Fusion parks the task in `in-review` with `status: "failed"` and an explicit blocker error instead of retry-looping auto-finalization.
    - Self-healing can still auto-finalize retry-exhausted failed review tasks when it can prove their branch content already landed on the merge target, so already-merged work does not deadlock in `in-review`.
+   - Repeated engine merge-queue drops now escalate to an explicit recoverable review failure: if auto-recovery hits `Auto-merge starvation:` in the task `error`, Fusion has already seen three consecutive enqueue attempts rejected by the engine merge queue. Operators can recover by clearing the failed state from the dashboard, which lets the usual unpause/clear flow re-attempt merge once the underlying queue wedge is resolved.
    - Non-recoverable state-machine errors during finalization (for example `Invalid transition: 'todo' → 'done'`) are treated as terminal review failures: recovery must not re-enqueue these tasks for merge unless task state changes prove they are recoverable.
 5. **done** — merged/finalized
 6. **archived** — preserved history, optionally cleaned from filesystem
@@ -237,7 +240,7 @@ The task detail modal exposes multiple tabs.
 
 In read mode, task metadata includes lightweight inline controls: priority can be changed from the priority chip, and execution mode can be toggled with a one-click lightning-bolt fast-mode button (Fast ↔ Standard) without opening full edit mode. These controls are intentionally aligned as a paired row (matched control height, baseline alignment, and mobile-safe wrapping) so frequent priority/mode changes stay quick and visually consistent.
 
-Task metadata also shows compact `Created` / `Updated` timestamps: recent values render as relative time (`just now`, `Xm`, `Xh`, `Xd`) and older values switch to short month/day dates; desktop keeps both timestamps on one row, with a mobile-stacked layout for readability.
+Task metadata also shows compact `Created` / `Updated` timestamps: recent values render as relative time (`just now`, `Xm`, `Xh`, `Xd`) and older values switch to short month/day dates; both timestamps stay on one row across desktop and mobile widths for a compact metadata presentation.
 
 Task settings edited from the modal now auto-save as you edit (change/blur with debounce for text-like fields). This includes title, description, dependencies, working/base branch (`branch`/`baseBranch`), workflow-step selection, model overrides in the edit form, and source issue metadata. In shared create/edit task forms, the GitHub Tracking controls are placed at the bottom of **More options** after **Workflow Steps**. The footer Save button remains available, but normal field edits no longer depend on a manual save click.
 
@@ -367,6 +370,26 @@ Archive entries preserve key metadata needed for restoration, including:
 - Moves task to `done`
 - Logs “Task restored from archive” when recovering from compact archive entry
 
+### Task-ID collision safety and operator recovery
+
+- Ordinary task creation, duplicate, and refine flows now fail safely if the chosen task ID already exists in active storage or archive storage. Existing task rows/files always win; the new create attempt must retry with a fresh reservation instead of overwriting data.
+- A failed create may burn a distributed reservation. Gaps in `FN-*` numbering are expected and are safer than reissuing a possibly-colliding ID.
+- `config.nextId` is legacy/read-only. The live allocator state is `distributed_task_id_state.nextSequence`, reconciled on store open against live tasks, archived task snapshots, and reservation history.
+
+If you suspect **historical overwrites from pre-FN-4044 builds**, inspect surviving evidence in this order:
+
+1. `archive.db` / archived task snapshots for the missing ID
+2. `.fusion/tasks/<id>/task.json.bak`, `PROMPT.md`, attachments, and any surviving worktree branch named for the task
+3. agent run logs / task documents / activity log entries that still mention the original ID
+4. git commits whose subject/body references the original task ID but no longer matches the current task metadata
+
+Recovery/backfill guidance:
+
+- If the original task row still exists in archive storage, unarchive or manually recreate the task from that snapshot.
+- If only prompt/worktree/git evidence survives, create a replacement task with a new ID and copy over the recovered description, prompt, documents, and attachments manually.
+- If both the active row and archive snapshot were overwritten, Fusion cannot reconstruct lost attachments/comments automatically; recreate them from git history, branch/worktree contents, screenshots, or external issue trackers.
+- Record the incident in the replacement task so future audits understand why the task ID and commit history diverge.
+
 ## GitHub Issue Import and PR Creation
 
 Import issues:
@@ -404,7 +427,7 @@ Tracking behavior is controlled per task:
 
 - `task.githubTracking.enabled` turns tracking on for that task.
 - `task.githubTracking.repoOverride` optionally forces a specific target repo (`owner/repo`).
-- In the dashboard **Task Detail** modal, eligible existing tasks (`triage`, `todo`, `in-progress`, `in-review`) always show a compact GitHub tracking summary row; linked-issue details and tracking controls are behind a disclosure arrow so tracking can still be enabled, disabled, or retargeted without reopening the task in a creation flow.
+- In the dashboard **Task Detail** modal, eligible existing tasks (`triage`, `todo`, `in-progress`, `in-review`) always show a compact GitHub tracking summary row. When tracking is currently disabled and editable, the header exposes a one-click **Enable GitHub tracking** button; linked-issue details and the rest of the tracking controls remain behind the disclosure arrow for disable/retarget flows.
 - When a task is already tracking-enabled but still unlinked, Task Detail exposes a **Create tracking issue** action in the disclosure content (including non-editable columns like `done`) so "Issue not yet created" is not a dead-end state.
 - Clearing the Task Detail repo override stores `null`, which reverts repo resolution to project/global defaults.
 - Explicit task-level enablement is honored even when project/global GitHub tracking defaults are unset. If `enabled: true` and the repo resolves at task scope (for example via `repoOverride`), Fusion attempts tracking-issue creation on both create-time and eligible edit-time flows.
@@ -421,6 +444,8 @@ When Fusion creates a tracking issue, it uses:
 - Title: `[FN-XXXX] Task title`
 - Body prefix: `Fusion task: FN-XXXX`
 - Body content: bounded plain-text task summary snippet (not full prompt content)
+
+When tracked tasks later move to `in-progress` or `done`, Fusion also posts a short lifecycle comment on the linked tracking issue. The `in-progress` comment stays plain-text and capped, while the `done` comment can include the merge commit SHA/subject, task branch, PR link, file-change stats, and merge timestamp when those fields are available.
 
 GitHub authentication/settings are configured in [Settings Reference](./settings-reference.md) via `githubAuthMode` (`gh-cli` or `token`) and `githubAuthToken`.
 

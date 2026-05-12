@@ -8,6 +8,7 @@ import { TaskExecutor, buildExecutionPrompt } from "../executor.js";
 import { createFnAgent } from "../pi.js";
 import { reviewStep as mockedReviewStepFn } from "../reviewer.js";
 import { execSync } from "node:child_process";
+import { writeFile, rm } from "node:fs/promises";
 import { findWorktreeUser, aiMergeTask } from "../merger.js";
 import { WorktreePool } from "../worktree-pool.js";
 import { generateWorktreeName, slugify } from "../worktree-names.js";
@@ -1325,6 +1326,44 @@ describe("TaskExecutor pause behavior", () => {
     // Should fall back to SessionManager.create (not open)
     expect(mockedSessionManager.create).toHaveBeenCalled();
     expect(mockedSessionManager.open).not.toHaveBeenCalled();
+  });
+
+  it("does not resume stale sessionFile when persisted worktree path mismatches live task worktree", async () => {
+    const store = createMockStore();
+    const sessionFilePath = "/tmp/fn-4031-stale-session.jsonl";
+    await writeFile(sessionFilePath, JSON.stringify({ cwd: "/tmp/test/.worktrees/bright-wren" }), "utf-8");
+
+    mockedExistsSync.mockImplementation((p) => String(p) !== "/tmp/test/.worktrees/fn-001");
+
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      },
+      sessionFile: "/tmp/sessions/new_session.jsonl",
+    } as any);
+
+    const executor = new TaskExecutor(store, "/tmp/test");
+    await executor.execute({
+      id: "FN-001",
+      title: "Stale resumed session",
+      description: "Test stale worktree session mismatch fallback",
+      column: "in-progress",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      worktree: "/tmp/test/.worktrees/fn-001",
+      sessionFile: sessionFilePath,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    expect(mockedSessionManager.open).not.toHaveBeenCalled();
+    expect(mockedSessionManager.create).toHaveBeenCalledWith("/tmp/test/.worktrees/fn-001");
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", { sessionFile: null });
+
+    await rm(sessionFilePath, { force: true });
   });
 });
 

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { TaskStore, Task } from "@fusion/core";
 import {
   RestartRecoveryCoordinator,
+  extractMissingWorktreePathFromSessionStartFailure,
   isMissingWorktreeSessionStartFailure,
   isRecoverableMissingWorktreeReviewFailure,
 } from "../restart-recovery-coordinator.js";
@@ -27,6 +28,11 @@ describe("RestartRecoveryCoordinator", () => {
     expect(isMissingWorktreeSessionStartFailure("Refusing to start coding agent in missing worktree: /tmp/wt")).toBe(true);
     expect(isMissingWorktreeSessionStartFailure("Refusing to start coding agent in incomplete worktree: /tmp/wt")).toBe(false);
     expect(isMissingWorktreeSessionStartFailure("Deterministic test verification failed")).toBe(false);
+  });
+
+  it("extracts missing-worktree path from session-start failure", () => {
+    expect(extractMissingWorktreePathFromSessionStartFailure("Refusing to start coding agent in missing worktree: /tmp/wt")).toBe("/tmp/wt");
+    expect(extractMissingWorktreePathFromSessionStartFailure("other error")).toBeNull();
   });
 
   it("identifies recoverable in-review missing-worktree failures with step progress", () => {

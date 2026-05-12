@@ -25,6 +25,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   ntfyEnabled: false,
   ntfyTopic: undefined,
   ntfyBaseUrl: undefined,
+  ntfyAccessToken: undefined,
   ntfyEvents: [
     "in-review",
     "merged",
@@ -211,7 +212,9 @@ export const DEFAULT_PROJECT_SETTINGS = {
   worktreeRebaseRemote: "",
   worktreeRebaseLocalBase: true,
   mergeConflictStrategy: "smart-prefer-main",
+  mergeStrategyOverlapBehavior: "flip-to-prefer-branch",
   workflowStepTimeoutMs: 360_000,
+  workflowRevisionForkOnScopeMismatch: true,
   strictScopeEnforcement: false,
   buildRetryCount: 0,
   verificationFixRetries: 3,

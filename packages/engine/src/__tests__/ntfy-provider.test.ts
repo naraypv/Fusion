@@ -26,6 +26,7 @@ describe("NtfyNotificationProvider", () => {
     await provider.initialize({
       topic: "topic-a",
       ntfyBaseUrl: "https://ntfy.local",
+      ntfyAccessToken: "secret-token",
       dashboardHost: "http://dash",
       projectId: "p1",
     });
@@ -63,6 +64,7 @@ describe("NtfyNotificationProvider", () => {
     expect(mocks.sendNtfyNotificationWithResult).toHaveBeenCalledWith(
       expect.objectContaining({
         topic: "topic-a",
+        ntfyAccessToken: "secret-token",
         title: expectedTitle,
         priority,
         message: expect.stringContaining(messagePart),
@@ -133,6 +135,48 @@ describe("NtfyNotificationProvider", () => {
         taskId: undefined,
         messageId: "msg-2",
         view: "mailbox",
+      }),
+    );
+  });
+
+  it("passes unicode mailbox content through verbatim for agent-to-user notifications", async () => {
+    await provider.sendNotification("message:agent-to-user" as any, {
+      taskId: "FN-1",
+      taskTitle: "T",
+      event: "message:agent-to-user" as any,
+      metadata: {
+        messageId: "msg-1",
+        fromId: "agent-1",
+        fromName: "Triage Bot",
+        preview: "preview text",
+      },
+    });
+
+    expect(mocks.sendNtfyNotificationWithResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "New message from Triage Bot",
+        message: "Triage Bot → you: preview text",
+      }),
+    );
+  });
+
+  it("passes unicode mailbox content through verbatim for agent-to-agent notifications", async () => {
+    await provider.sendNotification("message:agent-to-agent" as any, {
+      event: "message:agent-to-agent" as any,
+      metadata: {
+        messageId: "msg-2",
+        fromId: "agent-1",
+        toId: "agent-2",
+        fromName: "Triage Bot",
+        toName: "Executor Bot",
+        preview: "preview text",
+      },
+    });
+
+    expect(mocks.sendNtfyNotificationWithResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Triage Bot → Executor Bot",
+        message: "Triage Bot messaged Executor Bot: preview text",
       }),
     );
   });

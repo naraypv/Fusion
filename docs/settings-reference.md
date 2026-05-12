@@ -42,11 +42,14 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `ntfyEnabled` | `boolean` | `false` | Enable ntfy push notifications. |
 | `ntfyTopic` | `string` | `undefined` | ntfy topic name. |
 | `ntfyBaseUrl` | `string` | `undefined` | Optional custom ntfy server base URL (must use `http://` or `https://`). If blank/unset, Fusion uses `https://ntfy.sh` for both runtime and test notifications. |
+| `ntfyAccessToken` | `string` | `undefined` | Optional ntfy access token. When set, Fusion sends `Authorization: Bearer <token>` with ntfy publish requests, including Settings → Notifications test sends. Leave blank/unset to publish without authentication. |
 | `ntfyEvents` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `["in-review","merged","failed","awaiting-approval","awaiting-user-review","planning-awaiting-input","gridlock","fallback-used","memory-dreams-processed","message:agent-to-user","message:agent-to-agent"]` | Event types that trigger ntfy notifications. `planning-awaiting-input` fires when planning mode is waiting on user input. `gridlock` fires when all schedulable todo tasks are blocked; delivery is cooldown-throttled (first alert immediately, then suppressed for 15 minutes until gridlock resolves). `fallback-used` fires when Fusion recovers from a retryable model failure by switching to a configured fallback model. `memory-dreams-processed` fires when manual dream processing writes a new `DREAMS.md` entry (project and/or agent); disable it via ntfy/webhook event filters if you want to opt out. `message:agent-to-user` fires when an agent sends a direct message to the user. `message:agent-to-agent` fires when an agent sends a message to another agent (including replies). If you use a custom `ntfyEvents` list, this event must be present (or `ntfyEvents` must be unset so defaults apply) for agent-to-agent inbox notifications to send. |
 | `ntfyDashboardHost` | `string` | `undefined` | Dashboard host used to build deep links in notifications. |
 | `webhookEnabled` | `boolean` | `false` | Enable webhook notifications for task lifecycle events. Part of the legacy flat settings; prefer `notificationProviders` for new setups. |
 
 In **Settings → Notifications**, use **Test message notification** to exercise the full mailbox-message dispatch pipeline (`NotificationService.dispatch` → provider delivery), not just a raw ntfy POST.
+
+Fusion automatically falls back to ntfy's JSON publish format when a notification title or message contains non-Latin-1 characters, and truncates outgoing titles/messages to ntfy's documented size limits before sending.
 | `webhookUrl` | `string` | `undefined` | Webhook endpoint URL. Must be `http://` or `https://`. Part of legacy flat settings. |
 | `webhookFormat` | `"slack" \| "discord" \| "generic"` | `"generic"` | Webhook payload format. Part of legacy flat settings. |
 | `webhookEvents` | `string[]` | `[]` | Event filter for webhook notifications. Empty/omitted means all events. Part of legacy flat settings. |
@@ -144,6 +147,7 @@ When `id` is `"ntfy"` in `notificationProviders`, the provider `config` supports
 |---|---|---:|---|
 | `topic` | `string` | _required_ | ntfy topic name (1–64 chars, alphanumeric + `-_`). |
 | `ntfyBaseUrl` | `string` | `"https://ntfy.sh"` | Optional custom ntfy server URL. |
+| `ntfyAccessToken` | `string` | `undefined` | Optional access token. When set, provider sends `Authorization: Bearer <token>` on ntfy publishes. |
 | `events` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `DEFAULT_NTFY_EVENTS` | Event filter list used by the provider. For `gridlock`, enabled events are still cooldown-throttled at runtime (15-minute suppression window, reset on full resolution). `memory-dreams-processed` is emitted when manual dream processing appends a new project/agent `DREAMS.md` entry. `message:agent-to-user`/`message:agent-to-agent` are emitted for mailbox messages and deep-link to the specific message when `dashboardHost` is configured. |
 | `dashboardHost` | `string` | `undefined` | Dashboard host for deep links in notifications. |
 
@@ -178,6 +182,8 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `overlapIgnorePaths` | `string[]` | `[]` | Optional project-relative file or directory paths to exclude from overlap blocking (for example `docs` or `generated/openapi.json`). Entries are trimmed, deduplicated, and must not be absolute or contain `..` traversal. |
 | `autoMerge` | `boolean` | `true` | Auto-finalize tasks from `in-review`. |
 | `mergeStrategy` | `"direct" \| "pull-request"` | `"direct"` | Completion mode (local direct merge vs PR-first). |
+| `mergeConflictStrategy` | `"smart-prefer-main" \| "smart-prefer-branch" \| "ai-only" \| "abort"` | `"smart-prefer-main"` | Controls the merger's conflict-resolution cascade. `smart-prefer-main` fast-forwards local main from `origin` when possible, then tries AI resolution, then auto-resolve heuristics, then a final `-X ours` fallback that prefers main unless the overlap guard below says otherwise. `smart-prefer-branch` uses the same cascade but ends with `-X theirs` so the task branch wins. `ai-only` never silently picks a side, and `abort` stops after the first AI attempt. Legacy `smart` / `prefer-main` values are normalized automatically. |
+| `mergeStrategyOverlapBehavior` | `"flip-to-prefer-branch" \| "warn-only" \| "ignore"` | `"flip-to-prefer-branch"` | Safety control for `mergeConflictStrategy="smart-prefer-main"`. Before the Attempt 3 `-X ours` fallback, Fusion checks whether the task branch and recent `main` history overlap on the same files (30-commit lookback, matching the squash audit heuristics). `flip-to-prefer-branch` makes overlapping files prefer the task branch so hardening is not silently discarded (the FN-3936 class of regression). `warn-only` logs the overlap but keeps the legacy main-wins fallback. `ignore` disables the overlap guard and preserves legacy behavior exactly. |
 | `pushAfterMerge` | `boolean` | `false` | Auto-push to remote after successful direct merge. Includes pulling latest and AI conflict resolution. |
 | `pushRemote` | `string` | `"origin"` | Git remote (and optional branch) to push to after merge. |
 | `worktreeInitCommand` | `string` | `undefined` | Shell command run after worktree creation. For pnpm repos, prefer `pnpm install --frozen-lockfile` for deterministic bootstrap. |
@@ -208,6 +214,7 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `autoResolveConflicts` | `boolean` | `true` | Enable automatic merge conflict resolution. |
 | `smartConflictResolution` | `boolean` | `true` | Alias/preferred flag for smart conflict handling. |
 | `mergerAutostashMaxAgeHours` | `number` | `24` | Maximum autostash age in hours before startup/periodic stale-stash sweep drops `fusion-merger-autostash:*` leftovers (minimum `1`). |
+| `workflowRevisionForkOnScopeMismatch` | `boolean` | `true` | When enabled, workflow revision feedback that explicitly names files outside the task's declared File Scope is forked into a dependent follow-up triage task instead of being appended to the original task's `PROMPT.md`. Set to `false` to keep the legacy append-and-rerun behavior. |
 | `strictScopeEnforcement` | `boolean` | `false` | Block merges on out-of-scope file changes. |
 | `buildRetryCount` | `number` | `0` | Build retry attempts during merge. |
 | `verificationFixRetries` | `number` | `3` | In-merge auto-fix retry attempts after deterministic test/build verification failures (0-3). |
