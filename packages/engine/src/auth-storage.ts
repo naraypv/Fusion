@@ -5,8 +5,13 @@ import {
   choosePreferredStoredCredential,
   getClaudeCodeCredentialPaths,
   getCodexCliAuthPath,
+  getFusionAccountsPath,
+  MultiAccountAuthStore,
   readStoredCredentialsFromAuthFile,
   shouldHydrateStoredCredential,
+  type AccountCredentialRecord,
+  type AccountCredentialSummary,
+  type AccountFailureState,
   type StoredAuthCredential,
 } from "@fusion/core";
 import { AuthStorage } from "@mariozechner/pi-coding-agent";
@@ -15,6 +20,20 @@ import { getOAuthProvider } from "@mariozechner/pi-ai/oauth";
 import type { OAuthCredentials } from "@mariozechner/pi-ai/oauth";
 
 type StoredCredential = StoredAuthCredential;
+
+export interface FusionAuthStorageOptions {
+  selectedAccountIds?: Record<string, string | undefined>;
+  accountStore?: MultiAccountAuthStore;
+}
+
+export interface FusionAuthStorageExtras {
+  listAccounts(providerId?: string): AccountCredentialSummary[];
+  getSelectedAccount(providerId: string): AccountCredentialRecord | undefined;
+  selectAccount(providerId: string): AccountCredentialRecord | undefined;
+  markAccountFailure(accountId: string, failure: AccountFailureState, cooldownMs?: number): AccountCredentialRecord | undefined;
+  markAccountSuccess(accountId: string): AccountCredentialRecord | undefined;
+  removeAccount(accountId: string): boolean;
+}
 
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
@@ -137,8 +156,10 @@ function readModelsJsonApiKeys(home = getHomeDir()): Map<string, string> {
   return apiKeys;
 }
 
-export function createFusionAuthStorage(): AuthStorage {
+export function createFusionAuthStorage(options: FusionAuthStorageOptions = {}): AuthStorage {
   const primary = AuthStorage.create(getFusionAuthPath());
+  const accountStore = options.accountStore ?? new MultiAccountAuthStore(getFusionAccountsPath());
+  const selectedAccountIds = options.selectedAccountIds ?? {};
   let supplementalCredentials = readSupplementalCredentials();
   // models.json provider API keys — final fallback after primary auth and supplemental auth.json files
   let modelsJsonApiKeys = readModelsJsonApiKeys();
@@ -147,6 +168,10 @@ export function createFusionAuthStorage(): AuthStorage {
   // "resurrected" from supplemental credential files (e.g. ~/.claude/.credentials.json).
   // Cleared when the user re-authenticates via set().
   const loggedOutProviders = new Set<string>();
+  const accountCredential = (provider: string): StoredCredential | undefined => {
+    if (loggedOutProviders.has(provider)) return undefined;
+    return accountStore.credentialFor(provider, selectedAccountIds[provider]);
+  };
 
   const syncSupplementalOauthCredentials = () => {
     for (const [provider, credential] of Object.entries(supplementalCredentials)) {
@@ -187,6 +212,7 @@ export function createFusionAuthStorage(): AuthStorage {
         return (provider: string) => {
           target.logout(provider);
           loggedOutProviders.add(provider);
+          delete selectedAccountIds[provider];
         };
       }
 
@@ -194,6 +220,7 @@ export function createFusionAuthStorage(): AuthStorage {
         return (provider: string) => {
           target.remove(provider);
           loggedOutProviders.add(provider);
+          delete selectedAccountIds[provider];
         };
       }
 
@@ -218,7 +245,7 @@ export function createFusionAuthStorage(): AuthStorage {
           if (loggedOutProviders.has(provider)) {
             return undefined;
           }
-          return choosePreferredStoredCredential(
+          return accountCredential(provider) ?? choosePreferredStoredCredential(
             target.get(provider) as StoredCredential | undefined,
             supplementalCredentials[provider],
           );
@@ -230,7 +257,10 @@ export function createFusionAuthStorage(): AuthStorage {
           if (loggedOutProviders.has(provider)) {
             return false;
           }
-          return target.has(provider) || provider in supplementalCredentials || modelsJsonApiKeys.has(provider);
+          return accountStore.list(provider).length > 0 ||
+            target.has(provider) ||
+            provider in supplementalCredentials ||
+            modelsJsonApiKeys.has(provider);
         };
       }
 
@@ -239,13 +269,17 @@ export function createFusionAuthStorage(): AuthStorage {
           if (loggedOutProviders.has(provider)) {
             return false;
           }
-          return target.hasAuth(provider) || Boolean(supplementalCredentials[provider]) || modelsJsonApiKeys.has(provider);
+          return accountStore.list(provider).length > 0 ||
+            target.hasAuth(provider) ||
+            Boolean(supplementalCredentials[provider]) ||
+            modelsJsonApiKeys.has(provider);
         };
       }
 
       if (prop === "getAll") {
         return () => {
           const providerIds = new Set([
+            ...accountStore.list().map((account) => account.providerId),
             ...Object.keys(target.getAll() as Record<string, StoredCredential>),
             ...(loggedOutProviders.size > 0
               ? Object.keys(supplementalCredentials).filter((p) => !loggedOutProviders.has(p))
@@ -256,7 +290,7 @@ export function createFusionAuthStorage(): AuthStorage {
             if (loggedOutProviders.has(providerId)) {
               continue;
             }
-            const credential = choosePreferredStoredCredential(
+            const credential = accountCredential(providerId) ?? choosePreferredStoredCredential(
               (target.get(providerId) as StoredCredential | undefined),
               supplementalCredentials[providerId],
             );
@@ -270,7 +304,10 @@ export function createFusionAuthStorage(): AuthStorage {
 
       if (prop === "list") {
         return () => {
-          const providers = new Set([...target.list()]);
+          const providers = new Set([
+            ...accountStore.list().map((account) => account.providerId),
+            ...target.list(),
+          ]);
           for (const p of modelsJsonApiKeys.keys()) {
             if (!loggedOutProviders.has(p)) {
               providers.add(p);
@@ -291,16 +328,65 @@ export function createFusionAuthStorage(): AuthStorage {
             return undefined;
           }
 
-          // 1. Primary Fusion auth
+          // 1. Selected multi-account credential
+          const selectedAccountKey = resolveStoredCredentialApiKey(provider, accountCredential(provider));
+          if (selectedAccountKey) return selectedAccountKey;
+
+          // 2. Primary Fusion auth
           const primaryKey = await target.getApiKey(provider);
           if (primaryKey) return primaryKey;
 
-          // 2. Supplemental auth.json credentials (.pi + .codex)
+          // 3. Supplemental auth.json credentials (.pi + .codex + CLI homes)
           const supplementalKey = resolveStoredCredentialApiKey(provider, supplementalCredentials[provider]);
           if (supplementalKey) return supplementalKey;
 
-          // 3. models.json provider API keys (e.g., kimi-coding, lmstudio)
+          // 4. models.json provider API keys (e.g., kimi-coding, lmstudio)
           return modelsJsonApiKeys.get(provider);
+        };
+      }
+
+      if (prop === "listAccounts") {
+        return (provider?: string) => accountStore.listSummaries(provider);
+      }
+
+      if (prop === "getSelectedAccount") {
+        return (provider: string) =>
+          accountStore.selectAccount({ providerId: provider, accountId: selectedAccountIds[provider] });
+      }
+
+      if (prop === "selectAccount") {
+        return (provider: string) => {
+          const account = accountStore.selectAccount({ providerId: provider });
+          selectedAccountIds[provider] = account?.id;
+          if (account) {
+            loggedOutProviders.delete(provider);
+          }
+          return account;
+        };
+      }
+
+      if (prop === "markAccountFailure") {
+        return (accountId: string, failure: AccountFailureState, cooldownMs?: number) => {
+          const updated = accountStore.markFailure({ accountId, failure, cooldownMs });
+          if (updated && selectedAccountIds[updated.providerId] === accountId) {
+            delete selectedAccountIds[updated.providerId];
+          }
+          return updated;
+        };
+      }
+
+      if (prop === "markAccountSuccess") {
+        return (accountId: string) => accountStore.markSuccess(accountId);
+      }
+
+      if (prop === "removeAccount") {
+        return (accountId: string) => {
+          const account = accountStore.list().find((candidate) => candidate.id === accountId);
+          const removed = accountStore.removeAccount(accountId);
+          if (removed && account && selectedAccountIds[account.providerId] === accountId) {
+            delete selectedAccountIds[account.providerId];
+          }
+          return removed;
         };
       }
 

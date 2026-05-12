@@ -13,7 +13,7 @@ import * as nodeFs from "node:fs";
 import os from "node:os";
 import v8 from "node:v8";
 
-import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType, WorkflowStepTemplate } from "@fusion/core";
+import type { TaskStore, ScheduleType, ActivityEventType, ModelPreset, RoutineTriggerType, WorkflowStepTemplate, AddAccountResult } from "@fusion/core";
 import {
   type Task,
   type PiExtensionEntry,
@@ -207,12 +207,12 @@ export interface AuthStorageLike {
       onProgress?: (message: string) => void;
       signal?: AbortSignal;
     },
-  ): Promise<void>;
+  ): Promise<void | AddAccountResult>;
   logout(provider: string): void;
   /** Get providers that accept API keys (non-OAuth). Returns provider id and name. */
   getApiKeyProviders?(): Array<{ id: string; name: string }>;
   /** Save an API key for a provider. Creates or overwrites the existing key. */
-  setApiKey?(providerId: string, apiKey: string): void;
+  setApiKey?(providerId: string, apiKey: string): void | AddAccountResult;
   /** Remove the stored API key for a provider. No-op if not set. */
   clearApiKey?(providerId: string): void;
   /** Check if a provider has an API key configured. */

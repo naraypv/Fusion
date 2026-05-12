@@ -17,7 +17,7 @@ const execAsync = promisify(exec);
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import type { AgentStore, MessageStore, PermanentAgentGatingContext, TaskDetail, Settings, TaskStore } from "@fusion/core";
+import { resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy, type AgentStore, type MessageStore, type PermanentAgentGatingContext, type TaskDetail, type Settings, type TaskStore } from "@fusion/core";
 
 import {
   createResolvedAgentSession,
@@ -966,6 +966,8 @@ Follow instructions precisely and avoid unrelated changes.`,
             defaultModelId: executorModelId,
             fallbackProvider: settings.fallbackProvider,
             fallbackModelId: settings.fallbackModelId,
+            modelFallbackChain: resolveModelFallbackChain(settings),
+            routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
             defaultThinkingLevel: taskDetail.thinkingLevel ?? settings.defaultThinkingLevel,
             customTools: [
               ...pluginTools,

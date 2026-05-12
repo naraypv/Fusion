@@ -18,7 +18,7 @@
  */
 
 import type { AgentStore, AgentHeartbeatRun, HeartbeatInvocationSource, AgentHeartbeatConfig, AgentBudgetStatus, Message, MessageStore, TaskStore, TaskDetail, AgentRole, Agent, InboxTask, RunMutationContext, Settings, AgentConfigRevision, ReflectionStore } from "@fusion/core";
-import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy, canAgentTakeImplementationTask, canAgentTakeImplementationTaskForExplicitRouting } from "@fusion/core";
+import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy, canAgentTakeImplementationTask, canAgentTakeImplementationTaskForExplicitRouting, resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import { createHash } from "node:crypto";
@@ -1981,6 +1981,8 @@ export class HeartbeatMonitor {
           defaultModelId: heartbeatSessionModels.defaultModelId,
           fallbackProvider: heartbeatSessionModels.fallbackProvider,
           fallbackModelId: heartbeatSessionModels.fallbackModelId,
+          modelFallbackChain: heartbeatModelSettings ? resolveModelFallbackChain(heartbeatModelSettings) : undefined,
+          routeViaDspy: heartbeatModelSettings ? resolveRouteAllLlmCallsViaDspy(heartbeatModelSettings) : undefined,
           onText: (delta) => {
             outputLength += delta.length;
             appendStdoutExcerpt(delta);

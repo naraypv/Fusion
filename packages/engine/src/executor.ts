@@ -13,7 +13,9 @@ import {
   isEphemeralAgent,
   resolveAgentPrompt,
   resolveEffectiveAgentPermissionPolicy,
+  resolveModelFallbackChain,
   resolveProjectDefaultModel,
+  resolveRouteAllLlmCallsViaDspy,
   type RunCommandResult,
 } from "@fusion/core";
 import { findWorktreeUser } from "./merger.js";
@@ -3179,6 +3181,8 @@ export class TaskExecutor {
         );
         const executorFallbackProvider = settings.fallbackProvider;
         const executorFallbackModelId = settings.fallbackModelId;
+        const executorModelFallbackChain = resolveModelFallbackChain(settings);
+        const executorRouteViaDspy = resolveRouteAllLlmCallsViaDspy(settings);
         const executorThinkingLevel = detail.thinkingLevel ?? settings.defaultThinkingLevel;
 
         // Determine whether we're resuming a previous session (pause/resume)
@@ -3230,6 +3234,8 @@ export class TaskExecutor {
           defaultModelId: executorModelId,
           fallbackProvider: executorFallbackProvider,
           fallbackModelId: executorFallbackModelId,
+          modelFallbackChain: executorModelFallbackChain,
+          routeViaDspy: executorRouteViaDspy,
           defaultThinkingLevel: executorThinkingLevel,
           sessionManager,
           taskEnv,
@@ -3561,6 +3567,8 @@ export class TaskExecutor {
                 defaultModelId: executorModelId,
                 fallbackProvider: executorFallbackProvider,
                 fallbackModelId: executorFallbackModelId,
+                modelFallbackChain: executorModelFallbackChain,
+                routeViaDspy: executorRouteViaDspy,
                 defaultThinkingLevel: executorThinkingLevel,
                 sessionManager: SessionManager.create(worktreePath),
                 taskEnv,
@@ -5019,6 +5027,8 @@ Do not refactor, rename broadly, or make opportunistic improvements.
         onToolEnd: logger.onToolEnd,
         defaultProvider: executorProvider,
         defaultModelId: executorModelId,
+        modelFallbackChain: resolveModelFallbackChain(settings),
+        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
         defaultThinkingLevel: settings.defaultThinkingLevel,
         taskEnv: extraEnv,
         ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
@@ -5835,6 +5845,8 @@ and show an appropriate message to the user.\`
         defaultModelId: modelId,
         fallbackProvider: settings.fallbackProvider,
         fallbackModelId: settings.fallbackModelId,
+        modelFallbackChain: resolveModelFallbackChain(settings),
+        routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
         defaultThinkingLevel: settings.defaultThinkingLevel,
         taskEnv,
         // Skill selection: use assigned agent skills if available, otherwise role fallback
@@ -7422,6 +7434,8 @@ Child agent: ${agent.id} (${name})`;
             defaultModelId: childExecutorModelId,
             fallbackProvider: settings.fallbackProvider,
             fallbackModelId: settings.fallbackModelId,
+            modelFallbackChain: resolveModelFallbackChain(settings),
+            routeViaDspy: resolveRouteAllLlmCallsViaDspy(settings),
             taskEnv,
             // Skill selection: use assigned agent skills if available, otherwise role fallback
             ...(skillContext.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),

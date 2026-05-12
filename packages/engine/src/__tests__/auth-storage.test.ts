@@ -100,6 +100,24 @@ describe("createFusionAuthStorage", () => {
     expect(await authStorage.getApiKey("minimax")).toBe("second-key");
   });
 
+  it("does not keep using a selected account after it is marked failed", async () => {
+    const accountStore = new MultiAccountAuthStore(join(homeDir, ".fusion", "agent", "accounts.json"));
+    const first = accountStore.addApiKeyAccount("minimax", "first-key", { priority: 1 }).account;
+    accountStore.addApiKeyAccount("minimax", "second-key", { priority: 2 });
+    const authStorage = createFusionAuthStorage({ accountStore }) as ReturnType<typeof createFusionAuthStorage> & FusionAuthStorageExtras;
+
+    expect(authStorage.selectAccount("minimax")?.id).toBe(first.id);
+    expect(await authStorage.getApiKey("minimax")).toBe("first-key");
+
+    authStorage.markAccountFailure(first.id, {
+      kind: "rate_limit",
+      message: "429 too many requests",
+      at: new Date().toISOString(),
+    }, 60_000);
+
+    expect(await authStorage.getApiKey("minimax")).toBe("second-key");
+  });
+
   it("reads non-expired legacy Pi OAuth credentials as fallback", async () => {
     const legacyAgentDir = join(homeDir, ".pi", "agent");
     mkdirSync(legacyAgentDir, { recursive: true });
