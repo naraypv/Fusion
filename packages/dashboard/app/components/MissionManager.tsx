@@ -197,7 +197,14 @@ function getInterviewStatusLabel(status: AiSessionSummary["status"]): string {
 }
 
 function getInterviewActionLabel(status: AiSessionSummary["status"]): string {
-  return status === "error" ? "Retry interview" : "Resume interview";
+  switch (status) {
+    case "error":
+      return "Retry interview";
+    case "generating":
+      return "Generating plan";
+    default:
+      return "Resume interview";
+  }
 }
 
 /** Get the plan state for a milestone (derived from interviewState) */
@@ -3617,9 +3624,10 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
             onClick={() => handleResumeInterviewSession(session.id)}
             title={resumeActionLabel}
             aria-label={resumeActionLabel}
+            disabled={isGenerating}
           >
             {isGenerating ? <Loader2 size={14} className="spinner" /> : isErrored ? <RefreshCw size={14} /> : <Sparkles size={14} />}
-            <span>{isErrored ? "Retry" : "Resume"}</span>
+            <span>{isGenerating ? "Generating…" : isErrored ? "Retry" : "Resume"}</span>
           </button>
           <button
             className="mission-btn mission-btn--danger mission-btn--sm"
