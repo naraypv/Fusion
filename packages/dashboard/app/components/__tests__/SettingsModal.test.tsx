@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { ComponentProps } from "react";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsModal } from "../SettingsModal";
@@ -196,11 +197,12 @@ const defaultSettings = {
   webhookEvents: undefined,
 };
 
-function renderModal(props = {}) {
+function renderModal(props: Partial<ComponentProps<typeof SettingsModal>> = {}) {
   return render(
     <SettingsModal
       onClose={noop}
       addToast={noop}
+      initialSection="authentication"
       {...props}
     />
   );
@@ -243,11 +245,44 @@ describe("SettingsModal", () => {
     const authenticationHeading = screen.getByRole("heading", { name: "Authentication" });
     expect(authenticationHeading).toHaveClass("settings-section-heading");
 
-    await userEvent.click(screen.getAllByRole("button", { name: /^General$/ })[0]);
+    await userEvent.click(screen.getByRole("button", { name: /^General$/ }));
 
     const generalHeading = screen.getByRole("heading", { name: "General" });
     expect(generalHeading).toHaveClass("settings-section-heading");
     expect(container.querySelectorAll(".settings-section-heading").length).toBeGreaterThan(0);
+  });
+
+  it("defaults to the global General section when no initialSection is provided", async () => {
+    render(
+      <SettingsModal
+        onClose={noop}
+        addToast={noop}
+      />,
+    );
+    await waitForSettingsModalReady();
+
+    const generalNavButton = screen.getByRole("button", { name: /^General$/ });
+    expect(generalNavButton).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Authentication$/ })).not.toHaveClass("active");
+  });
+
+  it("honors an explicit initialSection override", async () => {
+    renderModal({ initialSection: "authentication" });
+    await waitForSettingsModalReady();
+
+    expect(screen.getByRole("button", { name: /^Authentication$/ })).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+  });
+
+  it("maps the legacy pi-extensions initialSection alias to Plugins", async () => {
+    renderModal({ initialSection: "pi-extensions" });
+    await waitForSettingsModalReady();
+
+    expect(screen.getByRole("button", { name: /^Plugins$/ })).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "Plugins" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pi Extensions" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByTestId("pi-extensions-manager")).toBeInTheDocument();
   });
 
   it("shows direct merge commit routing only for direct merges", async () => {
@@ -2416,7 +2451,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Remote Access/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
 
       it("hides research settings nav items when experimentalFeatures.researchView is disabled", async () => {
@@ -2455,7 +2490,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Research Defaults/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
 
       it("hides scheduled evals nav item when experimentalFeatures.evalsView is disabled", async () => {
@@ -2492,7 +2527,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Scheduled Evals/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
     });
 
@@ -3631,7 +3666,7 @@ describe("SettingsModal", () => {
     it("falls back to first visible section when initial section is unavailable", async () => {
       renderModal({ initialSection: "unknown-section" as any });
       await waitForSettingsModalReady();
-      expect(await screen.findByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
     });
   });
 

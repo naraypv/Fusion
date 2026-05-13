@@ -326,6 +326,8 @@ function normalizeExperimentalFeaturesForSave(features?: Record<string, boolean>
 type LegacySectionId = "pi-extensions";
 export type SectionId = SettingsSection["id"] | LegacySectionId;
 
+const DEFAULT_SETTINGS_SECTION: SectionId = "global-general";
+
 type PluginsSubsectionId = "fusion-plugins" | "pi-extensions";
 
 /** Local form state extends Settings with a worktreeInitCommand override and lets tokenCap carry null (delete semantic). */
@@ -335,7 +337,7 @@ interface SettingsModalProps {
   onClose: () => void;
   addToast: (message: string, type?: ToastType) => void;
   projectId?: string;
-  /** Optional section to show when the modal first opens. Defaults to first non-group-header section. */
+  /** Optional section to show when the modal first opens. Defaults to the global General section. */
   initialSection?: SectionId;
   /** Current theme mode */
   themeMode?: ThemeMode;
@@ -414,13 +416,13 @@ export function SettingsModal({
   const [scopedSettings, setScopedSettings] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
   // Track initial scoped values for null-as-delete semantics on project overrides
   const [initialScopedValues, setInitialScopedValues] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
-  // Find the first non-group-header section for default active section
+  // Find the first non-group-header section for visibility fallback handling
   const firstNonHeaderSection = SETTINGS_SECTIONS.find((s) => !s.isGroupHeader);
   const [activeSection, setActiveSection] = useState<SectionId>(() => {
     if (initialSection === "pi-extensions") {
       return "plugins";
     }
-    return initialSection ?? firstNonHeaderSection?.id ?? "authentication";
+    return initialSection ?? DEFAULT_SETTINGS_SECTION;
   });
   // Deterministic default: opening Plugins starts on Fusion Plugins unless legacy
   // `initialSection="pi-extensions"` is explicitly provided.
@@ -470,7 +472,9 @@ export function SettingsModal({
 
     return true;
   });
-  const firstVisibleSectionId = visibleSections.find((section) => !section.isGroupHeader)?.id ?? "general";
+  const firstVisibleSectionId = visibleSections.some((section) => section.id === DEFAULT_SETTINGS_SECTION)
+    ? DEFAULT_SETTINGS_SECTION
+    : (visibleSections.find((section) => !section.isGroupHeader)?.id ?? firstNonHeaderSection?.id ?? "general");
 
   /** Get the scope of the currently active section */
   const activeSectionScope = visibleSections.find((s) => s.id === activeSection)?.scope;
