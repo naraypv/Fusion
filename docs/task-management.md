@@ -99,6 +99,29 @@ Fusion task columns:
    - Self-healing can still auto-finalize retry-exhausted failed review tasks when it can prove their branch content already landed on the merge target, so already-merged work does not deadlock in `in-review`.
    - Repeated engine merge-queue drops now escalate to an explicit recoverable review failure: if auto-recovery hits `Auto-merge starvation:` in the task `error`, Fusion has already seen three consecutive enqueue attempts rejected by the engine merge queue. Operators can recover by clearing the failed state from the dashboard, which lets the usual unpause/clear flow re-attempt merge once the underlying queue wedge is resolved.
    - Non-recoverable state-machine errors during finalization (for example `Invalid transition: 'todo' → 'done'`) are treated as terminal review failures: recovery must not re-enqueue these tasks for merge unless task state changes prove they are recoverable.
+
+#### In-review stall signal
+
+Fusion now derives `task.inReviewStall` for non-paused `in-review` tasks when a known stuck-state shape is detected. This signal is state-based (not log-heuristic) and is computed server-side on task hydration.
+
+`InReviewStallCode` values:
+- `transient-merge-status-no-owner` — task is still in `merging`/`merging-pr`/`merging-fix` after the stale-merging age threshold, but no active merger owns it.
+- `merge-retries-exhausted` — `mergeRetries` reached the auto-merge retry cap without `mergeDetails.mergeConfirmed === true`.
+- `no-worktree-no-merge-confirmed` — task has no worktree path and merge is not confirmed (excluding explicit no-op merges).
+- `merge-blocker` — `getTaskMergeBlocker()` reports a merge/finalization blocker.
+
+Invariant: `inReviewStall` is **diagnostic-only**. It must never be used as an auto-completion trigger.
+
+Self-healing surfaces this diagnosis via task log entries in the form:
+- `In-review stall surfaced [<code>]: <reason>`
+
+These entries are rate-limited per `(task, code)` over `taskStuckTimeoutMs`, so unchanged stalls are not spammed every cycle while state transitions can still surface a new code immediately.
+
+Auto-completion/finalization remains owned by existing recovery passes:
+- `recoverStaleMergingStatus`
+- `finalizeNoOpReviewTasks`
+- `recoverMergeableReviewTasks`
+- `recoverAlreadyMergedReviewTasks`
 5. **done** — merged/finalized
 6. **archived** — preserved history, optionally cleaned from filesystem
 
