@@ -176,6 +176,45 @@ describe("TaskCard", () => {
     expect(container.querySelector(".card-status-badge")).toBeNull();
   });
 
+  it("renders stalled badge with reason tooltip when stalledReview is set", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          status: "merging",
+          stalledReview: {
+            reason: "Re-enqueued for merge 3 times in the last 60 minutes without leaving in-review",
+            heuristic: "reenqueue-churn",
+            matchCount: 3,
+            firstMatchAt: "2026-05-12T11:00:00.000Z",
+            lastMatchAt: "2026-05-12T11:50:00.000Z",
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const stalledBadge = screen.getByText("Stalled");
+    expect(stalledBadge.getAttribute("title")).toContain("Re-enqueued for merge 3 times");
+  });
+
+  it("does not render stalled badge when stalledReview is undefined", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          status: "merging",
+          stalledReview: undefined,
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.queryByText("Stalled")).toBeNull();
+  });
+
   it("shows paused by agent label when pausedByAgentId is set", () => {
     render(
       <TaskCard task={makeTask({ paused: true, pausedByAgentId: "agent-1" })} onOpenDetail={noop} addToast={noop} />,

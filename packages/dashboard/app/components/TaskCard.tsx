@@ -19,6 +19,7 @@ import { useBadgeWebSocket } from "../hooks/useBadgeWebSocket";
 import { getFreshBatchData } from "../hooks/useBatchBadgeFetch";
 import { useTaskDiffStats } from "../hooks/useTaskDiffStats";
 import { isTaskStuck } from "../utils/taskStuck";
+import { getStalledReviewSignal } from "../utils/taskStalledReview";
 import { getUnifiedTaskProgress } from "../utils/taskProgress";
 import { getEndToEndDurationMs, getTimedDurationMs, getWorkflowRuntimeMs, parseTimestampToMs } from "../utils/taskTiming";
 import type { ToastType } from "../hooks/useToast";
@@ -744,6 +745,7 @@ function TaskCardComponent({
   const normalizedPriority = normalizeTaskPriorityValue(task.priority);
   const showPriorityBadge = normalizedPriority !== DEFAULT_TASK_PRIORITY;
   const isStuck = isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs);
+  const stalledReview = getStalledReviewSignal(task);
   const isAwaitingApproval = task.column === "triage" && task.status === "awaiting-approval";
   const isArchived = task.column === "archived";
   const isAgentActive = !globalPaused && !queued && !isFailed && !isPaused && !isStuck && !isAwaitingApproval && (task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string));
@@ -1390,6 +1392,14 @@ function TaskCardComponent({
         {isStuck && (isPaused || !task.status || task.status === "queued") && (
           <span className="card-status-badge stuck">
             Stuck
+          </span>
+        )}
+        {stalledReview && task.column === "in-review" && !isPaused && (
+          <span
+            className="card-status-badge card-status-badge--in-review stalled-review"
+            title={stalledReview.reason}
+          >
+            Stalled
           </span>
         )}
         {hasGitHubBadge && (
