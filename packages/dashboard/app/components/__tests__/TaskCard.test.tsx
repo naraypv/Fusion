@@ -34,6 +34,7 @@ vi.mock("../../api", () => ({
 }));
 
 import { uploadAttachment, fetchMission, fetchAgent } from "../../api";
+import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -1043,8 +1044,70 @@ describe("TaskCard", () => {
     const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
     expect(link.getAttribute("href")).toBe("https://github.com/owner/repo/issues/42");
     expect(link.getAttribute("title")).toBe("Linked GitHub issue: owner/repo#42");
-    expect(link).toHaveClass("card-github-tracking-link");
+    expect(link).toHaveClass("card-source-provenance", "card-github-tracking-link");
     expect(screen.getByTestId("provider-icon-github")).toBeDefined();
+  });
+
+  it("keeps the GitHub tracking link keyboard focusable", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    expect(link.tabIndex).not.toBe(-1);
+    link.focus();
+    expect(document.activeElement).toBe(link);
+  });
+
+  it("renders safe external-link attributes for the GitHub tracking link", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(link.getAttribute("rel")).toContain("noreferrer");
+  });
+
+  it("keeps GitHub tracking link interaction-affordance CSS contract", () => {
+    const css = loadAllAppCssBaseOnly();
+
+    expect(css).toMatch(/\.card-github-tracking-link\s*\{[^}]*min-width:[^;]+;[^}]*min-height:[^;]+;[^}]*\}/);
+    expect(css).toContain(".card-github-tracking-link:hover");
+    expect(css).toMatch(/\.card-github-tracking-link:focus-visible\s*\{[^}]*--focus-ring-strong/);
   });
 
   it("does not render a GitHub tracking link when githubTracking is absent", () => {
