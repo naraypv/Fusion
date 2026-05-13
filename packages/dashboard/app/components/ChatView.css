@@ -195,7 +195,7 @@
 .chat-sidebar-search-icon {
   position: absolute;
   left: var(--space-md);
-  color: var(--text-tertiary);
+  color: var(--text-dim);
   pointer-events: none;
 }
 
@@ -237,7 +237,7 @@
 }
 
 .chat-session-item:hover {
-  background: var(--hover);
+  background: var(--card-hover);
 }
 
 .chat-session-item--active {
@@ -274,7 +274,7 @@
   justify-content: space-between;
   align-items: center;
   font-size: 11px;
-  color: var(--text-tertiary);
+  color: var(--text-dim);
 }
 
 .chat-session-meta-model {
@@ -352,7 +352,7 @@
 }
 
 .chat-session-context-menu button:hover {
-  background: var(--hover);
+  background: var(--card-hover);
 }
 
 /* Main chat thread */
@@ -930,7 +930,7 @@
 
 .chat-message-time {
   font-size: 11px;
-  color: var(--text-tertiary);
+  color: var(--text-dim);
   margin-top: 4px;
 }
 

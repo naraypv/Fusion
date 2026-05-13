@@ -1526,18 +1526,18 @@
 }
 
 .settings-lane-badge--override {
-  background-color: color-mix(in srgb, var(--color-accent) 20%, transparent);
-  color: var(--color-accent);
+  background-color: color-mix(in srgb, var(--todo) 20%, transparent);
+  color: var(--todo);
 }
 
 .settings-lane-badge--inherited {
-  background-color: color-mix(in srgb, var(--color-text-muted) 15%, transparent);
+  background-color: color-mix(in srgb, var(--text-muted) 15%, transparent);
   color: var(--text-muted);
 }
 
 .settings-description {
   font-size: 13px;
-  color: var(--text-secondary);
+  color: var(--text-dim);
   padding-inline: var(--space-xl);
   margin-block: 0 var(--space-md);
   line-height: 1.5;
