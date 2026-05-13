@@ -39,4 +39,24 @@ describe("filePathLinkify", () => {
     await user.click(screen.getByRole("button", { name: "src/foo.ts:42:7" }));
     expect(openFile).toHaveBeenCalledWith("src/foo.ts", { line: 42, col: 7 });
   });
+
+  it("allows long file path links to wrap", () => {
+    const openFile = vi.fn();
+
+    render(
+      <FileBrowserProvider openFile={openFile}>
+        <FilePathLink path="packages/some/very/long/nested/path/file.ts">
+          packages/some/very/long/nested/path/file.ts
+        </FilePathLink>
+      </FileBrowserProvider>,
+    );
+
+    const button = screen.getByRole("button", {
+      name: "packages/some/very/long/nested/path/file.ts",
+    });
+    const styles = getComputedStyle(button);
+
+    expect(styles.whiteSpace).toBe("normal");
+    expect(styles.display).not.toBe("inline-flex");
+  });
 });
