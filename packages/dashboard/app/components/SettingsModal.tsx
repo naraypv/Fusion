@@ -5108,7 +5108,7 @@ export function SettingsModal({
                         !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
                       }
                     >
-                      {testNotificationLoading["ntfy-message"] ? "Sending…" : "Test message notification"}
+                      {testNotificationLoading["ntfy-message"] ? "Sending…" : "Test direct message"}
                     </button>
                     <button
                       type="button"
@@ -5123,24 +5123,24 @@ export function SettingsModal({
                         !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
                       }
                     >
-                      {testNotificationLoading["ntfy-room"] ? "Sending…" : "Send test room notification"}
+                      {testNotificationLoading["ntfy-room"] ? "Sending…" : "Test room reply"}
                     </button>
                   </div>
                   {(testNotificationResult["ntfy"] || testNotificationResult["ntfy-message"] || testNotificationResult["ntfy-room"]) && (
                     <div className="notification-test-feedback" aria-live="polite">
                       {testNotificationResult["ntfy"] && (
                         <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy"].status}`}>
-                          {testNotificationResult["ntfy"].message}
+                          General: {testNotificationResult["ntfy"].message}
                         </small>
                       )}
                       {testNotificationResult["ntfy-message"] && (
                         <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy-message"].status}`}>
-                          {testNotificationResult["ntfy-message"].message}
+                          Direct message: {testNotificationResult["ntfy-message"].message}
                         </small>
                       )}
                       {testNotificationResult["ntfy-room"] && (
                         <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy-room"].status}`}>
-                          {testNotificationResult["ntfy-room"].message}
+                          Room reply: {testNotificationResult["ntfy-room"].message}
                         </small>
                       )}
                     </div>
