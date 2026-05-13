@@ -19,9 +19,10 @@ import { createResolvedAgentSession } from "../agent-session-helpers.js";
 const mockedCreateResolvedAgentSession = vi.mocked(createResolvedAgentSession);
 
 function buildSession(reviewText: string) {
+  const prompt = vi.fn().mockResolvedValue(undefined);
   return {
     session: {
-      prompt: vi.fn().mockResolvedValue(undefined),
+      prompt,
       subscribe: vi.fn().mockImplementation((cb: any) => {
         cb({
           type: "message_update",
@@ -66,6 +67,31 @@ describe("FN-4068 baseline — plan review UNAVAILABLE", () => {
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-4092",
       expect.stringContaining("review retry with fallback model after UNAVAILABLE verdict"),
+    );
+  });
+
+  it("retries on the same model with stricter verdict instruction when fallback model is not configured", async () => {
+    const first = buildSession("No parseable verdict here.");
+    const second = buildSession("### Verdict: APPROVE\n### Summary\nRecovered.");
+    mockedCreateResolvedAgentSession
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second);
+
+    const result = await reviewStep(
+      "/tmp/worktree",
+      "FN-4092",
+      2,
+      "Reproduce stall",
+      "plan",
+      "# prompt",
+      undefined,
+      {},
+    );
+
+    expect(result.verdict).toBe("APPROVE");
+    expect(mockedCreateResolvedAgentSession).toHaveBeenCalledTimes(2);
+    expect(second.session.prompt).toHaveBeenCalledWith(
+      expect.stringContaining('Respond with exactly one of: APPROVE | REVISE | RETHINK on a line starting with "Verdict:"'),
     );
   });
 });
