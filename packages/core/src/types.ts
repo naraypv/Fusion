@@ -197,6 +197,18 @@ export function normalizeMergeStrategyOverlapBehavior(
     ? value as MergeStrategyOverlapBehavior
     : "flip-to-prefer-branch";
 }
+
+export const POST_MERGE_AUDIT_MODES = ["block", "warn", "off"] as const;
+
+/** Controls how the merger reacts to a dirty post-merge audit (FN-4333). */
+export type PostMergeAuditMode = (typeof POST_MERGE_AUDIT_MODES)[number];
+
+export function normalizePostMergeAuditMode(value: unknown): PostMergeAuditMode {
+  return typeof value === "string"
+    && (POST_MERGE_AUDIT_MODES as readonly string[]).includes(value)
+    ? (value as PostMergeAuditMode)
+    : "block";
+}
 /** Policy for handling task execution when the selected node is unavailable/unhealthy. */
 export type UnavailableNodePolicy = "block" | "fallback-local";
 
@@ -2242,6 +2254,15 @@ export interface ProjectSettings {
   /** Controls overlap protection when `mergeConflictStrategy="smart-prefer-main"`
    *  reaches its Attempt 3 fallback. Default: "flip-to-prefer-branch". */
   mergeStrategyOverlapBehavior?: MergeStrategyOverlapBehavior;
+  /** Controls how the merger reacts to a dirty post-merge / post-rebase audit (FN-4333).
+   *  - "block" (default): throw `SquashAuditError`, park task as failed (today's behavior).
+   *  - "warn": log audit findings on the agent log but auto-complete the merge.
+   *  - "off": skip the post-merge audit entirely.
+   *
+   *  Regardless of mode, the merger short-circuits overlap-only findings on the
+   *  rebase-strategy path when deterministic merge verification has already proven
+   *  the resulting tree (silent drops are impossible by construction in that case). */
+  postMergeAuditMode?: PostMergeAuditMode;
   /** Wall-clock timeout (ms) for a single pre-merge workflow step's AI call.
    *  When a step exceeds this, the session is aborted and the executor is
    *  given one shot to retry with the configured fallback model before the

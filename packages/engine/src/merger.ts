@@ -36,6 +36,7 @@ import {
   getTaskMergeBlocker,
   normalizeMergeConflictStrategy,
   normalizeMergeStrategyOverlapBehavior,
+  normalizePostMergeAuditMode,
   resolveTaskMergeTarget,
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
@@ -53,6 +54,7 @@ import {
   type AgentPromptsConfig,
   type CanonicalMergeConflictStrategy,
   type DirectMergeCommitStrategy,
+  type PostMergeAuditMode,
   type TaskSourceIssue,
   type Task,
   type AutostashOrphanRecord,
@@ -4599,6 +4601,58 @@ function shouldRunPostMergeAudit(
   return (result.autoResolvedCount ?? 0) > 0 || result.attemptsMade === 3;
 }
 
+/**
+ * Decide what to do with a dirty post-merge audit (FN-4333 hot-fix).
+ *
+ * Three modes (`postMergeAuditMode` setting):
+ *  - `"off"`   — caller should skip auditing entirely (handled before this fn).
+ *  - `"warn"`  — log findings on the agent log but proceed; never throws.
+ *  - `"block"` — today's behavior: throw `SquashAuditError` and park the task,
+ *                EXCEPT for the deterministic-verification short-circuit:
+ *                rebase-strategy + overlap-only findings + a verified merged tree
+ *                cannot have produced silent drops (the tree is provably the
+ *                rebase output by construction), so we pass through clean.
+ *
+ * Pure / side-effect-free so it is unit-testable without spinning up a real
+ * merger flow. The merger call site uses the returned action to decide whether
+ * to throw or fall through.
+ */
+export type PostMergeAuditAction =
+  | { action: "pass"; reason: "verified-short-circuit" | "mode-warn" }
+  | { action: "block"; reason: "mode-block" };
+
+export function resolvePostMergeAuditAction(opts: {
+  mode: PostMergeAuditMode;
+  strategy: PostMergeAuditStrategy;
+  findings: SquashAuditFindings;
+  isTreeVerified: boolean;
+}): PostMergeAuditAction {
+  if (opts.findings.clean) {
+    // Caller should never invoke this on a clean audit, but be defensive.
+    return { action: "pass", reason: "mode-warn" };
+  }
+
+  const overlapOnly =
+    opts.findings.duplicateSubjects.length === 0
+    && opts.findings.touchedFileOverlaps.length > 0;
+
+  // Stage 1 short-circuit: a verified rebase tree with overlap-only findings
+  // cannot have produced silent drops. Pass regardless of mode (warn/block).
+  if (
+    opts.strategy === "rebase"
+    && overlapOnly
+    && opts.isTreeVerified
+  ) {
+    return { action: "pass", reason: "verified-short-circuit" };
+  }
+
+  if (opts.mode === "warn") {
+    return { action: "pass", reason: "mode-warn" };
+  }
+
+  return { action: "block", reason: "mode-block" };
+}
+
 function buildPostMergeAuditBlockingMessage(taskId: string, findings: SquashAuditFindings): string {
   const riskParts: string[] = [];
   if (findings.duplicateSubjects.length > 0) {
@@ -6665,7 +6719,12 @@ export async function aiMergeTask(
     const recordedSha = (isEmptyCommit || mergeWasEmpty) ? undefined : commitSha;
 
     const auditSha = recordedSha;
-    if (auditSha && shouldRunPostMergeAudit(selectedPostMergeAuditStrategy, result, mergeWasEmpty, isEmptyCommit, auditSha)) {
+    const postMergeAuditMode = normalizePostMergeAuditMode(settings.postMergeAuditMode);
+    if (
+      auditSha
+      && postMergeAuditMode !== "off"
+      && shouldRunPostMergeAudit(selectedPostMergeAuditStrategy, result, mergeWasEmpty, isEmptyCommit, auditSha)
+    ) {
       const auditFindings = selectedPostMergeAuditStrategy === "rebase" && rebaseMergeBaseSha
         ? await auditSquashMerge({
           rootDir,
@@ -6679,24 +6738,72 @@ export async function aiMergeTask(
           squashSha: auditSha,
         });
       if (!auditFindings.clean) {
-        const auditError = new SquashAuditError(taskId, auditSha, auditFindings);
+        // FN-4333: a verified rebase tree with overlap-only findings cannot have
+        // produced silent drops by construction. Check the verification cache to
+        // detect that case and pass through. `warn` mode passes any dirty audit.
+        let isTreeVerified = false;
+        try {
+          const { stdout: treeShaOut } = await execAsync(
+            `git rev-parse ${auditSha}^{tree}`,
+            { cwd: rootDir, encoding: "utf-8" },
+          );
+          const treeSha = treeShaOut.trim();
+          if (treeSha) {
+            const cacheHit = store.getVerificationCacheHit(
+              treeSha,
+              effectiveTestCommand ?? "",
+              effectiveBuildCommand ?? "",
+            );
+            isTreeVerified = Boolean(cacheHit);
+          }
+        } catch (err) {
+          mergerLog.warn(
+            `${taskId}: failed to resolve tree sha for audit verification short-circuit: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+
+        const decision = resolvePostMergeAuditAction({
+          mode: postMergeAuditMode,
+          strategy: selectedPostMergeAuditStrategy,
+          findings: auditFindings,
+          isTreeVerified,
+        });
+
+        if (decision.action === "block") {
+          const auditError = new SquashAuditError(taskId, auditSha, auditFindings);
+          await store.appendAgentLog(
+            taskId,
+            auditError.message,
+            "tool_error",
+            formatSquashAuditAgentLog(auditFindings),
+            "merger",
+          );
+          await store.updateTask(taskId, { status: null });
+          throw auditError;
+        }
+
+        const passLabel = decision.reason === "verified-short-circuit"
+          ? `${selectedPostMergeAuditStrategy === "rebase" ? "post-rebase" : "post-squash"} audit overlap cleared by deterministic verification`
+          : `${selectedPostMergeAuditStrategy === "rebase" ? "post-rebase" : "post-squash"} audit found ${auditFindings.issueCount} risk(s) — continuing (postMergeAuditMode=warn)`;
         await store.appendAgentLog(
           taskId,
-          auditError.message,
-          "tool_error",
+          passLabel,
+          "text",
           formatSquashAuditAgentLog(auditFindings),
           "merger",
         );
-        await store.updateTask(taskId, { status: null });
-        throw auditError;
+        mergerLog.log(`${taskId}: ${passLabel}`);
+      } else {
+        await store.appendAgentLog(
+          taskId,
+          selectedPostMergeAuditStrategy === "rebase" ? "post-rebase range audit clean" : "post-squash audit clean",
+          "text",
+          undefined,
+          "merger",
+        );
       }
-      await store.appendAgentLog(
-        taskId,
-        selectedPostMergeAuditStrategy === "rebase" ? "post-rebase range audit clean" : "post-squash audit clean",
-        "text",
-        undefined,
-        "merger",
-      );
+    } else if (auditSha && postMergeAuditMode === "off") {
+      mergerLog.log(`${taskId}: post-merge audit skipped (postMergeAuditMode=off)`);
     }
     if (isEmptyCommit) {
       mergerLog.warn(
