@@ -3344,7 +3344,7 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openNotificationsSection();
 
-      await userEvent.click(screen.getByRole("button", { name: /Test message notification/ }));
+      await userEvent.click(screen.getByRole("button", { name: /Test direct message/ }));
 
       await waitFor(() => {
         expect(mockTestNotification).toHaveBeenCalledWith(
@@ -3354,11 +3354,11 @@ describe("SettingsModal", () => {
         );
       });
       expect(addToast).toHaveBeenCalledWith(
-        "Test notification sent — check your ntfy app inbox!",
+        "Direct-message test sent — check your ntfy inbox for the agent-to-user message.",
         "success",
       );
-      expect(screen.getByText("Test notification sent — check your ntfy app inbox!")).toBeInTheDocument();
-      expect(screen.getAllByText("Test notification sent — check your ntfy app inbox!")[0].closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
+      expect(screen.getByText("Direct message: Direct-message test sent — check your ntfy inbox for the agent-to-user message.")).toBeInTheDocument();
+      expect(screen.getByText("Direct message: Direct-message test sent — check your ntfy inbox for the agent-to-user message.").closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
     });
 
     it("calls testNotification with ntfy room-event config when room test button clicked", async () => {
@@ -3368,7 +3368,7 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openNotificationsSection();
 
-      await userEvent.click(screen.getByRole("button", { name: /Send test room notification/ }));
+      await userEvent.click(screen.getByRole("button", { name: /Test room reply/ }));
 
       await waitFor(() => {
         expect(mockTestNotification).toHaveBeenCalledWith(
@@ -3378,9 +3378,26 @@ describe("SettingsModal", () => {
         );
       });
       expect(addToast).toHaveBeenCalledWith(
-        "Test notification sent — check your ntfy app inbox!",
+        "Room reply test sent — check your ntfy inbox for the room reply.",
         "success",
       );
+      expect(screen.getByText("Room reply: Room reply test sent — check your ntfy inbox for the room reply.")).toBeInTheDocument();
+    });
+
+    it("shows ntfy room-specific failure copy when room test fails", async () => {
+      const addToast = vi.fn();
+      mockTestNotification.mockResolvedValueOnce({ success: false, error: "boom" });
+      mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
+      renderModal({ addToast });
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+
+      await userEvent.click(screen.getByRole("button", { name: /Test room reply/ }));
+
+      await waitFor(() => {
+        expect(addToast).toHaveBeenCalledWith("Failed to send room reply test", "error");
+      });
+      expect(screen.getByText("Room reply: Failed to send room reply test")).toBeInTheDocument();
     });
 
     it("calls testNotification with webhook provider ID when webhook test button clicked", async () => {
