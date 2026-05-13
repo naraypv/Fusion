@@ -53,9 +53,6 @@
 }
 
 .workflow-results-edit-toggle {
-  width: auto;
-  min-height: calc(var(--space-lg) * 2 - var(--space-xs));
-  padding-inline: calc(var(--space-sm) + var(--space-xs) * 0.5);
   color: var(--text-muted);
   gap: calc(var(--space-xs) + var(--space-xs) * 0.5);
 }
