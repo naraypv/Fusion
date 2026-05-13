@@ -2211,7 +2211,7 @@ describe("executeHeartbeat", () => {
 
       expect(mockedCreateFnAgent).toHaveBeenCalledOnce();
       const callArgs = mockedCreateFnAgent.mock.calls[0]![0];
-      expect(callArgs.cwd).toBe("/tmp/test");
+      expect(callArgs.cwd).toBe("/tmp/worktree-fn-001");
       expect(callArgs.systemPrompt).toContain(HEARTBEAT_SYSTEM_PROMPT);
       expect(callArgs.systemPrompt).toContain("## Soul");
       expect(callArgs.systemPrompt).toContain("Act like a practical teammate who prioritizes clarity.");

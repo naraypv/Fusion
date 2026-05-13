@@ -2105,13 +2105,13 @@ export class HeartbeatMonitor {
         }
 
         let sessionCwd = rootDir;
-        if (!isNoTaskRun && taskDetail && heartbeatModelSettings) {
+        if (!isNoTaskRun && taskDetail) {
           try {
             const acquisition = await acquireTaskWorktree({
               task: taskDetail,
               rootDir,
               store: taskStore,
-              settings: heartbeatModelSettings,
+              settings: heartbeatModelSettings ?? {},
               logger: heartbeatLog,
               audit,
               runContext,
