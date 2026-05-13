@@ -1,9 +1,23 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import { render, screen } from "@testing-library/react";
 import type { IssueInfo, PrInfo } from "@fusion/core";
+import { loadAllAppCss } from "../../test/cssFixture";
 import { GitHubBadge } from "../GitHubBadge";
 
 describe("GitHubBadge", () => {
+  let styleEl: HTMLStyleElement;
+
+  beforeAll(() => {
+    styleEl = document.createElement("style");
+    styleEl.textContent = loadAllAppCss();
+    document.head.appendChild(styleEl);
+  });
+
+  afterAll(() => {
+    styleEl.remove();
+    document.body.innerHTML = "";
+  });
+
   const mockPrInfo: PrInfo = {
     url: "https://github.com/owner/repo/pull/42",
     number: 42,
@@ -138,6 +152,21 @@ describe("GitHubBadge", () => {
 
       // Second badge should be Issue (completed)
       expect(badges[1].classList.contains("card-github-badge--completed")).toBe(true);
+    });
+  });
+
+  describe("Badge styling", () => {
+    it("uses the updated badge gap and font size", () => {
+      render(<GitHubBadge prInfo={mockPrInfo} />);
+
+      const badge = screen.getByRole("link", { name: "#42" });
+      const styles = getComputedStyle(badge);
+
+      expect(styles.fontSize).toBe("9px");
+      const resolvedGap = styles.gap.startsWith("var(")
+        ? getComputedStyle(document.documentElement).getPropertyValue("--space-sm").trim()
+        : styles.gap;
+      expect(resolvedGap).toBe("8px");
     });
   });
 
