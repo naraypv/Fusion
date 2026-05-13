@@ -168,8 +168,12 @@
   line-height: 1.4;
   color: var(--text-muted);
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .card-status-badge.paused {
@@ -1195,6 +1199,8 @@
 
   .card-stalled-review-reason {
     font-size: 0.625rem;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
   }
 
   .card-mission-badge {
