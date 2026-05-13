@@ -774,6 +774,12 @@ Key server capabilities:
 - Remote login links carry auth material in query params (`rt` then `token` on redirect). Treat links/QR screenshots as secrets: they can leak through history, screenshots, and chat logs; prefer short-lived mode for sharing.
 - Intentional startup/banner text in `fn dashboard` and `fn serve` remains direct plain output for readability and backward-compatible scripting behavior.
 
+### Headless Node Mode (`fn serve` / `fn daemon`)
+- Headless runtimes now auto-register the current working directory as a project when it is missing from central registry metadata, then continue normal engine startup.
+- First-run auto-bootstrap logs one line: `[serve] Auto-registered project "<name>" at <cwd>` (or `[daemon] ...`).
+- This enables first-run startup in CI/Docker/cron without requiring a prior `fn init` or `fn project add`.
+- Pass `--no-auto-register` to either command to preserve legacy strict behavior.
+
 ### Real-time channels
 - **SSE**: `/api/events` (`sse.ts`)
   - Emits `task:*`, mission events, AI session updates, automation schedule events (`schedule:created`, `schedule:updated`, `schedule:deleted`, `schedule:run`), and research run lifecycle events (`research:run:created`, `research:run:updated`, `research:run:completed`, `research:run:failed`, `research:run:cancelled`) when available
