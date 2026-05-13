@@ -143,30 +143,6 @@ Task branch fields are intentionally distinct:
 
 `PrInfo.baseBranch` is unchanged and continues to represent pull-request target branch metadata.
 
-### Loud branch-conflict recovery
-
-When the executor tries to allocate the canonical task branch (`fusion/<task-id>`) and finds that branch already checked out in another live worktree, Fusion now **fails loudly by default** instead of silently forking work onto `fusion/<task-id>-2`, `-3`, and similar siblings.
-
-Default behavior:
-- task moves from `in-progress` back to `todo`
-- task `status` becomes `"failed"`
-- task keeps recovery context on the canonical branch/worktree metadata
-- task lifecycle logs and agent logs include the existing tip SHA plus stranded commit subjects
-
-Recovery is explicit:
-
-```bash
-fn task branch-recovery FN-001
-fn task branch-recovery FN-001 --reclaim fusion/fn-001
-fn task branch-recovery FN-001 --discard fusion/fn-001-2 --yes
-```
-
-- **Inspect** lists the canonical branch and any sibling branches with tip SHA, attached worktree path, and stranded commits.
-- **Reclaim** updates task metadata so the next executor run resumes from the chosen branch/worktree instead of allocating a fresh sibling.
-- **Discard** removes a selected stranded branch/worktree only when `--yes` is supplied.
-
-If you must preserve the old silent suffixing flow for a legacy workflow, set project setting `executorAllowSiblingBranchRename=true`. This is discouraged because it can hide earlier commits behind suffixed sibling branches and make recovery less obvious.
-
 ### Dependency reconciliation guidance
 
 When a task was created to resolve a temporary failure state in another task (for example, a preserved `in-review/failed` merge condition), its dependency contract may become stale after recovery.
@@ -192,6 +168,42 @@ Recommended pattern:
 - Re-audit after apply and resolve or explicitly disposition any related stale follow-up tasks.
 
 Do **not** patch `.fusion/fusion.db` directly without synchronizing `.fusion/tasks/*/task.json` through a supported store-backed path.
+
+## Branch conflict recovery
+
+When the executor tries to allocate the canonical task branch (`fusion/<task-id>`) and finds that branch already checked out in another live worktree, Fusion now fails loudly by default instead of silently renaming the run onto `fusion/<task-id>-2`, `-3`, or similar sibling branches. See [CLI Reference → Branch conflict recovery](./cli-reference.md#branch-conflict-recovery) for the command reference and [Settings Reference → executorAllowSiblingBranchRename](./settings-reference.md#executorallowsiblingbranchrename) for the legacy opt-out setting.
+
+1. **When this happens**
+
+   The executor refuses the branch allocation, moves the task from `in-progress` back to `todo`, sets `status: "failed"`, preserves the branch/worktree recovery metadata, and records the existing tip SHA plus stranded commit subjects in the task lifecycle log and structured agent log.
+
+2. **Inspect candidates**
+
+   Run the recovery command with no flags to list every matching canonical or sibling branch. The output includes the tip SHA, any attached worktree path, and the stranded commits that are not reachable from the run's start point.
+
+   ```bash
+   fn task branch-recovery FN-001
+   ```
+
+3. **Reclaim**
+
+   Reclaim points the task back at an existing canonical or sibling branch so the next executor run resumes there instead of allocating a new sibling. No commits are rewritten; Fusion only updates the task metadata.
+
+   ```bash
+   fn task branch-recovery FN-001 --reclaim fusion/fn-001-2
+   ```
+
+4. **Discard**
+
+   Discard deletes a stranded sibling branch and its worktree when you have confirmed the old work is no longer needed. `--yes` is mandatory because the action is destructive.
+
+   ```bash
+   fn task branch-recovery FN-001 --discard fusion/fn-001-2 --yes
+   ```
+
+5. **Opt-out / legacy mode**
+
+   If you must preserve the pre-FN-4068 behavior for a legacy workflow, enable [`executorAllowSiblingBranchRename`](./settings-reference.md#executorallowsiblingbranchrename). That restores silent suffixing onto sibling branches, but it is discouraged because it recreates the same hidden-work / data-loss pattern that motivated loud branch-conflict recovery in the first place.
 
 ## Task Execution Modes
 

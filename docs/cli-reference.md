@@ -459,20 +459,6 @@ fn task pause FN-001
 fn task unpause FN-001
 ```
 
-### Branch recovery
-
-```bash
-fn task branch-recovery FN-001
-fn task branch-recovery FN-001 --reclaim fusion/fn-001
-fn task branch-recovery FN-001 --discard fusion/fn-001-2 --yes
-```
-
-Use `fn task branch-recovery` when executor branch allocation fails because the canonical task branch is already checked out elsewhere.
-
-- No flags: inspect canonical + sibling recovery candidates, including tip SHA, attached worktree path, and stranded commits.
-- `--reclaim <branch>`: point the task back at an existing canonical/sibling branch so the next executor run resumes from that branch.
-- `--discard <branch> --yes`: explicitly delete a stranded branch/worktree. `--yes` is required for destructive cleanup.
-
 ### Node routing controls
 
 ```bash
@@ -505,6 +491,44 @@ fn task archive FN-001
 fn task unarchive FN-001
 fn task delete FN-001 --force
 ```
+
+### Branch conflict recovery
+
+Use `fn task branch-recovery` when executor branch allocation fails because the canonical task branch is already checked out elsewhere. By default, the command lists every recovery candidate for the task, including the branch tip SHA, attached worktree path (if any), and stranded commit subjects that are not reachable from the current run start point.
+
+```bash
+fn task branch-recovery FN-001
+fn task branch-recovery FN-001 --reclaim fusion/fn-001-2
+fn task branch-recovery FN-001 --discard fusion/fn-001-2 --yes
+```
+
+| Option | Description |
+|---|---|
+| `--reclaim <branch>` | Point the task at an existing canonical or sibling branch so the next executor run resumes from that branch without rewriting commits. |
+| `--discard <branch>` | Delete a stranded sibling branch and its worktree. Fusion refuses to run this destructive action unless `--yes` is also supplied. |
+| `--yes` | Confirm destructive discard when `--discard` is used. |
+
+Example inspect output:
+
+```bash
+fn task branch-recovery FN-001
+
+  Branch recovery candidates for FN-001
+    Canonical branch: fusion/fn-001
+    Current task branch: fusion/fn-001
+    Current task worktree: /repo/.worktrees/fn-001
+  • fusion/fn-001 (canonical)
+    tip: 0123456789abcdef0123456789abcdef01234567
+    worktree: /repo/.worktrees/fn-001
+    stranded commits:
+      - 0123456789ab fix: preserve stranded commits
+  • fusion/fn-001-2
+    tip: fedcba9876543210fedcba9876543210fedcba98
+    worktree: (not attached to a worktree)
+    stranded commits: none
+```
+
+See [Task Management → Branch conflict recovery](./task-management.md#branch-conflict-recovery) for the operator workflow and [Settings Reference → executorAllowSiblingBranchRename](./settings-reference.md#executorallowsiblingbranchrename) for the legacy opt-out setting.
 
 ### GitHub integration
 
