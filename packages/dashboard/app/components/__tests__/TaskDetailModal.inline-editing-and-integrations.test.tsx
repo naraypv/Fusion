@@ -2301,6 +2301,54 @@ describe("TaskDetailModal", () => {
       expect(screen.getByRole("button", { name: "Enable GitHub tracking" })).toHaveTextContent("Enable");
     });
 
+    it("FN-4228 shows loading state instead of disabled CTA while detail fetch is unresolved", async () => {
+      const { fetchTaskDetail } = await import("../../api");
+      const mockFetch = vi.mocked(fetchTaskDetail);
+      let resolveFetch: ((value: TaskDetail) => void) | undefined;
+      mockFetch.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFetch = resolve;
+          }),
+      );
+
+      const optimisticTask = makeTask({ id: "FN-001", column: "todo" });
+      delete (optimisticTask as Partial<Task>).prompt;
+      delete (optimisticTask as Partial<Task>).githubTracking;
+
+      render(
+        <TaskDetailModal
+          task={optimisticTask}
+          onClose={noop}
+          onOpenDetail={noopOpenDetail}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          addToast={noop}
+        />,
+      );
+
+      expect(screen.getByLabelText("GitHub tracking status")).toHaveTextContent("Loading");
+      expect(screen.getByText("Checking tracking status")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Enable GitHub tracking" })).toBeNull();
+      expect(screen.getByRole("status", { name: "Loading GitHub tracking status" })).toBeInTheDocument();
+
+      await act(async () => {
+        resolveFetch?.({
+          ...(makeTask({ id: "FN-001", column: "todo" }) as TaskDetail),
+          prompt: "# Spec",
+          githubTracking: { enabled: false },
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByLabelText("GitHub tracking status")).toHaveTextContent("Disabled");
+      });
+      expect(screen.getByText("Tracking is currently disabled")).toBeInTheDocument();
+      expect(screen.queryByRole("status", { name: "Loading GitHub tracking status" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Enable GitHub tracking" })).toBeInTheDocument();
+    });
+
     it("enables GitHub tracking via the inline header button without expanding the disclosure", async () => {
       const { updateTask } = await import("../../api");
       const mockUpdate = vi.mocked(updateTask);

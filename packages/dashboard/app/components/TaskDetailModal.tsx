@@ -812,10 +812,21 @@ export function TaskDetailContent({
   const canEditGithubTracking = GITHUB_TRACKING_EDITABLE_COLUMNS.has(task.column) && !isSaving;
   const githubTrackingEnabled = githubTrackingEnabledDraft ?? (workingTask.githubTracking?.enabled === true);
   const githubTrackedIssue = workingTask.githubTracking?.issue;
+  const githubTrackingDetailPending = detailLoading && typeof task.githubTracking === "undefined";
   const showInlineGithubTrackingEnableButton =
-    canEditGithubTracking && !githubTrackedIssue && (!githubTrackingEnabled || (isSavingGithubTracking && workingTask.githubTracking?.enabled !== true));
+    canEditGithubTracking
+    && !githubTrackedIssue
+    && !githubTrackingDetailPending
+    && (!githubTrackingEnabled || (isSavingGithubTracking && workingTask.githubTracking?.enabled !== true));
   const showGithubTrackingSection = canEditGithubTracking || githubTrackingEnabled || Boolean(githubTrackedIssue);
-  const githubTrackingStatus = githubTrackedIssue ? "Linked" : githubTrackingEnabled ? "Enabled" : "Disabled";
+  const githubTrackingStatus = githubTrackingDetailPending
+    ? "Loading"
+    : githubTrackedIssue
+      ? "Linked"
+      : githubTrackingEnabled
+        ? "Enabled"
+        : "Disabled";
+  const showGithubTrackingSpinner = !githubTrackedIssue && (isSavingGithubTracking || githubTrackingDetailPending);
   const effectiveGithubRepoDefault = resolveEffectiveGithubRepoDefault(settings ?? null, globalSettings);
   const githubRepoOverrideTrimmed = githubRepoOverrideDraft.trim();
 
@@ -2411,7 +2422,11 @@ export function TaskDetailContent({
                   </span>
                   {!githubTrackedIssue && (
                     <span className="detail-source-empty">
-                      {githubTrackingEnabled ? "Issue not yet created" : "Tracking is currently disabled"}
+                      {githubTrackingDetailPending
+                        ? "Checking tracking status"
+                        : githubTrackingEnabled
+                          ? "Issue not yet created"
+                          : "Tracking is currently disabled"}
                     </span>
                   )}
                 </div>
@@ -2425,15 +2440,17 @@ export function TaskDetailContent({
                     Enable
                   </button>
                 )}
-                {isSavingGithubTracking && !githubTrackedIssue && (
+                {showGithubTrackingSpinner && (
                   <span
                     className="detail-github-tracking-spinner"
                     role="status"
                     aria-live="polite"
-                    aria-label="Enabling GitHub tracking"
+                    aria-label={isSavingGithubTracking ? "Enabling GitHub tracking" : "Loading GitHub tracking status"}
                   >
                     <Loader2 size={16} className="spin" aria-hidden="true" />
-                    <span className="visually-hidden">Enabling GitHub tracking…</span>
+                    <span className="visually-hidden">
+                      {isSavingGithubTracking ? "Enabling GitHub tracking…" : "Loading GitHub tracking status…"}
+                    </span>
                   </span>
                 )}
                 <button
