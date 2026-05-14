@@ -75,6 +75,10 @@ function squashBranch(dir: string, branchName: string, fileName: string, content
 // Minimal stub settings / args used by commitOrAmendMergeWithFixes
 // ---------------------------------------------------------------------------
 
+function testTempParent(): string {
+  return process.env.FUSION_TEST_WORKER_ROOT ?? tmpdir();
+}
+
 function assertIsolatedWorkspace(dir: string): void {
   const repoRoot = process.env.FUSION_TEST_REAL_ROOT;
   if (!repoRoot) return;
@@ -88,19 +92,29 @@ const STUB_SETTINGS = {
 
 const createdDirs = new Set<string>();
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function cleanupTempDir(dir?: string): void {
   if (!dir) return;
   createdDirs.delete(dir);
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
       if (!existsSync(dir)) return;
       rmSync(dir, { recursive: true, force: true });
-      return;
+      if (!existsSync(dir)) return;
     } catch (error) {
-      if (attempt === 3) {
+      if (attempt === 5) {
         throw error;
       }
     }
+
+    sleepSync(attempt * 25);
+  }
+
+  if (existsSync(dir)) {
+    throw new Error(`failed to clean temp dir: ${dir}`);
   }
 }
 
@@ -118,7 +132,7 @@ describe("snapshotDirtyFiles", () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-merger-snapshot-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-merger-snapshot-"));
     createdDirs.add(dir);
     assertIsolatedWorkspace(dir);
     initRepo(dir);
@@ -168,7 +182,7 @@ describe("snapshotDirtyFiles", () => {
   });
 
   it("returns empty set when rootDir is not a git repo (error swallowed)", async () => {
-    const nonRepo = mkdtempSync(join(tmpdir(), "fusion-test-merger-non-repo-"));
+    const nonRepo = mkdtempSync(join(testTempParent(), "fusion-test-merger-non-repo-"));
     assertIsolatedWorkspace(nonRepo);
     try {
       const snapshot = await snapshotDirtyFiles(nonRepo);
@@ -184,7 +198,7 @@ describe("commitOrAmendMergeWithFixes — staging allowlist", () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-merger-allowlist-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-merger-allowlist-"));
     createdDirs.add(dir);
     assertIsolatedWorkspace(dir);
     initRepo(dir);
@@ -519,7 +533,7 @@ describe("snapshotDirtyFiles — paths with embedded spaces", () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-merger-snapshot-spaces-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-merger-snapshot-spaces-"));
     assertIsolatedWorkspace(dir);
     initRepo(dir);
   });
@@ -572,7 +586,7 @@ describe("commitOrAmendMergeWithFixes — embedded-space paths round-trip", () =
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-merger-allowlist-spaces-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-merger-allowlist-spaces-"));
     createdDirs.add(dir);
     assertIsolatedWorkspace(dir);
     initRepo(dir);

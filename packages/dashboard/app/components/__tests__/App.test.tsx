@@ -3,8 +3,15 @@ import { render, screen, fireEvent, waitFor, act, within } from "@testing-librar
 import type { NodeConfig, Settings } from "@fusion/core";
 import type { ProjectInfo } from "../../api";
 import { scopedKey } from "../../utils/projectStorage";
+import { useFileBrowser } from "../../context/FileBrowserContext";
 
 // No mock needed - tests use localStorage directly
+
+function FileBrowserProbe({ testId }: { testId: string }) {
+  const ctx = useFileBrowser();
+  const status = ctx && typeof ctx.openFile === "function" ? "ok" : "missing";
+  return <div data-testid={testId}>{status}</div>;
+}
 
 const defaultSettings: Settings = {
   maxConcurrent: 2,
@@ -16,10 +23,19 @@ const defaultSettings: Settings = {
   worktreeInitCommand: "",
   testCommand: "",
   buildCommand: "",
+  capacityRiskBannerEnabled: false,
+  capacityRiskTodoThreshold: 20,
   experimentalFeatures: { insights: true, skillsView: true, agentsView: true, memoryView: true, evalsView: true },
 };
 
- 
+const mockAgentStats = {
+  activeCount: 0,
+  busyCount: 0,
+  pausedCount: 0,
+  todoTaskCount: 0,
+  idleNonEphemeralCount: 1,
+};
+
 const mockSubscribeSse = vi.fn((..._args: any[]) => vi.fn());
 
 vi.mock("../../sse-bus", () => ({
@@ -48,8 +64,16 @@ vi.mock("../../api", async (importOriginal) => {
     fetchModels: vi.fn(() => Promise.resolve({ models: [], favoriteProviders: [], favoriteModels: [] })),
     fetchGitRemotes: vi.fn(() => Promise.resolve([])),
     fetchAgents: vi.fn(() => Promise.resolve([])),
+    fetchAgentStats: vi.fn(() => Promise.resolve({ ...mockAgentStats })),
     fetchTaskDetail: vi.fn((id: string) => Promise.resolve({ id, title: `Task ${id}` })),
     fetchUnreadCount: vi.fn(() => Promise.resolve({ unreadCount: 0 })),
+    fetchDashboardHealth: vi.fn(() => Promise.resolve({
+      status: "ok",
+      version: "1.0.0",
+      uptime: 1,
+      database: { healthy: true, lastCheckedAt: null, isRunning: false },
+      taskIdIntegrity: { status: "ok", checkedAt: "2026-05-12T00:00:00.000Z", anomalies: [], recommendedAction: null },
+    })),
     fetchPluginDashboardViews: vi.fn(() => Promise.resolve([])),
     fetchExecutorStats: vi.fn(() => Promise.resolve({
       globalPause: false,
@@ -339,6 +363,14 @@ vi.mock("../../components/TodoView", () => ({
   ),
 }));
 
+vi.mock("../../components/ChatView", () => ({
+  ChatView: () => <FileBrowserProbe testId="fb-probe-chat" />,
+}));
+
+vi.mock("../../components/DashboardLoader", () => ({
+  DashboardLoader: () => <FileBrowserProbe testId="fb-probe-loader" />,
+}));
+
 vi.mock("../../components/QuickChatFAB", () => ({
   QuickChatFAB: () => null,
 }));
@@ -578,6 +610,7 @@ beforeEach(() => {
   mockRefreshProjects.mockReset();
   mockRefreshProjects.mockImplementation(async () => {});
   mockCurrentProjectState.currentProject = { id: DEFAULT_PROJECT_ID, name: "Test Project", path: "/test", status: "active" as const, isolationMode: "in-process" as const, createdAt: "", updatedAt: "" };
+  mockCurrentProjectState.loading = false;
   mockCurrentProjectState.setCurrentProject.mockClear();
   mockCurrentProjectState.clearCurrentProject.mockClear();
   // Reset node context mocks
@@ -637,6 +670,70 @@ beforeEach(() => {
   });
   mockUseViewportMode.mockReset();
   mockUseViewportMode.mockReturnValue("desktop");
+  mockAgentStats.todoTaskCount = 0;
+  mockAgentStats.idleNonEphemeralCount = 1;
+});
+
+describe("FN-4250 FileBrowserProvider coverage", () => {
+  it("FN-4250: ChatView branch is inside FileBrowserProvider", async () => {
+    localStorage.setItem(taskViewStorageKey(), "chat");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("fb-probe-chat")).toHaveTextContent("ok");
+    });
+  });
+
+  it("FN-4250: loader branch is inside FileBrowserProvider", async () => {
+    mockProjectsState.loading = true;
+    mockCurrentProjectState.loading = true;
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("fb-probe-loader")).toHaveTextContent("ok");
+    });
+  });
+});
+
+describe("Capacity risk banner gating", () => {
+  it("does not render banner when capacityRiskBannerEnabled is false", async () => {
+    mockAgentStats.todoTaskCount = 21;
+    mockAgentStats.idleNonEphemeralCount = 0;
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      ...defaultSettings,
+      capacityRiskBannerEnabled: false,
+      capacityRiskTodoThreshold: 20,
+    });
+
+    render(<App />);
+    await waitForAppShell();
+
+    expect(screen.queryByText(/Capacity risk:/i)).not.toBeInTheDocument();
+  });
+
+  it("renders and dismisses banner when enabled", async () => {
+    mockAgentStats.todoTaskCount = 21;
+    mockAgentStats.idleNonEphemeralCount = 0;
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      ...defaultSettings,
+      capacityRiskBannerEnabled: true,
+      capacityRiskTodoThreshold: 20,
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/Capacity risk:/i)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /dismiss capacity warning/i }));
+
+    expect(localStorage.getItem(scopedKey("kb-capacity-risk-banner-dismissed", DEFAULT_PROJECT_ID))).toBe("true");
+    await waitFor(() => {
+      expect(screen.queryByText(/Capacity risk:/i)).not.toBeInTheDocument();
+    });
+  });
 });
 
 describe("App backend-unreachable first-run flow", () => {

@@ -13,17 +13,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Setup Node and install dependencies
+        uses: ./.github/actions/setup-node-pnpm
 
       - name: Lint
         run: pnpm lint
@@ -40,20 +31,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Setup Node and install dependencies
+        uses: ./.github/actions/setup-node-pnpm
 
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 3
@@ -67,23 +46,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build workspace
-        run: pnpm build
+      - name: Setup Node and install dependencies
+        uses: ./.github/actions/setup-node-pnpm
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+
+      - name: Build workspace
+        run: pnpm build
 
       - name: Run CLI slow lane (opt-in suites)
         run: pnpm test:slow-cli

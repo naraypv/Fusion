@@ -4,11 +4,14 @@
  */
 
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { userEvent } from "@testing-library/user-event";
 import { ChatView } from "../ChatView";
 import type { DiscoveredSkill } from "@fusion/dashboard";
 import { loadAllAppCss } from "../../test/cssFixture";
+import { FileBrowserProvider } from "../../context/FileBrowserContext";
 
 // Mock scrollIntoView for JSDOM
 Element.prototype.scrollIntoView = vi.fn();
@@ -22,6 +25,13 @@ import type { UseChatRoomsResult } from "../../hooks/useChatRooms";
 // Mock the hooks
 vi.mock("../../hooks/useChat");
 vi.mock("../../hooks/useChatRooms");
+vi.mock("../../hooks/useNavigationHistory", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../hooks/useNavigationHistory")>();
+  return {
+    ...actual,
+    useNavigationHistoryContext: () => ({ pushNav: vi.fn(), replaceCurrent: vi.fn() }),
+  };
+});
 
 const mockUseChat = vi.mocked(useChatModule.useChat);
 const mockUseChatRooms = vi.mocked(useChatRoomsModule.useChatRooms);
@@ -174,6 +184,50 @@ function setupMockRooms(overrides: Partial<UseChatRoomsResult> = {}) {
   mockUseChatRooms.mockReturnValue(state);
 }
 
+function createRoomFixture(name: string) {
+  return {
+    id: `room-${name}`,
+    projectId: "proj-123",
+    slug: name,
+    name,
+    createdAt: "2026-05-12T00:00:00.000Z",
+    updatedAt: "2026-05-12T00:00:00.000Z",
+  };
+}
+
+function setupStatefulCreateRoomMock(options?: { createRejects?: boolean }) {
+  const createRoom = vi.fn();
+
+  mockUseChatRooms.mockImplementation(() => {
+    const [roomsState, setRoomsState] = useState<UseChatRoomsResult["rooms"]>([]);
+    const [activeRoom, setActiveRoom] = useState<UseChatRoomsResult["activeRoom"]>(null);
+
+    return {
+      ...defaultRoomsState,
+      rooms: roomsState,
+      activeRoom,
+      activeRoomMembers: activeRoom
+        ? [{ roomId: activeRoom.id, agentId: "agent-001", role: "member", addedAt: "2026-05-12T00:00:00.000Z" }]
+        : [],
+      createRoom: async ({ name, memberAgentIds }) => {
+        createRoom({ name, memberAgentIds });
+        if (options?.createRejects) {
+          throw new Error("Failed to create room.");
+        }
+        const nextRoom = createRoomFixture(name);
+        setRoomsState((previous) => [...previous, nextRoom]);
+        setActiveRoom(nextRoom);
+        return nextRoom;
+      },
+      selectRoom: (roomId) => {
+        setActiveRoom(roomsState.find((room) => room.id === roomId) ?? null);
+      },
+    } satisfies UseChatRoomsResult;
+  });
+
+  return { createRoom };
+}
+
 function ensureMatchMedia() {
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {
@@ -201,7 +255,10 @@ function mockViewportMode(mode: "mobile" | "desktop") {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
+  _resetInitialViewportHeight();
   setupMockRooms();
+  mockViewportMode("desktop");
   mockFetchDiscoveredSkills.mockResolvedValue([]);
   mockCreateObjectURL.mockImplementation((file: File) => `blob:${file.name}`);
   Object.defineProperty(URL, "createObjectURL", { value: mockCreateObjectURL, writable: true });
@@ -215,7 +272,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
-  localStorage.removeItem("fusion:chat-scope");
+  localStorage.clear();
+  _resetInitialViewportHeight();
 });
 
 describe("ChatView", () => {
@@ -465,6 +523,28 @@ describe("ChatView", () => {
 
     expect(screen.getByText("Hello")).toBeInTheDocument();
     expect(screen.getByText("Hi there!")).toBeInTheDocument();
+  });
+
+  it("renders file paths in assistant inline code as clickable links while preserving the code wrapper", async () => {
+    const openFile = vi.fn();
+    setupMockChat({
+      activeSession: activeSessionFixture,
+      messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "see `packages/foo/bar.ts:42` for details", createdAt: "2026-04-08T00:00:00.000Z" }],
+    });
+
+    render(
+      <FileBrowserProvider openFile={openFile}>
+        <ChatView projectId="proj-123" addToast={vi.fn()} />
+      </FileBrowserProvider>,
+    );
+
+    const fileLink = screen.getByRole("button", { name: "packages/foo/bar.ts:42" });
+    const code = fileLink.closest("code");
+    expect(code).toBeTruthy();
+    expect(code?.querySelector("button.file-path-link")).toBe(fileLink);
+
+    await userEvent.click(fileLink);
+    expect(openFile).toHaveBeenCalledWith("packages/foo/bar.ts", { line: 42, col: undefined });
   });
 
   it("does not render markdown/plain toggle controls in the thread header", () => {
@@ -2040,7 +2120,8 @@ describe("ChatView", () => {
 
     expect(screen.getByText("Start a new conversation")).toBeInTheDocument();
     // Find the New Chat button in the empty state section
-    const emptyState = document.querySelector(".chat-empty-state") as HTMLElement | null;
+    const emptyStateText = screen.getByText("Start a new conversation");
+    const emptyState = emptyStateText.closest(".chat-empty-state") as HTMLElement | null;
     expect(within(emptyState!).getByRole("button", { name: /new chat/i })).toBeInTheDocument();
     // Should NOT have an agent selector in empty state
     expect(emptyState?.querySelector("select")).toBeNull();
@@ -2251,6 +2332,7 @@ describe("ChatView", () => {
     const toggle = screen.getByTestId("chat-thread-render-toggle");
     const providerIcon = identity.querySelector(".provider-icon");
     const modelTag = identity.querySelector(".chat-model-tag");
+    const newChatButton = screen.getByTestId("chat-thread-new-chat-btn");
 
     expect(header).toBeInTheDocument();
     expect(providerIcon).toBeInTheDocument();
@@ -2258,7 +2340,8 @@ describe("ChatView", () => {
     expect(modelTag).toBeInTheDocument();
     expect(modelTag).toHaveTextContent("Claude Sonnet 4.5");
     expect(toggle).toBeInTheDocument();
-    expect(header?.children[header.children.length - 1]).toBe(toggle);
+    expect(header?.children[header.children.length - 2]).toBe(toggle);
+    expect(header?.children[header.children.length - 1]).toBe(newChatButton);
     expect(document.querySelectorAll(".chat-thread-header .chat-model-tag")).toHaveLength(1);
   });
 
@@ -2787,6 +2870,82 @@ describe("ChatView sidebar structure", () => {
   });
 });
 
+describe("room creation", () => {
+  it("opens the newly created room and collapses the mobile sidebar on success", async () => {
+    const viewportSpy = mockViewportMode("mobile");
+    const { createRoom } = setupStatefulCreateRoomMock();
+    setupMockChat({ sessions: [], filteredSessions: [] });
+    localStorage.setItem("fusion:chat-scope", "rooms");
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-create-room-btn"));
+    const dialog = await screen.findByRole("dialog", { name: "Create room" });
+    await userEvent.type(within(dialog).getByLabelText("Room name"), "newroom");
+    await userEvent.click(within(screen.getByTestId("create-room-member-list")).getByText("Alpha"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create room" }));
+
+    await waitFor(() => {
+      expect(createRoom).toHaveBeenCalledWith({ name: "newroom", memberAgentIds: ["agent-001"] });
+    });
+    await waitFor(() => {
+      expect(document.querySelector(".chat-sidebar")).toHaveClass("chat-sidebar--hidden");
+    });
+    expect(screen.queryByRole("dialog", { name: "Create room" })).toBeNull();
+    expect(within(document.querySelector(".chat-room-thread-header") as HTMLElement).getByText("#newroom")).toBeInTheDocument();
+
+    viewportSpy.mockRestore();
+  });
+
+  it("opens the newly created room on desktop without hiding the sidebar", async () => {
+    const viewportSpy = mockViewportMode("desktop");
+    const { createRoom } = setupStatefulCreateRoomMock();
+    setupMockChat({ sessions: [], filteredSessions: [] });
+    localStorage.setItem("fusion:chat-scope", "rooms");
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-create-room-btn"));
+    const dialog = await screen.findByRole("dialog", { name: "Create room" });
+    await userEvent.type(within(dialog).getByLabelText("Room name"), "newroom");
+    await userEvent.click(within(screen.getByTestId("create-room-member-list")).getByText("Alpha"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create room" }));
+
+    await waitFor(() => {
+      expect(createRoom).toHaveBeenCalledWith({ name: "newroom", memberAgentIds: ["agent-001"] });
+    });
+    expect(document.querySelector(".chat-sidebar")).not.toHaveClass("chat-sidebar--hidden");
+    expect(screen.queryByRole("dialog", { name: "Create room" })).toBeNull();
+    expect(within(document.querySelector(".chat-room-thread-header") as HTMLElement).getByText("#newroom")).toBeInTheDocument();
+
+    viewportSpy.mockRestore();
+  });
+
+  it("keeps the modal open and sidebar visible when room creation fails", async () => {
+    const viewportSpy = mockViewportMode("mobile");
+    const { createRoom } = setupStatefulCreateRoomMock({ createRejects: true });
+    setupMockChat({ sessions: [], filteredSessions: [] });
+    localStorage.setItem("fusion:chat-scope", "rooms");
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    await userEvent.click(screen.getByTestId("chat-create-room-btn"));
+    const dialog = await screen.findByRole("dialog", { name: "Create room" });
+    await userEvent.type(within(dialog).getByLabelText("Room name"), "newroom");
+    await userEvent.click(within(screen.getByTestId("create-room-member-list")).getByText("Alpha"));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create room" }));
+
+    await waitFor(() => {
+      expect(createRoom).toHaveBeenCalledWith({ name: "newroom", memberAgentIds: ["agent-001"] });
+    });
+    expect(screen.getByRole("dialog", { name: "Create room" })).toBeInTheDocument();
+    expect(document.querySelector(".chat-sidebar")).not.toHaveClass("chat-sidebar--hidden");
+    expect(screen.queryByText("#newroom")).toBeNull();
+
+    viewportSpy.mockRestore();
+  });
+});
+
 describe("Direct/Rooms scope toggle", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -2856,6 +3015,42 @@ describe("Direct/Rooms scope toggle", () => {
     expect(screen.getByTestId("chat-search-input")).toBeInTheDocument();
     expect(document.querySelector(".chat-session-list")).toBeInTheDocument();
     expect(screen.getByTestId("chat-session-session-001")).toHaveClass("chat-session-item--active");
+  });
+
+  it("FN-4327: switching scope from Rooms to Direct re-anchors direct thread", async () => {
+    setupMockChat({
+      activeSession: { id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" },
+      messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" }],
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+    Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1200 });
+    Object.defineProperty(messagesContainer, "clientHeight", { configurable: true, get: () => 200 });
+    let scrollTopValue = 500;
+    Object.defineProperty(messagesContainer, "scrollTop", {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value: number) => {
+        scrollTopValue = value;
+      },
+    });
+
+    fireEvent.scroll(messagesContainer);
+    expect(screen.getByTestId("chat-jump-to-latest")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+    await userEvent.click(screen.getByTestId("chat-sidebar-scope-direct"));
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-jump-to-latest")).not.toBeInTheDocument();
+    });
   });
 
   it("forces direct scope when localStorage persisted rooms but chatRooms is off", () => {
@@ -3293,6 +3488,51 @@ describe("ChatView mobile behavior", () => {
       expect(sendMessage).toHaveBeenCalledWith("Hello mobile", []);
       expect(document.activeElement).toBe(input);
     } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("mobile mode: room send button sends on first touch and keeps composer focused", async () => {
+    const restoreMatchMedia = mockMobileViewport();
+    const sendRoomMessage = vi.fn().mockResolvedValue(undefined);
+    const sendMessage = vi.fn();
+
+    try {
+      localStorage.setItem("fusion:chat-scope", "rooms");
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [],
+        sendMessage,
+      });
+      setupMockRooms({
+        activeRoom: {
+          id: "room-001",
+          projectId: "proj-123",
+          name: "backend",
+          createdAt: "2026-04-08T00:00:00.000Z",
+          updatedAt: "2026-04-08T00:00:00.000Z",
+        },
+        sendRoomMessage,
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+      const input = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: "Hello mobile room" } });
+      input.focus();
+
+      const sendButton = screen.getByTestId("chat-send-btn");
+      fireEvent.touchStart(sendButton);
+      fireEvent.click(sendButton);
+
+      await waitFor(() => {
+        expect(sendRoomMessage).toHaveBeenCalledTimes(1);
+        expect(sendRoomMessage).toHaveBeenCalledWith("Hello mobile room");
+      });
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(input);
+    } finally {
+      localStorage.removeItem("fusion:chat-scope");
       restoreMatchMedia.mockRestore();
     }
   });
@@ -3800,6 +4040,93 @@ describe("ChatView mobile behavior", () => {
     }
   });
 
+  it("FN-4327: desktop visibility restore re-anchors direct chat and resets jump-to-latest state", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      const { rerender } = render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 600;
+      let scrollHeightValue = 1200;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => scrollHeightValue });
+      Object.defineProperty(messagesContainer, "clientHeight", { configurable: true, get: () => 200 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      fireEvent.scroll(messagesContainer);
+      expect(screen.getByTestId("chat-jump-to-latest")).toBeInTheDocument();
+
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1200);
+      });
+      await waitFor(() => {
+        expect(screen.queryByTestId("chat-jump-to-latest")).not.toBeInTheDocument();
+      });
+
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [
+          { id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" },
+          { id: "msg-002", sessionId: "session-001", role: "assistant", content: "Two", createdAt: "2026-04-08T00:00:10.000Z" },
+        ],
+      });
+      scrollTopValue = 700;
+      scrollHeightValue = 1300;
+      rerender(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1300);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    }
+  });
+
+  it("FN-4327: desktop pageshow re-anchors direct chat thread", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    try {
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        messages: [{ id: "msg-001", sessionId: "session-001", role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+      const messagesContainer = document.querySelector(".chat-messages") as HTMLDivElement;
+      let scrollTopValue = 420;
+      Object.defineProperty(messagesContainer, "scrollHeight", { configurable: true, get: () => 1280 });
+      Object.defineProperty(messagesContainer, "scrollTop", {
+        configurable: true,
+        get: () => scrollTopValue,
+        set: (value: number) => {
+          scrollTopValue = value;
+        },
+      });
+
+      fireEvent(window, new Event("pageshow"));
+
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(1280);
+      });
+    } finally {
+      restoreMatchMedia.mockRestore();
+    }
+  });
+
   it("FN-3884: retries bottom anchor while container height keeps growing", async () => {
     const restoreMatchMedia = mockDesktopViewport();
     const originalRaf = window.requestAnimationFrame;
@@ -4032,5 +4359,39 @@ describe("ChatView mobile CSS contract", () => {
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*opacity:\s*1/);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*min-width:\s*calc\(var\(--space-lg\)\s*\*\s*2\.25\)/);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*?\.chat-message-copy-action\s*\{[^}]*min-height:\s*calc\(var\(--space-lg\)\s*\*\s*2\.25\)/);
+  });
+});
+
+describe("ChatView empty-state token guards", () => {
+  it("renders loading and empty states with chat-empty-state class and no inline text-secondary style", () => {
+    setupMockChat({
+      sessions: [],
+      filteredSessions: [],
+      sessionsLoading: true,
+      activeSession: activeSessionFixture,
+      messages: [],
+      messagesLoading: true,
+    });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+
+    const loadingNodes = screen.getAllByText("Loading messages...");
+    const sidebarLoadingNode = screen.getByText("Loading...");
+
+    expect(sidebarLoadingNode.className).toContain("chat-empty-state");
+    expect(sidebarLoadingNode.getAttribute("style") ?? "").not.toContain("--text-secondary");
+
+    for (const node of loadingNodes) {
+      expect(node.className).toContain("chat-empty-state");
+      expect(node.getAttribute("style") ?? "").not.toContain("--text-secondary");
+    }
+  });
+
+  it("keeps ChatView source files free of --text-secondary", () => {
+    const chatViewTsx = readFileSync("app/components/ChatView.tsx", "utf8");
+    const chatViewCss = readFileSync("app/components/ChatView.css", "utf8");
+
+    expect(chatViewTsx.includes("--text-secondary")).toBe(false);
+    expect(chatViewCss.includes("--text-secondary")).toBe(false);
   });
 });

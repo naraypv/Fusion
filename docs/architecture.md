@@ -287,9 +287,10 @@ Intentional exclusions from shared snapshots:
 - The hook subscribes to `/api/events` and consumes `chat:room:created`, `chat:room:updated`, `chat:room:deleted`, `chat:room:member:added`, `chat:room:member:removed`, `chat:room:message:added`, `chat:room:message:updated`, and `chat:room:message:deleted` to keep UI state in sync.
 - Room messages persist through `POST /api/chat/rooms/:id/messages`; the route persists the user message first, then calls `ChatManager.sendRoomMessage(...)` to orchestrate room-member responders and persist assistant room replies with `chatStore.addRoomMessage(...)` (including `senderAgentId` for each responder).
 - `sendRoomMessage(...)` uses existing room-member + mention resolution rules: mentioned members are direct responders, non-mentioned members are ambient responders (capped by `ROOM_AMBIENT_MAX_RESPONDERS`), and non-member mentions are handled explicitly by the manager instead of silently disappearing.
+- Room responder prompt context is compacted deterministically: the newest 12 room messages stay verbatim, while older fetched history is summarized into a structured header (span, participants, and ranked highlights) before prompt size caps are enforced.
 - Room-reply generation is now non-silent on failure: if a room has members but no active responders can be resolved, or all responder generations fail/return empty output, `sendRoomMessage(...)` throws `RoomReplyGenerationError` and the route surfaces HTTP 502 instead of returning a silent user-only success.
 - `useChatRooms.sendRoomMessage()` now follows direct-chat style optimistic UX: append a temporary local user room message before `POST /api/chat/rooms/:id/messages`, reconcile that temp entry to the persisted user message on success, then refresh authoritative transcript state while continuing `chat:room:message:*` live SSE updates.
-- On failures, `useChatRooms.sendRoomMessage()` performs state reconciliation (rollback temp entry or replace with persisted transcript when POST partially succeeded) and rethrows; `ChatView` owns the single user-facing toast and keeps composer text for retry.
+- On failures, `useChatRooms.sendRoomMessage()` performs state reconciliation (rollback temp entry or replace with persisted transcript when POST partially succeeded) and rethrows; `ChatView` clears the composer immediately when dispatching a room send, restores the exact prior text only if the send rejects, and owns the single user-facing error toast.
 - Mention UI in rooms keeps direct-chat behavior unchanged while adding room affordances:
   - `AgentMentionPopup` receives room membership context and shows members first with a `status-dot` member indicator (`aria-label="Room member"`).
   - With an empty mention filter in room mode, only room members are listed; a hint row prompts the user to type to search non-members.
@@ -552,20 +553,33 @@ See [Memory Plugin Contract](./memory-plugin-contract.md) for the full plan.
 ### Agent roles
 - **Planning**: the planning processor generates task plans (`PROMPT.md`) and selects eligible planning tasks by priority first, then FIFO (`createdAt` ascending) within each priority tier.
 - **Executor**: `TaskExecutor` (`executor.ts`) implements tasks in worktrees
-- **Reviewer**: `reviewStep()` (`reviewer.ts`) performs plan/code reviews
+- **Reviewer**: `reviewStep()` (`reviewer.ts`) performs plan/code/spec reviews
 - **Merger**: `aiMergeTask()` (`merger.ts`) merges approved work
+
+#### Reviewer verdict recovery contract (FN-4092)
+- Reviewer verdicts are `APPROVE`, `REVISE`, `RETHINK`, or `UNAVAILABLE`.
+- For non-pause `UNAVAILABLE` or non-context reviewer prompt errors, `reviewStep()` retries once:
+  - Prefer configured validator fallback model (`validatorFallbackProvider` + `validatorFallbackModelId`, including project overrides), or
+  - Retry once on the same model with stricter `Verdict:` output instructions when no fallback model is configured.
+- Pause/engine-pause short-circuits still return `UNAVAILABLE` immediately and do not spawn/retry reviewer sessions.
+- Executor handling in `createReviewStepTool()` is now explicit:
+  - `plan`/`spec` `UNAVAILABLE` is advisory after retry exhaustion (`UNAVAILABLE (advisory)`), and execution proceeds.
+  - `code` `UNAVAILABLE` remains blocking; step completion must wait for a usable review verdict.
+  - Advisory and blocking paths are both logged to task logs for operator visibility.
 
 ### Scheduling and execution
 - `Scheduler` (`scheduler.ts`) — dependency-aware task scheduling that dispatches eligible todo tasks by priority first, then FIFO (`createdAt` ascending) within each priority tier.
-  - `blockedBy` invariant (FN-3924): the field is only durable when it references a current unresolved explicit dependency (or, for dependency-free tasks, an active overlap blocker). If no current blocker remains, scheduler/event reconciliation clears `blockedBy` to `null` and re-evaluates from live task state.
+  - `blockedBy` invariant (FN-3924/FN-4091): the field is only durable when it references a current unresolved explicit dependency (or, for dependency-free tasks, an active overlap blocker). Completion gating now validates `blockedBy` through live task resolution: missing blockers and blockers already in `done`/`archived` are treated as stale, while only still-active blockers continue to prevent `fn_task_done`. If no current blocker remains, scheduler/event reconciliation clears `blockedBy` to `null` and re-evaluates from live task state.
 
 #### BlockedBy stamping invariants
 - Scheduler writes overlap-based `blockedBy` only when overlap gating is active and there is a live overlapping active scope; otherwise overlap logic does not stamp blockers.
+- Active overlap scopes exclude permanently-failed `in-review` tasks (`status === "failed"`, typically produced by `checkStuckBudget()` after `stuckKillCount > maxStuckKills`) so superseding re-implementation tasks are not indefinitely queued behind work that will never merge. (FN-4200)
 - Stamping is sticky when valid (FN-3899): if a todo task is already `queued` behind a blocker that is still active and still overlaps, the scheduler preserves that blocker and skips rewrites.
 - When the blocker must change, selection is deterministic: active overlap candidates are ordered by task ID and the first overlapping task is chosen, removing tick-order churn.
 - Writes are idempotent: scheduler updates `status/blockedBy` only when values change, reducing per-tick churn and audit noise.
 - Self-healing remains responsible for terminal/missing blocker cleanup (`clearStaleBlockedBy()`), while scheduler overlap stamping now focuses on stable active-overlap attribution.
 - `StepSessionExecutor` (`step-session-executor.ts`) — per-step sessions + parallel wave execution
+- `createTaskUpdateTool()` (`executor.ts`) emits a diagnostic warning when an agent marks step N `in-progress` while another step on the same task is already `in-progress`; the update still proceeds so operators get evidence without changing task semantics.
 - `TaskCompletion` (`task-completion.ts`) — completion gate helpers
 - `SpecStaleness` (`spec-staleness.ts`) — stale spec detection utilities
 - `MissionExecutionLoop` (`mission-execution-loop.ts`) — validator/fix loop orchestration
@@ -602,11 +616,15 @@ Runtime action-gate flow (v1):
 - `TransientErrorDetector` (`transient-error-detector.ts`) — retriable error classification
 - `SelfHealingManager` (`self-healing.ts`) — auto-unpause/maintenance recovery actions
   - `recoverGhostReviewTasks()` is a fallback only for idle, non-terminal `in-review` states. Terminal/actionable states (notably `status: "failed"`) are preserved and **not** auto-kicked back to `todo`.
+
+#### Stuck-loop exhaustion terminal contract
+When stuck-kill retries are exhausted, `checkStuckBudget()` marks the task `status: "failed"`, moves it to `in-review`, and writes an error that starts with `STUCK_LOOP_EXHAUSTED:`. The error and final task-log line both include the kill count/max and last stuck reason (`loop` or `inactivity`). `StuckTaskDetector` also untracks the task and refuses to re-track it while that failed terminal error remains, preventing further automatic kill/requeue churn. The final log line explicitly states that no further automatic retries will run and directs operators to manually retry, pause, or move the task back to triage to resume work.
   - `recoverMissingWorktreeReviewFailures()` is a narrow failed-review recovery: only `status: "failed"` `in-review` tasks with the explicit session-start signature `Refusing to start coding agent in missing worktree:` (from `assertValidWorktreeSession()`) are requeued. Recovery clears stale session metadata (`worktree`, `branch`, `sessionFile`, transient failure state), preserves valid step progress/retry counters, logs the auto-recovery reason, and moves the task back to `todo` for a clean retry.
   - `recoverMergeableReviewTasks()` only re-enqueues truly eligible tasks; retry-exhausted review tasks are skipped to avoid re-enqueue/no-op loops that keep refreshing `updatedAt`.
   - `recoverAlreadyMergedReviewTasks()` auto-finalizes retry-exhausted `in-review` tasks when self-healing can prove their work already landed on the merge target, but it still honors `getTaskMergeBlocker()` before `in-review` → `done`. If a blocker remains (for example, incomplete steps), the task is surfaced in stable `in-review/failed` state with a blocker error instead of entering an auto-finalize loop.
+  - FN-4285 decision: add a follow-up for a tree-equality recovery strategy (`rev-parse <base>^{tree}` == `<task-branch>^{tree}`) in `findAlreadyMergedTaskCommit`. This closes stranded already-merged branches that evade trailer/ancestry/patch-id matching, with guardrails limited to retry-exhausted review tasks to avoid false positives during transient post-rebase parity windows.
   - No-`fn_task_done` recovery classification is normalized across executor, restart recovery, and self-healing: detection keys on executor-emitted `"without calling fn_task_done"` strings (while still tolerating legacy `task_done` wording), then applies the bounded ladder deterministically (in-session retries → bounded todo requeues with preserved progress when appropriate → terminal surfaced failure when budget is exhausted).
-  - `clearStaleBlockedBy()` clears `blockedBy` (and transient `status`) on todo tasks when their blocker is missing, done, archived, paused in-review, or failed in-review with merge retries exhausted. FN-3924 extends this with a dependency-integrity guard: if a task has explicit dependencies and `blockedBy` is not one of the currently unresolved deps, the stale marker is cleared. This repairs rows corrupted by historical overlap re-stamping and lets scheduler re-evaluate from live dependency state.
+  - `clearStaleBlockedBy()` clears `blockedBy` (and transient `status`) on todo tasks when their blocker is missing, done, archived, paused in-review, or failed in-review with merge retries exhausted. FN-3924 extends this with a dependency-integrity guard: if a task has explicit dependencies and `blockedBy` is not one of the currently unresolved deps, the stale marker is cleared. FN-4091 broadens the sweep to active `in-progress` and un-paused `in-review` tasks as well, but those repairs only null `blockedBy` (they do not rewrite scheduler-owned queued state). This repairs rows corrupted by historical overlap re-stamping and lets scheduler re-evaluate from live dependency state. The ad-hoc `scripts/recover-stale-blocked-by.mjs` remains a manual backstop for filesystem/db audits, not the primary repair path.
   - Together, `recoverAlreadyMergedReviewTasks()`, `clearStaleBlockedBy()`, and paused-aware in-review scheduling prevent merge-deadlock loops by finalizing already-landed work, clearing stale dependency blockers, and avoiding paused review cards re-blocking overlap dispatch.
   - Merge commit attribution is ownership-aware: a `mergeDetails.commitSha` is trusted only when reachable from `HEAD` **and** attributable to the task via `Fusion-Task-Id` trailer or task-ID-bearing subject. Reachable-but-unowned SHAs are rejected to prevent sibling done tasks from sharing misleading merge metadata.
 - `ProjectEngine` settings lifecycle handlers (`project-engine.ts`) treat `enginePaused` as a soft pause: clearing it dispatches runtime resume and, when `autoMerge` is enabled, performs an `in-review` eligibility sweep to requeue mergeable review tasks.
@@ -771,6 +789,12 @@ Key server capabilities:
 - Remote login links carry auth material in query params (`rt` then `token` on redirect). Treat links/QR screenshots as secrets: they can leak through history, screenshots, and chat logs; prefer short-lived mode for sharing.
 - Intentional startup/banner text in `fn dashboard` and `fn serve` remains direct plain output for readability and backward-compatible scripting behavior.
 
+### Headless Node Mode (`fn serve` / `fn daemon`)
+- Headless runtimes now auto-register the current working directory as a project when it is missing from central registry metadata, then continue normal engine startup.
+- First-run auto-bootstrap logs one line: `[serve] Auto-registered project "<name>" at <cwd>` (or `[daemon] ...`).
+- This enables first-run startup in CI/Docker/cron without requiring a prior `fn init` or `fn project add`.
+- Pass `--no-auto-register` to either command to preserve legacy strict behavior.
+
 ### Real-time channels
 - **SSE**: `/api/events` (`sse.ts`)
   - Emits `task:*`, mission events, AI session updates, automation schedule events (`schedule:created`, `schedule:updated`, `schedule:deleted`, `schedule:run`), and research run lifecycle events (`research:run:created`, `research:run:updated`, `research:run:completed`, `research:run:failed`, `research:run:cancelled`) when available
@@ -905,6 +929,12 @@ The client treats mapping persistence as part of onboarding success. If mapping 
 | GET | `/api/update-check` | Read cached/TTL-guarded npm update status for `@runfusion/fusion` (respects `updateCheckEnabled`). |
 | POST | `/api/update-check/refresh` | Clear cached update data and force a fresh npm update check. |
 | GET | `/api/updates/check` | Perform an on-demand npm registry check for the latest `@runfusion/fusion` version (no cache). |
+
+### Agent stats endpoint
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/agents/stats` | Aggregate agent/task stats used by operator summaries and capacity-risk signaling. Returns `activeCount`, `assignedTaskCount`, `completedRuns`, `failedRuns`, `successRate`, plus `idleNonEphemeralCount` (idle agents excluding ephemeral/runtime workers via `isEphemeralAgent`) and `todoTaskCount` (tasks currently in Todo). |
 
 ### Docker provisioning endpoints
 
@@ -1060,6 +1090,18 @@ Task steps use statuses: `pending`, `in-progress`, `done`, `skipped`.
 - **Post-merge** steps run in merger (`runPostMergeWorkflowSteps()`)
 
 ---
+
+### Stalled review detection
+
+`@fusion/core` computes a heuristic `task.stalledReview` signal during task hydration (both slim board listings and full/detail reads in `TaskStore`) by scanning recent task log activity.
+
+Current heuristics (see `packages/core/src/stalled-review-detector.ts`):
+- **Reenqueue churn** (`heuristic: "reenqueue-churn"`): at least `STALLED_REVIEW_REENQUEUE_THRESHOLD` (`3`) matches of `STALLED_REVIEW_REENQUEUE_PATTERN` within `STALLED_REVIEW_WINDOW_MS` (`60 minutes`).
+- **Invalid-transition loop** (`heuristic: "invalid-transition-loop"`): at least `STALLED_REVIEW_INVALID_TRANSITION_THRESHOLD` (`2`) matches of `STALLED_REVIEW_INVALID_TRANSITION_PATTERN` in log `action`/`outcome` within the same window.
+
+Detection is visibility-only: no scheduler/self-healing actions are triggered by this field. The dashboard `TaskCard` renders a `Stalled` badge for `in-review` tasks when `task.stalledReview` is present, with the heuristic reason in the tooltip.
+
+Tune sensitivity by adjusting the exported constants in `stalled-review-detector.ts`. Increase thresholds to reduce noise; decrease thresholds only with incident evidence, because lower values can over-flag transient recovery bursts.
 
 ## 10) Agent System
 
@@ -1329,7 +1371,7 @@ When Fusion does create a tracking issue, it formats the title as `[FN-XXXX] Tas
 
 When a tracked task later moves to `in-progress` or `done`, Fusion posts one short lifecycle comment on the linked tracking issue. These comments always include the Fusion task ID as plain text (`Fusion task: FN-XXXX`) and never link back to the Fusion app. The `in-progress` comment stays plain-text; the `done` comment can additionally include GitHub commit/PR markdown links plus branch, file-change, and merge-timestamp details when that merge context is available on the task. No comment is posted for any other transition.
 
-When a tracked task transitions into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`. When a task transitions out of `done` into any active column (`triage`, `todo`, `in-progress`, `in-review`), Fusion reopens it with `state_reason: reopened`. Moves from `done` to `archived` leave the issue closed. Tasks without `githubTracking.enabled` or without a linked issue are unaffected, and GitHub failures are logged to task activity without blocking the move.
+When a tracked task transitions into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`. When a task transitions out of `done` into any active column (`triage`, `todo`, `in-progress`, `in-review`), Fusion reopens it with `state_reason: reopened`. When a tracked task is permanently deleted, Fusion closes the linked GitHub issue with `state_reason: not_planned`. Moves from `done` to `archived` leave the issue closed. Tasks without `githubTracking.enabled` or without a linked issue are unaffected, and GitHub failures are logged to task activity without blocking the move.
 
 ### Worktree model
 - Each active task runs in isolated worktree under `.worktrees/*`

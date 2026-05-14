@@ -141,29 +141,24 @@
   border-radius: var(--radius-pill);
 }
 
-.card-status-badge.pulsing {
-  animation: pulse 1.5s ease-in-out infinite;
+.card-status-badge.stalled-review {
+  background: color-mix(in srgb, var(--color-warning) 18%, transparent);
+  color: var(--color-warning);
+  border: var(--btn-border-width) solid color-mix(in srgb, var(--color-warning) 30%, transparent);
 }
 
-.card-status-badge.failed {
-  background: var(--status-error-bg);
-  color: var(--color-error-dark);
-}
-
-.card-status-badge.stuck {
-  background: var(--status-triage-bg-deep);
-  color: var(--triage);
-  animation: stuck-pulse 2s ease-in-out infinite;
-}
-
-.card-status-badge.paused {
-  background: var(--status-done-bg-deep);
+.card-stalled-review-reason {
+  margin-top: var(--space-xs);
+  font-size: 0.6875rem;
+  line-height: 1.4;
   color: var(--text-muted);
-}
-
-.card-status-badge.awaiting-approval {
-  background: var(--status-triage-bg-deep);
-  color: var(--triage);
+  overflow: hidden;
+  white-space: normal;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .card-status-badge--triage {
@@ -189,6 +184,31 @@
 .card-status-badge--archived {
   background: var(--status-archived-bg);
   color: var(--text-muted);
+}
+
+.card-status-badge.pulsing {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.card-status-badge.failed {
+  background: var(--status-error-bg);
+  color: var(--color-error-dark);
+}
+
+.card-status-badge.stuck {
+  background: var(--status-triage-bg-deep);
+  color: var(--triage);
+  animation: stuck-pulse 2s ease-in-out infinite;
+}
+
+.card-status-badge.paused {
+  background: var(--status-done-bg-deep);
+  color: var(--text-muted);
+}
+
+.card-status-badge.awaiting-approval {
+  background: var(--status-triage-bg-deep);
+  color: var(--triage);
 }
 
 .card.stuck {
@@ -416,7 +436,6 @@
   align-items: center;
   gap: calc(var(--space-xs) / 2);
   font-size: 0.6875rem;
-  color: var(--color-info);
   position: relative;
   cursor: default;
 }
@@ -430,23 +449,6 @@
   background: color-mix(in srgb, var(--color-warning) 12%, transparent);
   border-radius: var(--radius-pill);
   padding-inline: calc(var(--space-xs) / 2);
-}
-
-.card-fanout-badge--high-impact {
-  color: var(--color-warning);
-  background: color-mix(in srgb, var(--color-warning) 16%, transparent);
-  border-radius: var(--radius-pill);
-  padding-inline: var(--space-xs);
-  font-weight: 600;
-}
-
-.card-fanout-badge--high-impact .card-fanout-count {
-  color: var(--text);
-}
-
-.card-fanout-badge--escalated {
-  color: var(--color-error);
-  background: color-mix(in srgb, var(--color-error) 16%, transparent);
 }
 
 .card-scope-badge[data-tooltip]:hover::after,
@@ -499,6 +501,14 @@
   align-items: center;
   gap: var(--space-xs);
   margin-top: var(--space-xs);
+}
+
+.card-bottom-right-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  margin-top: var(--space-sm);
+  min-width: 0;
 }
 
 .card-provider-icons {
@@ -562,9 +572,6 @@
     display: none;
   }
 
-  .card-fanout-badge--high-impact {
-    padding-inline: calc(var(--space-xs) / 2);
-  }
 }
 
 .card-agent-badge--loading {
@@ -626,14 +633,41 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-left: auto;
   flex-shrink: 0;
   color: var(--text-muted);
+}
+
+.card-footer-row > .card-source-provenance:first-of-type {
+  margin-left: auto;
 }
 
 .card-source-provenance .provider-icon {
   display: inline-flex;
   align-items: center;
+}
+
+.card-github-tracking-link {
+  min-width: calc(var(--space-xl) + var(--space-md));
+  min-height: calc(var(--space-xl) + var(--space-md));
+  padding: var(--space-xs);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.card-github-tracking-link:hover {
+  background: var(--card-hover);
+  color: var(--text);
+}
+
+.card-github-tracking-link:focus-visible {
+  background: var(--card-hover);
+  color: var(--text);
+  box-shadow: var(--focus-ring-strong);
+  outline: none;
 }
 
 .card-time-indicator {
@@ -1160,10 +1194,25 @@
     font-size: 0.625rem;
   }
 
+  .card-github-tracking-link {
+    min-width: calc(var(--space-xl) + var(--space-xl));
+    min-height: calc(var(--space-xl) + var(--space-xl));
+  }
+
+  .card-bottom-right-row {
+    margin-top: var(--space-xs);
+  }
+
   /* Card: smaller status badges for 280px width */
   .card-status-badge {
     font-size: 0.5625rem;
     padding: 1px 6px;
+  }
+
+  .card-stalled-review-reason {
+    font-size: 0.625rem;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
   }
 
   .card-mission-badge {

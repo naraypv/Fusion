@@ -17,12 +17,12 @@
  * - onTerminated: Called when a heartbeat run is terminated
  */
 
-import type { AgentStore, AgentHeartbeatRun, HeartbeatInvocationSource, AgentHeartbeatConfig, AgentBudgetStatus, Message, MessageStore, TaskStore, TaskDetail, AgentRole, Agent, InboxTask, RunMutationContext, Settings, AgentConfigRevision, ReflectionStore } from "@fusion/core";
-import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy, canAgentTakeImplementationTask, canAgentTakeImplementationTaskForExplicitRouting, resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
+import type { AgentStore, AgentHeartbeatRun, HeartbeatInvocationSource, AgentHeartbeatConfig, AgentBudgetStatus, Message, MessageStore, TaskStore, TaskDetail, AgentRole, Agent, InboxTask, RunMutationContext, Settings, AgentConfigRevision, ReflectionStore, ChatStore, ChatRoom, ChatRoomMessage } from "@fusion/core";
+import { ApprovalRequestStore, buildExecutionMemoryInstructions, isEphemeralAgent, hasAgentIdentity, resolveEffectiveAgentPermissionPolicy, canAgentTakeImplementationTask, canAgentTakeImplementationTaskForExplicitRouting, resolveModelFallbackChain, resolvePersistAgentThinkingLog, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@mariozechner/pi-ai";
 import { createHash } from "node:crypto";
-import { createTaskCreateTool, createTaskLogToolWithContext, createTaskDocumentWriteTool, createTaskDocumentReadTool, createListAgentsTool, createDelegateTaskTool, createGetAgentConfigTool, createUpdateAgentConfigTool, createAgentCreateTool, createAgentDeleteTool, createSendMessageTool, createReadMessagesTool, createMemoryTools, createReadEvaluationsTool, createUpdateIdentityTool, createReflectOnPerformanceTool, createWebFetchTool, readAgentMemoryWorkspaceLongTerm, taskCreateParams } from "./agent-tools.js";
+import { createTaskCreateTool, createTaskLogToolWithContext, createTaskDocumentWriteTool, createTaskDocumentReadTool, createListAgentsTool, createDelegateTaskTool, createGetAgentConfigTool, createUpdateAgentConfigTool, createAgentCreateTool, createAgentDeleteTool, createSendMessageTool, createReadMessagesTool, createPostRoomMessageTool, createMemoryTools, createReadEvaluationsTool, createUpdateIdentityTool, createReflectOnPerformanceTool, createWebFetchTool, readAgentMemoryWorkspaceLongTerm, taskCreateParams } from "./agent-tools.js";
 import { AgentLogger } from "./agent-logger.js";
 import {
   resolveAgentInstructionsWithRatings,
@@ -31,6 +31,7 @@ import {
 } from "./agent-instructions.js";
 import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import { heartbeatLog, formatError } from "./logger.js";
+import { acquireTaskWorktree } from "./worktree-acquisition.js";
 import { createRunAuditor, type EngineRunContext } from "./run-audit.js";
 import { promptWithFallback } from "./pi.js";
 import { createResolvedAgentSession, extractRuntimeHint, resolveHeartbeatSessionModels } from "./agent-session-helpers.js";
@@ -60,6 +61,8 @@ export interface HeartbeatMonitorOptions {
   agentStore?: AgentStore;
   /** Optional MessageStore for wake-on-message behavior */
   messageStore?: MessageStore;
+  /** Optional ChatStore for room-message visibility during heartbeats */
+  chatStore?: ChatStore;
   /** Polling interval in milliseconds (default: 3600000) */
   pollIntervalMs?: number;
   /** Heartbeat timeout in milliseconds (default: 60000) */
@@ -157,6 +160,17 @@ interface TrackedAgent {
   sessionIdBefore?: string;
 }
 
+/**
+ * Grace multiplier applied to each direct report's configured heartbeat
+ * interval before flagging it stale in reports-health summaries.
+ */
+const HEARTBEAT_GRACE_MULTIPLIER = 4;
+
+/**
+ * Minimum staleness threshold floor for very short heartbeat intervals.
+ */
+const MIN_HEARTBEAT_STALENESS_MS = 5 * 60_000;
+
 /** Format milliseconds into a human-readable duration string (e.g. "5m", "1h 20m", "2h"). */
 export function formatDuration(ms: number): string {
   const totalMinutes = Math.floor(ms / 60_000);
@@ -175,6 +189,30 @@ function formatRelativeTime(iso?: string | null): string {
   const elapsed = Date.now() - parsed;
   if (elapsed < 0) return "just now";
   return `${formatDuration(elapsed)} ago`;
+}
+
+function getHeartbeatAgeMs(agent: Agent, now: number = Date.now()): number {
+  const lastTs = agent.lastHeartbeatAt ? Date.parse(agent.lastHeartbeatAt) : Number.NaN;
+  return Number.isFinite(lastTs) ? Math.max(0, now - lastTs) : Number.NaN;
+}
+
+async function terminatePersistedHeartbeatRun(
+  store: AgentStore,
+  agentId: string,
+  runId: string,
+  stderrExcerpt: string,
+): Promise<boolean> {
+  const detail = await store.getRunDetail(agentId, runId);
+  if (detail && detail.status !== "completed" && detail.status !== "failed" && detail.status !== "terminated") {
+    await store.saveRun({
+      ...detail,
+      endedAt: new Date().toISOString(),
+      status: "terminated",
+      stderrExcerpt,
+    });
+  }
+  await store.endHeartbeatRun(runId, "terminated");
+  return true;
 }
 
 function isAutoClaimRelevantTasksEnabled(agent: Agent): boolean {
@@ -250,7 +288,7 @@ Examples of ONE useful coordination action:
 
 Keep work lightweight — this is a single-pass coordination check, not an implementation run.
 You have workspace read tools (for context gathering) plus fn_task_create, fn_task_log, fn_task_document tools,
-fn_send_message, fn_read_messages, fn_list_agents, fn_delegate_task, and memory tools.
+fn_send_message, fn_read_messages, fn_post_room_message, fn_list_agents, fn_delegate_task, and memory tools.
 
 **Task Documents:** Save important findings with fn_task_document_write(key="...", content="...").
 Documents persist across sessions and are visible in the dashboard's Documents tab.
@@ -295,7 +333,10 @@ When you are woken by an incoming message (source includes "wake-on-message"), y
    - If the message is informational, acknowledge it by logging with fn_task_log.
    - If the message requests net-new work, create a follow-up task with fn_task_create.
    - If ownership is clear and an agent is available, delegate using fn_delegate_task.
-4. After processing messages, continue with your normal heartbeat duties.
+4. If a Pending Room Messages section is present, review it too:
+   - Use fn_post_room_message only when the room content is relevant to your role, soul, or identity.
+   - Reference room message IDs when replying so humans can trace context.
+5. After processing messages, continue with your normal heartbeat duties.
 
 Example flow:
 - Read unread messages → identify "needs action" item → reply with intent (reply_to_message_id) → create/delegate task if execution is needed → log key decision.
@@ -339,7 +380,7 @@ You have coding-capable workspace tools (read/write/edit/bash within worktree bo
 - fn_get_agent_config and fn_update_agent_config (for direct reports only)
 - fn_memory_search, fn_memory_get, and fn_memory_append
 - fn_heartbeat_done
-- fn_send_message and fn_read_messages when messaging is enabled for this run (they may not always be available)
+- fn_send_message, fn_read_messages, and fn_post_room_message when messaging/room tools are enabled for this run (they may not always be available)
 
 ## Triage and Routing Decisions
 
@@ -376,7 +417,8 @@ When you are woken by an incoming message (source includes "wake-on-message"), y
    - If the message is informational, acknowledge it and respond via fn_send_message when appropriate.
    - If the message requests work, create a follow-up task with fn_task_create.
    - If the request has a clear owner and fn_delegate_task is available, delegate it directly.
-3. After processing messages, continue with your ambient work.
+3. If a Pending Room Messages section is present, review it too and use fn_post_room_message only when the room content is relevant to your role or identity.
+4. After processing messages, continue with your ambient work.
 
 Example flow:
 - Read inbox → classify message → reply with reply_to_message_id → create/delegate follow-up if needed → finish with fn_heartbeat_done.
@@ -404,7 +446,8 @@ export const HEARTBEAT_PROCEDURE = `## Heartbeat Procedure (run every tick, in o
    section of your system prompt.
 2. **Inbox** — when fn_read_messages is available, call it immediately and
    process unread/pending messages before any other action; reply with
-   reply_to_message_id when answering.
+   reply_to_message_id when answering. If Pending Room Messages are present,
+   review them in the prompt and use fn_post_room_message only when relevant.
 3. **Wake delta** — read the Wake Delta block above. The wake reason is the
    highest-priority change for this heartbeat. If you were woken by a comment
    or a message, acknowledge it before doing anything else.
@@ -453,7 +496,8 @@ export const HEARTBEAT_NO_TASK_PROCEDURE = `## Heartbeat Procedure (run every ti
    section of your system prompt.
 2. **Inbox** — when fn_read_messages is available, call it immediately and
    process unread/pending messages before any other action; reply with
-   reply_to_message_id when answering.
+   reply_to_message_id when answering. If Pending Room Messages are present,
+   review them in the prompt and use fn_post_room_message only when relevant.
 3. **Wake delta** — read the Wake Delta block above. The wake reason is the
    highest-priority change for this heartbeat. If you were woken by a comment
    or a message, acknowledge it before doing anything else.
@@ -570,6 +614,7 @@ export class HeartbeatMonitor {
   private taskStore?: TaskStore;
   private rootDir?: string;
   private messageStore?: MessageStore;
+  private chatStore?: ChatStore;
   private pluginRunner?: import("./plugin-runner.js").PluginRunner;
   private reflectionStore?: ReflectionStore;
   private reflectionService?: AgentReflectionService;
@@ -598,10 +643,102 @@ export class HeartbeatMonitor {
     this.taskStore = options.taskStore;
     this.rootDir = options.rootDir;
     this.messageStore = options.messageStore;
+    this.chatStore = options.chatStore;
     this.pluginRunner = options.pluginRunner;
     this.reflectionStore = options.reflectionStore;
     this.reflectionService = options.reflectionService;
     this.selfImproveService = options.selfImproveService;
+  }
+
+  getChatStore(): ChatStore | undefined {
+    return this.chatStore;
+  }
+
+  private async resolveRoomMessageSinceIso(agent: Agent, activeRunId: string): Promise<string> {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    try {
+      const recentRuns = await this.store.getRecentRuns(agent.id, 10);
+      const previousCompletedRun = recentRuns.find((candidate) => candidate.id !== activeRunId && candidate.endedAt);
+      const candidateIso = previousCompletedRun?.endedAt ?? agent.lastHeartbeatAt ?? twentyFourHoursAgo;
+      const candidateTime = Date.parse(candidateIso);
+      if (!Number.isFinite(candidateTime)) {
+        return twentyFourHoursAgo;
+      }
+      return new Date(Math.max(candidateTime, Date.now() - 24 * 60 * 60 * 1000)).toISOString();
+    } catch (error) {
+      heartbeatLog.warn(`Failed to resolve room-message lookback for ${agent.id}: ${error instanceof Error ? error.message : String(error)}`);
+      const fallbackTime = Date.parse(agent.lastHeartbeatAt ?? twentyFourHoursAgo);
+      if (!Number.isFinite(fallbackTime)) {
+        return twentyFourHoursAgo;
+      }
+      return new Date(Math.max(fallbackTime, Date.now() - 24 * 60 * 60 * 1000)).toISOString();
+    }
+  }
+
+  private getPendingRoomMessagesSection(entries: Array<{ room: ChatRoom; messages: ChatRoomMessage[] }>, truncatedCount: number): string[] {
+    if (entries.length === 0) {
+      return [];
+    }
+
+    const lines = ["", "Pending Room Messages:"];
+    for (const entry of entries) {
+      lines.push(`- [room: ${entry.room.name} (${entry.room.id})]`);
+      for (const message of entry.messages) {
+        const normalized = message.content.replace(/\s+/g, " ").trim();
+        const truncatedContent = normalized.length > 180 ? `${normalized.slice(0, 179)}…` : normalized;
+        lines.push(`  - [from: ${message.senderAgentId ?? "user"}] [${message.id}] ${truncatedContent}`);
+      }
+    }
+    if (truncatedCount > 0) {
+      lines.push(`  - (${truncatedCount} more truncated)`);
+    }
+    return lines;
+  }
+
+  private async getPendingRoomMessages(agent: Agent, sinceIso: string): Promise<{
+    entries: Array<{ room: ChatRoom; messages: ChatRoomMessage[] }>;
+    total: number;
+    truncatedCount: number;
+  }> {
+    if (!this.chatStore) {
+      return { entries: [], total: 0, truncatedCount: 0 };
+    }
+
+    try {
+      const rooms = this.chatStore.listRoomsForAgent(agent.id, { status: "active" });
+      const entries: Array<{ room: ChatRoom; messages: ChatRoomMessage[] }> = [];
+      let total = 0;
+      let surfaced = 0;
+      let truncatedCount = 0;
+
+      for (const room of rooms) {
+        const messages = this.chatStore.listRoomMessagesSince(room.id, sinceIso, {
+          excludeSenderAgentId: agent.id,
+          limit: 10,
+        });
+        if (messages.length === 0) {
+          continue;
+        }
+
+        total += messages.length;
+        const remaining = 30 - surfaced;
+        if (remaining <= 0) {
+          truncatedCount += messages.length;
+          continue;
+        }
+
+        const surfacedMessages = messages.slice(0, remaining);
+        truncatedCount += messages.length - surfacedMessages.length;
+        entries.push({ room, messages: surfacedMessages });
+        surfaced += surfacedMessages.length;
+      }
+
+      return { entries, total, truncatedCount };
+    } catch (error) {
+      heartbeatLog.warn(`Failed to fetch room messages for ${agent.id}: ${error instanceof Error ? error.message : String(error)}`);
+      return { entries: [], total: 0, truncatedCount: 0 };
+    }
   }
 
   private getApprovalRequestStore(): ApprovalRequestStore {
@@ -738,6 +875,10 @@ export class HeartbeatMonitor {
    * Called on monitor start AND periodically from the polling loop to keep
    * the system self-healing across versions. Best-effort — failures are
    * logged but do not block the caller.
+   *
+   * Complements SelfHealingManager.recoverAgentsRunningOnInactiveTasks():
+   * heartbeat reconciliation handles stale/no-run conditions, while self-healing
+   * handles task-column mismatches (for example running agents linked to todo tasks).
    */
   private async reconcileOrphanedRunningAgents(): Promise<void> {
     try {
@@ -750,24 +891,26 @@ export class HeartbeatMonitor {
           reason = "no active run";
         } else if (!this.trackedAgents.has(agent.id)) {
           const timeoutMs = this.resolveAgentConfig(agent.id).heartbeatTimeoutMs;
-          const lastTs = agent.lastHeartbeatAt ? Date.parse(agent.lastHeartbeatAt) : NaN;
-          const heartbeatAgeMs = Number.isFinite(lastTs) ? Math.max(0, now - lastTs) : Infinity;
-          if (heartbeatAgeMs > timeoutMs * 3) {
+          const heartbeatAgeMs = getHeartbeatAgeMs(agent, now);
+          // NOTE(FN-4278): this stale gate intentionally uses a per-run work-budget
+          // multiplier (`heartbeatTimeoutMs × 3`) because this path is only for
+          // untracked persisted `state="running"` rows where an in-memory tracked
+          // session is absent. It is not the direct-report freshness classifier.
+          // Freshness/staleness for active+idle reports is interval-based in
+          // `buildReportsHealthSection()` and dashboard `agentHealth.tsx` via
+          // `max(heartbeatIntervalMs × 4, 5m)` (FN-4255).
+          if (!Number.isFinite(heartbeatAgeMs) || heartbeatAgeMs > timeoutMs * 3) {
             try {
-              const detail = await this.store.getRunDetail(agent.id, activeRun.id);
-              if (detail && detail.status !== "completed" && detail.status !== "failed" && detail.status !== "terminated") {
-                await this.store.saveRun({
-                  ...detail,
-                  endedAt: new Date().toISOString(),
-                  status: "terminated",
-                  stderrExcerpt: `Reconciled stale run (no heartbeat for ${formatDuration(heartbeatAgeMs)}; threshold ${formatDuration(timeoutMs * 3)})`,
-                });
-              }
-              await this.store.endHeartbeatRun(activeRun.id, "terminated");
+              await terminatePersistedHeartbeatRun(
+                this.store,
+                agent.id,
+                activeRun.id,
+                `Reconciled stale run (no heartbeat for ${Number.isFinite(heartbeatAgeMs) ? formatDuration(heartbeatAgeMs) : "unknown"}; threshold ${formatDuration(timeoutMs * 3)})`,
+              );
             } catch (runEndErr) {
               heartbeatLog.warn(`Failed to terminate stale run ${activeRun.id} for ${agent.id}: ${runEndErr instanceof Error ? runEndErr.message : String(runEndErr)}`);
             }
-            reason = `stale heartbeat (${formatDuration(heartbeatAgeMs)} since lastHeartbeatAt)`;
+            reason = `stale heartbeat (${Number.isFinite(heartbeatAgeMs) ? formatDuration(heartbeatAgeMs) : "unknown"} since lastHeartbeatAt)`;
           }
         }
         if (!reason) continue;
@@ -1789,6 +1932,9 @@ export class HeartbeatMonitor {
             heartbeatTools.push(createSendMessageTool(this.messageStore, agentId));
             heartbeatTools.push(createReadMessagesTool(this.messageStore, agentId));
           }
+          if (this.chatStore) {
+            heartbeatTools.push(createPostRoomMessageTool(this.chatStore, agentId));
+          }
 
           heartbeatTools.push(createReadEvaluationsTool(this.store, this.reflectionStore, agentId));
           heartbeatTools.push(createUpdateIdentityTool(this.store, agentId));
@@ -1890,7 +2036,7 @@ export class HeartbeatMonitor {
             appendLog: (entry) => this.store.appendRunLog(agentId, run.id, entry),
             agent: agent.role as AgentRole,
             persistAgentToolOutput: memorySettings?.persistAgentToolOutput,
-            persistAgentThinkingLog: memorySettings?.persistAgentThinkingLog,
+            persistAgentThinkingLog: resolvePersistAgentThinkingLog(memorySettings, { ephemeral: isAgentEphemeral }),
           });
         } else if (taskId) {
           agentLogger = new AgentLogger({
@@ -1899,7 +2045,7 @@ export class HeartbeatMonitor {
             agent: agent.role as AgentRole,
             appendLog: (entry) => this.store.appendRunLog(agentId, run.id, entry),
             persistAgentToolOutput: memorySettings?.persistAgentToolOutput,
-            persistAgentThinkingLog: memorySettings?.persistAgentThinkingLog,
+            persistAgentThinkingLog: resolvePersistAgentThinkingLog(memorySettings, { ephemeral: isAgentEphemeral }),
           });
         }
 
@@ -1965,6 +2111,36 @@ export class HeartbeatMonitor {
           heartbeatLog.warn(`Failed to read heartbeat model settings for ${agentId}: ${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}`);
         }
 
+        let sessionCwd = rootDir;
+        if (!isNoTaskRun && taskDetail) {
+          try {
+            const acquisition = await acquireTaskWorktree({
+              task: taskDetail,
+              rootDir,
+              store: taskStore,
+              settings: heartbeatModelSettings ?? {},
+              logger: heartbeatLog,
+              audit,
+              runContext,
+              runInitCommand: false,
+            });
+            sessionCwd = acquisition.worktreePath;
+          } catch (worktreeErr) {
+            const detail = worktreeErr instanceof Error ? worktreeErr.message : String(worktreeErr);
+            heartbeatLog.warn(`Heartbeat worktree acquisition failed for ${agentId}: ${detail}`);
+            if (taskDetail.column !== "done" && taskDetail.column !== "archived") {
+              await taskStore.moveTask(taskDetail.id, "todo", { preserveProgress: true });
+            }
+            await this.completeRun(agentId, run.id, {
+              status: "completed",
+              resultJson: { reason: "worktree_acquisition_failed", detail },
+              stderrExcerpt: detail,
+              skipStateTransition: true,
+            });
+            return (await this.store.getRunDetail(agentId, run.id))!;
+          }
+        }
+
         const heartbeatSessionModels = resolveHeartbeatSessionModels(heartbeatModelSettings, agent.runtimeConfig);
 
         // Create agent session
@@ -1972,7 +2148,7 @@ export class HeartbeatMonitor {
           sessionPurpose: "heartbeat",
           runtimeHint: extractRuntimeHint(agent.runtimeConfig),
           pluginRunner: this.pluginRunner,
-          cwd: rootDir,
+          cwd: sessionCwd,
           systemPrompt: systemPromptFinal,
           systemPromptLayers: heartbeatLayers,
           tools: "coding",
@@ -2012,6 +2188,13 @@ export class HeartbeatMonitor {
           let pendingMessages: Message[] = [];
           let executionPrompt: string;
 
+          const sinceIso = await this.resolveRoomMessageSinceIso(agent, run.id);
+          const pendingRoomMessages = await this.getPendingRoomMessages(agent, sinceIso);
+          const pendingRoomMessagesLines = this.getPendingRoomMessagesSection(
+            pendingRoomMessages.entries,
+            pendingRoomMessages.truncatedCount,
+          );
+
           // Derive a stable wake reason from source, triggerDetail, and trigger
           // type so the agent can change its strategy based on *why* it woke up.
           // Mirrors paperclip's PAPERCLIP_WAKE_REASON (see plan: wake delta).
@@ -2035,8 +2218,19 @@ export class HeartbeatMonitor {
           // existing instructionsPath/instructionsText reload contract) so an
           // operator can iterate on procedure text without restarting agents.
           const customProcedure = await resolveAgentHeartbeatProcedure(agent, rootDir);
-          const heartbeatProcedureText = customProcedure
-            ?? (isNoTaskRun ? HEARTBEAT_NO_TASK_PROCEDURE : HEARTBEAT_PROCEDURE);
+          const customProcedureConfigured = Boolean(customProcedure);
+          const shouldOverrideCustomProcedureForNoTaskRun = isNoTaskRun && customProcedureConfigured;
+          if (shouldOverrideCustomProcedureForNoTaskRun) {
+            heartbeatLog.log(
+              `Agent ${agentId} no-task heartbeat bypassed configured heartbeatProcedurePath and used HEARTBEAT_NO_TASK_PROCEDURE to keep prompt guidance aligned with ambient tools`,
+            );
+          }
+          const heartbeatProcedureText = shouldOverrideCustomProcedureForNoTaskRun
+            ? HEARTBEAT_NO_TASK_PROCEDURE
+            : (customProcedure ?? (isNoTaskRun ? HEARTBEAT_NO_TASK_PROCEDURE : HEARTBEAT_PROCEDURE));
+          const heartbeatProcedureSource = shouldOverrideCustomProcedureForNoTaskRun
+            ? "default-no-task-override"
+            : (customProcedure ? "custom" : "default");
           const reportsHealthSection = await this.buildReportsHealthSection(agent.id, this.store);
 
           if (isNoTaskRun) {
@@ -2086,6 +2280,7 @@ export class HeartbeatMonitor {
               `- wake reason: ${wakeReason}`,
               `- assigned task: none`,
               `- pending messages: ${pendingMessages.length}`,
+              `- pending room messages: ${pendingRoomMessages.total}`,
               `- auto-claim relevant tasks: ${autoClaimEnabled ? "enabled" : "disabled"}`,
               "",
               "Treat this wake delta as the highest-priority change for this heartbeat.",
@@ -2120,6 +2315,7 @@ export class HeartbeatMonitor {
               "prioritize tasks that align with your role and soul before creating net-new tasks.",
               ...candidateLines,
               ...pendingMessagesLines,
+              ...pendingRoomMessagesLines,
               "",
               "Your soul, instructions, and memory are already loaded in the system prompt.",
               "Focus on work that benefits the project without requiring a specific task context.",
@@ -2198,6 +2394,7 @@ export class HeartbeatMonitor {
               `- wake reason: ${wakeReason}`,
               `- assigned task: ${taskId}`,
               `- pending messages: ${pendingMessages.length}`,
+              `- pending room messages: ${pendingRoomMessages.total}`,
               `- triggering comments: ${effectiveTriggeringCommentIds?.length ?? 0}`,
               "",
               "Treat this wake delta as the highest-priority change for this heartbeat.",
@@ -2215,6 +2412,7 @@ export class HeartbeatMonitor {
               taskDetail!.prompt ? `PROMPT.md:\n${taskDetail!.prompt}` : "No PROMPT.md available.",
               ...triggeringCommentLines,
               ...pendingMessagesLines,
+              ...pendingRoomMessagesLines,
               ...(reportsHealthSection ? ["", reportsHealthSection] : []),
               "",
               "Run the Heartbeat Procedure above. Call fn_heartbeat_done when finished.",
@@ -2228,7 +2426,7 @@ export class HeartbeatMonitor {
               ...run,
               systemPrompt: truncatePrompt(systemPromptFinal, 100_000),
               executionPrompt: truncatePrompt(executionPrompt, 100_000),
-              heartbeatProcedureSource: customProcedure ? "custom" : "default",
+              heartbeatProcedureSource,
             };
             await this.store.saveRun(runWithPrompts);
             // Update local run reference so completeRun merges correctly
@@ -2450,7 +2648,11 @@ export class HeartbeatMonitor {
 
     const now = Date.now();
     const rows = reports.map((report) => {
-      const timeoutMs = this.resolveAgentConfig(report.id).heartbeatTimeoutMs;
+      const { pollIntervalMs, heartbeatTimeoutMs } = this.resolveAgentConfig(report.id);
+      const staleThresholdMs = Math.max(
+        pollIntervalMs * HEARTBEAT_GRACE_MULTIPLIER,
+        MIN_HEARTBEAT_STALENESS_MS,
+      );
       const lastHeartbeatTs = report.lastHeartbeatAt ? Date.parse(report.lastHeartbeatAt) : NaN;
       const heartbeatAgeMs = Number.isFinite(lastHeartbeatTs) ? Math.max(0, now - lastHeartbeatTs) : Infinity;
 
@@ -2460,8 +2662,8 @@ export class HeartbeatMonitor {
       } else if (report.state === "error") {
         health = "**stuck**";
       } else if (report.state === "running") {
-        health = heartbeatAgeMs <= timeoutMs * 2 ? "healthy" : "**stuck**";
-      } else if ((report.state === "active" || report.state === "idle") && heartbeatAgeMs > timeoutMs * 3) {
+        health = heartbeatAgeMs <= heartbeatTimeoutMs * 2 ? "healthy" : "**stuck**";
+      } else if ((report.state === "active" || report.state === "idle") && heartbeatAgeMs > staleThresholdMs) {
         health = "**stale**";
       }
 
@@ -2577,6 +2779,9 @@ export class HeartbeatMonitor {
     if (messageStore) {
       tools.push(createSendMessageTool(messageStore, agentId));
       tools.push(createReadMessagesTool(messageStore, agentId));
+    }
+    if (this.chatStore) {
+      tools.push(createPostRoomMessageTool(this.chatStore, agentId));
     }
 
     tools.push(createReadEvaluationsTool(this.store, this.reflectionStore, agentId));
@@ -2896,6 +3101,7 @@ export class HeartbeatTriggerScheduler {
 
   private static readonly TIMER_AUDIT_INTERVAL_MS = 60_000;
   private static readonly DEFAULT_REPAIR_STALE_MULTIPLIER = 2;
+  private static readonly DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
 
   constructor(store: AgentStore, callback: TriggerCallback, taskStore?: TaskStore, options?: { isTaskExecuting?: (taskId: string) => boolean }) {
     this.store = store;
@@ -3407,6 +3613,43 @@ export class HeartbeatTriggerScheduler {
     return Math.round(intervalMs * staleMultiplier);
   }
 
+  private getActiveRunStaleThresholdMs(agent: Agent, staleMultiplier: number): number {
+    const runtimeConfig = (agent.runtimeConfig ?? {}) as { heartbeatTimeoutMs?: number };
+    const rawTimeoutMs = runtimeConfig.heartbeatTimeoutMs;
+    const timeoutMs = typeof rawTimeoutMs === "number" && Number.isFinite(rawTimeoutMs) && rawTimeoutMs > 0
+      ? Math.max(5000, Math.round(rawTimeoutMs))
+      : HeartbeatTriggerScheduler.DEFAULT_HEARTBEAT_TIMEOUT_MS;
+    return Math.round(timeoutMs * staleMultiplier);
+  }
+
+  private async maybeReapStaleActiveRun(
+    agent: Agent,
+    activeRun: AgentHeartbeatRun,
+    reason: "audit" | "timer",
+    staleMultiplier: number,
+  ): Promise<{ reaped: boolean; elapsedMs: number; thresholdMs: number }> {
+    if (!isHeartbeatManaged(agent)) {
+      return { reaped: false, elapsedMs: Number.NaN, thresholdMs: Number.NaN };
+    }
+
+    const thresholdMs = this.getActiveRunStaleThresholdMs(agent, staleMultiplier);
+    const elapsedMs = getHeartbeatAgeMs(agent);
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= thresholdMs) {
+      return { reaped: false, elapsedMs, thresholdMs };
+    }
+
+    await terminatePersistedHeartbeatRun(
+      this.store,
+      agent.id,
+      activeRun.id,
+      `Reaped stale heartbeat run before next tick (no heartbeat for ${formatDuration(elapsedMs)}; threshold ${formatDuration(thresholdMs)})`,
+    );
+    heartbeatLog.warn(
+      `Heartbeat stale-run reaped reason=orphaned-run-reaped agentId=${agent.id} runId=${activeRun.id} elapsedMs=${elapsedMs} thresholdMs=${thresholdMs} source=${reason}`,
+    );
+    return { reaped: true, elapsedMs, thresholdMs };
+  }
+
   private async markRepairMetadata(agent: Agent, staleAtRepair: boolean, staleRepairReason?: string): Promise<void> {
     const updater = (this.store as { updateAgent?: (agentId: string, updates: { metadata: Record<string, unknown> }) => Promise<unknown> }).updateAgent;
     if (typeof updater !== "function") {
@@ -3449,9 +3692,23 @@ export class HeartbeatTriggerScheduler {
         if (this.timers.has(agent.id)) continue;
 
         const activeRun = await this.store.getActiveHeartbeatRun(agent.id);
+        const activeRunId = activeRun?.id ?? null;
+        let reapedActiveRun = false;
+        let activeRunElapsedMs = Number.NaN;
+        let activeRunThresholdMs = Number.NaN;
         if (activeRun) {
-          heartbeatLog.log(`Timer audit skipped re-arm for ${agent.id} (active run)`);
-          continue;
+          if (settings?.globalPause || settings?.enginePaused) {
+            heartbeatLog.log(`Timer audit skipped re-arm for ${agent.id} (active run)`);
+            continue;
+          }
+          const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "audit", staleMultiplier);
+          reapedActiveRun = reapResult.reaped;
+          activeRunElapsedMs = reapResult.elapsedMs;
+          activeRunThresholdMs = reapResult.thresholdMs;
+          if (!reapedActiveRun) {
+            heartbeatLog.log(`Timer audit skipped re-arm for ${agent.id} (active run)`);
+            continue;
+          }
         }
 
         this.registerAgent(agent.id, this.getAgentTimerConfig(agent), {
@@ -3459,8 +3716,7 @@ export class HeartbeatTriggerScheduler {
         });
 
         const staleThresholdMs = this.getRepairStaleThresholdMs(agent, staleMultiplier);
-        const lastHeartbeatMs = agent.lastHeartbeatAt ? Date.parse(agent.lastHeartbeatAt) : Number.NaN;
-        const elapsedMs = Number.isFinite(lastHeartbeatMs) ? Date.now() - lastHeartbeatMs : Number.NaN;
+        const elapsedMs = getHeartbeatAgeMs(agent);
         const staleAtRepair = Number.isFinite(elapsedMs) && elapsedMs > staleThresholdMs;
         const staleRepairReason = staleAtRepair
           ? `No heartbeat for ${Math.round(elapsedMs / 1000)}s before timer audit repair (threshold ${Math.round(staleThresholdMs / 1000)}s)`
@@ -3468,6 +3724,11 @@ export class HeartbeatTriggerScheduler {
         await this.markRepairMetadata(agent, staleAtRepair, staleRepairReason);
 
         rearmedCount++;
+        if (reapedActiveRun && activeRunId) {
+          heartbeatLog.log(
+            `Timer audit re-armed after stale-run reap reason=timer-audit-rearmed agentId=${agent.id} runId=${activeRunId} elapsedMs=${activeRunElapsedMs} thresholdMs=${activeRunThresholdMs}`,
+          );
+        }
         if (staleAtRepair) {
           heartbeatLog.warn(`Timer re-armed stale agent ${agent.id} (audit:${reason}): ${staleRepairReason ?? "heartbeat exceeded stale threshold before repair"}`);
         } else {
@@ -3503,13 +3764,6 @@ export class HeartbeatTriggerScheduler {
         return;
       }
 
-      // Check for active runs
-      const activeRun = await this.store.getActiveHeartbeatRun(agentId);
-      if (activeRun) {
-        heartbeatLog.log(`Timer tick skipped for ${agentId} (active run)`);
-        return;
-      }
-
       // Guard: when parallel execution is disabled, skip if the agent's bound task is actively executing
       const timerRc = (agent.runtimeConfig ?? {}) as { allowParallelExecution?: boolean };
       if (timerRc.allowParallelExecution === false && agent.taskId && this.isTaskExecuting?.(agent.taskId)) {
@@ -3519,16 +3773,28 @@ export class HeartbeatTriggerScheduler {
 
       // Global/engine pause guard: scheduler should not dispatch timer callbacks
       // while globally paused (hard stop) or engine paused (soft stop for timers).
-      if (this.taskStore) {
-        const settings = await this.taskStore.getSettings();
-        if (settings.globalPause) {
-          heartbeatLog.log(`Timer tick skipped for ${agentId} (global pause active)`);
+      const settings = this.taskStore ? await this.taskStore.getSettings() : null;
+      if (settings?.globalPause) {
+        heartbeatLog.log(`Timer tick skipped for ${agentId} (global pause active)`);
+        return;
+      }
+      if (settings?.enginePaused) {
+        heartbeatLog.log(`Timer tick skipped for ${agentId} (engine paused)`);
+        return;
+      }
+
+      // Check for active runs
+      const activeRun = await this.store.getActiveHeartbeatRun(agentId);
+      if (activeRun) {
+        const staleMultiplier = this.resolveRepairStaleMultiplier(settings);
+        const reapResult = await this.maybeReapStaleActiveRun(agent, activeRun, "timer", staleMultiplier);
+        if (!reapResult.reaped) {
+          heartbeatLog.log(`Timer tick skipped for ${agentId} (active run)`);
           return;
         }
-        if (settings.enginePaused) {
-          heartbeatLog.log(`Timer tick skipped for ${agentId} (engine paused)`);
-          return;
-        }
+        heartbeatLog.log(
+          `Heartbeat tick resumed after stale-run reap reason=tick-proceeded-after-reap agentId=${agentId} runId=${activeRun.id} elapsedMs=${reapResult.elapsedMs} thresholdMs=${reapResult.thresholdMs}`,
+        );
       }
 
       // Budget enforcement is handled in HeartbeatMonitor.executeHeartbeat() for timer sources.

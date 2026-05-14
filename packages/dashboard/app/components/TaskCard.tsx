@@ -19,6 +19,7 @@ import { useBadgeWebSocket } from "../hooks/useBadgeWebSocket";
 import { getFreshBatchData } from "../hooks/useBatchBadgeFetch";
 import { useTaskDiffStats } from "../hooks/useTaskDiffStats";
 import { isTaskStuck } from "../utils/taskStuck";
+import { getStalledReviewSignal } from "../utils/taskStalledReview";
 import { getUnifiedTaskProgress } from "../utils/taskProgress";
 import { getEndToEndDurationMs, getTimedDurationMs, getWorkflowRuntimeMs, parseTimestampToMs } from "../utils/taskTiming";
 import type { ToastType } from "../hooks/useToast";
@@ -326,6 +327,21 @@ function getIssueUrlFromMetadata(metadata: Task["sourceMetadata"]): string | und
   return typeof issueUrl === "string" && issueUrl.length > 0 ? issueUrl : undefined;
 }
 
+function parseGithubIssueUrl(url?: string): { owner: string; repo: string; number: number } | null {
+  if (!url) return null;
+  const match = url.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:$|[/?#])/i);
+  if (!match) return null;
+
+  const issueNumber = Number(match[3]);
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) return null;
+
+  return {
+    owner: match[1],
+    repo: match[2],
+    number: issueNumber,
+  };
+}
+
 function areTaskWorkflowResultsEqual(previous?: Task["workflowStepResults"], next?: Task["workflowStepResults"]): boolean {
   if (!previous && !next) return true;
   if (!previous || !next) return false;
@@ -451,6 +467,11 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previousTask.sourceAgentId === nextTask.sourceAgentId &&
     previousTask.sourceMetadata?.issueUrl === nextTask.sourceMetadata?.issueUrl &&
     previousTask.sourceMetadata?.agentName === nextTask.sourceMetadata?.agentName &&
+    previousTask.stalledReview?.reason === nextTask.stalledReview?.reason &&
+    previousTask.stalledReview?.heuristic === nextTask.stalledReview?.heuristic &&
+    previousTask.stalledReview?.matchCount === nextTask.stalledReview?.matchCount &&
+    previousTask.stalledReview?.firstMatchAt === nextTask.stalledReview?.firstMatchAt &&
+    previousTask.stalledReview?.lastMatchAt === nextTask.stalledReview?.lastMatchAt &&
     areAttachmentsEqual(previousTask.attachments, nextTask.attachments) &&
     areCommentsEqual(previousTask.comments, nextTask.comments) &&
     areTaskDependenciesEqual(previousTask.dependencies, nextTask.dependencies) &&
@@ -729,6 +750,8 @@ function TaskCardComponent({
   const normalizedPriority = normalizeTaskPriorityValue(task.priority);
   const showPriorityBadge = normalizedPriority !== DEFAULT_TASK_PRIORITY;
   const isStuck = isTaskStuck(task, taskStuckTimeoutMs, lastFetchTimeMs);
+  const stalledReview = getStalledReviewSignal(task);
+  const showStalledReview = Boolean(stalledReview && task.column === "in-review" && !isPaused);
   const isAwaitingApproval = task.column === "triage" && task.status === "awaiting-approval";
   const isArchived = task.column === "archived";
   const isAgentActive = !globalPaused && !queued && !isFailed && !isPaused && !isStuck && !isAwaitingApproval && (task.column === "in-progress" || ACTIVE_STATUSES.has(task.status as string));
@@ -736,11 +759,34 @@ function TaskCardComponent({
 
   // Check if this card can be edited inline
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isAgentActive && !isPaused && !queued && onUpdateTask;
+  const githubTrackedIssue = task.githubTracking?.issue;
+  const hasGithubTrackingLink = Boolean(githubTrackedIssue);
   const hasGitHubBadge = Boolean(task.prInfo || task.issueInfo);
   const isGitHubImportedTask = task.sourceType === "github_import";
+  const sourceIssueUrl = getIssueUrlFromMetadata(task.sourceMetadata);
+  const sourceIssueFromUrl = useMemo(() => parseGithubIssueUrl(sourceIssueUrl), [sourceIssueUrl]);
+  const issueInfoFromUrl = useMemo(() => parseGithubIssueUrl(task.issueInfo?.url), [task.issueInfo?.url]);
+  const issueInfoOwner = issueInfoFromUrl?.owner;
+  const issueInfoRepo = issueInfoFromUrl?.repo;
+  const hasMatchingIssueInfoBadge = Boolean(
+    task.issueInfo
+    && githubTrackedIssue
+    && task.issueInfo.number === githubTrackedIssue.number
+    && issueInfoOwner === githubTrackedIssue.owner
+    && issueInfoRepo === githubTrackedIssue.repo,
+  );
+  const hasMatchingSourceIssue = Boolean(
+    sourceIssueFromUrl
+    && githubTrackedIssue
+    && sourceIssueFromUrl.number === githubTrackedIssue.number
+    && sourceIssueFromUrl.owner === githubTrackedIssue.owner
+    && sourceIssueFromUrl.repo === githubTrackedIssue.repo,
+  );
+  const showTrackingIndicator = hasGithubTrackingLink
+    && !hasMatchingIssueInfoBadge
+    && !hasMatchingSourceIssue;
   const branchMetadata = useMemo(() => getVisibleTaskCardBranches(task), [task.id, task.branch, task.baseBranch]);
   const hasBranchMetadata = Boolean(branchMetadata.branch || branchMetadata.baseBranch);
-  const sourceIssueUrl = getIssueUrlFromMetadata(task.sourceMetadata);
   const isAgentCreated = isAgentCreatedTask(task);
   const sourceAgentName = getSourceAgentName(task);
   const agentCreatedTitle = sourceAgentName ? `Created by agent: ${sourceAgentName}` : "Created by agent";
@@ -1354,6 +1400,14 @@ function TaskCardComponent({
             Stuck
           </span>
         )}
+        {showStalledReview && stalledReview && (
+          <span
+            className="card-status-badge card-status-badge--in-review stalled-review"
+            title={stalledReview.reason}
+          >
+            Stalled
+          </span>
+        )}
         {hasGitHubBadge && (
           <GitHubBadge
             prInfo={livePrInfo}
@@ -1507,6 +1561,11 @@ function TaskCardComponent({
           )}
         </div>
       </div>
+      {showStalledReview && stalledReview && (
+        <div className="card-stalled-review-reason" title={stalledReview.reason}>
+          {stalledReview.reason}
+        </div>
+      )}
       {isFailed && task.error && (
         <div className="card-error" title={task.error}>
           <span className="card-error-icon">⚠</span>
@@ -1649,14 +1708,13 @@ function TaskCardComponent({
           )}
           {fanout && fanout.totalCount > 0 && (
             <span
-              className={`card-fanout-badge${fanout.staleBlockedByDependentIds.length > 0 ? " card-fanout-badge--stale" : ""}${fanout.isHighFanout ? " card-fanout-badge--high-impact" : ""}${fanout.escalation ? " card-fanout-badge--escalated" : ""}`}
+              className={`card-fanout-badge${fanout.staleBlockedByDependentIds.length > 0 ? " card-fanout-badge--stale" : ""}`}
               data-tooltip={`Blocking ${fanout.totalCount} active task(s); ${fanout.activeTodoCount} waiting in todo${fanout.isHighFanout ? ` (high fan-out threshold: ${HIGH_FANOUT_BLOCKER_TODO_THRESHOLD})` : ""}${fanout.escalation ? ` · escalated after ${Math.floor(fanout.escalation.blockingAgeMs / 60000)}m in blocking column` : ""}`}
             >
               <GitBranch size={12} style={{ verticalAlign: "middle" }} />
               <span>
                 {fanout.escalation ? "Escalated" : fanout.isHighFanout ? "High fan-out" : "Blocks"}{" "}
                 <span className="card-fanout-count">{fanout.totalCount}</span>
-                {fanout.isHighFanout ? ` (${fanout.activeTodoCount} todo)` : ""}
                 {fanout.staleBlockedByDependentIds.length > 0 ? ` (${fanout.staleBlockedByDependentIds.length} stale)` : ""}
               </span>
             </span>
@@ -1685,6 +1743,22 @@ function TaskCardComponent({
               <span className="visually-hidden">Assigned to {agentName ?? task.assignedAgentId}</span>
             </span>
           )}
+        </div>
+      )}
+      {showTrackingIndicator && githubTrackedIssue && (
+        <div className="card-bottom-right-row">
+          <a
+            className="card-source-provenance card-github-tracking-link"
+            href={githubTrackedIssue.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`Linked GitHub issue: ${githubTrackedIssue.owner}/${githubTrackedIssue.repo}#${githubTrackedIssue.number}`}
+            aria-label={`Linked GitHub issue #${githubTrackedIssue.number}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <ProviderIcon provider="github" size="sm" />
+            <span>{`#${githubTrackedIssue.number}`}</span>
+          </a>
         </div>
       )}
       <PluginSlot slotId="task-card-badge" projectId={projectId} />

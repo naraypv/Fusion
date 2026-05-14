@@ -240,9 +240,7 @@ async function getResearchAvailability(store: TaskStore): Promise<{ ok: boolean;
   const backend = (resolved.searchProvider as string | undefined) ?? settings.researchGlobalWebSearchProvider ?? "builtin";
   const configured = backend === "builtin"
     ? true
-    : backend === "none"
-      ? false
-      : backend === "searxng"
+    : backend === "searxng"
         ? Boolean(settings.researchGlobalSearxngUrl)
         : backend === "brave"
           ? Boolean(settings.researchGlobalBraveApiKey)
@@ -1476,7 +1474,7 @@ export default function kbExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fn_research_run",
     label: "fn: Run Research",
-    description: "Start a bounded research run and optionally wait for findings.",
+    description: "Cited-research pipeline: create a bounded search/fetch/synthesis run (not an autonomous experiment loop) and optionally wait for completion.",
     parameters: Type.Object({
       query: Type.String({ description: "Research query or question" }),
       wait_for_completion: Type.Optional(Type.Boolean({ description: "Wait for the run to complete before returning (default: false)" })),
@@ -1540,7 +1538,7 @@ export default function kbExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fn_research_list",
     label: "fn: List Research Runs",
-    description: "List recent research runs.",
+    description: "Cited-research pipeline: list recent search/fetch/synthesis runs (not experiment-loop sessions).",
     parameters: Type.Object({
       status: Type.Optional(StringEnum([...RESEARCH_RUN_STATUSES], { description: "Filter by run status" }) as unknown as TSchema),
       limit: Type.Optional(Type.Number({ description: "Max runs to return (default: 10)" })),
@@ -1564,7 +1562,7 @@ export default function kbExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fn_research_get",
     label: "fn: Get Research Run",
-    description: "Get one research run and structured findings.",
+    description: "Cited-research pipeline: get one run with structured findings and citations (not experiment-loop state).",
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
@@ -1606,7 +1604,7 @@ export default function kbExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fn_research_cancel",
     label: "fn: Cancel Research Run",
-    description: "Cancel an in-flight research run. Terminal runs return INVALID_TRANSITION.",
+    description: "Cited-research pipeline: cancel an in-flight run; terminal runs return INVALID_TRANSITION (does not control experiment loops).",
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
@@ -1668,7 +1666,7 @@ export default function kbExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "fn_research_retry",
     label: "fn: Retry Research Run",
-    description: "Retry a failed research run when lifecycle marks it retryable.",
+    description: "Cited-research pipeline: retry a failed run when lifecycle marks it retryable (not an autonomous experiment loop retry).",
     parameters: Type.Object({ id: Type.String({ description: "Research run ID" }) }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
@@ -2022,20 +2020,36 @@ export default function kbExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use to see all missions and their current status",
       "Missions are grouped by status (active, planning, complete, etc.)",
+      "Drafts represent unfinished mission interview sessions; fn_mission_show does not work on draft IDs because no mission row exists yet",
       "Use before fn_mission_show to find a specific mission ID",
     ],
-    parameters: Type.Object({}),
+    parameters: Type.Object({
+      includeDrafts: Type.Optional(Type.Boolean({ description: "Include in-flight mission interview drafts (default: true)" })),
+    }),
 
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = await getStore(ctx.cwd);
       const missionStore = store.getMissionStore();
+      const includeDrafts = params.includeDrafts ?? true;
 
       const missions = missionStore.listMissions();
+      const drafts = includeDrafts
+        ? (store.getDatabase()
+          .prepare(
+            `SELECT id, title, status, updatedAt
+             FROM ai_sessions
+             WHERE type = 'mission_interview'
+               AND status IN ('generating', 'awaiting_input', 'error')
+               AND COALESCE(archived, 0) = 0
+             ORDER BY updatedAt DESC`,
+          )
+          .all() as Array<{ id: string; title: string; status: "generating" | "awaiting_input" | "error"; updatedAt: string }>)
+        : [];
 
-      if (missions.length === 0) {
+      if (missions.length === 0 && drafts.length === 0) {
         return {
           content: [{ type: "text", text: "No missions yet." }],
-          details: { count: 0 },
+          details: { count: 0, drafts: [] },
         };
       }
 
@@ -2050,8 +2064,17 @@ export default function kbExtension(pi: ExtensionAPI) {
       const lines: string[] = [];
       lines.push(`Missions (${missions.length})`);
       lines.push(
-        `Summary: active ${summary.active}, planning ${summary.planning}, blocked ${summary.blocked}, complete ${summary.complete}, archived ${summary.archived}\n`,
+        `Summary: active ${summary.active}, planning ${summary.planning}, blocked ${summary.blocked}, complete ${summary.complete}, archived ${summary.archived}`,
       );
+      lines.push("");
+
+      if (drafts.length > 0) {
+        lines.push(`Drafts (${drafts.length})`);
+        for (const draft of drafts) {
+          lines.push(`  ◌ ${draft.id}: ${draft.title} (draft · interview ${draft.status})`);
+        }
+        lines.push("");
+      }
 
       for (const mission of missions) {
         const statusIcon = mission.status === "complete" ? "✓" : mission.status === "active" ? "●" : mission.status === "blocked" ? "⚠" : "○";
@@ -2061,7 +2084,11 @@ export default function kbExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { count: missions.length, missions: missions.map((m) => ({ id: m.id, title: m.title, status: m.status })) },
+        details: {
+          count: missions.length,
+          missions: missions.map((m) => ({ id: m.id, title: m.title, status: m.status })),
+          drafts: drafts.map((draft) => ({ id: draft.id, title: draft.title, status: draft.status, updatedAt: draft.updatedAt })),
+        },
       };
     },
   });

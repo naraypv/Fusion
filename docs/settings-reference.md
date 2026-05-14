@@ -43,11 +43,11 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | `ntfyTopic` | `string` | `undefined` | ntfy topic name. |
 | `ntfyBaseUrl` | `string` | `undefined` | Optional custom ntfy server base URL (must use `http://` or `https://`). If blank/unset, Fusion uses `https://ntfy.sh` for both runtime and test notifications. |
 | `ntfyAccessToken` | `string` | `undefined` | Optional ntfy access token. When set, Fusion sends `Authorization: Bearer <token>` with ntfy publish requests, including Settings → Notifications test sends. Leave blank/unset to publish without authentication. |
-| `ntfyEvents` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `["in-review","merged","failed","awaiting-approval","awaiting-user-review","planning-awaiting-input","gridlock","fallback-used","memory-dreams-processed","message:agent-to-user","message:agent-to-agent"]` | Event types that trigger ntfy notifications. `planning-awaiting-input` fires when planning mode is waiting on user input. `gridlock` fires when all schedulable todo tasks are blocked; delivery is cooldown-throttled (first alert immediately, then suppressed for 15 minutes until gridlock resolves). `fallback-used` fires when Fusion recovers from a retryable model failure by switching to a configured fallback model. `memory-dreams-processed` fires when manual dream processing writes a new `DREAMS.md` entry (project and/or agent); disable it via ntfy/webhook event filters if you want to opt out. `message:agent-to-user` fires when an agent sends a direct message to the user. `message:agent-to-agent` fires when an agent sends a message to another agent (including replies). If you use a custom `ntfyEvents` list, this event must be present (or `ntfyEvents` must be unset so defaults apply) for agent-to-agent inbox notifications to send. |
+| `ntfyEvents` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent" \| "message:room")[]` | `["in-review","merged","failed","awaiting-approval","awaiting-user-review","planning-awaiting-input","gridlock","fallback-used","memory-dreams-processed","message:agent-to-user","message:agent-to-agent","message:room"]` | Event types that trigger ntfy notifications. `planning-awaiting-input` fires when planning mode is waiting on user input. `gridlock` fires when all schedulable todo tasks are blocked; delivery is cooldown-throttled (first alert immediately, then suppressed for 15 minutes until gridlock resolves). `fallback-used` fires when Fusion recovers from a retryable model failure by switching to a configured fallback model. `memory-dreams-processed` fires when manual dream processing writes a new `DREAMS.md` entry (project and/or agent); disable it via ntfy/webhook event filters if you want to opt out. `message:agent-to-user` fires when an agent sends a direct message to the user. `message:agent-to-agent` fires when an agent sends a message to another agent (including replies). `message:room` fires when an agent posts an assistant reply in a chat room. If you use a custom `ntfyEvents` list, these message events must be present (or `ntfyEvents` must be unset so defaults apply) for the corresponding notifications to send. |
 | `ntfyDashboardHost` | `string` | `undefined` | Dashboard host used to build deep links in notifications. |
 | `webhookEnabled` | `boolean` | `false` | Enable webhook notifications for task lifecycle events. Part of the legacy flat settings; prefer `notificationProviders` for new setups. |
 
-In **Settings → Notifications**, use **Test message notification** to exercise the full mailbox-message dispatch pipeline (`NotificationService.dispatch` → provider delivery), not just a raw ntfy POST.
+In **Settings → Notifications**, use **Test message inbox** or **Test room reply** to exercise the full message-dispatch pipeline (`NotificationService.dispatch` → provider delivery), not just a raw ntfy POST.
 
 Fusion automatically falls back to ntfy's JSON publish format when a notification title or message contains non-Latin-1 characters, and truncates outgoing titles/messages to ntfy's documented size limits before sending.
 | `webhookUrl` | `string` | `undefined` | Webhook endpoint URL. Must be `http://` or `https://`. Part of legacy flat settings. |
@@ -85,14 +85,16 @@ Fusion automatically falls back to ntfy's JSON publish format when a notificatio
 > Mesh lifecycle note: settings sync is executed by the process-level `PeerExchangeService` started by `fn serve`/`fn dashboard`. `InProcessRuntime` does not instantiate settings-sync mesh services per project.
 | `dashboardCurrentProjectIdByNode` | `Record<string, string>` | `undefined` | Map of node ID to last-selected project ID. Use key `"local"` for the local node. Persists project context across browser restarts and PWA sessions. |
 | `persistAgentToolOutput` | `boolean` | `true` | Controls whether detailed `detail` payloads are persisted for `tool`, `tool_result`, and `tool_error` agent log entries. When disabled, tool timeline rows are still recorded, but verbose payloads are omitted. |
-| `persistAgentThinkingLog` | `boolean` | `false` | Controls whether `thinking`/reasoning agent log entries are persisted. When disabled (default), only persisted `thinking` rows are suppressed; normal assistant text output and tool rows are unchanged. |
+| `persistAgentThinkingLogPermanent` | `boolean` | `false` | Controls whether `thinking`/reasoning rows are persisted for permanent (non-ephemeral) agents. |
+| `persistAgentThinkingLogEphemeral` | `boolean` | `false` | Controls whether `thinking`/reasoning rows are persisted for ephemeral/task-worker/spawned agents. |
+| `persistAgentThinkingLog` *(deprecated)* | `boolean` | `false` | Legacy fallback alias for thinking-row persistence. When set and a granular key above is still undefined, this legacy value is used for that agent kind. Leaving both granular keys off preserves default-off behavior; assistant text and tool rows are unchanged. |
 | `researchGlobalDefaults` | `ResearchGlobalDefaults` | `{ searchProvider: "builtin", synthesisProvider: undefined, synthesisModelId: undefined, enabledSources: { webSearch: true, pageFetch: true, github: false, localDocs: true, llmSynthesis: true }, maxSourcesPerRun: 20, defaultExportFormat: "markdown" }` | Global Research defaults shared by all projects. Web search defaults to the built-in WebSearch/WebFetch-backed provider; project overrides come from `researchSettings`. |
 | `researchGlobalEnabled` | `boolean` | `true` | Enable or disable the research subsystem globally. When false, dashboard/API/CLI/agent entrypoints reject new runs. |
 | `researchGlobalMaxConcurrentRuns` | `number` | `3` | Maximum concurrent research runs across all projects. |
 | `researchGlobalDefaultTimeout` | `number` | `300000` | Default timeout for end-to-end research runs in milliseconds (5 minutes). |
 | `researchGlobalMaxSourcesPerRun` | `number` | `20` | Maximum number of sources per research run. |
 | `researchGlobalMaxSynthesisRounds` | `number` | `2` | Maximum synthesis rounds per research run. |
-| `researchGlobalWebSearchProvider` | `"builtin" \| "searxng" \| "brave" \| "google" \| "tavily" \| "none"` | `"builtin"` | Web search backend for research. Default: `"builtin"` (uses agent-native WebSearch/WebFetch tools with no API key requirement). |
+| `researchGlobalWebSearchProvider` | `"builtin" \| "searxng" \| "brave" \| "google" \| "tavily"` | `"builtin"` | Web search backend for research. Default: `"builtin"` (uses agent-native WebSearch/WebFetch tools with no API key requirement). Web search itself is always enabled. |
 | `researchGlobalSearxngUrl` | `string` | `undefined` | SearXNG instance URL (required when provider is `"searxng"`). |
 | `researchGlobalBraveApiKey` | `string` | `undefined` | Brave Search API key (required when provider is `"brave"`). |
 | `researchGlobalGoogleSearchApiKey` | `string` | `undefined` | Google Custom Search API key (required when provider is `"google"`). |
@@ -148,7 +150,7 @@ When `id` is `"ntfy"` in `notificationProviders`, the provider `config` supports
 | `topic` | `string` | _required_ | ntfy topic name (1–64 chars, alphanumeric + `-_`). |
 | `ntfyBaseUrl` | `string` | `"https://ntfy.sh"` | Optional custom ntfy server URL. |
 | `ntfyAccessToken` | `string` | `undefined` | Optional access token. When set, provider sends `Authorization: Bearer <token>` on ntfy publishes. |
-| `events` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent")[]` | `DEFAULT_NTFY_EVENTS` | Event filter list used by the provider. For `gridlock`, enabled events are still cooldown-throttled at runtime (15-minute suppression window, reset on full resolution). `memory-dreams-processed` is emitted when manual dream processing appends a new project/agent `DREAMS.md` entry. `message:agent-to-user`/`message:agent-to-agent` are emitted for mailbox messages and deep-link to the specific message when `dashboardHost` is configured. |
+| `events` | `("in-review" \| "merged" \| "failed" \| "awaiting-approval" \| "awaiting-user-review" \| "planning-awaiting-input" \| "gridlock" \| "fallback-used" \| "memory-dreams-processed" \| "message:agent-to-user" \| "message:agent-to-agent" \| "message:room")[]` | `DEFAULT_NTFY_EVENTS` | Event filter list used by the provider. For `gridlock`, enabled events are still cooldown-throttled at runtime (15-minute suppression window, reset on full resolution). `memory-dreams-processed` is emitted when manual dream processing appends a new project/agent `DREAMS.md` entry. `message:agent-to-user`/`message:agent-to-agent` are emitted for mailbox messages and deep-link to the specific message when `dashboardHost` is configured. `message:room` is emitted for assistant replies in chat rooms and deep-links to the room when `dashboardHost` is configured. |
 | `dashboardHost` | `string` | `undefined` | Dashboard host for deep links in notifications. |
 
 Disable daily update checks globally:
@@ -182,14 +184,37 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `overlapIgnorePaths` | `string[]` | `[]` | Optional project-relative file or directory paths to exclude from overlap blocking (for example `docs` or `generated/openapi.json`). Entries are trimmed, deduplicated, and must not be absolute or contain `..` traversal. |
 | `autoMerge` | `boolean` | `true` | Auto-finalize tasks from `in-review`. |
 | `mergeStrategy` | `"direct" \| "pull-request"` | `"direct"` | Completion mode (local direct merge vs PR-first). |
+| `directMergeCommitStrategy` | `"auto" \| "always-squash" \| "always-rebase"` | `"auto"` | Direct-merge commit routing mode. `auto` keeps the legacy squash path for branches with zero or one substantive commit, but switches multi-substantive direct merges to a history-preserving rebase-and-merge/cherry-pick path so commit boundaries, subjects, and `Fusion-Task-Id` trailers survive on `main`. `always-squash` forces the legacy squash path; `always-rebase` always preserves per-commit history. Only applies when `mergeStrategy="direct"`. |
 | `mergeConflictStrategy` | `"smart-prefer-main" \| "smart-prefer-branch" \| "ai-only" \| "abort"` | `"smart-prefer-main"` | Controls the merger's conflict-resolution cascade. `smart-prefer-main` fast-forwards local main from `origin` when possible, then tries AI resolution, then auto-resolve heuristics, then a final `-X ours` fallback that prefers main unless the overlap guard below says otherwise. `smart-prefer-branch` uses the same cascade but ends with `-X theirs` so the task branch wins. `ai-only` never silently picks a side, and `abort` stops after the first AI attempt. Legacy `smart` / `prefer-main` values are normalized automatically. |
+| `mergeDiffVolumeMinLines` | `number` | `20` | Minimum branch-net line volume before Fusion compares a file's staged squash delta against the branch's net delta. Applied at merge time and clamped to `>= 1`. |
+| `mergeDiffVolumeThreshold` | `number` | `0.2` | Minimum staged-to-branch-net ratio allowed for a non-allowlisted file during auto-resolved squash finalization. Applied at merge time and clamped to `0..1`. |
+| `mergeDiffVolumeAllowlist` | `string[]` | `[]` | Additional glob patterns skipped by the pre-commit diff-volume gate, beyond the built-in generated-file and lockfile allowlists. |
 | `mergeStrategyOverlapBehavior` | `"flip-to-prefer-branch" \| "warn-only" \| "ignore"` | `"flip-to-prefer-branch"` | Safety control for `mergeConflictStrategy="smart-prefer-main"`. Before the Attempt 3 `-X ours` fallback, Fusion checks whether the task branch and recent `main` history overlap on the same files (30-commit lookback, matching the squash audit heuristics). `flip-to-prefer-branch` makes overlapping files prefer the task branch so hardening is not silently discarded (the FN-3936 class of regression). `warn-only` logs the overlap but keeps the legacy main-wins fallback. `ignore` disables the overlap guard and preserves legacy behavior exactly. |
+
+### Per-task direct-merge override
+
+When a project uses `mergeStrategy: "direct"`, an individual task can override the project-level `directMergeCommitStrategy` by adding this line anywhere in `PROMPT.md`:
+
+```md
+**Direct Merge Commit Strategy:** auto
+```
+
+Accepted values:
+- `auto` — squash if the branch has 0–1 substantive commits; preserve per-commit history if it has 2+
+- `always-squash` — force the legacy squash path for this task
+- `always-rebase` — force the history-preserving path for this task
+
+Override precedence for direct merges is:
+1. Task `PROMPT.md` line `**Direct Merge Commit Strategy:** ...`
+2. Project `directMergeCommitStrategy`
+3. Default `"auto"`
 | `pushAfterMerge` | `boolean` | `false` | Auto-push to remote after successful direct merge. Includes pulling latest and AI conflict resolution. |
 | `pushRemote` | `string` | `"origin"` | Git remote (and optional branch) to push to after merge. |
 | `worktreeInitCommand` | `string` | `undefined` | Shell command run after worktree creation. For pnpm repos, prefer `pnpm install --frozen-lockfile` for deterministic bootstrap. |
 | `testCommand` | `string` | `undefined` | Merge-time test command (hard gate). When unset, Fusion auto-detects from lockfile. |
 | `buildCommand` | `string` | `undefined` | Merge-time build command (hard gate). |
 | `recycleWorktrees` | `boolean` | `false` | Reuse worktrees from a pool for faster startup. |
+| `executorAllowSiblingBranchRename` | `boolean` | `false` | Opt back into the legacy executor behavior that silently allocates sibling branches (`fusion/<task-id>-2`, `-2-2`, …) when the canonical task branch is already checked out elsewhere. When disabled (default), branch conflicts fail loudly, leave the task in `todo` with `status: "failed"`, and expose stranded commits for explicit recovery via [`fn task branch-recovery`](./cli-reference.md#fn-task). See [Task Management → Branch conflict recovery](./task-management.md#branch-conflict-recovery). The dashboard Settings modal exposes the same toggle with warning copy because this legacy mode is discouraged. |
 | `worktreeNaming` | `"random" \| "task-id" \| "task-title"` | `"random"` | Naming mode for new worktree directories. |
 | `taskPrefix` | `string` | `"FN"` | Prefix used for newly generated task IDs. |
 | `includeTaskIdInCommit` | `boolean` | `true` | Include task ID as commit scope in generated commits. |
@@ -206,8 +231,8 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `executionModelId` | `string` | `undefined` | Model ID for task execution agents. |
 | `validatorProvider` | `string` | `undefined` | Provider for plan/code reviewers. |
 | `validatorModelId` | `string` | `undefined` | Model ID for plan/code reviewers. |
-| `validatorFallbackProvider` | `string` | `undefined` | Fallback provider for reviewers. |
-| `validatorFallbackModelId` | `string` | `undefined` | Fallback model ID for reviewers. |
+| `validatorFallbackProvider` | `string` | `undefined` | Fallback provider for reviewers; also used by reviewer UNAVAILABLE/error recovery retry before returning terminal UNAVAILABLE. |
+| `validatorFallbackModelId` | `string` | `undefined` | Fallback model ID for reviewers; paired with `validatorFallbackProvider` for reviewer recovery retry. |
 | `modelPresets` | `ModelPreset[]` | `[]` | Reusable executor/reviewer model presets. |
 | `autoSelectModelPreset` | `boolean` | `false` | Auto-select presets by task size. |
 | `defaultPresetBySize` | `{ S?: string; M?: string; L?: string }` | `{}` | Mapping for `S`/`M`/`L` → preset ID. |
@@ -220,12 +245,15 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `verificationFixRetries` | `number` | `3` | In-merge auto-fix retry attempts after deterministic test/build verification failures (0-3). |
 | `buildTimeoutMs` | `number` | `300000` | Build timeout in milliseconds (5 minutes). |
 | `requirePlanApproval` | `boolean` | `false` | Require manual approval before planning → todo. |
+| `ephemeralAgentsEnabled` | `boolean` | `true` | When enabled (default), Fusion spawns short-lived `executor-FN-XXXX` workers for task execution. When disabled, only permanent executor agents run tasks; the scheduler auto-assigns dispatchable tasks using reporting-chain-aware load balancing, and tasks stay queued until an eligible permanent executor is available. |
 | `agentProvisioning` | `{ approvalMode?: "always" \| "trusted-only" \| "never"; trustedRoles?: string[]; trustedAgentIds?: string[]; alwaysApproveDelete?: boolean }` | `{}` | Approval policy for `fn_agent_create`/`fn_agent_delete` (`approvalMode` default `trusted-only`, delete approvals default on via `alwaysApproveDelete: true`). |
 | `completionDocumentationMode` | `"off" \| "changeset" \| "changelog"` | `"off"` | Controls triage prompt injection for release-note artifacts in future task specs. `"changeset"` requires `.changeset/*.md` workflow guidance; `"changelog"` requires updating an existing changelog file (without inventing a new one); `"off"` disables this automation. |
 | `specStalenessEnabled` | `boolean` | `false` | Enforce automatic re-planning for stale plans. |
 | `specStalenessMaxAgeMs` | `number` | `21600000` | Spec staleness threshold in ms (6 hours). |
 | `taskStuckTimeoutMs` | `number` | `undefined` | Inactivity timeout for stuck-task recovery. |
 | `staleHighFanoutBlockerAgeThresholdMs` | `number` | `7200000` | Age threshold (ms) before high-fan-out blockers escalate in dashboard task cards/footer. Applies only to blockers currently in `in-progress`/`in-review`; age is computed from `columnMovedAt ?? updatedAt`. |
+| `capacityRiskBannerEnabled` | `boolean` | `false` | Opt-in gate for the board-level capacity-risk banner. When enabled, the banner is shown once risk conditions are met and can be dismissed per project. |
+| `capacityRiskTodoThreshold` | `number` | `20` | Todo threshold for the board-level capacity-risk banner (applies when `capacityRiskBannerEnabled` is true). Warning appears only when `todoCount > capacityRiskTodoThreshold` **and** there are zero idle non-ephemeral agents, auto-clears as soon as an idle agent becomes available or todo falls back to threshold/below, and re-arms after threshold/toggle changes. |
 | `aiSessionTtlMs` | `number` | `604800000` | TTL in ms for persisted planning/subtask/mission sessions (7 days). |
 | `aiSessionCleanupIntervalMs` | `number` | `3600000` | Interval in ms for AI session cleanup sweeps (1 hour). |
 | `autoUnpauseEnabled` | `boolean` | `true` | Auto-unpause after rate-limit-triggered pauses; manual pauses stay paused until explicitly unpaused by the user. |
@@ -243,7 +271,7 @@ Defaults from `DEFAULT_PROJECT_SETTINGS`; key scope from `PROJECT_SETTINGS_KEYS`
 | `githubCommentOnDone` | `boolean` | `false` | When enabled, tasks imported from GitHub issues post a completion comment to the source issue when the task moves to `done`. |
 | `githubCommentTemplate` | `string` | `undefined` | Optional issue comment template used by `githubCommentOnDone`. Supports `{taskId}` and `{taskTitle}` placeholders. If unset, Fusion uses a default completion message. |
 | `githubTrackingEnabledByDefault` | `boolean` | `false` | Project-level default for enabling issue tracking on new tasks. Even when this is false, issue creation can still occur per task if tracking is explicitly enabled. |
-| `githubTrackingDefaultRepo` | `string` | `undefined` | Project default issue-tracking repo (`owner/repo`) used before global fallback for tracked task creation (precedence: task override → project default → global default). This key is dual-scope: project saves go through `PUT /api/settings` (Settings → Merge). |
+| `githubTrackingDefaultRepo` | `string` | `undefined` | Project default issue-tracking repo (`owner/repo`) used before global fallback for tracked task creation (precedence: task override → project default → global default). This key is dual-scope: project saves go through `PUT /api/settings` (Settings → General → GitHub Tracking) while global saves go through `PUT /api/settings/global` (Settings → Global General). |
 | `githubAuthMode` | `"gh-cli" \| "token"` | `"gh-cli"` | Project GitHub auth strategy used by tracking lifecycle integration. `"gh-cli"` requires an installed/authenticated `gh` CLI. `"token"` requires a non-empty `githubAuthToken` (or `GITHUB_TOKEN` env fallback). Tracking lifecycle auth is strict per selected mode (no cross-fallback). |
 | `githubAuthToken` | `string` | `undefined` | Optional project PAT used when `githubAuthMode` is `"token"` (takes precedence over server startup token for tracking flows). |
 | `autoCreatePr` | `boolean` | `false` | Auto-create PRs for completed tasks. |
@@ -331,7 +359,7 @@ Recovery entrypoints in the dashboard:
 ### Authentication troubleshooting (mobile OAuth fallback)
 
 When an OAuth provider returns a localhost callback that this dashboard host cannot open directly, use the **manual code** fallback in Settings/Onboarding:
-- Tap **Login** for the provider, complete sign-in in the browser, then paste either the final redirect URL or the authorization code into the fallback textbox.
+- Tap **Login** for the provider, complete sign-in in the browser, then paste either the final redirect URL or the authorization code into the fallback textbox. Fusion now shows a pre-login warning first so you know to copy the browser address bar URL before the redirect tab appears to fail.
 - On mobile/coarse-pointer layouts, the fallback textbox now auto-scrolls into view on focus (and after keyboard viewport shifts) so the paste/submit path remains usable.
 
 **Credential storage rule:** API keys for Research providers are not stored in settings JSON. They are managed through the existing auth storage pipeline (`/api/auth/status`, `POST /api/auth/api-key`, `DELETE /api/auth/api-key`) and persisted in auth credential storage with masked hints in API responses.
@@ -548,7 +576,7 @@ For post-merge prompt workflow steps, explicit step-level `modelProvider` + `mod
 
 ### Title summarization model
 
-Used for task title auto-summarization and (when enabled) AI merge commit summaries.
+Used for task title auto-summarization, GitHub tracking issue title summarization when tasks are untitled, and (when enabled) AI merge commit summaries.
 
 1. Project `titleSummarizerProvider` + `titleSummarizerModelId`
 2. Global `titleSummarizerGlobalProvider` + `titleSummarizerGlobalModelId`

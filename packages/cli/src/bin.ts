@@ -118,7 +118,7 @@ async function loadCommandHandlers() {
   const { runServe } = await import("./commands/serve.js");
   const { runDaemon } = await import("./commands/daemon.js");
   const { runDesktop } = await import("./commands/desktop.js");
-  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskPrCreate } = await import("./commands/task.js");
+  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode, runTaskPrCreate, runTaskBranchRecovery } = await import("./commands/task.js");
   const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
   const { runSettingsExport } = await import("./commands/settings-export.js");
   const { runSettingsImport } = await import("./commands/settings-import.js");
@@ -165,6 +165,7 @@ async function loadCommandHandlers() {
     runTaskPlan,
     runTaskDelete,
     runTaskRetry,
+    runTaskBranchRecovery,
     runTaskComment,
     runTaskComments,
     runTaskSteer,
@@ -252,10 +253,10 @@ Usage:
   fn dashboard --paused               Start with automation paused
   fn dashboard --dev                  Start web UI only (no AI engine)
   fn dashboard --interactive          Start with interactive port selection
-  fn serve [--port <port>] [--host <host>] [--paused] [--daemon]
+  fn serve [--port <port>] [--host <host>] [--paused] [--daemon] [--no-auto-register]
                                       Start Fusion as a headless node (API + engine, no UI)
-                                      Use --daemon to enable bearer token authentication
-  fn daemon [--port <port>] [--host <host>] [--token <token>] [--paused] [--token-only]
+                                      Auto-registers cwd project on first run (use --no-auto-register to disable)
+  fn daemon [--port <port>] [--host <host>] [--token <token>] [--paused] [--token-only] [--no-auto-register]
                                       Start Fusion daemon (API + engine, auth required)
   fn desktop                          Launch the Fusion desktop app (Electron)
   fn desktop --dev                    Launch with hot-reload (connects to Vite dev server)
@@ -286,20 +287,22 @@ Usage:
   fn task set-node <id> <node-name-or-id>  Set a per-task node override
   fn task clear-node <id>                Clear a per-task node override
   fn task retry <id>                  Retry a failed task (clears error, moves to todo)
+  fn task branch-recovery <id> [--reclaim <branch>] [--discard <branch> --yes]
+                                      Inspect, reclaim, or discard stranded task branches
   fn task pr-create <id> [--title <title>] [--base <branch>] [--body <body>]
                          Create a GitHub PR for an in-review task
   fn task import <owner/repo> [opts]  Import GitHub issues as tasks
   fn research create --query <text> [--wait] [--max-wait-ms <ms>] [--json]
-                                      Create and optionally wait for a research run
+                                      Create and optionally wait for a cited-research run (search/fetch/synthesis)
   fn research list | ls [--status <status>] [--limit <n>] [--json]
-                                      List research runs
-  fn research show <run-id> [--json]  Show research run details
+                                      List cited-research runs
+  fn research show <run-id> [--json]  Show cited-research run details
   fn research export <run-id> [--format <json|markdown|pdf>] [--output <path>] [--json]
-                                      Export research run results
+                                      Export cited-research run results
   fn research cancel <run-id> [--json]
-                                      Cancel an active research run
+                                      Cancel an active cited-research run
   fn research retry <run-id> [--json]
-                                      Retry a failed/cancelled research run
+                                      Retry a failed/cancelled cited-research run
   fn mission create [title] [desc]    Create a new mission
   fn mission list | ls                List missions
   fn mission show | info <id>         Show mission details
@@ -538,6 +541,7 @@ async function main() {
     runTaskPlan,
     runTaskDelete,
     runTaskRetry,
+    runTaskBranchRecovery,
     runTaskComment,
     runTaskComments,
     runTaskSteer,
@@ -662,7 +666,8 @@ async function main() {
         const hostIdx = args.indexOf("--host");
         const host = hostIdx !== -1 && hostIdx + 1 < args.length ? args[hostIdx + 1] : undefined;
         const daemon = args.includes("--daemon");
-        await runServe(port, { paused, interactive, host, daemon });
+        const noAutoRegister = args.includes("--no-auto-register");
+        await runServe(port, { paused, interactive, host, daemon, noAutoRegister });
         break;
       }
 
@@ -678,7 +683,8 @@ async function main() {
         const tokenIdx = args.indexOf("--token");
         const token = tokenIdx !== -1 && tokenIdx + 1 < args.length ? args[tokenIdx + 1] : undefined;
         const tokenOnly = args.includes("--token-only");
-        await runDaemon({ port, paused, interactive, host, token, tokenOnly });
+        const noAutoRegister = args.includes("--no-auto-register");
+        await runDaemon({ port, paused, interactive, host, token, tokenOnly, noAutoRegister });
         break;
       }
 
@@ -1142,6 +1148,20 @@ async function main() {
             await runTaskRetry(id, projectName);
             break;
           }
+          case "branch-recovery": {
+            const id = args[2];
+            if (!id) {
+              console.error("Usage: fn task branch-recovery <id> [--reclaim <branch>] [--discard <branch> --yes]");
+              process.exit(1);
+            }
+            const reclaimIdx = args.indexOf("--reclaim");
+            const discardIdx = args.indexOf("--discard");
+            const reclaim = reclaimIdx !== -1 && reclaimIdx + 1 < args.length ? args[reclaimIdx + 1] : undefined;
+            const discard = discardIdx !== -1 && discardIdx + 1 < args.length ? args[discardIdx + 1] : undefined;
+            const yes = args.includes("--yes");
+            await runTaskBranchRecovery(id, { reclaim, discard, yes }, projectName);
+            break;
+          }
           case "pr-create": {
             const id = args[2];
             if (!id) {
@@ -1231,9 +1251,11 @@ async function main() {
             break;
           }
           case "list":
-          case "ls":
-            await runMissionList(projectName);
+          case "ls": {
+            const includeDrafts = !args.includes("--no-drafts");
+            await runMissionList(projectName, { includeDrafts });
             break;
+          }
           case "show":
           case "info": {
             const id = args[2];

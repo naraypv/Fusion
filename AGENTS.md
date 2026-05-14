@@ -118,6 +118,12 @@ pnpm --filter @fusion/dashboard test:build          # built client output contra
 
 Run the default dashboard gate for ordinary dashboard work. Run `test:deep` when changing broad dashboard architecture, shared modal/view infrastructure, route registration, or anything that could invalidate the curated selection. Run `test:browser-smoke` for layout, responsive, navigation, modal, or CSS changes. Run `test:build` for Vite/build output, lazy-loading, chunking, static asset, or client-dist changes.
 
+### Engine test helper convention
+
+`packages/engine/src/__tests__/executor-test-helpers.ts` now defaults `isUsableTaskWorktree` to `true` via a helper-level `worktree-pool` mock so fabricated worktree paths continue to pass FN-4114 liveness gating without real `git worktree add` setup.
+To test failure paths, override per test with `vi.spyOn(worktreePool, "isUsableTaskWorktree").mockResolvedValueOnce(false)` (or `.mockResolvedValue(false)` in a scoped `beforeEach`).
+This is test-only scaffolding; production liveness assertions in `packages/engine/src/executor.ts` remain unchanged.
+
 ### Package-Specific Test Commands
 
 Common targeted lanes:
@@ -217,9 +223,17 @@ Two rules, learned the hard way (FN-2370 silently reverted three commits' work):
 
 1. **If a branch contains commits that duplicate work already on main, rebase the branch onto main and drop the duplicates *before* merging.** This usually happens when a branch was rebased from a stale base while the same work was also landed directly on main. Subjects that match recent main commits are the tell — `git log main..branch --format=%s` should not overlap with `git log <base>..main --format=%s`. Auto-resolvers cannot tell which side of a duplicated change is canonical and will silently drop refinements from the newer side.
 
-2. **Prefer rebase-and-merge over squash for branches spanning multiple feature commits.** Squash collapses authorship and makes per-commit reverts impossible. Rebase-and-merge preserves the commit boundary so a regression can be reverted cleanly without losing the rest of the branch.
+2. **Prefer rebase-and-merge over squash for branches spanning multiple substantive commits.** Fusion's direct merger now defaults `directMergeCommitStrategy="auto"`, which keeps squash for branches with 0–1 substantive commits but automatically switches multi-substantive branches to a history-preserving rebase/cherry-pick path. Use the project setting `directMergeCommitStrategy` or the task-level `**Direct Merge Commit Strategy:** auto|always-squash|always-rebase` PROMPT line when you need to force a route.
 
 After any squash that auto-resolved conflicts, the merger now runs the post-squash audit as a blocking gate before auto-completing the task. Flagged merges stay in `in-review` for inspection, and only a clean audit proceeds to `done`.
+
+Before those auto-resolved squash commits are written, the merger also runs a per-file diff-volume gate: it compares each file's staged squash delta against the branch's net delta vs its merge-base, and blocks the merge in `in-review` when a non-allowlisted file loses too much branch volume. This is the pre-commit guard against FN-3936-style silent drops where fallback resolution kept a branch's commit message but discarded the branch's main file edits.
+
+### File-Scope invariant on squash merges
+
+Every squash commit path now enforces a file-scope invariant immediately before writing the commit: the staged file set must overlap the task's declared `## File Scope` from `PROMPT.md`. The invariant runs on the standard squash path, the Attempt 3 `-X ours/theirs` fallback, and the verification-fix rebuild/finalize path. When the staged files have zero overlap with a non-empty declared scope, the merger throws a structured `FileScopeViolationError`, logs the declared scope + staged files to the merger agent log, resets the pre-squash state, and leaves the task in `in-review` for inspection instead of landing the commit.
+
+Tasks can opt out per task via `task.scopeOverride = true`; when present, the merger bypasses the invariant and logs `task.scopeOverrideReason` when provided. Empty declared file scopes are not enforced.
 
 When `mergeConflictStrategy="smart-prefer-main"`, the merger also runs an overlap guard before the Attempt 3 `-X ours` fallback. If recent `main` commits (30-commit lookback) touched files the task branch also changed, the default `mergeStrategyOverlapBehavior="flip-to-prefer-branch"` makes those overlapping files prefer the task branch instead of silently discarding branch hardening; `warn-only` preserves the legacy fallback while logging the risk, and `ignore` disables the guard.
 
@@ -868,6 +882,12 @@ Cards have `--focus-ring-strong` focus style and `--card-hover` background on ho
 
 ---
 
+### File-path links in dashboard text
+
+- Reuse `packages/dashboard/app/utils/filePathLinkify.tsx` plus `packages/dashboard/app/context/FileBrowserContext.tsx` whenever a dashboard surface should open workspace paths in `FileBrowserModal`.
+- Wrap plain text with `linkifyFilePaths(...)`, and wrap mixed JSX/markdown/highlight output with `linkifyReactChildren(...)` so existing formatting survives.
+- Mount surfaces under `FileBrowserProvider` and route clicks through its `openFile(path, { workspace?, line?, col? })` handler instead of adding one-off modal state plumbing.
+
 ### Adding New CSS
 
 1. **Always use tokens** — `var(--space-md)`, `var(--text-muted)`, `var(--radius-md)`, `var(--transition-fast)`, etc. Never write `padding: 8px` or `color: #e6edf3` directly.
@@ -891,6 +911,7 @@ Cards have `--focus-ring-strong` focus style and `--card-hover` background on ho
 - **CSS regex tests in test files** — When changing mobile CSS values (e.g., `min-height`), update both the CSS and the corresponding test assertions. Use non-greedy `[^}]*` patterns for block-scoped regex, not `[\s\S]*` which can bleed across block boundaries.
 - **BEM specificity conflicts** — When a container state class (`.quick-entry-box--expanded`) and an element modifier (`.quick-entry-input--expanded`) both target the same element, the container may win due to higher specificity. Use `:not(.modifier)` to scope container rules: `.quick-entry-box--expanded .quick-entry-input:not(.quick-entry-input--expanded)`.
 - **CSS in `@media` blocks** — Don't search backwards for the nearest `@media` to check if a rule is mobile-scoped. Track brace depth to confirm the line is inside the block. Many components are defined globally even if they only visually appear on mobile.
+- **Mobile board view-switch scroll-snap pitfall (FN-001)** — `scroll-snap-type: x mandatory` on mobile `.board` can cause iOS Safari to compress the viewport into a corner when switching from ListView because stale layout measurements are snapped before flex children resolve. Use `scroll-snap-type: x proximity` combined with `overflow-anchor: none` instead.
 
 ## Learned User Preferences
 

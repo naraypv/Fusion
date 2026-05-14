@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { ListView } from "../ListView";
 import type { Task, TaskDetail } from "@fusion/core";
 import { scopedKey } from "../../utils/projectStorage";
+import { loadAllAppCss } from "../../test/cssFixture";
 
 // Mock the API
 vi.mock("../../api", () => ({
@@ -18,6 +19,7 @@ vi.mock("../../api", () => ({
     groupOverlappingFiles: true,
     autoMerge: true,
   }),
+  fetchGlobalSettings: vi.fn().mockResolvedValue({}),
   fetchTaskDetail: vi.fn(),
   batchUpdateTaskModels: vi.fn(),
   fetchNodes: vi.fn().mockResolvedValue([]),
@@ -33,6 +35,27 @@ vi.mock("../../hooks/useConfirm", () => ({
 const mockAddToast = vi.fn();
 const TEST_PROJECT_ID = "proj-123";
 const scopedStorageKey = (key: string) => scopedKey(key, TEST_PROJECT_ID);
+
+function mountCssForBadgeTests() {
+  const style = document.createElement("style");
+  style.textContent = loadAllAppCss();
+  document.head.appendChild(style);
+  document.documentElement.style.setProperty("--status-error-bg", "rgb(255, 230, 230)");
+  document.documentElement.style.setProperty("--color-error-dark", "rgb(200, 0, 0)");
+  document.documentElement.style.setProperty("--status-in-review-bg", "rgb(230, 255, 230)");
+  document.documentElement.style.setProperty("--in-review", "rgb(0, 160, 0)");
+  document.documentElement.style.setProperty("--triage", "rgb(240, 140, 0)");
+  document.documentElement.style.setProperty("--todo", "rgb(80, 120, 220)");
+  return () => {
+    style.remove();
+    document.documentElement.style.removeProperty("--status-error-bg");
+    document.documentElement.style.removeProperty("--color-error-dark");
+    document.documentElement.style.removeProperty("--status-in-review-bg");
+    document.documentElement.style.removeProperty("--in-review");
+    document.documentElement.style.removeProperty("--triage");
+    document.documentElement.style.removeProperty("--todo");
+  };
+}
 
 const createMockTask = (overrides: Partial<Task> = {}): Task => ({
   id: "FN-001",
@@ -642,6 +665,39 @@ describe("ListView", () => {
 
     const statusBadge = screen.getByText("failed");
     expect(statusBadge.className).toContain("failed");
+  });
+
+  it.each([
+    {
+      name: "failed + in-review uses error token color",
+      classes: "list-status-badge list-status-badge--in-review failed",
+      expectedClass: "failed",
+      expectedColor: "var(--color-error-dark)",
+      disallowedColor: "var(--in-review)",
+    },
+    {
+      name: "stuck + todo uses triage token color",
+      classes: "list-status-badge list-status-badge--todo stuck",
+      expectedClass: "stuck",
+      expectedColor: "var(--triage)",
+      disallowedColor: "var(--todo)",
+    },
+  ])("FN-4208 keeps list badge state precedence: $name", ({ classes, expectedClass, expectedColor, disallowedColor }) => {
+    const cleanupCss = mountCssForBadgeTests();
+    try {
+      const badge = document.createElement("span");
+      badge.className = classes;
+      badge.textContent = "status";
+      document.body.appendChild(badge);
+
+      expect(badge.className).toContain(expectedClass);
+      expect(getComputedStyle(badge).color).toBe(expectedColor);
+      expect(getComputedStyle(badge).color).not.toBe(disallowedColor);
+
+      badge.remove();
+    } finally {
+      cleanupCss();
+    }
   });
 
   it("renders paused tasks with dimmed styling", () => {

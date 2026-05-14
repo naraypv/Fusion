@@ -36,10 +36,12 @@ import {
   getTaskMergeBlocker,
   normalizeMergeConflictStrategy,
   normalizeMergeStrategyOverlapBehavior,
+  normalizePostMergeAuditMode,
   resolveTaskMergeTarget,
   resolveTitleSummarizerSettingsModel,
   resolveAgentPrompt,
   resolveModelFallbackChain,
+  resolvePersistAgentThinkingLog,
   resolveRouteAllLlmCallsViaDspy,
   summarizeCommitBody,
   summarizeCommitSubject,
@@ -53,6 +55,8 @@ import {
   type Settings,
   type AgentPromptsConfig,
   type CanonicalMergeConflictStrategy,
+  type DirectMergeCommitStrategy,
+  type PostMergeAuditMode,
   type TaskSourceIssue,
   type Task,
   type AutostashOrphanRecord,
@@ -73,8 +77,11 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext } from "./run-audit.js";
 import { createWebFetchTool } from "./agent-tools.js";
-import { auditSquashMerge, MERGER_MAIN_OVERLAP_LOOKBACK_COMMITS, type SquashAuditFindings } from "./merger-squash-audit.js";
+import { auditSquashMerge, MERGER_MAIN_OVERLAP_LOOKBACK_COMMITS, type PostMergeAuditStrategy, type SquashAuditFindings } from "./merger-squash-audit.js";
 import { detectMergeOverlap, restoreBranchWinsFiles } from "./merger-overlap-guard.js";
+import { checkDiffVolume, DiffVolumeRegressionError } from "./merger-diff-volume-gate.js";
+
+export { DiffVolumeRegressionError } from "./merger-diff-volume-gate.js";
 
 /** Conflict type classification for merge conflict resolution */
 export type ConflictType =
@@ -145,7 +152,7 @@ function truncateWorkflowScriptOutput(output: string): string {
 }
 
 /** Check if a path matches a glob pattern (simple glob support: * and **) */
-function matchGlob(path: string, pattern: string): boolean {
+export function matchGlob(path: string, pattern: string): boolean {
   // Handle ** which matches across directory boundaries (must do before single *)
   if (pattern.includes("**")) {
     // Convert ** to match any characters including /
@@ -187,6 +194,77 @@ function matchGlob(path: string, pattern: string): boolean {
     .replace(/\*/g, "[^/]*");
   const regex = new RegExp(`^${regexPattern}$`);
   return regex.test(fileName) || regex.test(path);
+}
+
+interface DiffVolumeGateSettings {
+  minLines: number;
+  threshold: number;
+  allowlistGlobs: string[];
+}
+
+function resolveDiffVolumeGateSettings(settings?: Settings): DiffVolumeGateSettings {
+  const minLinesRaw = settings?.mergeDiffVolumeMinLines ?? 20;
+  const thresholdRaw = settings?.mergeDiffVolumeThreshold ?? 0.2;
+  return {
+    minLines: Math.max(1, Math.trunc(Number.isFinite(minLinesRaw) ? minLinesRaw : 20)),
+    threshold: Math.min(1, Math.max(0, Number.isFinite(thresholdRaw) ? thresholdRaw : 0.2)),
+    allowlistGlobs: Array.isArray(settings?.mergeDiffVolumeAllowlist)
+      ? settings.mergeDiffVolumeAllowlist.filter((glob): glob is string => typeof glob === "string" && glob.trim().length > 0)
+      : [],
+  };
+}
+
+function formatDiffVolumeFindings(findings: ReadonlyArray<{ file: string; branchNet: number; staged: number; ratio: number }>): string {
+  return findings
+    .map((finding) => `${finding.file} (branchNet=${finding.branchNet}, staged=${finding.staged}, ratio=${finding.ratio.toFixed(3)})`)
+    .join("\n");
+}
+
+async function resetToIntegrationTarget(rootDir: string, integrationTargetSha: string): Promise<void> {
+  await execAsync(`git reset --hard ${quoteArg(integrationTargetSha)}`, {
+    cwd: rootDir,
+    encoding: "utf-8",
+  });
+  await execAsync("git clean -fd", {
+    cwd: rootDir,
+    encoding: "utf-8",
+  });
+}
+
+async function runDiffVolumeGate(params: {
+  rootDir: string;
+  branch: string;
+  integrationTargetSha: string;
+  taskId: string;
+  settings?: Settings;
+  store?: TaskStore;
+}): Promise<void> {
+  try {
+    const gateSettings = resolveDiffVolumeGateSettings(params.settings);
+    await checkDiffVolume({
+      rootDir: params.rootDir,
+      branch: params.branch,
+      integrationTargetSha: params.integrationTargetSha,
+      minLines: gateSettings.minLines,
+      threshold: gateSettings.threshold,
+      allowlistGlobs: gateSettings.allowlistGlobs,
+      taskId: params.taskId,
+    });
+  } catch (error: unknown) {
+    if (!(error instanceof DiffVolumeRegressionError)) throw error;
+    await resetToIntegrationTarget(params.rootDir, params.integrationTargetSha);
+    const details = formatDiffVolumeFindings(error.findings);
+    if (params.store) {
+      await params.store.appendAgentLog(
+        params.taskId,
+        `Diff-volume gate blocked auto-resolved squash before commit`,
+        "tool_error",
+        details,
+        "merger",
+      );
+    }
+    throw error;
+  }
 }
 
 export async function getStagedFiles(cwd: string): Promise<string[]> {
@@ -486,7 +564,7 @@ export class SquashAuditError extends Error {
     public readonly squashSha: string,
     public readonly findings: SquashAuditFindings,
   ) {
-    super(buildSquashAuditBlockingMessage(taskId, squashSha, findings));
+    super(buildPostMergeAuditBlockingMessage(taskId, findings));
     this.name = "SquashAuditError";
   }
 }
@@ -933,7 +1011,8 @@ async function attemptInMergeVerificationFix(
       taskId,
       agent: "merger",
       persistAgentToolOutput: settings.persistAgentToolOutput,
-      persistAgentThinkingLog: settings.persistAgentThinkingLog,
+      // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
       onAgentText: options.onAgentText,
       onAgentTool: options.onAgentTool,
     });
@@ -2045,7 +2124,8 @@ async function runAiAgentForAutostashConflict(params: {
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
     onAgentText: options.onAgentText
       ? (_id: string, delta: string) => options.onAgentText!(delta)
       : undefined,
@@ -2417,7 +2497,8 @@ async function runAiAgentForAutostashHardFail(params: {
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
     onAgentText: options.onAgentText
       ? (_id: string, delta: string) => options.onAgentText!(delta)
       : undefined,
@@ -3348,6 +3429,23 @@ export async function commitOrAmendMergeWithFixes(
       // This is the phantom-merge fix: previously the code blindly amended
       // HEAD (the previous task's commit), silently dropping the current
       // task's branch and inheriting the prior task's stats.
+      if (store) {
+        await enforceSquashFileScopeInvariant({
+          store,
+          taskId,
+          rootDir,
+          task: await store.getTask(taskId),
+          resetLabel: "file-scope invariant violation",
+        });
+      }
+      await runDiffVolumeGate({
+        rootDir,
+        branch,
+        integrationTargetSha: preAttemptHeadSha,
+        taskId,
+        settings,
+        store,
+      });
       await execAsync(
         `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
         { cwd: rootDir },
@@ -3373,6 +3471,23 @@ export async function commitOrAmendMergeWithFixes(
     // HEAD moved — AI agent committed already. Amend with deterministic
     // message + any new staged fixes folded in. `--amend -m` replaces both
     // the message and includes any newly-staged content.
+    if (store) {
+      await enforceSquashFileScopeInvariant({
+        store,
+        taskId,
+        rootDir,
+        task: await store.getTask(taskId),
+        resetLabel: "file-scope invariant violation",
+      });
+    }
+    await runDiffVolumeGate({
+      rootDir,
+      branch,
+      integrationTargetSha: preAttemptHeadSha,
+      taskId,
+      settings,
+      store,
+    });
     await execAsync(
       `git commit --amend ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
       { cwd: rootDir },
@@ -3394,6 +3509,9 @@ export async function commitOrAmendMergeWithFixes(
     mergerLog.log(`${taskId}: amended merge commit with verification fixes (deterministic message)`);
     return { ok: true, reason: "completed" };
   } catch (err: unknown) {
+    if (err instanceof DiffVolumeRegressionError || err instanceof FileScopeViolationError) {
+      throw err;
+    }
     const errorMessage = err instanceof Error ? err.message : String(err);
     mergerLog.warn(`${taskId}: failed to finalize merge commit: ${errorMessage}`);
     return { ok: false, reason: "unknown-phantom" };
@@ -3496,6 +3614,104 @@ function matchesScope(filePath: string, scopePatterns: string[]): boolean {
  * When `strict` is true, throws an error on scope violations instead of
  * just returning warnings (hard guardrail that blocks merge).
  */
+
+export class FileScopeViolationError extends Error {
+  taskId: string;
+  stagedFiles: string[];
+  declaredScope: string[];
+
+  constructor(taskId: string, stagedFiles: string[], declaredScope: string[]) {
+    const stagedList = stagedFiles.length > 0 ? stagedFiles.join(", ") : "<none outside .changeset/>";
+    const scopeList = declaredScope.join(", ");
+    super(
+      `File-scope invariant violation for ${taskId}: staged files [${stagedList}] have zero overlap with declared File Scope [${scopeList}]. Refile genuinely out-of-scope work as a follow-up task via fn_task_create before retrying this merge.`,
+    );
+    this.name = "FileScopeViolationError";
+    this.taskId = taskId;
+    this.stagedFiles = stagedFiles;
+    this.declaredScope = declaredScope;
+  }
+}
+
+export async function assertSquashOverlapsFileScope(params: {
+  store: TaskStore;
+  taskId: string;
+  rootDir: string;
+  task: Task;
+}): Promise<void> {
+  const { store, taskId, rootDir, task } = params;
+
+  if (task.scopeOverride === true) {
+    const reasonSuffix = task.scopeOverrideReason?.trim()
+      ? ` — reason: ${task.scopeOverrideReason.trim()}`
+      : "";
+    await store.appendAgentLog(
+      taskId,
+      `file-scope invariant bypassed via scopeOverride${reasonSuffix}`,
+      "text",
+      undefined,
+      "merger",
+    );
+    return;
+  }
+
+  if (typeof (store as Partial<TaskStore>).parseFileScopeFromPrompt !== "function") {
+    return;
+  }
+
+  const declaredScope = await store.parseFileScopeFromPrompt(taskId);
+  if (declaredScope.length === 0) {
+    return;
+  }
+
+  const { stdout } = await execAsync("git diff --cached --name-only", {
+    cwd: rootDir,
+    encoding: "utf-8",
+  });
+  const stagedFiles = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  const scopedStagedFiles = stagedFiles.filter((file) => !file.startsWith(".changeset/"));
+  const hasOverlap = scopedStagedFiles.some((file) => matchesScope(file, declaredScope));
+  if (!hasOverlap) {
+    throw new FileScopeViolationError(taskId, stagedFiles, declaredScope);
+  }
+}
+
+function formatFileScopeViolationAgentLog(error: FileScopeViolationError): string {
+  const stagedFiles = error.stagedFiles.length > 0 ? error.stagedFiles.join("\n") : "<none>";
+  return [
+    `taskId: ${error.taskId}`,
+    "declaredScope:",
+    ...error.declaredScope.map((entry) => `- ${entry}`),
+    "stagedFiles:",
+    ...stagedFiles.split("\n").map((entry) => `- ${entry}`),
+  ].join("\n");
+}
+
+async function enforceSquashFileScopeInvariant(params: {
+  store: TaskStore;
+  taskId: string;
+  rootDir: string;
+  task: Task;
+  resetLabel: string;
+}): Promise<void> {
+  try {
+    await assertSquashOverlapsFileScope(params);
+  } catch (error: unknown) {
+    if (!(error instanceof FileScopeViolationError)) {
+      throw error;
+    }
+    await params.store.appendAgentLog(
+      params.taskId,
+      error.message,
+      "tool_error",
+      formatFileScopeViolationAgentLog(error),
+      "merger",
+    );
+    resetMergeWithWarn(params.rootDir, params.taskId, params.resetLabel);
+    throw error;
+  }
+}
+
 export async function validateDiffScope(
   store: TaskStore,
   taskId: string,
@@ -3965,6 +4181,126 @@ async function ensureTaskTrailersOnHead(rootDir: string, task: Pick<Task, "id"> 
   }
 }
 
+async function cherryPickCommitPreservingTaskTrailers(
+  rootDir: string,
+  commitSha: string,
+  task: Pick<Task, "id"> & { lineageId?: string },
+  mergeConflictStrategy: CanonicalMergeConflictStrategy,
+  smartConflictResolution: boolean,
+  result: MergeResult,
+): Promise<void> {
+  try {
+    await execAsync(`git cherry-pick ${quoteArg(commitSha)}`, { cwd: rootDir });
+  } catch (error) {
+    const conflictedFiles = await getConflictedFiles(rootDir);
+    if (conflictedFiles.length === 0) {
+      throw error;
+    }
+
+    if (smartConflictResolution) {
+      let unresolvedComplex = 0;
+      for (const file of conflictedFiles) {
+        const type = await classifyConflict(file, rootDir);
+        if (type === "lockfile-ours") {
+          await resolveWithOurs(file, rootDir);
+          result.autoResolvedCount = (result.autoResolvedCount ?? 0) + 1;
+        } else if (type === "generated-theirs") {
+          await resolveWithTheirs(file, rootDir);
+          result.autoResolvedCount = (result.autoResolvedCount ?? 0) + 1;
+        } else if (type === "trivial-whitespace") {
+          await resolveTrivialWhitespace(file, rootDir);
+          result.autoResolvedCount = (result.autoResolvedCount ?? 0) + 1;
+        } else {
+          unresolvedComplex += 1;
+        }
+      }
+
+      if (unresolvedComplex === 0) {
+        await execAsync("git cherry-pick --continue", { cwd: rootDir });
+        await ensureTaskTrailersOnHead(rootDir, task);
+        return;
+      }
+    }
+
+    try {
+      await execAsync("git cherry-pick --abort", { cwd: rootDir });
+    } catch {
+      // best effort
+    }
+
+    if (mergeConflictStrategy === "smart-prefer-main") {
+      await execAsync(`git cherry-pick -X ours ${quoteArg(commitSha)}`, { cwd: rootDir });
+    } else if (mergeConflictStrategy === "smart-prefer-branch") {
+      await execAsync(`git cherry-pick -X theirs ${quoteArg(commitSha)}`, { cwd: rootDir });
+    } else {
+      throw error;
+    }
+  }
+
+  await ensureTaskTrailersOnHead(rootDir, task);
+}
+
+async function applyBranchCommitsPreservingHistory(params: {
+  rootDir: string;
+  baseRef: string;
+  branch: string;
+  task: Pick<Task, "id"> & { lineageId?: string };
+  taskId: string;
+  store: TaskStore;
+  mergeConflictStrategy: CanonicalMergeConflictStrategy;
+  smartConflictResolution: boolean;
+  result: MergeResult;
+  testCommand?: string;
+  buildCommand?: string;
+  testSource?: "explicit" | "inferred";
+  buildSource?: "explicit" | "inferred";
+  signal?: AbortSignal;
+}): Promise<{ landedCommitCount: number; landedCommitShas: string[]; baseSha: string }> {
+  const { rootDir, baseRef, branch, task, taskId, store, mergeConflictStrategy, smartConflictResolution, result, testCommand, buildCommand, testSource, buildSource, signal } = params;
+  const { stdout: baseShaStdout } = await execAsync(`git rev-parse ${quoteArg(baseRef)}`, { cwd: rootDir, encoding: "utf-8" });
+  const baseSha = baseShaStdout.trim();
+  const { stdout: commitStdout } = await execAsync(`git rev-list --reverse ${quoteArg(`${baseSha}..${branch}`)}`, {
+    cwd: rootDir,
+    encoding: "utf-8",
+  });
+  const commitShas = commitStdout.trim().split("\n").map((line) => line.trim()).filter(Boolean);
+  const landedCommitShas: string[] = [];
+
+  for (const commitSha of commitShas) {
+    throwIfAborted(signal, taskId);
+    await cherryPickCommitPreservingTaskTrailers(
+      rootDir,
+      commitSha,
+      task,
+      mergeConflictStrategy,
+      smartConflictResolution,
+      result,
+    );
+    const { stdout: landedShaOut } = await execAsync("git rev-parse HEAD", { cwd: rootDir, encoding: "utf-8" });
+    landedCommitShas.push(landedShaOut.trim());
+  }
+
+  if (testCommand || buildCommand) {
+    throwIfAborted(signal, taskId);
+    await runDeterministicVerification(
+      store,
+      rootDir,
+      taskId,
+      testCommand,
+      buildCommand,
+      testSource,
+      buildSource,
+      signal,
+    );
+  }
+
+  return {
+    landedCommitCount: landedCommitShas.length,
+    landedCommitShas,
+    baseSha,
+  };
+}
+
 /** Build the --author flag for git commits based on project settings. */
 function getCommitAuthorArg(settings: {
   commitAuthorEnabled?: boolean;
@@ -4165,14 +4501,167 @@ function quoteArg(value: string): string {
   return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
-function shouldRunPostSquashAudit(result: MergeResult, mergeWasEmpty: boolean, isEmptyCommit: boolean, commitSha?: string): boolean {
+function parseDirectMergeCommitStrategyOverride(prompt: string | undefined): DirectMergeCommitStrategy | undefined {
+  if (!prompt) return undefined;
+  const match = prompt.match(/^\*\*Direct Merge Commit Strategy:\*\*\s*(auto|always-squash|always-rebase)\s*$/im);
+  return match?.[1] as DirectMergeCommitStrategy | undefined;
+}
+
+function resolveDirectMergeCommitStrategy(
+  settings: Pick<Settings, "directMergeCommitStrategy">,
+  prompt: string | undefined,
+): { strategy: DirectMergeCommitStrategy; source: "project" | "prompt" } {
+  const promptOverride = parseDirectMergeCommitStrategyOverride(prompt);
+  if (promptOverride) {
+    return { strategy: promptOverride, source: "prompt" };
+  }
+  return {
+    strategy: settings.directMergeCommitStrategy ?? "auto",
+    source: "project",
+  };
+}
+
+interface BranchCommitClassification {
+  sha: string;
+  subject: string;
+  substantive: boolean;
+}
+
+function isGeneratedOnlyPath(filePath: string): boolean {
+  return GENERATED_PATTERNS.some((pattern) => matchGlob(filePath, pattern))
+    || LOCKFILE_PATTERNS.some((pattern) => matchGlob(filePath, pattern));
+}
+
+function isNonSubstantiveCommitChange(change: { status: string; filePath: string }): boolean {
+  if (change.filePath.startsWith(".changeset/")) {
+    return change.status === "A";
+  }
+  return isGeneratedOnlyPath(change.filePath);
+}
+
+async function classifyBranchCommitsForDirectMerge(
+  rootDir: string,
+  baseRef: string,
+  branch: string,
+): Promise<{ commits: BranchCommitClassification[]; substantiveCommitCount: number }> {
+  const { stdout: commitStdout } = await execAsync(`git rev-list --reverse ${quoteArg(`${baseRef}..${branch}`)}`, {
+    cwd: rootDir,
+    encoding: "utf-8",
+  });
+  const commitShas = commitStdout.trim().split("\n").map((line) => line.trim()).filter(Boolean);
+  const commits: BranchCommitClassification[] = [];
+
+  for (const sha of commitShas) {
+    let subject = sha;
+    try {
+      const { stdout } = await execAsync(`git log -1 --format=%s ${quoteArg(sha)}`, {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      subject = stdout.trim() || sha;
+    } catch {
+      // best-effort subject lookup
+    }
+
+    let substantive = true;
+    try {
+      const { stdout } = await execAsync(`git diff-tree --root --no-commit-id --name-status -r ${quoteArg(sha)}`, {
+        cwd: rootDir,
+        encoding: "utf-8",
+      });
+      const changes = stdout
+        .trim()
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [status, ...pathParts] = line.split(/\s+/);
+          return { status: status ?? "", filePath: pathParts[pathParts.length - 1] ?? "" };
+        })
+        .filter((change) => change.filePath);
+      substantive = changes.length === 0 || changes.some((change) => !isNonSubstantiveCommitChange(change));
+    } catch {
+      substantive = true;
+    }
+
+    commits.push({ sha, subject, substantive });
+  }
+
+  return {
+    commits,
+    substantiveCommitCount: commits.filter((commit) => commit.substantive).length,
+  };
+}
+
+function shouldRunPostMergeAudit(
+  strategy: PostMergeAuditStrategy,
+  result: MergeResult,
+  mergeWasEmpty: boolean,
+  isEmptyCommit: boolean,
+  commitSha?: string,
+): boolean {
   if (mergeWasEmpty || isEmptyCommit || !commitSha) {
     return false;
+  }
+  if (strategy === "rebase") {
+    return true;
   }
   return (result.autoResolvedCount ?? 0) > 0 || result.attemptsMade === 3;
 }
 
-function buildSquashAuditBlockingMessage(taskId: string, squashSha: string, findings: SquashAuditFindings): string {
+/**
+ * Decide what to do with a dirty post-merge audit (FN-4333 hot-fix).
+ *
+ * Three modes (`postMergeAuditMode` setting):
+ *  - `"off"`   — caller should skip auditing entirely (handled before this fn).
+ *  - `"warn"`  — log findings on the agent log but proceed; never throws.
+ *  - `"block"` — today's behavior: throw `SquashAuditError` and park the task,
+ *                EXCEPT for the deterministic-verification short-circuit:
+ *                rebase-strategy + overlap-only findings + a verified merged tree
+ *                cannot have produced silent drops (the tree is provably the
+ *                rebase output by construction), so we pass through clean.
+ *
+ * Pure / side-effect-free so it is unit-testable without spinning up a real
+ * merger flow. The merger call site uses the returned action to decide whether
+ * to throw or fall through.
+ */
+export type PostMergeAuditAction =
+  | { action: "pass"; reason: "verified-short-circuit" | "mode-warn" }
+  | { action: "block"; reason: "mode-block" };
+
+export function resolvePostMergeAuditAction(opts: {
+  mode: PostMergeAuditMode;
+  strategy: PostMergeAuditStrategy;
+  findings: SquashAuditFindings;
+  isTreeVerified: boolean;
+}): PostMergeAuditAction {
+  if (opts.findings.clean) {
+    // Caller should never invoke this on a clean audit, but be defensive.
+    return { action: "pass", reason: "mode-warn" };
+  }
+
+  const overlapOnly =
+    opts.findings.duplicateSubjects.length === 0
+    && opts.findings.touchedFileOverlaps.length > 0;
+
+  // Stage 1 short-circuit: a verified rebase tree with overlap-only findings
+  // cannot have produced silent drops. Pass regardless of mode (warn/block).
+  if (
+    opts.strategy === "rebase"
+    && overlapOnly
+    && opts.isTreeVerified
+  ) {
+    return { action: "pass", reason: "verified-short-circuit" };
+  }
+
+  if (opts.mode === "warn") {
+    return { action: "pass", reason: "mode-warn" };
+  }
+
+  return { action: "block", reason: "mode-block" };
+}
+
+function buildPostMergeAuditBlockingMessage(taskId: string, findings: SquashAuditFindings): string {
   const riskParts: string[] = [];
   if (findings.duplicateSubjects.length > 0) {
     riskParts.push(`${findings.duplicateSubjects.length} duplicate-subject risk${findings.duplicateSubjects.length === 1 ? "" : "s"}`);
@@ -4181,7 +4670,8 @@ function buildSquashAuditBlockingMessage(taskId: string, squashSha: string, find
     riskParts.push(`${findings.touchedFileOverlaps.length} touched-file overlap risk${findings.touchedFileOverlaps.length === 1 ? "" : "s"}`);
   }
   const summary = riskParts.length > 0 ? riskParts.join(", ") : `${findings.issueCount} audit finding(s)`;
-  return `${taskId}: post-squash audit blocked auto-completion for ${squashSha.slice(0, 8)} (${summary})`;
+  const label = findings.strategy === "rebase" ? "post-rebase range audit" : "post-squash audit";
+  return `${taskId}: ${label} blocked auto-completion for ${findings.auditTargetLabel.slice(0, 8)} (${summary})`;
 }
 
 function formatSquashAuditAgentLog(findings: SquashAuditFindings): string {
@@ -4507,7 +4997,8 @@ You are assisting with a paused \`git pull --rebase\`.
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
     onAgentText: options?.onAgentText
       ? (_id, delta) => options.onAgentText?.(delta)
       : undefined,
@@ -5617,6 +6108,37 @@ export async function aiMergeTask(
     diffStat = "(unable to read diff)";
   }
 
+  let selectedPostMergeAuditStrategy: PostMergeAuditStrategy = "squash";
+  let classifiedBranchCommits: BranchCommitClassification[] = [];
+  if (settings.mergeStrategy !== "pull-request") {
+    const configuredRoute = resolveDirectMergeCommitStrategy(settings, task.prompt);
+    if (configuredRoute.strategy === "auto") {
+      try {
+        const classification = await classifyBranchCommitsForDirectMerge(
+          rootDir,
+          diffBaseRef || mergeTarget.branch,
+          branch,
+        );
+        classifiedBranchCommits = classification.commits;
+        selectedPostMergeAuditStrategy = classification.substantiveCommitCount >= 2 ? "rebase" : "squash";
+      } catch (error) {
+        mergerLog.warn(`${taskId}: failed to classify branch commits for direct-merge routing: ${getCommandErrorMessage(error)}`);
+        selectedPostMergeAuditStrategy = "squash";
+      }
+    } else {
+      selectedPostMergeAuditStrategy = configuredRoute.strategy === "always-rebase" ? "rebase" : "squash";
+    }
+
+    const classificationSummary = classifiedBranchCommits.length > 0
+      ? ` [${classifiedBranchCommits.map((commit) => `${commit.substantive ? "substantive" : "generated-only"}:${commit.subject}`).join("; ")}]`
+      : "";
+    const routeMessage =
+      `Direct merge commit routing: ${selectedPostMergeAuditStrategy} ` +
+      `(setting ${configuredRoute.strategy} from ${configuredRoute.source})${classificationSummary}`;
+    mergerLog.log(`${taskId}: ${routeMessage}`);
+    await store.appendAgentLog(taskId, routeMessage, "text", undefined, "merger");
+  }
+
   const aiMergeSummary = settings.useAiMergeCommitSummary
     ? await generateAiMergeSummary(commitLog, diffStat, settings, rootDir)
     : null;
@@ -5730,6 +6252,7 @@ export async function aiMergeTask(
         buildSource: effectiveBuildSource,
         preMergeRebaseFallthrough,
         attempt3BranchWinsFiles: preferBranchOnOverlapFiles,
+        preAttemptHeadSha,
       }, aiTracker);
 
       if (success) {
@@ -5765,6 +6288,14 @@ export async function aiMergeTask(
         } catch {
           // best-effort abort cleanup
         }
+        throw error;
+      }
+
+      if (
+        error instanceof DiffVolumeRegressionError
+        || error?.name === "DiffVolumeRegressionError"
+        || error?.name === "FileScopeViolationError"
+      ) {
         throw error;
       }
 
@@ -6071,48 +6602,70 @@ export async function aiMergeTask(
 
   // Track AI agent invocation for resolutionMethod calculation
   const aiTracker: AiInvocationTracker = { aiWasInvoked: false };
+  let rebaseMergeBaseSha: string | undefined;
 
   // Execute attempts with escalation
   let merged = false;
 
-  // Attempt 1: Standard AI merge
-  merged = await mergeAttempt(1);
-
-  // Attempt 2: Auto-resolve lock/generated files, then AI (if enabled).
-  // Skipped for "abort" — that strategy gives the user one AI shot, no more.
-  if (!merged && smartConflictResolution && mergeConflictStrategy !== "abort") {
-    merged = await mergeAttempt(2);
-  }
-
-  // Attempt 3: -X theirs (smart-prefer-branch) or -X ours (smart-prefer-main) fallback.
-  // Skipped for "ai-only" (no silent side-pick) and "abort" (one shot only).
-  //
-  // Also skipped when `preMergeRebaseFallthrough` is set: under prefer-main
-  // the whole purpose of refusing -X ours after a failed rebase is to
-  // prevent silent re-introduction of main's deletions. Layers 1+2 couldn't
-  // unblock the rebase, so the worktree is still in a state where -X ours
-  // would re-introduce branch-only content. Trust only AI Attempts 1+2 here
-  // — their output is gated by deterministic verification (test + build),
-  // which is what enforces the prefer-main safety contract.
-  if (
-    !merged
-    && smartConflictResolution
-    && mergeConflictStrategy !== "ai-only"
-    && mergeConflictStrategy !== "abort"
-    && !preMergeRebaseFallthrough
-  ) {
-    merged = await mergeAttempt(3);
-  } else if (!merged && preMergeRebaseFallthrough) {
-    await store.logEntry(
+  if (selectedPostMergeAuditStrategy === "rebase") {
+    const rebaseResult = await applyBranchCommitsPreservingHistory({
+      rootDir,
+      baseRef: diffBaseRef || mergeTarget.branch,
+      branch,
+      task,
       taskId,
-      `Attempt 3 (-X ours fallback) suppressed: pre-merge rebase recovery layers 1+2 failed under smart-prefer-main, so the unsafe ours-side fallback is skipped to honor the strategy's safety contract. Verification-gated AI Attempts 1+2 already exhausted; merge cannot complete safely without manual intervention.`,
-      "PreMergeRebaseFallthrough",
-    );
-  }
+      store,
+      mergeConflictStrategy,
+      smartConflictResolution,
+      result,
+      testCommand: effectiveTestCommand,
+      buildCommand: effectiveBuildCommand,
+      testSource: effectiveTestSource,
+      buildSource: effectiveBuildSource,
+      signal: options.signal,
+    });
+    rebaseMergeBaseSha = rebaseResult.baseSha;
+    merged = true;
+  } else {
+    // Attempt 1: Standard AI merge
+    merged = await mergeAttempt(1);
 
-  // Bubble the empty-merge flag up to the metadata block.
-  if (aiTracker.mergeWasEmpty) {
-    mergeWasEmpty = true;
+    // Attempt 2: Auto-resolve lock/generated files, then AI (if enabled).
+    // Skipped for "abort" — that strategy gives the user one AI shot, no more.
+    if (!merged && smartConflictResolution && mergeConflictStrategy !== "abort") {
+      merged = await mergeAttempt(2);
+    }
+
+    // Attempt 3: -X theirs (smart-prefer-branch) or -X ours (smart-prefer-main) fallback.
+    // Skipped for "ai-only" (no silent side-pick) and "abort" (one shot only).
+    //
+    // Also skipped when `preMergeRebaseFallthrough` is set: under prefer-main
+    // the whole purpose of refusing -X ours after a failed rebase is to
+    // prevent silent re-introduction of main's deletions. Layers 1+2 couldn't
+    // unblock the rebase, so the worktree is still in a state where -X ours
+    // would re-introduce branch-only content. Trust only AI Attempts 1+2 here
+    // — their output is gated by deterministic verification (test + build),
+    // which is what enforces the prefer-main safety contract.
+    if (
+      !merged
+      && smartConflictResolution
+      && mergeConflictStrategy !== "ai-only"
+      && mergeConflictStrategy !== "abort"
+      && !preMergeRebaseFallthrough
+    ) {
+      merged = await mergeAttempt(3);
+    } else if (!merged && preMergeRebaseFallthrough) {
+      await store.logEntry(
+        taskId,
+        `Attempt 3 (-X ours fallback) suppressed: pre-merge rebase recovery layers 1+2 failed under smart-prefer-main, so the unsafe ours-side fallback is skipped to honor the strategy's safety contract. Verification-gated AI Attempts 1+2 already exhausted; merge cannot complete safely without manual intervention.`,
+        "PreMergeRebaseFallthrough",
+      );
+    }
+
+    // Bubble the empty-merge flag up to the metadata block.
+    if (aiTracker.mergeWasEmpty) {
+      mergeWasEmpty = true;
+    }
   }
 
   // If all attempts failed
@@ -6144,7 +6697,10 @@ export async function aiMergeTask(
     let deletions: number | undefined;
 
     try {
-      const { stdout: statsOutput } = await execAsync("git show --shortstat --format= HEAD", {
+      const statsCommand = selectedPostMergeAuditStrategy === "rebase" && rebaseMergeBaseSha
+        ? `git diff --shortstat ${quoteArg(`${rebaseMergeBaseSha}..HEAD`)}`
+        : "git show --shortstat --format= HEAD";
+      const { stdout: statsOutput } = await execAsync(statsCommand, {
         cwd: rootDir,
         encoding: "utf-8",
       });
@@ -6173,24 +6729,91 @@ export async function aiMergeTask(
     const recordedSha = (isEmptyCommit || mergeWasEmpty) ? undefined : commitSha;
 
     const auditSha = recordedSha;
-    if (auditSha && shouldRunPostSquashAudit(result, mergeWasEmpty, isEmptyCommit, auditSha)) {
-      const auditFindings = await auditSquashMerge({
-        rootDir,
-        squashSha: auditSha,
-      });
+    const postMergeAuditMode = normalizePostMergeAuditMode(settings.postMergeAuditMode);
+    if (
+      auditSha
+      && postMergeAuditMode !== "off"
+      && shouldRunPostMergeAudit(selectedPostMergeAuditStrategy, result, mergeWasEmpty, isEmptyCommit, auditSha)
+    ) {
+      const auditFindings = selectedPostMergeAuditStrategy === "rebase" && rebaseMergeBaseSha
+        ? await auditSquashMerge({
+          rootDir,
+          strategy: "rebase",
+          rangeBaseSha: rebaseMergeBaseSha,
+          rangeHeadSha: auditSha,
+        })
+        : await auditSquashMerge({
+          rootDir,
+          strategy: "squash",
+          squashSha: auditSha,
+        });
       if (!auditFindings.clean) {
-        const auditError = new SquashAuditError(taskId, auditSha, auditFindings);
+        // FN-4333: a verified rebase tree with overlap-only findings cannot have
+        // produced silent drops by construction. Check the verification cache to
+        // detect that case and pass through. `warn` mode passes any dirty audit.
+        let isTreeVerified = false;
+        try {
+          const { stdout: treeShaOut } = await execAsync(
+            `git rev-parse ${auditSha}^{tree}`,
+            { cwd: rootDir, encoding: "utf-8" },
+          );
+          const treeSha = treeShaOut.trim();
+          if (treeSha) {
+            const cacheHit = store.getVerificationCacheHit(
+              treeSha,
+              effectiveTestCommand ?? "",
+              effectiveBuildCommand ?? "",
+            );
+            isTreeVerified = Boolean(cacheHit);
+          }
+        } catch (err) {
+          mergerLog.warn(
+            `${taskId}: failed to resolve tree sha for audit verification short-circuit: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+
+        const decision = resolvePostMergeAuditAction({
+          mode: postMergeAuditMode,
+          strategy: selectedPostMergeAuditStrategy,
+          findings: auditFindings,
+          isTreeVerified,
+        });
+
+        if (decision.action === "block") {
+          const auditError = new SquashAuditError(taskId, auditSha, auditFindings);
+          await store.appendAgentLog(
+            taskId,
+            auditError.message,
+            "tool_error",
+            formatSquashAuditAgentLog(auditFindings),
+            "merger",
+          );
+          await store.updateTask(taskId, { status: null });
+          throw auditError;
+        }
+
+        const passLabel = decision.reason === "verified-short-circuit"
+          ? `${selectedPostMergeAuditStrategy === "rebase" ? "post-rebase" : "post-squash"} audit overlap cleared by deterministic verification`
+          : `${selectedPostMergeAuditStrategy === "rebase" ? "post-rebase" : "post-squash"} audit found ${auditFindings.issueCount} risk(s) — continuing (postMergeAuditMode=warn)`;
         await store.appendAgentLog(
           taskId,
-          auditError.message,
-          "tool_error",
+          passLabel,
+          "text",
           formatSquashAuditAgentLog(auditFindings),
           "merger",
         );
-        await store.updateTask(taskId, { status: null });
-        throw auditError;
+        mergerLog.log(`${taskId}: ${passLabel}`);
+      } else {
+        await store.appendAgentLog(
+          taskId,
+          selectedPostMergeAuditStrategy === "rebase" ? "post-rebase range audit clean" : "post-squash audit clean",
+          "text",
+          undefined,
+          "merger",
+        );
       }
-      await store.appendAgentLog(taskId, "post-squash audit clean", "text", undefined, "merger");
+    } else if (auditSha && postMergeAuditMode === "off") {
+      mergerLog.log(`${taskId}: post-merge audit skipped (postMergeAuditMode=off)`);
     }
     if (isEmptyCommit) {
       mergerLog.warn(
@@ -6633,6 +7256,8 @@ interface MergeAttemptParams {
    *  the task branch after the default `-X ours` squash so overlapping files
    *  keep the branch's hardening while non-overlapping files still prefer main. */
   attempt3BranchWinsFiles?: Set<string>;
+  /** HEAD of the integration target immediately before this squash attempt began. */
+  preAttemptHeadSha?: string;
 }
 
 /** Mutable flags carried through the merge cascade. */
@@ -6649,7 +7274,7 @@ interface AiInvocationTracker {
  * Returns true if merge succeeded, false if should retry (for attempts 1-2).
  * Throws on unrecoverable errors.
  */
-async function executeMergeAttempt(
+export async function executeMergeAttempt(
   params: MergeAttemptParams,
   aiTracker: AiInvocationTracker,
 ): Promise<boolean> {
@@ -6804,6 +7429,21 @@ async function executeMergeAttempt(
               aiSummary: safeBody,
               aiSubject,
             });
+            await enforceSquashFileScopeInvariant({
+              store,
+              taskId,
+              rootDir,
+              task: await store.getTask(taskId),
+              resetLabel: "file-scope invariant violation",
+            });
+            await runDiffVolumeGate({
+              rootDir,
+              branch,
+              integrationTargetSha: params.preAttemptHeadSha || "HEAD",
+              taskId,
+              settings,
+              store,
+            });
             await execAsync(
               `git commit ${subjectArg} ${bodyArg}${trailerArg}${authorArg}`,
               { cwd: rootDir },
@@ -6926,6 +7566,13 @@ async function executeMergeAttempt(
     // Spawn AI agent
     throwIfAborted(options.signal, taskId);
     aiTracker.aiWasInvoked = true; // Track that AI was invoked
+    await enforceSquashFileScopeInvariant({
+      store,
+      taskId,
+      rootDir,
+      task: await store.getTask(taskId),
+      resetLabel: "file-scope invariant violation",
+    });
     const agentResult = await runAiAgentForCommit({
       store,
       rootDir,
@@ -6943,6 +7590,7 @@ async function executeMergeAttempt(
       buildCommand,
       sourceIssueRef,
       preMergeRebaseFallthrough: params.preMergeRebaseFallthrough,
+      preAttemptHeadSha: params.preAttemptHeadSha,
     });
 
     // Handle build failure
@@ -7052,7 +7700,11 @@ async function executeMergeAttempt(
     // and trip the phantom-merge guard even though the task's content is
     // already on HEAD. Retrying with auto-conflict-resolution can't help a
     // verification failure anyway — there are no conflicts to resolve.
-    if (error?.name === "VerificationError") {
+    if (
+      error?.name === "VerificationError"
+      || error?.name === "DiffVolumeRegressionError"
+      || error?.name === "FileScopeViolationError"
+    ) {
       throw error;
     }
 
@@ -7072,7 +7724,7 @@ async function executeMergeAttempt(
  *   - "theirs" — the task branch wins (mergeConflictStrategy="smart-prefer-branch")
  *   - "ours" — the main branch wins (mergeConflictStrategy="smart-prefer-main", default)
  */
-async function attemptWithSideStrategy(
+export async function attemptWithSideStrategy(
   params: MergeAttemptParams,
   side: "theirs" | "ours" = "theirs",
   aiTracker?: AiInvocationTracker,
@@ -7100,7 +7752,7 @@ async function attemptWithSideStrategy(
 
     return finalizeSideStrategyAttempt(params, side, aiTracker);
   } catch (error) {
-    if (error instanceof Error && error.name === "MergeAbortedError") {
+    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "DiffVolumeRegressionError" || error.name === "FileScopeViolationError")) {
       throw error;
     }
     mergerLog.error(`${taskId}: -X ${side} merge failed: ${error}`);
@@ -7141,7 +7793,7 @@ async function attemptWithMixedSideStrategy(
 
     return finalizeSideStrategyAttempt(params, strategy.defaultSide, aiTracker);
   } catch (error) {
-    if (error instanceof Error && error.name === "MergeAbortedError") {
+    if (error instanceof Error && (error.name === "MergeAbortedError" || error.name === "DiffVolumeRegressionError" || error.name === "FileScopeViolationError")) {
       throw error;
     }
     mergerLog.error(`${taskId}: overlap-aware merge failed: ${error}`);
@@ -7201,6 +7853,21 @@ async function finalizeSideStrategyAttempt(
     aiSummary: aiSummary?.trim().length ? aiSummary : safeBody,
     aiSubject,
   });
+  await enforceSquashFileScopeInvariant({
+    store,
+    taskId,
+    rootDir,
+    task: await store.getTask(taskId),
+    resetLabel: "file-scope invariant violation",
+  });
+  await runDiffVolumeGate({
+    rootDir,
+    branch,
+    integrationTargetSha: params.preAttemptHeadSha || "HEAD",
+    taskId,
+    settings,
+    store,
+  });
   await execAsync(
     `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
     { cwd: rootDir },
@@ -7255,6 +7922,8 @@ interface AiAgentParams {
    *  the merge prompt when the pre-merge rebase recovery cascade fell
    *  through. See MergePromptParams.preMergeRebaseFallthrough for details. */
   preMergeRebaseFallthrough?: string;
+  /** HEAD of the integration target immediately before this squash attempt began. */
+  preAttemptHeadSha?: string;
 }
 
 /**
@@ -7296,6 +7965,7 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     testCommand,
     buildCommand,
     preMergeRebaseFallthrough,
+    preAttemptHeadSha,
   } = params;
 
   const settings = await store.getSettings();
@@ -7330,7 +8000,8 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
     onAgentText: options.onAgentText
       ? (_id, delta) => options.onAgentText!(delta)
       : undefined,
@@ -7554,6 +8225,14 @@ async function runAiAgentForCommit(params: AiAgentParams): Promise<{ success: bo
           includeTaskId,
           aiSummary: aiSummary?.trim().length ? aiSummary : safeBody,
           aiSubject,
+        });
+        await runDiffVolumeGate({
+          rootDir,
+          branch,
+          integrationTargetSha: preAttemptHeadSha || "HEAD",
+          taskId,
+          settings,
+          store,
         });
         await execAsync(
           `git commit ${subjectArg} ${bodyArg}${issueRefBodyArg}${trailerArg}${authorArg}`,
@@ -7938,7 +8617,8 @@ If issues are found that need attention, describe them clearly and include concr
     taskId,
     agent: "merger",
     persistAgentToolOutput: settings.persistAgentToolOutput,
-    persistAgentThinkingLog: settings.persistAgentThinkingLog,
+    // Merger agents are task-scoped ephemeral workers.
+    persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
   });
 
   try {

@@ -1,6 +1,6 @@
 // ChatView.css is imported eagerly from App.tsx to avoid a flash of
 // unstyled content when the lazy chunk loads. Do not re-import here.
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -41,11 +41,19 @@ import { useFileMention } from "../hooks/useFileMention";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { matchesAgentMentionFilter } from "./mentionMatching";
+import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
+import { linkifyFilePaths, linkifyReactChildren } from "../utils/filePathLinkify";
 
 export interface ChatViewProps {
   projectId?: string;
   addToast: (msg: string, type?: "success" | "error" | "warning") => void;
   experimentalFeatures?: Record<string, boolean>;
+}
+
+const CHAT_INPUT_MAX_HEIGHT_PX = 320;
+
+export function clampChatInputHeight(scrollHeight: number): number {
+  return Math.min(scrollHeight, CHAT_INPUT_MAX_HEIGHT_PX);
 }
 
 function formatRelativeTime(dateStr: string): string {
@@ -322,11 +330,25 @@ function renderToolCalls(toolCalls?: ToolCallInfo[]): ReactNode {
 }
 
 const chatMarkdownComponents: Components = {
+  p: ({ children, ...props }) => (
+    <p {...props}>{linkifyReactChildren(children)}</p>
+  ),
+  li: ({ children, ...props }) => (
+    <li {...props}>{linkifyReactChildren(children)}</li>
+  ),
   pre: ({ children, ...props }) => (
     <pre {...props} className="chat-markdown-pre">
       {children}
     </pre>
   ),
+  code: ({ children, ...props }) => {
+    const text = typeof children === "string" ? children : React.Children.toArray(children).join("");
+    const linkedChildren = linkifyFilePaths(text);
+    if (linkedChildren.length === 1 && typeof linkedChildren[0] === "string") {
+      return <code {...props}>{children}</code>;
+    }
+    return <code {...props}>{linkedChildren}</code>;
+  },
   table: ({ children, ...props }) => (
     <table {...props} className="chat-markdown-table">
       {children}
@@ -345,6 +367,27 @@ const CHAT_SIDEBAR_MIN_WIDTH = 180;
 const CHAT_SIDEBAR_MAX_WIDTH = 500;
 const CHAT_SIDEBAR_STORAGE_KEY = "fusion:chat-sidebar-width";
 const CHAT_SCOPE_STORAGE_KEY = "fusion:chat-scope";
+const CHAT_DRAFT_STORAGE_PREFIX = "fusion:chat-draft:";
+
+function getChatDraftKey(scope: "direct" | "rooms", id: string | null | undefined): string | null {
+  if (!id) {
+    return null;
+  }
+
+  return `${CHAT_DRAFT_STORAGE_PREFIX}${scope}:${id}`;
+}
+
+function getPersistedChatDraft(key: string | null): string {
+  if (!key) {
+    return "";
+  }
+
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 interface PendingAttachment {
   file: File;
@@ -767,7 +810,7 @@ const ChatMessageItem = memo(function ChatMessageItem({
                 <TriangleAlert size={14} aria-hidden="true" />
                 <span>Failure details</span>
               </summary>
-              {failureInfo.detail && <pre className="chat-message-failure-detail">{failureInfo.detail}</pre>}
+              {failureInfo.detail && <pre className="chat-message-failure-detail">{linkifyFilePaths(failureInfo.detail)}</pre>}
               {renderFailureReference(failureInfo.reference)}
             </details>
           )}
@@ -806,7 +849,7 @@ const ChatMessageItem = memo(function ChatMessageItem({
       {message.thinkingOutput && (
         <details className="chat-message-thinking">
           <summary>Thinking</summary>
-          <pre className="chat-message-thinking-content">{message.thinkingOutput}</pre>
+          <pre className="chat-message-thinking-content">{linkifyFilePaths(message.thinkingOutput)}</pre>
         </details>
       )}
       {renderedAttachments}
@@ -839,18 +882,35 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
   } = useChat(projectId, addToast);
 
   const [showNewDialog, setShowNewDialog] = useState(false);
-  const [messageInput, setMessageInput] = useState("");
+  const chatRoomsEnabled = experimentalFeatures?.chatRooms === true;
+  const [chatScope, setChatScope] = useState<"direct" | "rooms">(() => {
+    try {
+      const persistedScope = localStorage.getItem(CHAT_SCOPE_STORAGE_KEY);
+      if (persistedScope === "rooms" && chatRoomsEnabled) {
+        return "rooms";
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+
+    return "direct";
+  });
+  // Keep this hook unconditional to preserve hook ordering and test stability.
+  // Rooms UI and interactions are fully gated by `chatRoomsEnabled`.
+  const rooms = useChatRooms(projectId, addToast);
+  const [messageInput, setMessageInput] = useState(() => {
+    const initialDraftKey = getChatDraftKey(
+      chatScope,
+      chatScope === "rooms" ? rooms.activeRoom?.id : activeSession?.id,
+    );
+    return getPersistedChatDraft(initialDraftKey);
+  });
   const [contextMenu, setContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [confirmDeleteRoomId, setConfirmDeleteRoomId] = useState<string | null>(null);
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(CHAT_SIDEBAR_DEFAULT_WIDTH);
-  const [chatScope, setChatScope] = useState<"direct" | "rooms">("direct");
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
-  const chatRoomsEnabled = experimentalFeatures?.chatRooms === true;
-  // Keep this hook unconditional to preserve hook ordering and test stability.
-  // Rooms UI and interactions are fully gated by `chatRoomsEnabled`.
-  const rooms = useChatRooms(projectId, addToast);
   const [agentsMap, setAgentsMap] = useState<Map<string, Agent>>(new Map());
   const [discoveredSkills, setDiscoveredSkills] = useState<DiscoveredSkill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(true);
@@ -872,6 +932,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
   const [isUserScrolling, setIsUserScrolling] = useState(false);
   const [copyFeedbackByMessageId, setCopyFeedbackByMessageId] = useState<Record<string, CopyFeedbackState>>({});
   const [mobileSessionMenuOpen, setMobileSessionMenuOpen] = useState(false);
+  const { pushNav } = useNavigationHistoryContext();
 
   // File mention state and hook
   const [, setFileMentionPopupVisible] = useState(false);
@@ -898,6 +959,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
   const mobileSessionMenuRef = useRef<HTMLDivElement>(null);
   const isUserScrollingRef = useRef(false);
   const lastAnchoredThreadStateRef = useRef<{ threadId: string; loaded: boolean; hasMessages: boolean } | null>(null);
+  const previousChatScopeRef = useRef<"direct" | "rooms" | null>(null);
   const hideSkillMenuTimeoutRef = useRef<number | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -947,6 +1009,37 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
       // Ignore storage errors.
     }
   }, [chatRoomsEnabled, chatScope]);
+
+  const activeDraftKey = getChatDraftKey(
+    chatScope,
+    chatScope === "rooms" ? rooms.activeRoom?.id : activeSession?.id,
+  );
+  const lastDraftKeyRef = useRef<string | null>(activeDraftKey);
+
+  useEffect(() => {
+    if (activeDraftKey === lastDraftKeyRef.current) {
+      return;
+    }
+
+    lastDraftKeyRef.current = activeDraftKey;
+    setMessageInput(getPersistedChatDraft(activeDraftKey));
+  }, [activeDraftKey]);
+
+  useEffect(() => {
+    if (!activeDraftKey || lastDraftKeyRef.current !== activeDraftKey) {
+      return;
+    }
+
+    try {
+      if (messageInput) {
+        localStorage.setItem(activeDraftKey, messageInput);
+        return;
+      }
+      localStorage.removeItem(activeDraftKey);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [activeDraftKey, messageInput]);
 
   const roomThreadActive = chatRoomsEnabled && chatScope === "rooms" && !!rooms.activeRoom;
   const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } = useMobileKeyboard({
@@ -1204,7 +1297,32 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
   }, [isMobile, activeSession]);
 
   useEffect(() => {
-    if (!isMobile || (!activeSession && !roomThreadActive)) {
+    const previousScope = previousChatScopeRef.current;
+    previousChatScopeRef.current = chatScope;
+
+    if (chatScope !== "direct") {
+      return;
+    }
+
+    if (previousScope !== null && previousScope !== "rooms") {
+      return;
+    }
+
+    const messagesContainer = messagesContainerRef.current;
+    if (!messagesContainer) {
+      return;
+    }
+
+    anchorToBottom(messagesContainer);
+    isUserScrollingRef.current = false;
+    setIsUserScrolling(false);
+  }, [chatScope, anchorToBottom]);
+
+  useEffect(() => {
+    if (!activeSession && !roomThreadActive) {
+      return;
+    }
+    if (roomThreadActive && !isMobile) {
       return;
     }
 
@@ -1214,6 +1332,8 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
         return;
       }
       anchorToBottom(messagesContainer);
+      isUserScrollingRef.current = false;
+      setIsUserScrolling(false);
     };
 
     const onVisibilityChange = () => {
@@ -1352,8 +1472,29 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
     [createSession, addToast, isMobile],
   );
 
+  const resizeComposer = useCallback((textarea?: HTMLTextAreaElement | null) => {
+    const composer = textarea ?? inputRef.current;
+    if (!composer) {
+      return;
+    }
+
+    composer.style.height = "auto";
+    composer.style.height = `${clampChatInputHeight(composer.scrollHeight)}px`;
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [messageInput, resizeComposer]);
+
   const clearComposerState = useCallback(() => {
     setMessageInput("");
+    if (activeDraftKey) {
+      try {
+        localStorage.removeItem(activeDraftKey);
+      } catch {
+        // Ignore storage errors.
+      }
+    }
     setShowSkillMenu(false);
     setSkillFilter("");
     setMentionPopupVisible(false);
@@ -1367,7 +1508,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
       }
       return [];
     });
-  }, []);
+  }, [activeDraftKey]);
 
   // Handle send message including pending attachment uploads.
   const handleSend = useCallback(() => {
@@ -1415,10 +1556,13 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
         return;
       }
 
+      const previousInput = messageInput;
+      clearComposerState();
+
       try {
         await rooms.sendRoomMessage(trimmed);
-        clearComposerState();
       } catch (error) {
+        setMessageInput(previousInput);
         const message = error instanceof Error && error.message.trim()
           ? error.message
           : "Failed to send room message";
@@ -1444,8 +1588,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
 
         window.requestAnimationFrame(() => {
           if (!inputRef.current) return;
-          inputRef.current.style.height = "auto";
-          inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 120)}px`;
+          resizeComposer(inputRef.current);
           inputRef.current.focus();
         });
 
@@ -1456,7 +1599,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
       setSkillFilter("");
       setHighlightedSkillIndex(0);
     },
-    [],
+    [resizeComposer],
   );
 
   const handleMentionSelect = useCallback(
@@ -1483,13 +1626,12 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
 
       window.requestAnimationFrame(() => {
         if (!inputRef.current) return;
-        inputRef.current.style.height = "auto";
-        inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 120)}px`;
+        resizeComposer(inputRef.current);
         inputRef.current.focus();
         inputRef.current.setSelectionRange(nextCursorPos, nextCursorPos);
       });
     },
-    [mentionStartPos, messageInput],
+    [mentionStartPos, messageInput, resizeComposer],
   );
 
 
@@ -1643,9 +1785,8 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
       updateFileMentionPosition(textarea);
     }
 
-    textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
-  }, [updateMentionState]);
+    resizeComposer(textarea);
+  }, [updateMentionState, resizeComposer]);
 
   const handleInputSelectionChange = useCallback(
     (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
@@ -1827,6 +1968,12 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
     setMobileSessionMenuOpen(false);
   }, [selectSession]);
 
+  const handleRoomBack = useCallback(() => {
+    rooms.selectRoom(null);
+    setSidebarVisible(true);
+    setMobileSessionMenuOpen(false);
+  }, [rooms]);
+
   // Render empty state (no active session)
   const renderEmptyState = () => {
     return (
@@ -1844,6 +1991,28 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
   const activeModelTag = formatModelTag(activeSession?.modelProvider, activeSession?.modelId);
   const activeModelProvider = activeSession?.modelProvider ?? null;
   const hasThreadInView = Boolean(activeSession || isStreaming || messages.length > 0);
+  const hasMobileDetailSelection = chatScope === "rooms" ? roomThreadActive : Boolean(activeSession);
+  const previousHasMobileDetailSelectionRef = useRef(hasMobileDetailSelection);
+
+  useEffect(() => {
+    const previousHasMobileDetailSelection = previousHasMobileDetailSelectionRef.current;
+    previousHasMobileDetailSelectionRef.current = hasMobileDetailSelection;
+
+    if (!isMobile) {
+      return;
+    }
+
+    if (previousHasMobileDetailSelection || !hasMobileDetailSelection) {
+      return;
+    }
+
+    // Mobile list/detail surfaces must stack a view entry on top of the
+    // shared browser-history nav entry so swipe-back returns to the list.
+    pushNav({
+      type: "view",
+      revert: chatScope === "rooms" ? handleRoomBack : handleBack,
+    });
+  }, [chatScope, handleBack, handleRoomBack, hasMobileDetailSelection, isMobile, pushNav]);
 
   const threadHeaderTitle = activeSession?.agentId === FN_AGENT_ID
     ? (activeModelTag ?? "Fusion")
@@ -2018,13 +2187,9 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
             {/* Session list section */}
             <div className="chat-session-list chat-sidebar-list">
               {sessionsLoading ? (
-                <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
-                  Loading...
-                </div>
+                <div className="chat-empty-state chat-empty-state--padded">Loading...</div>
               ) : filteredSessions.length === 0 ? (
-                <div style={{ padding: "12px", color: "var(--text-secondary)", fontSize: "13px" }}>
-                  No conversations yet
-                </div>
+                <div className="chat-empty-state chat-empty-state--padded">No conversations yet</div>
               ) : (
                 filteredSessions.map((session) => (
                   <div
@@ -2092,7 +2257,6 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
               <div className="chat-session-list chat-sidebar-list">
                 {rooms.rooms.map((room) => {
                   const isActive = rooms.activeRoom?.id === room.id;
-                  const memberCount = isActive ? rooms.activeRoomMembers.length : "—";
                   return (
                     <div
                       key={room.id}
@@ -2118,7 +2282,11 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
                     >
                       <span className="chat-room-item-details">
                         <span className="chat-room-item-name">#{room.name}</span>
-                        <span className="chat-room-item-meta">{memberCount} {memberCount === 1 ? "member" : "members"}</span>
+                        {isActive ? (
+                          <span className="chat-room-item-meta">
+                            {rooms.activeRoomMembers.length} {rooms.activeRoomMembers.length === 1 ? "member" : "members"}
+                          </span>
+                        ) : null}
                       </span>
                       <button
                         type="button"
@@ -2254,10 +2422,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
             <>
               <div className="chat-room-thread-header">
                 {isMobile && (
-                  <button className="btn-icon" onClick={() => {
-                    rooms.selectRoom(null);
-                    setSidebarVisible(true);
-                  }} data-testid="chat-back-btn">
+                  <button className="btn-icon" onClick={handleRoomBack} data-testid="chat-back-btn">
                     <ChevronLeft size={16} />
                   </button>
                 )}
@@ -2278,9 +2443,9 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
               </div>
               <div className="chat-messages" ref={messagesContainerRef} onScroll={updateScrollState}>
                 {rooms.messagesLoading ? (
-                  <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>Loading messages...</div>
+                  <div className="chat-empty-state">Loading messages...</div>
                 ) : rooms.messages.length === 0 ? (
-                  <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>No messages yet. Start the conversation!</div>
+                  <div className="chat-empty-state">No messages yet. Start the conversation!</div>
                 ) : (
                   rooms.messages.map((message) => {
                     const senderName = message.senderAgentId ? (agentsMap.get(message.senderAgentId)?.name ?? message.senderAgentId.slice(0, 30)) : "You";
@@ -2358,6 +2523,22 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
                 <button
                   type="button"
                   className="chat-input-send"
+                  // Keep keyboard up when sending. preventDefault fires on
+                  // pointerdown for touch pointers (BEFORE iOS blurs the
+                  // textarea — the synthesized mousedown is too late on
+                  // iOS), and on mousedown for desktop. Crucially we do NOT
+                  // call preventDefault on touchstart and we do NOT run the
+                  // action here — both of those broke quick taps. Click
+                  // still fires from the iOS touch sequence and runs the
+                  // action reliably.
+                  onPointerDown={(event) => {
+                    if (event.pointerType && event.pointerType !== "mouse") {
+                      event.preventDefault();
+                    }
+                  }}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                  }}
                   onClick={() => {
                     void handleSendDispatch();
                   }}
@@ -2487,7 +2668,7 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
                 {streamingThinking && (
                   <details className="chat-message-thinking">
                     <summary>Thinking</summary>
-                    <pre className="chat-message-thinking-content">{streamingThinking}</pre>
+                    <pre className="chat-message-thinking-content">{linkifyFilePaths(streamingThinking)}</pre>
                   </details>
                 )}
                 <div className="chat-typing-indicator">
@@ -2498,13 +2679,11 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
               </div>
             </>
           ) : messagesLoading ? (
-            <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>Loading messages...</div>
+            <div className="chat-empty-state">Loading messages...</div>
           ) : messages.length === 0 && !activeSession ? (
             renderEmptyState()
           ) : messages.length === 0 && activeSession ? (
-            <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>
-              No messages yet. Start the conversation!
-            </div>
+            <div className="chat-empty-state">No messages yet. Start the conversation!</div>
           ) : (
             <>
               {messages.map((message) => (
@@ -2745,7 +2924,13 @@ export function ChatView({ projectId, addToast, experimentalFeatures }: ChatView
           existingRoomNames={rooms.rooms.map((room) => room.name)}
           onCreate={async (draft) => {
             await rooms.createRoom({ name: draft.name, memberAgentIds: draft.memberAgentIds });
+            if (chatScope !== "rooms") {
+              setChatScope("rooms");
+            }
             setCreateRoomOpen(false);
+            if (isMobile) {
+              setSidebarVisible(false);
+            }
           }}
         />
       )}

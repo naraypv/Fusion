@@ -145,6 +145,10 @@ async function runOverlapMerge(dir: string, taskId: string, settingsOverrides: R
   return { store, result };
 }
 
+function testTempParent(): string {
+  return process.env.FUSION_TEST_WORKER_ROOT ?? tmpdir();
+}
+
 function assertIsolatedWorkspace(dir: string): void {
   const repoRoot = process.env.FUSION_TEST_REAL_ROOT;
   if (!repoRoot) return;
@@ -153,19 +157,29 @@ function assertIsolatedWorkspace(dir: string): void {
 
 const createdDirs = new Set<string>();
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function cleanupTempDir(dir?: string): void {
   if (!dir) return;
   createdDirs.delete(dir);
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
       if (!existsSync(dir)) return;
       rmSync(dir, { recursive: true, force: true });
-      return;
+      if (!existsSync(dir)) return;
     } catch (error) {
-      if (attempt === 3) {
+      if (attempt === 5) {
         throw error;
       }
     }
+
+    sleepSync(attempt * 25);
+  }
+
+  if (existsSync(dir)) {
+    throw new Error(`failed to clean temp dir: ${dir}`);
   }
 }
 
@@ -179,7 +193,7 @@ describe("merger overlap guard", () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-overlap-guard-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-overlap-guard-"));
     createdDirs.add(dir);
     assertIsolatedWorkspace(dir);
     initRepo(dir);
@@ -326,7 +340,7 @@ describe("aiMergeTask overlap-aware fallback integration", () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "fusion-test-overlap-merge-"));
+    dir = mkdtempSync(join(testTempParent(), "fusion-test-overlap-merge-"));
     createdDirs.add(dir);
     assertIsolatedWorkspace(dir);
     initRepo(dir);
@@ -360,7 +374,11 @@ describe("aiMergeTask overlap-aware fallback integration", () => {
 
     git(dir, "git checkout main");
     commitFile(dir, "store.ts", "export const mode = 'main fallback';\n", "feat: main follow-up");
-    commitSeries(dir, "filler", 31);
+    // 40 filler commits pushes the conflicting main edit well beyond the
+    // default 30-commit lookback window, avoiding a tight boundary condition
+    // that caused intermittent failures when initRepo/setup commits shifted
+    // the effective position of the "main follow-up" commit.
+    commitSeries(dir, "filler", 40);
 
     const { result } = await runOverlapMerge(dir, "FN-051");
 

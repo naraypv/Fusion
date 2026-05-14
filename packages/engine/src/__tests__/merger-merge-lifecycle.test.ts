@@ -124,8 +124,10 @@ vi.mock("../context-limit-detector.js", () => ({
 vi.mock("../merger-squash-audit.js", () => ({
   MERGER_MAIN_OVERLAP_LOOKBACK_COMMITS: 30,
   auditSquashMerge: vi.fn(async () => ({
+    strategy: "squash",
     squashSha: "mergedcommit123",
     parentSha: "parent123",
+    auditTargetLabel: "mergedcommit123",
     squashSubject: "feat: squash merge",
     lookback: 30,
     branchSubjects: [],
@@ -2349,8 +2351,10 @@ describe("aiMergeTask post-squash audit gate", () => {
       },
     } as any);
     mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "squash",
       squashSha: "mergedcommit123",
       parentSha: "parent123",
+      auditTargetLabel: "mergedcommit123",
       squashSubject: "feat: squash merge",
       lookback: 30,
       branchSubjects: [],
@@ -2396,10 +2400,13 @@ describe("aiMergeTask post-squash audit gate", () => {
     });
   }
 
-  function createAuditStore() {
+  function createAuditStore(
+    overrides: Partial<typeof DEFAULT_SETTINGS> = {},
+    taskOverrides: Partial<Task> & { prompt?: string } = {},
+  ) {
     const store = createMockStore(
-      { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050" },
-      [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review" } as Task],
+      { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", ...taskOverrides } as Task & { prompt?: string },
+      [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review", ...taskOverrides } as Task & { prompt?: string }],
     );
     (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...DEFAULT_SETTINGS,
@@ -2407,8 +2414,118 @@ describe("aiMergeTask post-squash audit gate", () => {
       mergeConflictStrategy: "ai-only",
       worktreeRebaseBeforeMerge: false,
       worktreeRebaseLocalBase: false,
+      ...overrides,
     });
     return store;
+  }
+
+  function setupNoConflictMergeExecSync() {
+    mockedExecSync.mockImplementation((cmd: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes("symbolic-ref --short HEAD")) return "main" as any;
+      if (cmdStr.includes("rev-parse --verify")) return Buffer.from("abc123");
+      if (cmdStr === "git rev-parse HEAD" || cmdStr.startsWith("git rev-parse HEAD ")) return "mergedcommit123" as any;
+      if (cmdStr.includes("git log")) return "- feat: something" as any;
+      if (cmdStr.includes("merge-base")) return Buffer.from("abc123");
+      if (cmdStr.includes("rev-list --count")) return "1\n" as any;
+      if (cmdStr.includes("git diff") && cmdStr.includes("--stat")) return "1 file changed" as any;
+      if (cmdStr.includes("merge --squash") && !cmdStr.includes("-X")) return Buffer.from("");
+      if (cmdStr.includes("diff --name-only --diff-filter=U")) return "" as any;
+      if (cmdStr.includes("diff --cached --quiet")) return "1" as any;
+      if (cmdStr.includes("git commit ")) return Buffer.from("");
+      if (cmdStr.includes("show --shortstat")) return "2 files changed, 4 insertions(+), 1 deletion(-)" as any;
+      if (cmdStr.includes("branch -d") || cmdStr.includes("branch -D")) return Buffer.from("");
+      if (cmdStr.includes("worktree remove")) return Buffer.from("");
+      return Buffer.from("");
+    });
+  }
+
+  function setupAttempt3FallbackMergeExecSync() {
+    let hasConflicts = true;
+    mockedExecSync.mockImplementation((cmd: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes("symbolic-ref --short HEAD")) return "main" as any;
+      if (cmdStr.includes("rev-parse --verify")) return Buffer.from("abc123");
+      if (cmdStr === "git rev-parse HEAD" || cmdStr.startsWith("git rev-parse HEAD ")) return "mergedcommit123" as any;
+      if (cmdStr.includes("git log")) return "- feat: something" as any;
+      if (cmdStr.includes("merge-base")) return Buffer.from("abc123");
+      if (cmdStr.includes("rev-list --count")) return "1\n" as any;
+      if (cmdStr.includes("git diff") && cmdStr.includes("--stat")) return "1 file changed" as any;
+      if (cmdStr.includes("merge --squash") && !cmdStr.includes("-X")) {
+        throw new Error("Merge conflict");
+      }
+      if (cmdStr.includes("merge -X ours --squash")) {
+        hasConflicts = false;
+        return Buffer.from("");
+      }
+      if (cmdStr.includes("diff --name-only --diff-filter=U")) {
+        return hasConflicts ? "src/complex.ts\n" : "";
+      }
+      if (cmdStr.includes("diff-tree")) {
+        const error = new Error("exit code 1") as any;
+        error.stdout = "+const x = 2;\n-const x = 1;";
+        throw error;
+      }
+      if (cmdStr.includes("diff --cached --quiet")) return "1" as any;
+      if (cmdStr.includes("git commit ")) return Buffer.from("");
+      if (cmdStr.includes("show --shortstat")) return "3 files changed, 10 insertions(+), 2 deletions(-)" as any;
+      if (cmdStr.includes("branch -d") || cmdStr.includes("branch -D") || cmdStr.includes("worktree remove") || cmdStr.includes("reset --merge")) return Buffer.from("");
+      return Buffer.from("");
+    });
+  }
+
+  function setupEmptySquashMergeExecSync() {
+    mockedExecSync.mockImplementation((cmd: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes("symbolic-ref --short HEAD")) return "main" as any;
+      if (cmdStr.includes("rev-parse --verify")) return Buffer.from("abc123");
+      if (cmdStr === "git rev-parse HEAD" || cmdStr.startsWith("git rev-parse HEAD ")) return "mergedcommit123" as any;
+      if (cmdStr.includes("git log")) return "- feat: something" as any;
+      if (cmdStr.includes("merge-base")) return Buffer.from("abc123");
+      if (cmdStr.includes("rev-list --count")) return "1\n" as any;
+      if (cmdStr.includes("git diff") && cmdStr.includes("--stat")) return "0 files changed" as any;
+      if (cmdStr.includes("merge --squash") && !cmdStr.includes("-X")) return Buffer.from("");
+      if (cmdStr.includes("diff --name-only --diff-filter=U")) return "" as any;
+      if (cmdStr.includes("diff --cached --quiet")) return "0" as any;
+      if (cmdStr.includes("show --shortstat")) return "0 files changed" as any;
+      if (cmdStr.includes("branch -d") || cmdStr.includes("branch -D") || cmdStr.includes("worktree remove")) return Buffer.from("");
+      return Buffer.from("");
+    });
+  }
+
+  function setupRebaseRouteExecSync() {
+    let headIndex = 0;
+    const landedHeads = ["landedcommit001", "landedcommit002"];
+    mockedExecSync.mockImplementation((cmd: any) => {
+      const cmdStr = String(cmd);
+      if (cmdStr.includes("symbolic-ref --short HEAD")) return "main" as any;
+      if (cmdStr.includes("rev-parse --verify")) return Buffer.from("abc123");
+      if (cmdStr === "git rev-parse HEAD" || cmdStr.startsWith("git rev-parse HEAD ")) {
+        return (headIndex > 0 ? landedHeads[Math.min(headIndex - 1, landedHeads.length - 1)] : "basehead123") as any;
+      }
+      if (cmdStr.includes('git rev-parse "main"') || cmdStr.includes("git rev-parse main")) return "basehead123" as any;
+      if (cmdStr.includes('git rev-list --count "main..fusion/fn-050"')) return "2\n" as any;
+      if (cmdStr.includes('git rev-list --reverse "main..fusion/fn-050"') || cmdStr.includes('git rev-list --reverse "basehead123..fusion/fn-050"')) {
+        return "commit-a\ncommit-b\ncommit-c\n" as any;
+      }
+      if (cmdStr.includes('git log -1 --format=%s "commit-a"')) return "fix: substantive one" as any;
+      if (cmdStr.includes('git log -1 --format=%s "commit-b"')) return "chore: changeset only" as any;
+      if (cmdStr.includes('git log -1 --format=%s "commit-c"')) return "feat: substantive two" as any;
+      if (cmdStr.includes('git log "main..fusion/fn-050" --format="- %s"')) return "- fix: substantive one\n- chore: changeset only\n- feat: substantive two" as any;
+      if (cmdStr.includes("git log -1 --pretty=%B")) return "commit body" as any;
+      if (cmdStr.includes('git diff-tree --root --no-commit-id --name-status -r "commit-a"')) return "M\tsrc/feature-a.ts\n" as any;
+      if (cmdStr.includes('git diff-tree --root --no-commit-id --name-status -r "commit-b"')) return "A\t.changeset/fn-050.md\n" as any;
+      if (cmdStr.includes('git diff-tree --root --no-commit-id --name-status -r "commit-c"')) return "M\tsrc/feature-b.ts\n" as any;
+      if (cmdStr.includes("git diff") && cmdStr.includes("--stat")) return "2 files changed" as any;
+      if (cmdStr.includes('git cherry-pick "commit-a"') || cmdStr.includes('git cherry-pick "commit-b"') || cmdStr.includes('git cherry-pick "commit-c"')) {
+        headIndex += 1;
+        return Buffer.from("");
+      }
+      if (cmdStr.includes("git -c trailer.ifExists=addIfDifferent commit --amend --no-edit")) return Buffer.from("");
+      if (cmdStr.includes('git diff --shortstat "basehead123..HEAD"')) return "2 files changed, 6 insertions(+), 1 deletion(-)" as any;
+      if (cmdStr.includes("branch -d") || cmdStr.includes("branch -D") || cmdStr.includes("worktree remove")) return Buffer.from("");
+      return Buffer.from("");
+    });
   }
 
   it("moves the task to done when the post-squash audit is clean", async () => {
@@ -2420,17 +2537,107 @@ describe("aiMergeTask post-squash audit gate", () => {
     expect(result.merged).toBe(true);
     expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
       rootDir: "/tmp/root",
+      strategy: "squash",
       squashSha: "mergedcommit123",
     });
     expect(store.appendAgentLog).toHaveBeenCalledWith("FN-050", "post-squash audit clean", "text", undefined, "merger");
     expect(store.moveTask).toHaveBeenCalledWith("FN-050", "done");
   });
 
+  it("routes multi-substantive auto branches through rebase range audit", async () => {
+    setupRebaseRouteExecSync();
+    mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "rebase",
+      rangeBaseSha: "basehead123",
+      rangeHeadSha: "landedcommit002",
+      parentSha: "basehead123",
+      auditTargetLabel: "basehead123..landedcommit002",
+      lookback: 30,
+      branchSubjects: ["fix: substantive one", "feat: substantive two"],
+      recentMainSubjects: [],
+      duplicateSubjects: [],
+      touchedFiles: ["src/feature-a.ts", "src/feature-b.ts"],
+      touchedFileOverlaps: [],
+      findings: [],
+      issueCount: 0,
+      clean: true,
+    });
+    const store = createAuditStore();
+
+    await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
+      rootDir: "/tmp/root",
+      strategy: "rebase",
+      rangeBaseSha: "basehead123",
+      rangeHeadSha: "landedcommit002",
+    });
+    expect(store.appendAgentLog).toHaveBeenCalledWith("FN-050", "post-rebase range audit clean", "text", undefined, "merger");
+  });
+
+  it("honors the per-task always-rebase override", async () => {
+    setupRebaseRouteExecSync();
+    mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "rebase",
+      rangeBaseSha: "basehead123",
+      rangeHeadSha: "landedcommit002",
+      parentSha: "basehead123",
+      auditTargetLabel: "basehead123..landedcommit002",
+      lookback: 30,
+      branchSubjects: ["fix: substantive one", "feat: substantive two"],
+      recentMainSubjects: [],
+      duplicateSubjects: [],
+      touchedFiles: [],
+      touchedFileOverlaps: [],
+      findings: [],
+      issueCount: 0,
+      clean: true,
+    });
+    const store = createAuditStore({}, { prompt: "**Direct Merge Commit Strategy:** always-rebase" });
+
+    await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
+      rootDir: "/tmp/root",
+      strategy: "rebase",
+      rangeBaseSha: "basehead123",
+      rangeHeadSha: "landedcommit002",
+    });
+  });
+
+  it("keeps the squash path for single-substantive branches in auto mode", async () => {
+    setupAutoResolvedMergeExecSync();
+    const store = createAuditStore();
+
+    await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
+      rootDir: "/tmp/root",
+      strategy: "squash",
+      squashSha: "mergedcommit123",
+    });
+  });
+
+  it("honors the per-task always-squash override", async () => {
+    setupAutoResolvedMergeExecSync();
+    const store = createAuditStore({}, { prompt: "**Direct Merge Commit Strategy:** always-squash" });
+
+    await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
+      rootDir: "/tmp/root",
+      strategy: "squash",
+      squashSha: "mergedcommit123",
+    });
+  });
+
   it("blocks completion and logs duplicate-subject findings", async () => {
     setupAutoResolvedMergeExecSync();
     mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "squash",
       squashSha: "mergedcommit123",
       parentSha: "parent123",
+      auditTargetLabel: "mergedcommit123",
       squashSubject: "feat: squash merge",
       lookback: 30,
       branchSubjects: ["feat: duplicate subject"],
@@ -2462,8 +2669,10 @@ describe("aiMergeTask post-squash audit gate", () => {
   it("blocks completion and logs touched-file-overlap findings", async () => {
     setupAutoResolvedMergeExecSync();
     mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "squash",
       squashSha: "mergedcommit123",
       parentSha: "parent123",
+      auditTargetLabel: "mergedcommit123",
       squashSubject: "feat: squash merge",
       lookback: 30,
       branchSubjects: ["feat: branch change"],
@@ -2498,6 +2707,117 @@ describe("aiMergeTask post-squash audit gate", () => {
       "merger",
     );
     expect(store.updateTask).toHaveBeenCalledWith("FN-050", { status: null });
+  });
+
+  it("blocks completion and logs combined duplicate-subject and touched-file findings", async () => {
+    setupAutoResolvedMergeExecSync();
+    mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "squash",
+      squashSha: "mergedcommit123",
+      parentSha: "parent123",
+      auditTargetLabel: "mergedcommit123",
+      squashSubject: "feat: squash merge",
+      lookback: 30,
+      branchSubjects: ["feat: duplicate subject", "feat: branch change"],
+      recentMainSubjects: ["feat: duplicate subject"],
+      duplicateSubjects: [{ type: "duplicate-subject", subject: "feat: duplicate subject" }],
+      touchedFiles: ["src/shared.ts"],
+      touchedFileOverlaps: [{
+        type: "touched-file-overlap",
+        file: "src/shared.ts",
+        recentMainCommits: [{ sha: "abc1234", subject: "fix: recent main change" }],
+      }],
+      findings: [
+        { type: "duplicate-subject", subject: "feat: duplicate subject" },
+        {
+          type: "touched-file-overlap",
+          file: "src/shared.ts",
+          recentMainCommits: [{ sha: "abc1234", subject: "fix: recent main change" }],
+        },
+      ],
+      issueCount: 2,
+      clean: false,
+    });
+    const store = createAuditStore();
+
+    await expect(aiMergeTask(store, "/tmp/root", "FN-050")).rejects.toThrow(/post-squash audit blocked auto-completion/);
+
+    expect(vi.mocked(store.moveTask).mock.calls.some(([, column]) => column === "done")).toBe(false);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-050", { status: null });
+    expect(store.appendAgentLog).toHaveBeenCalledWith(
+      "FN-050",
+      expect.stringContaining("post-squash audit blocked auto-completion"),
+      "tool_error",
+      expect.stringContaining("Duplicate-subject risks:\n- feat: duplicate subject\n\nTouched-file overlap risks:\n- src/shared.ts\n  - abc1234 fix: recent main change"),
+      "merger",
+    );
+  });
+
+  it("skips the post-squash audit when the squash succeeds without auto-resolution", async () => {
+    setupNoConflictMergeExecSync();
+    const store = createAuditStore();
+
+    const result = await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(result.merged).toBe(true);
+    expect(mockedAuditSquashMerge).not.toHaveBeenCalled();
+    expect(store.moveTask).toHaveBeenCalledWith("FN-050", "done");
+    expect(
+      vi.mocked(store.appendAgentLog).mock.calls.some(([, message]) => String(message).includes("post-squash audit clean") || String(message).includes("post-squash audit blocked auto-completion")),
+    ).toBe(false);
+  });
+
+  it("runs the post-squash audit after the attempt 3 -X ours fallback path", async () => {
+    setupAttempt3FallbackMergeExecSync();
+    mockedAuditSquashMerge.mockResolvedValue({
+      strategy: "squash",
+      squashSha: "mergedcommit123",
+      parentSha: "parent123",
+      auditTargetLabel: "mergedcommit123",
+      squashSubject: "feat: squash merge",
+      lookback: 30,
+      branchSubjects: ["feat: duplicate subject"],
+      recentMainSubjects: ["feat: duplicate subject"],
+      duplicateSubjects: [{ type: "duplicate-subject", subject: "feat: duplicate subject" }],
+      touchedFiles: [],
+      touchedFileOverlaps: [],
+      findings: [{ type: "duplicate-subject", subject: "feat: duplicate subject" }],
+      issueCount: 1,
+      clean: false,
+    });
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockRejectedValue(new Error("Agent failed")),
+        dispose: vi.fn(),
+      },
+    } as any);
+    const store = createAuditStore({
+      mergeConflictStrategy: "smart-prefer-main",
+      worktreeRebaseBeforeMerge: true,
+    });
+
+    await expect(aiMergeTask(store, "/tmp/root", "FN-050")).rejects.toThrow(/post-squash audit blocked auto-completion/);
+
+    expect(mockedAuditSquashMerge).toHaveBeenCalledWith({
+      rootDir: "/tmp/root",
+      strategy: "squash",
+      squashSha: "mergedcommit123",
+    });
+    expect(store.updateTask).toHaveBeenCalledWith("FN-050", { status: null });
+  });
+
+  it("skips the post-squash audit when the squash merge is empty", async () => {
+    setupEmptySquashMergeExecSync();
+    const store = createAuditStore();
+
+    const result = await aiMergeTask(store, "/tmp/root", "FN-050");
+
+    expect(result.merged).toBe(true);
+    expect(mockedAuditSquashMerge).not.toHaveBeenCalled();
+    expect(store.moveTask).toHaveBeenCalledWith("FN-050", "done");
+    expect(
+      vi.mocked(store.appendAgentLog).mock.calls.some(([, message]) => String(message).includes("post-squash audit blocked auto-completion")),
+    ).toBe(false);
   });
 });
 

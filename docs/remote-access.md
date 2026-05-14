@@ -239,6 +239,12 @@ Remote hotkeys:
 - `/api/remote-access/auth/login-url`
 - `/remote-login?rt=...` public login handoff route
 
+Headless startup now auto-registers the current working directory as a Fusion project when it is not already in the central project registry. On first run you'll see:
+
+- `[serve] Auto-registered project "<name>" at <cwd>`
+
+This removes the old requirement to run `fn init`/`fn project add` first in CI, Docker, cron, and other non-interactive environments. Use `fn serve --no-auto-register` to keep the previous strict behavior.
+
 Parity expectations:
 
 - Remote control/status contracts are the same in dashboard and headless runtime.

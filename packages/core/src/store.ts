@@ -21,6 +21,7 @@ import { EvalStore } from "./eval-store.js";
 import { BackwardCompat, ProjectRequiredError } from "./migration.js";
 import { CentralCore } from "./central-core.js";
 import { getTaskMergeBlocker, resolveTaskMergeTarget } from "./task-merge.js";
+import { getInReviewStallReason } from "./in-review-stall.js";
 import { ensureMemoryFileWithBackend } from "./project-memory.js";
 import { runCommandAsync } from "./run-command.js";
 import { createLogger } from "./logger.js";
@@ -29,6 +30,11 @@ import { sanitizeTitle } from "./ai-summarize.js";
 import { assertProjectRootDir } from "./project-root-guard.js";
 import { generateTaskLineageId, normalizeTaskCommitAssociation } from "./task-lineage.js";
 import { createDistributedTaskIdAllocator, reconcileTaskIdState, resolveLocalNodeId, type DistributedTaskIdAllocator } from "./distributed-task-id.js";
+import { detectStalledReview } from "./stalled-review-detector.js";
+import {
+  detectTaskIdIntegrityAnomalies,
+  type TaskIdIntegrityReport,
+} from "./task-id-integrity.js";
 import {
   buildBootstrapPrompt,
   replicationCollisionError,
@@ -109,6 +115,8 @@ interface TaskRow {
   modifiedFiles: string | null;
   missionId: string | null;
   sliceId: string | null;
+  scopeOverride: number | null;
+  scopeOverrideReason: string | null;
   assignedAgentId: string | null;
   pausedByAgentId: string | null;
   assigneeUserId: string | null;
@@ -279,6 +287,7 @@ const AGENT_LOG_TOOL_DETAIL_TRUNCATION_NOTICE =
   "\n\n[tool output truncated to keep dashboard log views responsive]";
 const AGENT_LOG_TOOL_TYPES = new Set<AgentLogEntry["type"]>(["tool", "tool_result", "tool_error"]);
 const storeLog = createLogger("task-store");
+const coreLog = createLogger("core");
 
 /**
  * Reject branch names that would be unsafe to interpolate into a shell command.
@@ -587,6 +596,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   private configLock: Promise<void> = Promise.resolve();
   /** Startup/open guard for distributed_task_id_state reconciliation. */
   private taskIdStateReconciled = false;
+  /** Cached startup/refresh integrity report for allocator-related task ID anomalies. */
+  private taskIdIntegrityReport: TaskIdIntegrityReport = {
+    status: "ok",
+    checkedAt: new Date().toISOString(),
+    anomalies: [],
+  };
+  /** Prevent duplicate anomaly logs when the report content has not changed. */
+  private lastTaskIdIntegrityLogSignature: string | null = null;
   /** Cached workflow steps — invalidated on create/update/delete */
   private workflowStepsCache: import("./types.js").WorkflowStep[] | null = null;
   /** Plugin-contributed workflow step templates injected by engine runtime. */
@@ -708,11 +725,74 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return this._archiveDb;
   }
 
+  private buildTaskIdIntegrityFallbackReport(): TaskIdIntegrityReport {
+    return {
+      status: "ok",
+      checkedAt: new Date().toISOString(),
+      anomalies: [],
+    };
+  }
+
+  private detectAndCacheTaskIdIntegrityReport(): TaskIdIntegrityReport {
+    const report = detectTaskIdIntegrityAnomalies(this.db);
+    this.taskIdIntegrityReport = report;
+    const signature = report.status === "anomaly" ? JSON.stringify(report.anomalies) : null;
+    if (report.status === "anomaly" && signature !== this.lastTaskIdIntegrityLogSignature) {
+      coreLog.error("[task-id-integrity] anomaly detected", { anomalies: report.anomalies });
+    }
+    this.lastTaskIdIntegrityLogSignature = signature;
+    return report;
+  }
+
+  private mergeTaskIdIntegrityReports(...reports: TaskIdIntegrityReport[]): TaskIdIntegrityReport {
+    const checkedAt = reports[reports.length - 1]?.checkedAt ?? new Date().toISOString();
+    const seen = new Set<string>();
+    const anomalies = reports.flatMap((report) => report.anomalies).filter((anomaly) => {
+      const key = JSON.stringify(anomaly);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+    return {
+      status: anomalies.length > 0 ? "anomaly" : "ok",
+      checkedAt,
+      anomalies,
+    };
+  }
+
+  refreshTaskIdIntegrityReport(): TaskIdIntegrityReport {
+    try {
+      return this.detectAndCacheTaskIdIntegrityReport();
+    } catch (error) {
+      const fallback = this.buildTaskIdIntegrityFallbackReport();
+      this.taskIdIntegrityReport = fallback;
+      this.lastTaskIdIntegrityLogSignature = null;
+      coreLog.warn("[task-id-integrity] detector failed; degrading to healthy report", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return fallback;
+    }
+  }
+
+  getTaskIdIntegrityReport(): TaskIdIntegrityReport {
+    return this.taskIdIntegrityReport;
+  }
+
   private reconcileDistributedTaskIdStateOnOpen(): void {
     if (this.taskIdStateReconciled) {
       return;
     }
+    const previousReport = this.taskIdIntegrityReport;
+    const preReconcileReport = this.refreshTaskIdIntegrityReport();
     reconcileTaskIdState(this.db);
+    const postReconcileReport = this.refreshTaskIdIntegrityReport();
+    this.taskIdIntegrityReport = this.mergeTaskIdIntegrityReports(
+      previousReport,
+      preReconcileReport,
+      postReconcileReport,
+    );
     this.taskIdStateReconciled = true;
   }
 
@@ -800,6 +880,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       executionStartBranch: row.executionStartBranch || undefined,
       branch: row.branch || undefined,
       baseCommitSha: row.baseCommitSha || undefined,
+      scopeOverride: row.scopeOverride ? true : undefined,
+      scopeOverrideReason: row.scopeOverrideReason || undefined,
       modelPresetId: row.modelPresetId || undefined,
       modelProvider: row.modelProvider || undefined,
       modelId: row.modelId || undefined,
@@ -1154,7 +1236,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       "dependencies", "steps", "comments", "review", "reviewState", "workflowStepResults", "steeringComments",
       "attachments", "prInfo", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
       "breakIntoSubtasks", "enabledWorkflowSteps", "modifiedFiles",
-      "missionId", "sliceId", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
+      "missionId", "sliceId", "scopeOverride", "scopeOverrideReason", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
       "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch",
       // `log` is fetched in slim mode so the server can aggregate
@@ -1203,7 +1285,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       "dependencies", "steps", "attachments", "steeringComments",
       "comments", "review", "reviewState", "workflowStepResults", "prInfo", "issueInfo", "githubTracking", "sourceIssueProvider", "sourceIssueRepository", "sourceIssueExternalIssueId", "sourceIssueNumber", "sourceIssueUrl", "mergeDetails",
       "breakIntoSubtasks", "enabledWorkflowSteps", "modifiedFiles",
-      "missionId", "sliceId", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
+      "missionId", "sliceId", "scopeOverride", "scopeOverrideReason", "assignedAgentId", "pausedByAgentId", "assigneeUserId", "nodeId", "effectiveNodeId", "effectiveNodeSource",
       "sourceType", "sourceAgentId", "sourceRunId", "sourceSessionId", "sourceMessageId", "sourceParentTaskId", "sourceMetadata",
       "checkedOutBy", "checkedOutAt", "checkoutNodeId", "checkoutRunId", "checkoutLeaseRenewedAt", "checkoutLeaseEpoch",
     ];
@@ -1303,6 +1385,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       toJson(task.modifiedFiles || []),
       task.missionId ?? null,
       task.sliceId ?? null,
+      task.scopeOverride ? 1 : null,
+      task.scopeOverrideReason ?? null,
       task.assignedAgentId ?? null,
       task.pausedByAgentId ?? null,
       task.assigneeUserId ?? null,
@@ -1342,9 +1426,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         dependencies, steps, log, attachments, steeringComments,
         comments, review, reviewState, workflowStepResults, prInfo, issueInfo, githubTracking,
         sourceIssueProvider, sourceIssueRepository, sourceIssueExternalIssueId, sourceIssueNumber, sourceIssueUrl,
-        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt, checkoutNodeId, checkoutRunId, checkoutLeaseRenewedAt, checkoutLeaseEpoch
+        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, scopeOverride, scopeOverrideReason, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt, checkoutNodeId, checkoutRunId, checkoutLeaseRenewedAt, checkoutLeaseEpoch
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `).run(...this.getTaskPersistValues(task));
     this.db.bumpLastModified();
@@ -1367,9 +1451,9 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         dependencies, steps, log, attachments, steeringComments,
         comments, review, reviewState, workflowStepResults, prInfo, issueInfo, githubTracking,
         sourceIssueProvider, sourceIssueRepository, sourceIssueExternalIssueId, sourceIssueNumber, sourceIssueUrl,
-        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt, checkoutNodeId, checkoutRunId, checkoutLeaseRenewedAt, checkoutLeaseEpoch
+        mergeDetails, breakIntoSubtasks, enabledWorkflowSteps, modifiedFiles, missionId, sliceId, scopeOverride, scopeOverrideReason, assignedAgentId, pausedByAgentId, assigneeUserId, nodeId, effectiveNodeId, effectiveNodeSource, sourceType, sourceAgentId, sourceRunId, sourceSessionId, sourceMessageId, sourceParentTaskId, sourceMetadata, checkedOutBy, checkedOutAt, checkoutNodeId, checkoutRunId, checkoutLeaseRenewedAt, checkoutLeaseEpoch
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
       ON CONFLICT(id) DO UPDATE SET
         lineageId = excluded.lineageId,
@@ -1442,6 +1526,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         modifiedFiles = excluded.modifiedFiles,
         missionId = excluded.missionId,
         sliceId = excluded.sliceId,
+        scopeOverride = excluded.scopeOverride,
+        scopeOverrideReason = excluded.scopeOverrideReason,
         assignedAgentId = excluded.assignedAgentId,
         pausedByAgentId = excluded.pausedByAgentId,
         assigneeUserId = excluded.assigneeUserId,
@@ -2724,6 +2810,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       modelPresetId: input.modelPresetId,
       assignedAgentId: input.assignedAgentId,
       assigneeUserId: input.assigneeUserId,
+      scopeOverride: input.scopeOverride === true ? true : undefined,
+      scopeOverrideReason: input.scopeOverrideReason,
       nodeId: input.nodeId,
       modelProvider: input.modelProvider,
       modelId: input.modelId,
@@ -2908,6 +2996,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         };
       }
 
+      task.stalledReview = detectStalledReview(task, { now: Date.now() });
+
       // Sync steps from PROMPT.md if task.steps is empty
       if (task.steps.length === 0) {
         task.steps = await this.parseStepsFromPrompt(id);
@@ -2987,8 +3077,11 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     const sql = `SELECT ${selectClause} FROM tasks${whereClause} ORDER BY createdAt ASC`;
 
     const rows = this.db.prepare(sql).all(...params);
+    const now = Date.now();
     const activeTasks = await Promise.all((rows as unknown as TaskRow[]).map(async (row) => {
       const task = this.rowToTask(row);
+      task.inReviewStall = getInReviewStallReason(task, { now });
+      task.stalledReview = detectStalledReview(task, { now });
 
       // Slim path: aggregate the timed-execution total server-side, then
       // strip the heavy log payload from the wire response. Without this
@@ -3070,9 +3163,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       ).all(since, resolvedLimit + 1) as TaskRow[]);
 
     const hasMore = rows.length > resolvedLimit;
+    const now = Date.now();
     const tasks = rows.slice(0, resolvedLimit).map((row) => {
       const task = this.rowToTask(row);
+      task.inReviewStall = getInReviewStallReason(task, { now });
       task.timedExecutionMs = this.computeTimedExecutionMs(task.log);
+      task.stalledReview = detectStalledReview(task, { now });
       task.log = [];
       task.githubTracking = undefined;
       return task;
@@ -3178,8 +3274,10 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       `).all(...params) as unknown as TaskRow[];
     }
 
+    const now = Date.now();
     const activeMatches = await Promise.all(rows.map(async (row) => {
       const task = this.rowToTask(row);
+      task.inReviewStall = getInReviewStallReason(task, { now });
 
       // Slim path mirrors `listTasks`: aggregate timed execution server-side
       // before stripping the heavy log payload from the wire response.
@@ -3568,7 +3666,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
 
   async updateTask(
     id: string,
-    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; status?: string | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; currentStep?: number; blockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; assigneeUserId?: string | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; checkoutNodeId?: string | null; checkoutRunId?: string | null; checkoutLeaseRenewedAt?: string | null; checkoutLeaseEpoch?: number | null; paused?: boolean; baseBranch?: string | null; branch?: string | null; executionStartBranch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; workflowStepRetries?: number; stuckKillCount?: number | null; postReviewFixCount?: number | null; recoveryRetryCount?: number | null; taskDoneRetryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; modelProvider?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningModelId?: string | null; thinkingLevel?: string | null; error?: string | null; summary?: string | null; sessionFile?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; review?: import("./types.js").TaskReview | null; reviewState?: import("./types.js").TaskReviewState | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; githubTracking?: import("./types.js").TaskGithubTracking | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; missionId?: string | null; sliceId?: string | null },
+    updates: { title?: string; description?: string; priority?: TaskPriority | null; prompt?: string; worktree?: string | null; status?: string | null; dependencies?: string[]; steps?: import("./types.js").TaskStep[]; currentStep?: number; blockedBy?: string | null; assignedAgentId?: string | null; pausedByAgentId?: string | null; assigneeUserId?: string | null; scopeOverride?: boolean | null; scopeOverrideReason?: string | null; nodeId?: string | null; effectiveNodeId?: string | null; effectiveNodeSource?: string | null; checkedOutBy?: string | null; checkedOutAt?: string | null; checkoutNodeId?: string | null; checkoutRunId?: string | null; checkoutLeaseRenewedAt?: string | null; checkoutLeaseEpoch?: number | null; paused?: boolean; baseBranch?: string | null; branch?: string | null; executionStartBranch?: string | null; baseCommitSha?: string | null; size?: "S" | "M" | "L"; reviewLevel?: number; executionMode?: import("./types.js").ExecutionMode | null; mergeRetries?: number; workflowStepRetries?: number; stuckKillCount?: number | null; postReviewFixCount?: number | null; recoveryRetryCount?: number | null; taskDoneRetryCount?: number | null; verificationFailureCount?: number | null; mergeConflictBounceCount?: number | null; nextRecoveryAt?: string | null; enabledWorkflowSteps?: string[]; modelProvider?: string | null; modelId?: string | null; validatorModelProvider?: string | null; validatorModelId?: string | null; planningModelProvider?: string | null; planningModelId?: string | null; thinkingLevel?: string | null; error?: string | null; summary?: string | null; sessionFile?: string | null; executionStartedAt?: string | null; executionCompletedAt?: string | null; review?: import("./types.js").TaskReview | null; reviewState?: import("./types.js").TaskReviewState | null; workflowStepResults?: import("./types.js").WorkflowStepResult[] | null; mergeDetails?: import("./types.js").MergeDetails | null; sourceIssue?: import("./types.js").TaskSourceIssue | null; githubTracking?: import("./types.js").TaskGithubTracking | null; tokenUsage?: import("./types.js").TaskTokenUsage | null; modifiedFiles?: string[] | null; missionId?: string | null; sliceId?: string | null },
     runContext?: RunMutationContext,
   ): Promise<Task> {
     return this.withTaskLock(id, async () => {
@@ -3700,6 +3798,16 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         task.assigneeUserId = undefined;
       } else if (updates.assigneeUserId !== undefined) {
         task.assigneeUserId = updates.assigneeUserId;
+      }
+      if (updates.scopeOverride === null) {
+        task.scopeOverride = undefined;
+      } else if (updates.scopeOverride !== undefined) {
+        task.scopeOverride = updates.scopeOverride || undefined;
+      }
+      if (updates.scopeOverrideReason === null) {
+        task.scopeOverrideReason = undefined;
+      } else if (updates.scopeOverrideReason !== undefined) {
+        task.scopeOverrideReason = updates.scopeOverrideReason;
       }
       if (updates.nodeId === null) {
         task.nodeId = undefined;
@@ -5180,7 +5288,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     // Populate cache with current state. The watcher only needs metadata to
     // detect created/updated/moved/deleted events; full task logs stay on the
     // detail path.
-    const tasks = await this.listTasks({ slim: true, startupMemo: true });
+    const tasks = await this.listTasks({ slim: true, startupMemo: false });
     this.taskCache.clear();
     for (const task of tasks) {
       this.taskCache.set(task.id, { ...task });

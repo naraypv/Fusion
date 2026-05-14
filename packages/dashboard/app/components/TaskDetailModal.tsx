@@ -1,10 +1,11 @@
 import "./TaskDetailModal.css";
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft, Zap } from "lucide-react";
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft, Zap, Loader2 } from "lucide-react";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Task, TaskDetail, TaskAttachment, Column, MergeResult, Settings, GlobalSettings, AgentLogEntry, Agent, TaskPriority, TaskSourceIssue, WorkflowStepResult } from "@fusion/core";
 import {
@@ -43,6 +44,7 @@ import { appendTokenQuery } from "../auth";
 import { extractDependencyDeleteConflict } from "../utils/taskDelete";
 import { computeBlockerFanoutMap } from "../hooks/useBlockerFanout";
 import { resolveEffectiveGithubRepoDefault } from "./githubTracking";
+import { linkifyFilePaths, linkifyReactChildren } from "../utils/filePathLinkify";
 
 interface ModelSelection {
   provider?: string;
@@ -51,7 +53,18 @@ interface ModelSelection {
 
 const ACTIVE_STATUSES = new Set(["planning", "researching", "executing", "finalizing", "merging", "merging-fix"]);
 
-
+const markdownLinkifyComponents: Components = {
+  p: ({ children, ...props }) => <p {...props}>{linkifyReactChildren(children)}</p>,
+  li: ({ children, ...props }) => <li {...props}>{linkifyReactChildren(children)}</li>,
+  code: ({ children, ...props }) => {
+    const text = typeof children === "string" ? children : React.Children.toArray(children).join("");
+    const linkedChildren = linkifyFilePaths(text);
+    if (linkedChildren.length === 1 && typeof linkedChildren[0] === "string") {
+      return <code {...props}>{children}</code>;
+    }
+    return <code {...props}>{linkedChildren}</code>;
+  },
+};
 
 /**
  * Resolve the effective executor model following the engine's resolution order:
@@ -80,6 +93,19 @@ function extractReviewerModelFromLog(entries: AgentLogEntry[]): { provider: stri
     }
   }
   return result;
+}
+
+function hasUsableTrackingTitle(task: { title?: string | null; description?: string | null }): boolean {
+  if ((task.title ?? "").trim().length > 0) {
+    return true;
+  }
+
+  const firstMeaningfulLine = (task.description ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+
+  return Boolean(firstMeaningfulLine);
 }
 
 function extractAssignedRuntimeModel(agent: Agent | null | undefined): ModelSelection {
@@ -202,7 +228,7 @@ function getStepStatusColor(status: string): string {
     case "done":
       return "var(--color-success)";
     case "in-progress":
-      return "var(--todo)";
+      return "var(--in-progress)";
     case "skipped":
       return "var(--text-dim)";
     case "pending":
@@ -453,8 +479,17 @@ export function TaskDetailContent({
   // keeps populating while a task runs after the modal was opened. `log` is
   // stripped to [] in SSE payloads (stripTaskListHeavyFields), so we preserve
   // fullDetail.log to keep the Activity timeline populated.
+  // FN-4161: board/restart flows open the modal from slim task rows where
+  // `githubTracking` is intentionally omitted; preserve the fetched full-detail
+  // tracking blob instead of letting the sparse parent prop overwrite it.
   const workingTask: TaskDetail = fullDetail
-    ? ({ ...fullDetail, ...task, prompt: fullDetail.prompt, log: fullDetail.log } as TaskDetail)
+    ? ({
+      ...fullDetail,
+      ...task,
+      prompt: fullDetail.prompt,
+      log: fullDetail.log,
+      githubTracking: task.githubTracking ?? fullDetail.githubTracking,
+    } as TaskDetail)
     : ({ ...task, prompt: "" } as TaskDetail);
   const canRetryTask =
     task.status === "failed" ||
@@ -586,11 +621,11 @@ export function TaskDetailContent({
     setEditExecutionMode(normalizeExecutionModeValue(task.executionMode));
     setSourceIssueExpanded(false);
     setGithubTrackingExpanded(false);
-    setGithubRepoOverrideDraft(task.githubTracking?.repoOverride ?? "");
+    setGithubRepoOverrideDraft(workingTask.githubTracking?.repoOverride ?? "");
     setGithubTrackingEnabledDraft(null);
     setGithubRepoOverrideError(null);
     setIsEditing(false);
-  }, [task.id, task.title, task.description, task.branch, task.baseBranch, task.sourceIssue, task.executionMode, task.githubTracking]);
+  }, [task.id, task.title, task.description, task.branch, task.baseBranch, task.sourceIssue, task.executionMode, workingTask.githubTracking]);
 
   useEffect(() => {
     setWorkflowEnabledSteps(task.enabledWorkflowSteps || []);
@@ -606,10 +641,10 @@ export function TaskDetailContent({
 
   useEffect(() => {
     if (githubTrackingEnabledDraft === null) return;
-    if ((task.githubTracking?.enabled === true) === githubTrackingEnabledDraft) {
+    if ((workingTask.githubTracking?.enabled === true) === githubTrackingEnabledDraft) {
       setGithubTrackingEnabledDraft(null);
     }
-  }, [githubTrackingEnabledDraft, task.githubTracking?.enabled]);
+  }, [githubTrackingEnabledDraft, workingTask.githubTracking?.enabled]);
 
   // Load merged settings for effective model resolution
   useEffect(() => {
@@ -788,10 +823,24 @@ export function TaskDetailContent({
   // Check if task can be edited
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isSaving;
   const canEditGithubTracking = GITHUB_TRACKING_EDITABLE_COLUMNS.has(task.column) && !isSaving;
-  const githubTrackingEnabled = githubTrackingEnabledDraft ?? (task.githubTracking?.enabled === true);
-  const githubTrackedIssue = task.githubTracking?.issue;
+  const githubTrackingEnabled = githubTrackingEnabledDraft ?? (workingTask.githubTracking?.enabled === true);
+  const githubTrackedIssue = workingTask.githubTracking?.issue;
+  const githubTrackingDetailPending = detailLoading && typeof task.githubTracking === "undefined";
+  const canCreateTrackingIssue = hasUsableTrackingTitle(task);
+  const showInlineGithubTrackingEnableButton =
+    canEditGithubTracking
+    && !githubTrackedIssue
+    && !githubTrackingDetailPending
+    && (!githubTrackingEnabled || (isSavingGithubTracking && workingTask.githubTracking?.enabled !== true));
   const showGithubTrackingSection = canEditGithubTracking || githubTrackingEnabled || Boolean(githubTrackedIssue);
-  const githubTrackingStatus = githubTrackedIssue ? "Linked" : githubTrackingEnabled ? "Enabled" : "Disabled";
+  const githubTrackingStatus = githubTrackingDetailPending
+    ? "Loading"
+    : githubTrackedIssue
+      ? "Linked"
+      : githubTrackingEnabled
+        ? "Enabled"
+        : "Disabled";
+  const showGithubTrackingSpinner = !githubTrackedIssue && (isSavingGithubTracking || githubTrackingDetailPending);
   const effectiveGithubRepoDefault = resolveEffectiveGithubRepoDefault(settings ?? null, globalSettings);
   const githubRepoOverrideTrimmed = githubRepoOverrideDraft.trim();
 
@@ -808,12 +857,12 @@ export function TaskDetailContent({
       }, projectId);
       onTaskUpdated?.(updatedTask);
     } catch (err) {
-      setGithubTrackingEnabledDraft(task.githubTracking?.enabled === true);
+      setGithubTrackingEnabledDraft(workingTask.githubTracking?.enabled === true);
       addToast(`Failed to update ${task.id}: ${getErrorMessage(err)}`, "error");
     } finally {
       if (mountedRef.current) setIsSavingGithubTracking(false);
     }
-  }, [addToast, canEditGithubTracking, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, task.githubTracking?.enabled, task.id]);
+  }, [addToast, canEditGithubTracking, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, workingTask.githubTracking?.enabled, task.id]);
 
   const handleSaveGithubRepoOverride = useCallback(async () => {
     if (!canEditGithubTracking || isSavingGithubTracking) return;
@@ -839,6 +888,10 @@ export function TaskDetailContent({
 
   const handleRetryGithubTrackingIssueCreate = useCallback(async () => {
     if (!githubTrackingEnabled || githubTrackedIssue || isSavingGithubTracking) return;
+    if (!hasUsableTrackingTitle(task)) {
+      addToast("Add a title before creating a tracking issue", "info");
+      return;
+    }
     setIsSavingGithubTracking(true);
     try {
       const updatedTask = await updateTask(task.id, {
@@ -853,7 +906,7 @@ export function TaskDetailContent({
     } finally {
       if (mountedRef.current) setIsSavingGithubTracking(false);
     }
-  }, [addToast, githubTrackedIssue, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, task.id]);
+  }, [addToast, githubTrackedIssue, githubTrackingEnabled, isSavingGithubTracking, onTaskUpdated, projectId, task]);
 
   const enterEditMode = useCallback(() => {
     if (!canEdit) return;
@@ -2297,7 +2350,7 @@ export function TaskDetailContent({
             <div className="detail-section detail-summary">
               <h4>Summary</h4>
               <div className="markdown-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownLinkifyComponents}>
                   {task.summary}
                 </ReactMarkdown>
               </div>
@@ -2387,20 +2440,37 @@ export function TaskDetailContent({
                   </span>
                   {!githubTrackedIssue && (
                     <span className="detail-source-empty">
-                      {githubTrackingEnabled ? "Issue not yet created" : "Tracking is currently disabled"}
+                      {githubTrackingDetailPending
+                        ? "Checking tracking status"
+                        : githubTrackingEnabled
+                          ? "Issue not yet created"
+                          : "Tracking is currently disabled"}
                     </span>
                   )}
                 </div>
-                {canEditGithubTracking && !githubTrackingEnabled && !githubTrackedIssue && !isSavingGithubTracking && (
+                {showInlineGithubTrackingEnableButton && (
                   <button
                     type="button"
-                    className="btn btn-sm btn-primary touch-target detail-github-tracking-enable"
+                    className="btn btn-sm btn-primary detail-github-tracking-enable"
                     aria-label="Enable GitHub tracking"
-                    onClick={() => void handleToggleGithubTracking()}
                     disabled={isSavingGithubTracking}
+                    onClick={() => void handleToggleGithubTracking()}
                   >
-                    Enable GitHub tracking
+                    Enable
                   </button>
+                )}
+                {showGithubTrackingSpinner && (
+                  <span
+                    className="detail-github-tracking-spinner"
+                    role="status"
+                    aria-live="polite"
+                    aria-label={isSavingGithubTracking ? "Enabling GitHub tracking" : "Loading GitHub tracking status"}
+                  >
+                    <Loader2 size={16} className="spin" aria-hidden="true" />
+                    <span className="visually-hidden">
+                      {isSavingGithubTracking ? "Enabling GitHub tracking…" : "Loading GitHub tracking status…"}
+                    </span>
+                  </span>
                 )}
                 <button
                   type="button"
@@ -2443,9 +2513,19 @@ export function TaskDetailContent({
                   )}
                   <div className="detail-github-tracking-controls">
                     {!githubTrackedIssue && githubTrackingEnabled && (
-                      <button className="btn btn-sm touch-target" onClick={() => void handleRetryGithubTrackingIssueCreate()} disabled={isSavingGithubTracking}>
-                        Create tracking issue
-                      </button>
+                      <>
+                        <button
+                          className="btn btn-sm touch-target"
+                          onClick={() => void handleRetryGithubTrackingIssueCreate()}
+                          disabled={isSavingGithubTracking || !canCreateTrackingIssue}
+                          title={!canCreateTrackingIssue ? "Add a title or description so a tracking issue can be created." : undefined}
+                        >
+                          Create tracking issue
+                        </button>
+                        {!canCreateTrackingIssue && (
+                          <small className="detail-github-tracking-helper">Tracking issue will be created once this task has a title or description to summarize.</small>
+                        )}
+                      </>
                     )}
                     {canEditGithubTracking && (
                       <>
@@ -2643,7 +2723,7 @@ export function TaskDetailContent({
               <div className="spec-loading">Loading specification…</div>
             ) : workingTask.prompt ? (
               <div className="markdown-body">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownLinkifyComponents}>
                   {workingTask.prompt.replace(/^#\s+[^\n]*\n+/, "")}
                 </ReactMarkdown>
               </div>

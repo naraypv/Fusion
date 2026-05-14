@@ -8,6 +8,74 @@
 - Startup/store-open allocator reconciliation bumps each active prefix sequence to `max(current nextSequence, max(tasks suffix)+1, max(archivedTasks suffix)+1, max(reservation sequence)+1)` so stale allocator rows self-heal before local task creation resumes.
 - Create-class task persistence is intentionally non-destructive: new tasks use plain `INSERT` semantics, while `ON CONFLICT(id) DO UPDATE` remains update-only. If counters drift and a reserved ID still collides, the create fails and the existing SQLite row / task directory stays intact.
 
+### Task-ID integrity detection
+
+Fusion runs a read-only task-ID integrity detector at startup and on demand to surface allocator regressions before operators lose track of overwritten cards. The detector checks for:
+
+- duplicate task IDs inside `tasks`
+- task IDs that exist in both `tasks` and `archivedTasks`
+- `distributed_task_id_state.nextSequence` values that point at or below an already-used numeric suffix
+- committed reservation rows that still reference existing task IDs
+- active task rows whose prefix falls outside the prefixes declared in `distributed_task_id_state`
+
+The latest report is exposed in two operator-facing places:
+
+- `GET /api/health` returns a `taskIdIntegrity` object with `status`, `checkedAt`, `anomalies`, and a `recommendedAction` string. When anomalies are present, the top-level health `status` becomes `"degraded"` even if the SQLite integrity check is still healthy.
+- The dashboard renders a non-dismissible task-ID integrity banner for anomalous reports so the operator sees the issue in the same session.
+
+### Operator playbook
+
+When the detector reports an anomaly:
+
+1. Pause task delegation and avoid creating new tasks until the state is understood.
+2. Inspect the affected task IDs in the dashboard/database and confirm whether any live task content or archived records mismatched their IDs.
+3. If the historical allocator audit script is available in your checkout, run it before resuming normal task creation.
+
+### Detecting historical task-ID overwrites
+
+If allocator state drifted before the current guards landed, historical task records may still contain overwrite evidence. Run the audit script from the project root:
+
+```bash
+node scripts/audit-task-id-collisions.mjs [--project-root /path/to/project]
+```
+
+The script checks for:
+- `task.json.history` timestamps older than the active DB row's `createdAt`
+- task-title mismatches between SQLite and the first `#` heading in `PROMPT.md`
+- task-title mismatches against the latest `Fusion-Task-Id` commit subject on `main`
+- active tasks that share an ID with an `archivedTasks` row
+
+Treat flagged candidates as recovery leads, not automatic truth: review the surviving task files, logs, and commit history, then file a follow-up recovery task for any confirmed overwrite.
+
+### Reconciling stale task title/description vs canonical PROMPT.md
+
+Use the one-shot reconciliation script only when the surviving evidence agrees on a single canonical task identity and the ambiguity is limited to stale metadata fields on that same task row:
+
+```bash
+node scripts/reconcile-fn-3909-identity.mjs [--project-root /path/to/project] [--apply]
+```
+
+The script is intentionally narrow and idempotent:
+- dry-run is the default and prints the before/after title + description diff without mutating anything
+- `--apply` only updates task `FN-3909` through `TaskStore.updateTask(...)` and appends an audit log entry referencing `FN-4194`
+- the script refuses to run if `PROMPT.md` no longer matches the expected canonical heading, if the stale heartbeat-scope row contents are not present, or if the row is already canonical without the reconciliation marker
+
+Use this path for the confirmed FN-3909 mismatch (canonical UI-fix prompt/merge history, stale heartbeat-scope title/description). Do **not** use it for allocator-collision or overwrite incidents that may involve multiple tasks or conflicting survivors; run `scripts/audit-task-id-collisions.mjs` first and treat those cases as recovery/postmortem work instead of automatic metadata repair.
+
+### Forensic / historical-task reconciliation: where to read from
+
+For any audit/forensic/reconciliation task that targets another task ID (for example FN-4194 reconciling FN-3909), source-of-truth locations are always at the project root:
+
+- On-disk task artifacts: `<rootDir>/.fusion/tasks/{ID}/` (`task.json`, `PROMPT.md`, `attachments/`, agent logs)
+- Task database row: `<rootDir>/.fusion/fusion.db` (SQLite in WAL mode)
+
+Important execution nuance:
+
+- `.fusion/` is gitignored, so worktrees branched from `main` do not contain other tasks' artifact directories or the live DB file.
+- The running worktree's own `.fusion/` (when present) is scratch/session state for the running task only; do not treat it as authoritative evidence for historical tasks.
+- Triage spec writers inject this guidance via `TRIAGE_SYSTEM_PROMPT` and `FAST_TRIAGE_SYSTEM_PROMPT` in `packages/engine/src/triage.ts`.
+- Executor-side path normalization remains consistent with this rule through `scopePromptToWorktree` in `packages/engine/src/step-session-executor.ts`, which rewrites accidental worktree-local `.fusion` references back to project-root `.fusion` paths.
+
 ## SQLite write-path lock recovery (FN-4042 / FN-4083)
 
 - Every disk-backed SQLite connection that Fusion opens for project storage (`fusion.db`), the central registry (`fusion-central.db`), archives (`archive.db`), and worktree hydration explicitly sets `PRAGMA busy_timeout = 5000` and `PRAGMA journal_mode = WAL` at connection open time before write work begins.

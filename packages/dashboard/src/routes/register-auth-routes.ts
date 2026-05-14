@@ -338,6 +338,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
    */
   router.get("/auth/status", async (req, res) => {
     try {
+      const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
       const storage = getAuthStorage();
       storage.reload();
       const oauthProviders = storage.getOAuthProviders();
@@ -354,6 +355,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
         lastLoginResult?: SafeAddAccountResult;
         loginInstructions?: string;
         manualCode?: ManualCodeConfig;
+        requiresManualCode?: boolean;
       }[] = oauthProviders.map((p) => ({
         ...withAccountStatus(storage, {
           id: p.id,
@@ -361,6 +363,7 @@ export const registerAuthRoutes: ApiRouteRegistrar = (ctx) => {
           authenticated: storage.hasAuth(p.id) && !isExpiredOauthCredential(p.id, storage),
           type: "oauth" as const,
           loginInProgress: loginInProgress.has(p.id),
+          requiresManualCode: getManualCodeConfig(p.id, origin) !== undefined || undefined,
         }),
       }));
 

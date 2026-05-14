@@ -28,14 +28,31 @@ function makeTmpDir(): string {
   return dir;
 }
 
+async function removeTrackedTmpDir(dir: string | undefined): Promise<void> {
+  if (!dir) return;
+  try {
+    await rm(dir, { recursive: true, force: true });
+  } catch {
+    rmSync(dir, { recursive: true, force: true });
+  } finally {
+    createdTmpDirs.delete(dir);
+  }
+}
+
 async function cleanupTmpDirsAsync(): Promise<void> {
   const cleanup = Array.from(createdTmpDirs);
-  await Promise.all(
-    cleanup.map(async (dir) => {
-      await rm(dir, { recursive: true, force: true });
-      createdTmpDirs.delete(dir);
-    }),
-  );
+  await Promise.all(cleanup.map((dir) => removeTrackedTmpDir(dir)));
+}
+
+function removeTrackedTmpDirSync(dir: string | undefined): void {
+  if (!dir) return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best-effort fallback during teardown
+  } finally {
+    createdTmpDirs.delete(dir);
+  }
 }
 
 function cleanupTmpDirsSync(): void {
@@ -362,7 +379,7 @@ describe("Database", () => {
         expect(freshDb.integrityCheckLastRunAt).toBeTruthy();
       } finally {
         freshDb.close();
-        rmSync(freshDir, { recursive: true, force: true });
+        removeTrackedTmpDirSync(freshDir);
         integritySpy.mockRestore();
         vi.useRealTimers();
       }
@@ -385,7 +402,7 @@ describe("Database", () => {
         expect(integritySpy).toHaveBeenCalledTimes(1);
       } finally {
         freshDb.close();
-        rmSync(freshDir, { recursive: true, force: true });
+        removeTrackedTmpDirSync(freshDir);
         integritySpy.mockRestore();
         vi.useRealTimers();
       }
@@ -418,7 +435,7 @@ describe("Database", () => {
       } finally {
         dbA.close();
         dbB.close();
-        rmSync(freshDir, { recursive: true, force: true });
+        removeTrackedTmpDirSync(freshDir);
         integritySpy.mockRestore();
         vi.useRealTimers();
       }
@@ -451,7 +468,7 @@ describe("Database", () => {
       } finally {
         dbA.close();
         dbB.close();
-        rmSync(freshDir, { recursive: true, force: true });
+        removeTrackedTmpDirSync(freshDir);
         integritySpy.mockRestore();
         vi.useRealTimers();
       }
@@ -1269,7 +1286,7 @@ describe("schema migrations", () => {
   let tmpDir: string;
 
   afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
+    await removeTrackedTmpDir(tmpDir);
   });
 
   it("migrates a v1 database by adding missing columns", () => {
@@ -2196,7 +2213,7 @@ describe("FTS5 full-text search", () => {
     } catch {
       // already closed
     }
-    await rm(tmpDir, { recursive: true, force: true });
+    await removeTrackedTmpDir(tmpDir);
   });
 
   it("creates tasks_fts virtual table after init", () => {
@@ -2409,7 +2426,7 @@ describe("Database FTS5 guard behavior", () => {
       expect(localDb.rebuildFts5Index()).toBe(false);
     } finally {
       localDb.close();
-      await rm(tmpDir, { recursive: true, force: true });
+      await removeTrackedTmpDir(tmpDir);
       if (prevEnv === undefined) {
         delete process.env.FUSION_DISABLE_FTS5;
       } else {
@@ -2423,7 +2440,7 @@ describe("createDatabase factory", () => {
   let tmpDir: string;
 
   afterEach(async () => {
-    await rm(tmpDir, { recursive: true, force: true });
+    await removeTrackedTmpDir(tmpDir);
   });
 
   it("creates a database instance without auto-init", () => {
@@ -2564,40 +2581,62 @@ describe("migration v67 drops orphan project auth tables", () => {
     const temp = makeTmpDir();
     const fusion = join(temp, ".fusion");
     const localDb = new Database(fusion);
-    localDb.init();
-    // Simulate a user who ran the old migration 63 (schema version 63–66) and
-    // therefore has the orphan project_auth_* tables sitting in their DB. We
-    // recreate them by hand and roll the schemaVersion back so the new
-    // migration runs on the next init.
-    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_users (id TEXT PRIMARY KEY)`);
-    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_memberships (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
-    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_providers (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
-    localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_sessions (id TEXT PRIMARY KEY, userId TEXT, membershipId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE, FOREIGN KEY (membershipId) REFERENCES project_auth_memberships(id) ON DELETE CASCADE)`);
-    localDb.prepare("UPDATE __meta SET value = '66' WHERE key = 'schemaVersion'").run();
-    localDb.close();
+    let migrated: Database | undefined;
 
-    const migrated = new Database(fusion);
-    migrated.init();
-    expect(migrated.getSchemaVersion()).toBe(72);
-    const tables = migrated
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
-      .all() as Array<{ name: string }>;
-    expect(tables).toEqual([]);
-    migrated.close();
-    rmSync(temp, { recursive: true, force: true });
+    try {
+      localDb.init();
+      // Simulate a user who ran the old migration 63 (schema version 63–66) and
+      // therefore has the orphan project_auth_* tables sitting in their DB. We
+      // recreate them by hand and roll the schemaVersion back so the new
+      // migration runs on the next init.
+      localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_users (id TEXT PRIMARY KEY)`);
+      localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_memberships (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
+      localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_providers (id TEXT PRIMARY KEY, userId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE)`);
+      localDb.exec(`CREATE TABLE IF NOT EXISTS project_auth_sessions (id TEXT PRIMARY KEY, userId TEXT, membershipId TEXT, FOREIGN KEY (userId) REFERENCES project_auth_users(id) ON DELETE CASCADE, FOREIGN KEY (membershipId) REFERENCES project_auth_memberships(id) ON DELETE CASCADE)`);
+      localDb.prepare("UPDATE __meta SET value = '66' WHERE key = 'schemaVersion'").run();
+      localDb.close();
+
+      migrated = new Database(fusion);
+      migrated.init();
+      expect(migrated.getSchemaVersion()).toBe(72);
+      const tables = migrated
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
+        .all() as Array<{ name: string }>;
+      expect(tables).toEqual([]);
+    } finally {
+      try {
+        migrated?.close();
+      } catch {
+        // already closed
+      }
+      try {
+        localDb.close();
+      } catch {
+        // already closed
+      }
+      removeTrackedTmpDirSync(temp);
+    }
   });
 
   it("is a no-op on fresh DBs that never had the auth tables", () => {
     const temp = makeTmpDir();
     const fusion = join(temp, ".fusion");
     const fresh = new Database(fusion);
-    fresh.init();
-    expect(fresh.getSchemaVersion()).toBe(72);
-    const tables = fresh
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
-      .all() as Array<{ name: string }>;
-    expect(tables).toEqual([]);
-    fresh.close();
-    rmSync(temp, { recursive: true, force: true });
+
+    try {
+      fresh.init();
+      expect(fresh.getSchemaVersion()).toBe(72);
+      const tables = fresh
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'project_auth_%'")
+        .all() as Array<{ name: string }>;
+      expect(tables).toEqual([]);
+    } finally {
+      try {
+        fresh.close();
+      } catch {
+        // already closed
+      }
+      removeTrackedTmpDirSync(temp);
+    }
   });
 });

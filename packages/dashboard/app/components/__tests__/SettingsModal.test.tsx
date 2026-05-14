@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { ComponentProps } from "react";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsModal } from "../SettingsModal";
@@ -59,6 +60,7 @@ const mockSetDroidCliEnabled = vi.fn();
 const mockFetchCursorCliStatus = vi.fn();
 const mockSetCursorCliEnabled = vi.fn();
 const mockUseWorkspaceFileBrowser = vi.fn();
+const mockConfirm = vi.fn();
 
 vi.mock("../../api", async (importOriginal) => {
   const { createDashboardApiMock } = await import("../../test/mockApi");
@@ -129,6 +131,10 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: (...args: unknown[]) => mockUseMobileKeyboard(...args),
 }));
 
+vi.mock("../../hooks/useConfirm", () => ({
+  useConfirm: () => ({ confirm: (...args: unknown[]) => mockConfirm(...args) }),
+}));
+
 vi.mock("../../hooks/useViewportMode", () => ({
   useViewportMode: () => "mobile",
 }));
@@ -176,11 +182,14 @@ const defaultSettings = {
   overlapIgnorePaths: [],
   autoMerge: true,
   mergeStrategy: "direct",
+  directMergeCommitStrategy: "auto",
   pushAfterMerge: false,
   pushRemote: "origin",
   verificationFixRetries: 2,
   workflowRevisionForkOnScopeMismatch: true,
   recycleWorktrees: false,
+  ephemeralAgentsEnabled: true,
+  executorAllowSiblingBranchRename: false,
   worktreeNaming: "random",
   includeTaskIdInCommit: true,
   worktreeInitCommand: "",
@@ -193,11 +202,12 @@ const defaultSettings = {
   webhookEvents: undefined,
 };
 
-function renderModal(props = {}) {
+function renderModal(props: Partial<ComponentProps<typeof SettingsModal>> = {}) {
   return render(
     <SettingsModal
       onClose={noop}
       addToast={noop}
+      initialSection="authentication"
       {...props}
     />
   );
@@ -240,12 +250,78 @@ describe("SettingsModal", () => {
     const authenticationHeading = screen.getByRole("heading", { name: "Authentication" });
     expect(authenticationHeading).toHaveClass("settings-section-heading");
 
-    await userEvent.click(screen.getAllByRole("button", { name: /^General$/ })[0]);
+    await userEvent.click(screen.getByRole("button", { name: /^General$/ }));
 
     const generalHeading = screen.getByRole("heading", { name: "General" });
     expect(generalHeading).toHaveClass("settings-section-heading");
     expect(container.querySelectorAll(".settings-section-heading").length).toBeGreaterThan(0);
   });
+
+  it("defaults to the global General section when no initialSection is provided", async () => {
+    render(
+      <SettingsModal
+        onClose={noop}
+        addToast={noop}
+      />,
+    );
+    await waitForSettingsModalReady();
+
+    const generalNavButton = screen.getByRole("button", { name: /^General$/ });
+    expect(generalNavButton).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Authentication$/ })).not.toHaveClass("active");
+  });
+
+  it("honors an explicit initialSection override", async () => {
+    renderModal({ initialSection: "authentication" });
+    await waitForSettingsModalReady();
+
+    expect(screen.getByRole("button", { name: /^Authentication$/ })).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+  });
+
+  it("maps the legacy pi-extensions initialSection alias to Plugins", async () => {
+    renderModal({ initialSection: "pi-extensions" });
+    await waitForSettingsModalReady();
+
+    expect(screen.getByRole("button", { name: /^Plugins$/ })).toHaveClass("active");
+    expect(screen.getByRole("heading", { name: "Plugins" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pi Extensions" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByTestId("pi-extensions-manager")).toBeInTheDocument();
+  });
+
+  it("shows direct merge commit routing only for direct merges", async () => {
+    renderModal();
+    await waitForSettingsModalReady();
+
+    await userEvent.click(screen.getByRole("button", { name: /^Merge$/ }));
+    expect(screen.getByLabelText("Direct merge commit routing")).toHaveValue("auto");
+
+    await userEvent.selectOptions(screen.getByLabelText("Auto-completion mode"), "pull-request");
+    expect(screen.queryByLabelText("Direct merge commit routing")).not.toBeInTheDocument();
+  });
+
+  it("persists the legacy sibling branch rename escape hatch in worktree settings", async () => {
+    renderModal();
+    await waitForSettingsModalReady();
+
+    await userEvent.click(screen.getByRole("button", { name: /^Worktrees$/ }));
+
+    const checkbox = screen.getByRole("checkbox", { name: "Allow silent sibling branch rename during executor conflicts" });
+    expect(checkbox).not.toBeChecked();
+
+    await userEvent.click(checkbox);
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(mockUpdateSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ executorAllowSiblingBranchRename: true }),
+        undefined,
+      );
+    });
+    expect(screen.getByText(/restores the legacy behavior/i)).toBeInTheDocument();
+  });
+
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -272,6 +348,7 @@ describe("SettingsModal", () => {
     mockFetchSettings.mockResolvedValue(defaultSettings);
     mockFetchSettingsByScope.mockResolvedValue({ global: defaultSettings, project: {} });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
+    mockConfirm.mockResolvedValue(true);
     mockFetchModels.mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] });
     mockFetchCustomProviders.mockResolvedValue({ providers: [] });
     mockCreateCustomProvider.mockResolvedValue({ provider: {} });
@@ -519,14 +596,15 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("checkbox", { name: "Save tool output in agent logs" })).not.toBeChecked();
     });
 
-    it("defaults persistAgentThinkingLog checkbox to unchecked", async () => {
+    it("defaults thinking-log checkboxes to unchecked", async () => {
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
 
-      expect(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" })).not.toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking for permanent agents" })).not.toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking for ephemeral / task-worker agents" })).not.toBeChecked();
     });
 
-    it("reflects persisted checked thinking-log value from global settings", async () => {
+    it("falls back to legacy thinking-log flag when granular fields are unset", async () => {
       mockFetchSettings.mockResolvedValue({
         ...defaultSettings,
         persistAgentThinkingLog: true,
@@ -539,7 +617,8 @@ describe("SettingsModal", () => {
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
 
-      expect(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking for permanent agents" })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Save AI thinking for ephemeral / task-worker agents" })).toBeChecked();
     });
 
     it("saves persistAgentToolOutput only via global settings payload", async () => {
@@ -561,11 +640,12 @@ describe("SettingsModal", () => {
       }
     });
 
-    it("saves persistAgentThinkingLog only via global settings payload", async () => {
+    it("saves granular thinking-log flags only via global settings payload", async () => {
       renderModal({ initialSection: "global-general" });
       await waitForSettingsModalReady();
 
-      await userEvent.click(screen.getByRole("checkbox", { name: "Save AI thinking/reasoning in agent logs" }));
+      await userEvent.click(screen.getByRole("checkbox", { name: "Save AI thinking for permanent agents" }));
+      await userEvent.click(screen.getByRole("checkbox", { name: "Save AI thinking for ephemeral / task-worker agents" }));
       await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
       await waitFor(() => {
@@ -573,9 +653,13 @@ describe("SettingsModal", () => {
       });
 
       const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
-      expect(globalPayload.persistAgentThinkingLog).toBe(true);
+      expect(globalPayload.persistAgentThinkingLogPermanent).toBe(true);
+      expect(globalPayload.persistAgentThinkingLogEphemeral).toBe(true);
+      expect(globalPayload.persistAgentThinkingLog).toBeUndefined();
       if (mockUpdateSettings.mock.calls.length > 0) {
         const projectPayload = mockUpdateSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(projectPayload.persistAgentThinkingLogPermanent).toBeUndefined();
+        expect(projectPayload.persistAgentThinkingLogEphemeral).toBeUndefined();
         expect(projectPayload.persistAgentThinkingLog).toBeUndefined();
       }
     });
@@ -643,6 +727,114 @@ describe("SettingsModal", () => {
         const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
         expect(globalPayload.completionDocumentationMode).toBeUndefined();
       }
+    });
+
+    it("saves ephemeral agent toggle in project settings payload", async () => {
+      renderModal({ initialSection: "general" });
+      await waitForSettingsModalReady();
+
+      const ephemeralToggle = screen.getByLabelText("Use ephemeral task-worker agents") as HTMLInputElement;
+      expect(ephemeralToggle.checked).toBe(true);
+
+      await userEvent.click(ephemeralToggle);
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalled();
+      });
+
+      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+      expect(payload.ephemeralAgentsEnabled).toBe(false);
+    });
+
+    it("renders and saves GitHub tracking controls in the General section", async () => {
+      renderModal({ initialSection: "general" });
+      await waitForSettingsModalReady();
+
+      expect(screen.getByRole("heading", { name: "GitHub Tracking" })).toBeInTheDocument();
+
+      const modeSelect = screen.getByLabelText("Default tracking mode for new tasks") as HTMLSelectElement;
+      const repoInput = screen.getByLabelText("Project default tracking repo") as HTMLInputElement;
+      expect(modeSelect.value).toBe("off");
+      expect(repoInput.value).toBe("");
+
+      await userEvent.selectOptions(modeSelect, "new-tasks");
+      await userEvent.type(repoInput, "octo/repo");
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalled();
+      });
+
+      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+      expect(payload.githubTrackingEnabledByDefault).toBe(true);
+      expect(payload.githubTrackingDefaultRepo).toBe("octo/repo");
+
+      if (mockUpdateGlobalSettings.mock.calls.length > 0) {
+        const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(globalPayload.githubTrackingDefaultRepo).toBeUndefined();
+      }
+    });
+
+    it("saves GitHub tracking defaults as disabled and clears the repo when emptied", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        githubTrackingEnabledByDefault: true,
+        githubTrackingDefaultRepo: "octo/existing",
+      });
+
+      renderModal({ initialSection: "general" });
+      await waitForSettingsModalReady();
+
+      const modeSelect = screen.getByLabelText("Default tracking mode for new tasks") as HTMLSelectElement;
+      const repoInput = screen.getByLabelText("Project default tracking repo") as HTMLInputElement;
+
+      expect(modeSelect.value).toBe("new-tasks");
+      expect(repoInput.value).toBe("octo/existing");
+
+      await userEvent.selectOptions(modeSelect, "off");
+      await userEvent.clear(repoInput);
+      await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalled();
+      });
+
+      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
+      expect(payload.githubTrackingEnabledByDefault).toBe(false);
+      expect(payload.githubTrackingDefaultRepo).toBeUndefined();
+    });
+
+    it("hides summarization model picker when summarization and default tracking are disabled", async () => {
+      renderModal({ initialSection: "models" });
+      await waitForSettingsModalReady();
+
+      await userEvent.click(screen.getByRole("button", { name: "Project Models" }));
+
+      expect(screen.queryByText("Title, commit message, and GitHub tracking issue summarization model")).not.toBeInTheDocument();
+    });
+
+    it("shows summarization model picker for GitHub tracking defaults", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        githubTrackingEnabledByDefault: true,
+      });
+
+      renderModal({ initialSection: "models" });
+      await waitForSettingsModalReady();
+
+      await userEvent.click(screen.getByRole("button", { name: "Project Models" }));
+
+      expect(screen.getByText("Title, commit message, and GitHub tracking issue summarization model")).toBeInTheDocument();
+    });
+
+    it("always shows GitHub tracking summarization helper copy", async () => {
+      renderModal({ initialSection: "general" });
+      await waitForSettingsModalReady();
+
+      expect(
+        screen.getByText(/Tracking issues use this task's title\. If a task has no title yet, Fusion can summarize its description using the title summarization model in Project Models\./),
+      ).toBeInTheDocument();
     });
   });
 
@@ -1158,6 +1350,71 @@ describe("SettingsModal", () => {
         expect(scrollToSpy).toHaveBeenCalledWith({ top: 0, behavior: "smooth" });
       });
       expect(openSpy).toHaveBeenCalled();
+    });
+
+    it("warns before starting manual-code oauth login and stops when cancelled", async () => {
+      vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth", requiresManualCode: true }],
+      });
+      mockConfirm.mockResolvedValueOnce(false);
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
+
+      await waitFor(() => {
+        expect(mockConfirm).toHaveBeenCalledWith({
+          title: "Heads up — manual paste-back required",
+          message:
+            "After you sign in with Anthropic, the browser will try to redirect to a localhost address that this dashboard can't reach. The redirect tab will look like it failed. Before that happens, copy the full URL from the browser address bar — you'll paste it back here to finish login. Continue?",
+          confirmLabel: "Continue to login",
+          cancelLabel: "Cancel",
+        });
+      });
+      expect(mockLoginProvider).not.toHaveBeenCalled();
+    });
+
+    it("continues manual-code oauth login after confirmation", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "anthropic", name: "Anthropic", authenticated: false, type: "oauth", requiresManualCode: true }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({ url: "https://claude.ai/oauth/authorize" });
+      mockConfirm.mockResolvedValueOnce(true);
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const anthropicCard = screen.getByTestId("auth-provider-icon-anthropic").closest(".auth-provider-card") as HTMLElement;
+      await userEvent.click(within(anthropicCard).getByRole("button", { name: "Login" }));
+
+      await waitFor(() => {
+        expect(mockConfirm).toHaveBeenCalled();
+        expect(mockLoginProvider).toHaveBeenCalledWith("anthropic");
+        expect(openSpy).toHaveBeenCalledWith("https://claude.ai/oauth/authorize", "_blank");
+      });
+    });
+
+    it("skips the warning for oauth providers without manual-code fallback", async () => {
+      const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+      mockFetchAuthStatus.mockResolvedValueOnce({
+        providers: [{ id: "github", name: "GitHub", authenticated: false, type: "oauth" }],
+      });
+      mockLoginProvider.mockResolvedValueOnce({ url: "https://example.com/auth" });
+
+      renderModal();
+      await waitForSettingsModalReady();
+
+      await userEvent.click(screen.getByRole("button", { name: "Login" }));
+
+      await waitFor(() => {
+        expect(mockConfirm).not.toHaveBeenCalled();
+        expect(mockLoginProvider).toHaveBeenCalledWith("github");
+        expect(openSpy).toHaveBeenCalledWith("https://example.com/auth", "_blank");
+      });
     });
 
     it("renders Anthropic pasted-code form when login response includes manualCode", async () => {
@@ -2105,20 +2362,18 @@ describe("SettingsModal", () => {
       });
     });
 
-    it("renders and saves github issue tracking controls", async () => {
+    it("keeps GitHub tracking controls out of Merge and preserves GitHub authentication controls", async () => {
       renderModal({ initialSection: "merge" });
       await waitForSettingsModalReady();
 
-      expect(screen.getByRole("heading", { name: "GitHub Issue Tracking" })).toBeInTheDocument();
-      expect(screen.getByRole("checkbox", { name: "Default GitHub tracking ON for new tasks" })).not.toBeChecked();
-      expect(screen.getByLabelText("Project default tracking repo")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Default tracking mode for new tasks")).not.toBeInTheDocument();
+      expect(screen.queryByLabelText("Project default tracking repo")).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "GitHub Authentication" })).toBeInTheDocument();
 
       const authModeSelect = screen.getByLabelText("GitHub auth mode") as HTMLSelectElement;
       expect(authModeSelect.value).toBe("gh-cli");
       expect(screen.queryByLabelText("GitHub personal access token")).not.toBeInTheDocument();
 
-      await userEvent.click(screen.getByRole("checkbox", { name: "Default GitHub tracking ON for new tasks" }));
-      await userEvent.type(screen.getByLabelText("Project default tracking repo"), "octo/repo");
       await userEvent.selectOptions(authModeSelect, "token");
       await userEvent.type(screen.getByLabelText("GitHub personal access token"), "ghp_test_token");
       await userEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -2128,15 +2383,8 @@ describe("SettingsModal", () => {
       });
 
       const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
-      expect(payload.githubTrackingEnabledByDefault).toBe(true);
-      expect(payload.githubTrackingDefaultRepo).toBe("octo/repo");
       expect(payload.githubAuthMode).toBe("token");
       expect(payload.githubAuthToken).toBe("ghp_test_token");
-
-      if (mockUpdateGlobalSettings.mock.calls.length > 0) {
-        const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
-        expect(globalPayload.githubTrackingDefaultRepo).toBeUndefined();
-      }
     });
   });
 
@@ -2265,7 +2513,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Remote Access/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
 
       it("hides research settings nav items when experimentalFeatures.researchView is disabled", async () => {
@@ -2304,7 +2552,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Research Defaults/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
 
       it("hides scheduled evals nav item when experimentalFeatures.evalsView is disabled", async () => {
@@ -2341,7 +2589,7 @@ describe("SettingsModal", () => {
         await waitForSettingsModalReady();
 
         expect(screen.queryByRole("button", { name: /Scheduled Evals/i })).not.toBeInTheDocument();
-        expect(screen.getByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+        expect(screen.getByRole("heading", { name: "General" })).toBeInTheDocument();
       });
     });
 
@@ -3004,7 +3252,7 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("Access token (optional)")).toBeInTheDocument();
     });
 
-    it("shows fallback, dreams, and mailbox message events for both providers", async () => {
+    it("shows fallback, dreams, and mailbox/room message events for both providers", async () => {
       mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
       renderModal();
       await waitForSettingsModalReady();
@@ -3014,16 +3262,20 @@ describe("SettingsModal", () => {
       expect(screen.getByLabelText("DREAMS.md entry added")).toBeInTheDocument();
       const agentToUserNtfy = screen.getByLabelText("Agent → user message") as HTMLInputElement;
       const agentToAgentNtfy = screen.getByLabelText("Agent → agent message") as HTMLInputElement;
+      const roomMessageNtfy = screen.getByLabelText("Agent message in room") as HTMLInputElement;
       expect(agentToUserNtfy.checked).toBe(true);
       expect(agentToAgentNtfy.checked).toBe(true);
+      expect(roomMessageNtfy.checked).toBe(true);
 
       await userEvent.click(screen.getByLabelText("Webhook notifications"));
       expect(screen.getAllByLabelText("Fallback model used (recovered)").length).toBeGreaterThan(0);
       expect(screen.getAllByLabelText("DREAMS.md entry added").length).toBeGreaterThan(0);
       const [agentToUserWebhook] = screen.getAllByLabelText("Agent → user message") as HTMLInputElement[];
       const [agentToAgentWebhook] = screen.getAllByLabelText("Agent → agent message") as HTMLInputElement[];
+      const [roomMessageWebhook] = screen.getAllByLabelText("Agent message in room") as HTMLInputElement[];
       expect(agentToUserWebhook.checked).toBe(true);
       expect(agentToAgentWebhook.checked).toBe(true);
+      expect(roomMessageWebhook.checked).toBe(true);
     });
 
     it("shows webhook fields when webhook provider is enabled", async () => {
@@ -3103,7 +3355,7 @@ describe("SettingsModal", () => {
       await waitForSettingsModalReady();
       await openNotificationsSection();
 
-      await userEvent.click(screen.getByRole("button", { name: /Test message notification/ }));
+      await userEvent.click(screen.getByRole("button", { name: /Test message inbox/ }));
 
       await waitFor(() => {
         expect(mockTestNotification).toHaveBeenCalledWith(
@@ -3113,11 +3365,50 @@ describe("SettingsModal", () => {
         );
       });
       expect(addToast).toHaveBeenCalledWith(
-        "Test notification sent — check your ntfy app inbox!",
+        "Message inbox test sent — check your ntfy inbox for the agent-to-user message.",
         "success",
       );
-      expect(screen.getByText("Test notification sent — check your ntfy app inbox!")).toBeInTheDocument();
-      expect(screen.getAllByText("Test notification sent — check your ntfy app inbox!")[0].closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
+      expect(screen.getByText("Message inbox: Message inbox test sent — check your ntfy inbox for the agent-to-user message.")).toBeInTheDocument();
+      expect(screen.getByText("Message inbox: Message inbox test sent — check your ntfy inbox for the agent-to-user message.").closest(".notification-test-feedback")).toHaveAttribute("aria-live", "polite");
+    });
+
+    it("calls testNotification with ntfy room-event config when room test button clicked", async () => {
+      const addToast = vi.fn();
+      mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
+      renderModal({ addToast });
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+
+      await userEvent.click(screen.getByRole("button", { name: /Test room reply/ }));
+
+      await waitFor(() => {
+        expect(mockTestNotification).toHaveBeenCalledWith(
+          "ntfy",
+          { messageEventType: "message:room" },
+          undefined,
+        );
+      });
+      expect(addToast).toHaveBeenCalledWith(
+        "Room reply test sent — check your ntfy inbox for the room reply.",
+        "success",
+      );
+      expect(screen.getByText("Room reply: Room reply test sent — check your ntfy inbox for the room reply.")).toBeInTheDocument();
+    });
+
+    it("shows ntfy room-specific failure copy when room test fails", async () => {
+      const addToast = vi.fn();
+      mockTestNotification.mockResolvedValueOnce({ success: false, error: "boom" });
+      mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
+      renderModal({ addToast });
+      await waitForSettingsModalReady();
+      await openNotificationsSection();
+
+      await userEvent.click(screen.getByRole("button", { name: /Test room reply/ }));
+
+      await waitFor(() => {
+        expect(addToast).toHaveBeenCalledWith("Failed to send room reply test", "error");
+      });
+      expect(screen.getByText("Room reply: Failed to send room reply test")).toBeInTheDocument();
     });
 
     it("calls testNotification with webhook provider ID when webhook test button clicked", async () => {
@@ -3344,6 +3635,61 @@ describe("SettingsModal", () => {
       );
     });
 
+    it("shows web search as always on in project research settings", async () => {
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchProjectSection();
+
+      const webSearch = await screen.findByRole("checkbox", { name: /Web Search/i });
+      expect(webSearch).toBeChecked();
+      expect(webSearch).toBeDisabled();
+      expect(screen.getByText("Always on")).toBeInTheDocument();
+      expect(screen.getByText(/Web search is always enabled\. Configure the search provider under Research Defaults\./i)).toBeInTheDocument();
+    });
+
+    it("does not mutate enabledSources.webSearch when toggling other sources", async () => {
+      mockFetchSettings.mockResolvedValueOnce({
+        ...defaultSettings,
+        experimentalFeatures: { researchView: true },
+        researchSettings: {
+          enabled: true,
+          enabledSources: {
+            webSearch: false,
+            pageFetch: true,
+            github: false,
+            localDocs: true,
+            llmSynthesis: true,
+          },
+        },
+      });
+
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchProjectSection();
+
+      const webSearch = await screen.findByRole("checkbox", { name: /Web Search/i });
+      expect(webSearch).toBeChecked();
+      await userEvent.click(webSearch);
+      expect(webSearch).toBeChecked();
+
+      await userEvent.click(screen.getByRole("checkbox", { name: "Page Fetch" }));
+      await userEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => {
+        expect(mockUpdateSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            researchSettings: expect.objectContaining({
+              enabledSources: expect.objectContaining({
+                webSearch: false,
+                pageFetch: false,
+              }),
+            }),
+          }),
+          undefined,
+        );
+      });
+    });
+
     it("saves project research settings through updateSettings only", async () => {
       renderModal();
       await waitForSettingsModalReady();
@@ -3416,6 +3762,45 @@ describe("SettingsModal", () => {
       expect(screen.getByText(/Open Authentication Settings/i)).toBeInTheDocument();
     });
 
+    it("keeps default max sources outside advanced details and groups provider controls", async () => {
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchGlobalSection();
+
+      const details = screen.getByText(/Advanced — external search providers/i).closest("details");
+      const maxSourcesInput = screen.getByLabelText("Default Max Sources Per Run");
+      expect(details).toBeTruthy();
+      expect(maxSourcesInput.closest("details")).toBeNull();
+      expect(details).not.toContainElement(maxSourcesInput);
+
+      const builtInRadio = screen.getByLabelText(/Built-in \(uses agent web tools\)/i);
+      const providerGroup = builtInRadio.closest(".settings-research-provider-group");
+      expect(providerGroup).toBeTruthy();
+      expect(providerGroup).toContainElement(details);
+      expect(providerGroup).toContainElement(screen.getByText(/No API key required\./i));
+    });
+
+    it("groups project limits fields in one grid and keeps validation error visible", async () => {
+      renderModal();
+      await waitForSettingsModalReady();
+      await openResearchProjectSection();
+
+      const maxConcurrent = screen.getByLabelText("Max Concurrent Runs");
+      const maxSources = screen.getByLabelText("Max Sources Per Run");
+      const maxDuration = screen.getByLabelText("Max Duration (ms)");
+      const requestTimeout = screen.getByLabelText("Request Timeout (ms)");
+
+      const limitsGrid = maxConcurrent.closest(".settings-research-limits-grid");
+      expect(limitsGrid).toBeTruthy();
+      expect(maxSources.closest(".settings-research-limits-grid")).toBe(limitsGrid);
+      expect(maxDuration.closest(".settings-research-limits-grid")).toBe(limitsGrid);
+      expect(requestTimeout.closest(".settings-research-limits-grid")).toBe(limitsGrid);
+
+      fireEvent.change(maxConcurrent, { target: { value: "0" } });
+      await userEvent.click(screen.getByText("Save"));
+      expect(await screen.findByText("Research max concurrent runs must be at least 1.")).toBeInTheDocument();
+    });
+
     it("shows missing credentials warning and routes CTA to Authentication", async () => {
       mockFetchSettings.mockResolvedValueOnce({
         ...defaultSettings,
@@ -3443,7 +3828,7 @@ describe("SettingsModal", () => {
     it("falls back to first visible section when initial section is unavailable", async () => {
       renderModal({ initialSection: "unknown-section" as any });
       await waitForSettingsModalReady();
-      expect(await screen.findByRole("heading", { name: "Authentication" })).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
     });
   });
 

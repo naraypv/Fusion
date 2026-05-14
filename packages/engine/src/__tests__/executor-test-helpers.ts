@@ -106,6 +106,13 @@ vi.mock("../worktree-names.js", async () => {
     generateWorktreeName: vi.fn().mockReturnValue("swift-falcon"),
   };
 });
+vi.mock("../worktree-pool.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../worktree-pool.js")>();
+  return {
+    ...actual,
+    isUsableTaskWorktree: vi.fn().mockResolvedValue(true),
+  };
+});
 
 vi.mock("node:child_process", async () => {
   const { promisify } = await import("node:util");
@@ -170,6 +177,7 @@ vi.mock("node:child_process", async () => {
 });
 vi.mock("node:fs", () => ({
   existsSync: vi.fn().mockReturnValue(true),
+  realpathSync: vi.fn((path: string) => path),
 }));
 
 export const mockExecuteAll = vi.fn().mockResolvedValue([]);
@@ -227,8 +235,9 @@ import { findWorktreeUser } from "../merger.js";
 import { StepSessionExecutor } from "../step-session-executor.js";
 import { withRateLimitRetry } from "../rate-limit-retry.js";
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { hydrateWorktreeDb } from "../worktree-db-hydrate.js";
+import { isUsableTaskWorktree } from "../worktree-pool.js";
 
 export const mockedCreateFnAgent = vi.mocked(createFnAgent);
 export const mockedSessionManager = vi.mocked(SessionManager);
@@ -238,7 +247,9 @@ export const mockedStepSessionExecutor = vi.mocked(StepSessionExecutor);
 export const mockedWithRateLimitRetry = vi.mocked(withRateLimitRetry);
 export const mockedExecSync = vi.mocked(execSync);
 export const mockedExistsSync = vi.mocked(existsSync);
+export const mockedRealpathSync = vi.mocked(realpathSync);
 export const mockedHydrateWorktreeDb = vi.mocked(hydrateWorktreeDb);
+export const mockedIsUsableTaskWorktree = vi.mocked(isUsableTaskWorktree);
 
 export type EventListener = (...args: unknown[]) => void;
 
@@ -309,6 +320,7 @@ export function createMockStore() {
 
 export function resetExecutorMocks() {
   vi.clearAllMocks();
+  mockedIsUsableTaskWorktree.mockResolvedValue(true);
   mockExecuteAll.mockResolvedValue([]);
   mockTerminateAllSessions.mockResolvedValue(undefined);
   mockCleanup.mockResolvedValue(undefined);

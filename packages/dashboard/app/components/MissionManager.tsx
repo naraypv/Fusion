@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import type { ToastType } from "../hooks/useToast";
 import { useViewportMode } from "../hooks/useViewportMode";
+import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
 import { subscribeSse } from "../sse-bus";
 import { MissionInterviewModal } from "./MissionInterviewModal";
 import { MilestoneSliceInterviewModal } from "./MilestoneSliceInterviewModal";
@@ -57,6 +58,7 @@ import {
   fetchMission,
   updateMission,
   deleteMission,
+  ApiRequestError,
   createMilestone,
   updateMilestone,
   deleteMilestone,
@@ -92,9 +94,11 @@ import {
   fetchValidationRun,
   fetchAiSessions,
   fetchAiSession,
+  fetchMissionInterviewDrafts,
+  discardMissionInterviewDraft,
   type AiSessionSummary,
 } from "../api";
-import type { AutopilotState } from "./mission-types";
+import type { AutopilotState, MissionInterviewDraftSummary } from "./mission-types";
 
 const MISSION_SIDEBAR_DEFAULT_WIDTH = 300;
 const MISSION_SIDEBAR_MIN_WIDTH = 220;
@@ -193,7 +197,14 @@ function getInterviewStatusLabel(status: AiSessionSummary["status"]): string {
 }
 
 function getInterviewActionLabel(status: AiSessionSummary["status"]): string {
-  return status === "error" ? "Retry interview" : "Resume interview";
+  switch (status) {
+    case "error":
+      return "Retry interview";
+    case "generating":
+      return "Generating plan";
+    default:
+      return "Resume interview";
+  }
 }
 
 /** Get the plan state for a milestone (derived from interviewState) */
@@ -465,6 +476,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const isMobile = useViewportMode() === "mobile";
+  const { pushNav } = useNavigationHistoryContext();
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     if (typeof window === "undefined") return MISSION_SIDEBAR_DEFAULT_WIDTH;
     const stored = window.localStorage.getItem(MISSION_SIDEBAR_STORAGE_KEY);
@@ -564,7 +576,8 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
   const [showInterviewModal, setShowInterviewModal] = useState(false);
 
   // Pending mission interview sessions (for resume prompt after page reload)
-  const [pendingInterviewSessions, setPendingInterviewSessions] = useState<AiSessionSummary[]>([]);
+  const [_pendingInterviewSessions, setPendingInterviewSessions] = useState<AiSessionSummary[]>([]);
+  const [missionInterviewDrafts, setMissionInterviewDrafts] = useState<MissionInterviewDraftSummary[]>([]);
   const [localResumeSessionId, setLocalResumeSessionId] = useState<string | undefined>(undefined);
   const dismissedResumeSessionIdRef = useRef<string | null>(null);
   const effectiveResumeSessionId =
@@ -620,6 +633,25 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       console.warn("[MissionManager] Failed to fetch pending interview sessions:", err);
     });
     return () => { cancelled = true; };
+  }, [isActive, projectId, effectiveResumeSessionId]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    let cancelled = false;
+
+    fetchMissionInterviewDrafts(projectId)
+      .then((drafts) => {
+        if (!cancelled) {
+          setMissionInterviewDrafts(drafts);
+        }
+      })
+      .catch((err) => {
+        console.warn("[MissionManager] Failed to fetch mission interview drafts:", err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [isActive, projectId, effectiveResumeSessionId]);
 
   // Auto-open milestone/slice interview modal when resuming from background session
@@ -2030,6 +2062,23 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     autopilotState,
     selectedMission?.lastAutopilotActivityAt,
   );
+
+  const previousSelectedMissionIdRef = useRef<string | null>(selectedMission?.id ?? null);
+
+  useEffect(() => {
+    const previousSelectedMissionId = previousSelectedMissionIdRef.current;
+    const currentSelectedMissionId = selectedMission?.id ?? null;
+    previousSelectedMissionIdRef.current = currentSelectedMissionId;
+
+    if (!isActive || !isMobile || !currentSelectedMissionId || previousSelectedMissionId === currentSelectedMissionId) {
+      return;
+    }
+
+    // MissionManager may already sit behind an App-level modal nav entry.
+    // On mobile, selecting a mission stacks a view entry on top so back goes
+    // detail → list → modal close instead of skipping the in-modal list.
+    pushNav({ type: "view", revert: handleBackToList });
+  }, [handleBackToList, isActive, isMobile, pushNav, selectedMission?.id]);
 
   const selectedMilestoneTelemetry = useMemo(() => {
     if (!validationTelemetry || !selectedMilestoneId || !isMilestoneValidationTelemetry(validationTelemetry)) {
@@ -3520,15 +3569,50 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     setShowInterviewModal(false);
   };
 
-  const renderInterviewSessionItems = () => pendingInterviewSessions.map((session) => {
+  const handleDiscardInterviewSession = async (sessionId: string) => {
+    try {
+      await discardMissionInterviewDraft(sessionId, projectId);
+      setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.status === 409) {
+        addToast("Draft is open in another tab", "error");
+        return;
+      }
+      if (err instanceof ApiRequestError && err.status === 404) {
+        setMissionInterviewDrafts((current) => current.filter((session) => session.id !== sessionId));
+        return;
+      }
+      addToast(getErrorMessage(err) || "Failed to discard draft", "error");
+      return;
+    } finally {
+      setDeleteConfirmId(null);
+    }
+  };
+
+  const renderInterviewSessionItems = () => missionInterviewDrafts.map((session) => {
     const isErrored = session.status === "error";
     const isGenerating = session.status === "generating";
+    const resumeActionLabel = getInterviewActionLabel(session.status);
 
     return (
       <div
         key={session.id}
         className="mission-list__item mission-list__item--interview"
+        role="button"
+        tabIndex={0}
+        aria-label={`Resume interview ${session.title || "Mission interview"}`}
         onClick={() => handleResumeInterviewSession(session.id)}
+        onKeyDown={(event) => {
+          if (event.currentTarget !== event.target) return;
+          if (event.key === "Enter") {
+            handleResumeInterviewSession(session.id);
+            return;
+          }
+          if (event.key === " ") {
+            event.preventDefault();
+            handleResumeInterviewSession(session.id);
+          }
+        }}
       >
         <div className="mission-list__item-content">
           <div className="mission-list__item-header">
@@ -3548,14 +3632,25 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 : "Interview is waiting for your next response."}
           </p>
         </div>
-        <div className="mission-list__item-actions" onClick={(event) => event.stopPropagation()}>
+        <div className="mission-list__item-actions mission-list__resume-actions" onClick={(event) => event.stopPropagation()}>
           <button
-            className={`mission-icon-btn ${isErrored ? "mission-icon-btn--danger" : "mission-icon-btn--success"}`}
+            className="mission-btn mission-btn--ghost mission-btn--sm"
             onClick={() => handleResumeInterviewSession(session.id)}
-            title={getInterviewActionLabel(session.status)}
-            aria-label={getInterviewActionLabel(session.status)}
+            title={resumeActionLabel}
+            aria-label={resumeActionLabel}
+            disabled={isGenerating}
           >
             {isGenerating ? <Loader2 size={14} className="spinner" /> : isErrored ? <RefreshCw size={14} /> : <Sparkles size={14} />}
+            <span>{isGenerating ? "Generating…" : isErrored ? "Retry" : "Resume"}</span>
+          </button>
+          <button
+            className="mission-btn mission-btn--danger mission-btn--sm"
+            onClick={() => setDeleteConfirmId({ type: "interview_draft", id: session.id })}
+            title="Discard draft"
+            aria-label="Discard draft"
+          >
+            <Trash2 size={14} />
+            <span>Discard</span>
           </button>
         </div>
       </div>
@@ -3581,7 +3676,22 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
       <div
         key={m.id}
         className={`mission-list__item ${isSelected ? "mission-list__item--selected" : ""} ${isInterviewStyle ? "mission-list__item--interview" : ""}`}
+        role="button"
+        tabIndex={0}
+        aria-label={`Open mission ${m.title}`}
+        aria-pressed={isSelected}
         onClick={() => handleSelectMission(mission)}
+        onKeyDown={(event) => {
+          if (event.currentTarget !== event.target) return;
+          if (event.key === "Enter") {
+            handleSelectMission(mission);
+            return;
+          }
+          if (event.key === " ") {
+            event.preventDefault();
+            handleSelectMission(mission);
+          }
+        }}
       >
         <div className="mission-list__item-content">
           <div className="mission-list__item-header">
@@ -3758,9 +3868,18 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
               )}
 
               {/* Mission and interview items */}
+              {missionInterviewDrafts.length > 0 && (
+                <div className="mission-list__drafts-group">
+                  <div className="mission-list__drafts-header">
+                    <Sparkles size={16} className="mission-list__item-icon" />
+                    <span>Drafts</span>
+                    <span>({missionInterviewDrafts.length})</span>
+                  </div>
+                  {renderInterviewSessionItems()}
+                </div>
+              )}
               {renderMissionListItems(persistedInterviewMissions, { interviewStyle: true })}
               {renderMissionListItems(standardMissions)}
-              {renderInterviewSessionItems()}
 
               {/* Edit mission form */}
               {editingMissionId && (
@@ -3811,7 +3930,7 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
                 </div>
               )}
 
-              {missions.length === 0 && !isCreatingMission && (
+              {missions.length === 0 && missionInterviewDrafts.length === 0 && persistedInterviewMissions.length === 0 && !isCreatingMission && (
                 <div className="mission-manager__empty mission-manager__empty--large mission-manager__empty--mission">
                   <Target size={32} />
                   <h3 className="mission-manager__empty-title">No missions yet</h3>
@@ -3846,37 +3965,45 @@ export function MissionManager({ isOpen, isInline = false, onClose, addToast, pr
     );
   };
 
-  const renderDeleteConfirmPanel = () => (
-    <div className="mission-confirm-panel mission-confirm-panel--danger">
-      <div className="mission-confirm-panel__content">
-        <p>
-          Delete this {deleteConfirmId?.type}? This cannot be undone.
-        </p>
-        <div className="mission-confirm-panel__actions">
-          <button
-            className="mission-btn mission-btn--danger"
-            onClick={async () => {
-              if (!deleteConfirmId) return;
-              if (deleteConfirmId.type === "mission") {
-                await handleDeleteMission(deleteConfirmId.id);
-              } else if (deleteConfirmId.type === "milestone") {
-                await handleDeleteMilestone(deleteConfirmId.id);
-              } else if (deleteConfirmId.type === "slice") {
-                await handleDeleteSlice(deleteConfirmId.id);
-              } else if (deleteConfirmId.type === "feature") {
-                await handleDeleteFeature(deleteConfirmId.id);
-              }
-            }}
-          >
-            Delete
-          </button>
-          <button className="mission-btn mission-btn--ghost" onClick={() => setDeleteConfirmId(null)}>
-            Cancel
-          </button>
+  const renderDeleteConfirmPanel = () => {
+    const isInterviewDraftDelete = deleteConfirmId?.type === "interview_draft";
+
+    return (
+      <div className="mission-confirm-panel mission-confirm-panel--danger">
+        <div className="mission-confirm-panel__content">
+          <p>
+            {isInterviewDraftDelete
+              ? "Discard this interview draft? This removes the saved draft and cannot be undone."
+              : `Delete this ${deleteConfirmId?.type}? This cannot be undone.`}
+          </p>
+          <div className="mission-confirm-panel__actions">
+            <button
+              className="mission-btn mission-btn--danger"
+              onClick={async () => {
+                if (!deleteConfirmId) return;
+                if (deleteConfirmId.type === "mission") {
+                  await handleDeleteMission(deleteConfirmId.id);
+                } else if (deleteConfirmId.type === "milestone") {
+                  await handleDeleteMilestone(deleteConfirmId.id);
+                } else if (deleteConfirmId.type === "slice") {
+                  await handleDeleteSlice(deleteConfirmId.id);
+                } else if (deleteConfirmId.type === "feature") {
+                  await handleDeleteFeature(deleteConfirmId.id);
+                } else if (deleteConfirmId.type === "interview_draft") {
+                  await handleDiscardInterviewSession(deleteConfirmId.id);
+                }
+              }}
+            >
+              {isInterviewDraftDelete ? "Discard" : "Delete"}
+            </button>
+            <button className="mission-btn mission-btn--ghost" onClick={() => setDeleteConfirmId(null)}>
+              Cancel
+            </button>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderLinkTaskPanel = () => (
     <div className="mission-confirm-panel mission-confirm-panel--link">

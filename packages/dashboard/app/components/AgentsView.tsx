@@ -1,5 +1,5 @@
 import "./AgentsView.css";
-import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense, type CSSProperties } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useId, lazy, Suspense, type CSSProperties, type ReactNode } from "react";
 import { Plus, Play, Pause, Activity, Trash2, RefreshCw, Bot, List, ChevronRight, Filter, Upload, Network, SlidersHorizontal, ZoomIn, ZoomOut, Minimize2, Info } from "lucide-react";
 import type { Agent, AgentCapability, AgentOnboardingSummary, AgentState, OrgTreeNode } from "../api";
 import { updateAgent, updateAgentState, deleteAgent, startAgentRun, fetchOrgTree, fetchSettings, updateSettings } from "../api";
@@ -25,7 +25,13 @@ import {
 } from "../utils/heartbeatIntervals";
 import { isEphemeralAgent, getErrorMessage } from "@fusion/core";
 import { formatAgentSkillBadgeLabel } from "../utils/agentSkills";
-import { resolveOrgChartLayoutMode, type OrgChartLayoutMode } from "./agentsOrgChartLayout";
+import {
+  ORG_CHART_LAYOUT_STORAGE_KEY,
+  isOrgChartLayoutPreference,
+  resolveOrgChartLayoutMode,
+  type OrgChartLayoutMode,
+  type OrgChartLayoutPreference,
+} from "./agentsOrgChartLayout";
 import { AgentAvatar } from "./AgentAvatar";
 import { AgentErrorIndicator } from "./AgentErrorDetailsModal";
 
@@ -208,6 +214,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
     const saved = getScopedItem("fn-agent-view", projectId);
     return (saved === "list" || saved === "board" || saved === "org") ? saved : "list";
   });
+  const [orgChartLayoutPreference, setOrgChartLayoutPreference] = useState<OrgChartLayoutPreference>(() => {
+    if (typeof window === "undefined") return "auto";
+    const saved = getScopedItem(ORG_CHART_LAYOUT_STORAGE_KEY, projectId);
+    return isOrgChartLayoutPreference(saved) ? saved : "auto";
+  });
   const [orgTree, setOrgTree] = useState<OrgTreeNode[]>([]);
   const [isOrgTreeLoading, setIsOrgTreeLoading] = useState(false);
   const [orgChartViewportWidth, setOrgChartViewportWidth] = useState(0);
@@ -233,6 +244,15 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   useEffect(() => {
     setScopedItem("fn-agent-view", agentView, projectId);
   }, [agentView, projectId]);
+
+  useEffect(() => {
+    const saved = getScopedItem(ORG_CHART_LAYOUT_STORAGE_KEY, projectId);
+    setOrgChartLayoutPreference(isOrgChartLayoutPreference(saved) ? saved : "auto");
+  }, [projectId]);
+
+  useEffect(() => {
+    setScopedItem(ORG_CHART_LAYOUT_STORAGE_KEY, orgChartLayoutPreference, projectId);
+  }, [orgChartLayoutPreference, projectId]);
 
   const [editingRoleForAgent, setEditingRoleForAgent] = useState<string | null>(null);
   const roleSelectRef = useRef<HTMLSelectElement>(null);
@@ -720,7 +740,51 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
   const orgChartLayoutMode: OrgChartLayoutMode = useMemo(() => resolveOrgChartLayoutMode({
     tree: displayOrgTree,
     availableWidth: orgChartViewportWidth,
-  }), [displayOrgTree, orgChartViewportWidth]);
+    preference: orgChartLayoutPreference,
+  }), [displayOrgTree, orgChartLayoutPreference, orgChartViewportWidth]);
+  const handleOrgChartLayoutPreferenceChange = useCallback((preference: OrgChartLayoutPreference) => {
+    setOrgChartLayoutPreference(preference);
+    const isEdgeZoom = orgChartZoomIndex === 0 || orgChartZoomIndex === ORG_CHART_ZOOM_LEVELS.length - 1;
+    const nextLayoutMode = resolveOrgChartLayoutMode({
+      tree: displayOrgTree,
+      availableWidth: orgChartViewportWidth,
+      preference,
+    });
+    if (isEdgeZoom && nextLayoutMode !== orgChartLayoutMode) {
+      setOrgChartZoomIndex(1);
+    }
+  }, [displayOrgTree, orgChartLayoutMode, orgChartViewportWidth, orgChartZoomIndex]);
+
+  const renderOrgChartLayoutToggle = useCallback(() => {
+    const options: Array<{ value: OrgChartLayoutPreference; label: string; icon: ReactNode; ariaLabel: string }> = [
+      { value: "horizontal", label: "Horizontal", icon: <Network size={16} />, ariaLabel: "Horizontal layout" },
+      { value: "vertical", label: "Vertical", icon: <List size={16} />, ariaLabel: "Vertical layout" },
+      { value: "auto", label: "Auto", icon: <RefreshCw size={16} />, ariaLabel: "Automatic layout" },
+    ];
+
+    return (
+      <div className="agent-org-chart-layout-toggle" data-testid="agent-org-chart-layout-toggle">
+        {options.map((option) => {
+          const isActive = orgChartLayoutPreference === option.value;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              className={`btn-icon touch-target agent-org-chart-layout-toggle__button${isActive ? " btn-icon--active" : ""}`}
+              onClick={() => handleOrgChartLayoutPreferenceChange(option.value)}
+              aria-pressed={isActive}
+              aria-label={option.ariaLabel}
+              title={option.ariaLabel}
+              data-layout-value={option.value}
+            >
+              {option.icon}
+              <span className="agent-org-chart-layout-toggle__text">{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }, [handleOrgChartLayoutPreferenceChange, orgChartLayoutPreference]);
 
   /** Get skill badges from agent metadata */
   const getSkillBadges = (agent: Agent): string[] => {
@@ -1020,6 +1084,7 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
               <div className="agent-org-chart-shell" data-testid="agent-org-chart-shell">
                 {isMobileViewport ? (
                   <div className="agent-org-chart-controls" data-testid="agent-org-chart-controls">
+                    {renderOrgChartLayoutToggle()}
                     <button
                       type="button"
                       className="btn-icon touch-target"
@@ -1052,7 +1117,11 @@ export function AgentsView({ addToast, projectId, onOpenTaskLogs, agentOnboardin
                       Fit
                     </button>
                   </div>
-                ) : null}
+                ) : (
+                  <div className="agent-org-chart-toolbar">
+                    {renderOrgChartLayoutToggle()}
+                  </div>
+                )}
                 <div
                   ref={orgChartViewportRef}
                   className="agent-org-chart-viewport"

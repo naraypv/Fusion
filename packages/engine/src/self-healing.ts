@@ -17,7 +17,7 @@ import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { getTaskMergeBlocker, isEphemeralAgent, type AgentStore, type TaskStore, type Settings, type Task, type MergeDetails } from "@fusion/core";
+import { getInReviewStallReason, getTaskMergeBlocker, isEphemeralAgent, type AgentStore, type TaskStore, type Settings, type Task, type MergeDetails } from "@fusion/core";
 import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 import { createLogger } from "./logger.js";
 import { getRegisteredWorktreePaths, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
@@ -93,6 +93,11 @@ export interface SelfHealingOptions {
    * Used to avoid clearing a transient merge status mid-merge.
    */
   getActiveMergeTaskId?: () => string | null;
+  /**
+   * Minimum blocker age before stale merge fan-out is cleared from downstream
+   * blockedBy pointers. Must be >= staleMergingStatusMinAgeMs.
+   */
+  staleMergingFanoutMinAgeMs?: number;
   hasActiveAgentExecution?: (agentId: string) => boolean;
   restartDurableAgentHeartbeat?: (agentId: string, context: { reason: string; attempt: number }) => Promise<boolean>;
 }
@@ -129,9 +134,11 @@ const MAX_AUTO_MERGE_RETRIES = 3;
 const MAX_STARVATION_DROPS = 3;
 const DEADLOCK_RECOVERY_COOLDOWN_MS = 15 * 60_000;
 const DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS = 5 * 60_000;
+const DEFAULT_STALE_MERGING_FANOUT_MIN_AGE_MS = 15 * 60_000;
 const DURABLE_ERROR_RECOVERY_MAX_RETRIES = 5;
 const DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS = 30_000;
 const DURABLE_ERROR_RECOVERY_MAX_COOLDOWN_MS = 15 * 60_000;
+const RUNNING_ON_INACTIVE_TASK_STALE_RUN_MS = 5 * 60_000;
 
 interface LandedTaskCommit {
   sha: string;
@@ -316,7 +323,9 @@ export class SelfHealingManager {
       { name: "orphaned-planning", fn: () => this.recoverOrphanedPlanningTasks().then(() => undefined) },
       { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents().then(() => undefined) },
       { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns().then(() => undefined) },
+      { name: "recover-running-on-inactive-tasks", fn: () => this.recoverAgentsRunningOnInactiveTasks().then(() => undefined) },
       { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy().then(() => undefined) },
+      { name: "surface-in-review-stalls", fn: () => this.surfaceInReviewStalls().then(() => undefined) },
     ];
 
     for (const step of steps) {
@@ -444,10 +453,17 @@ export class SelfHealingManager {
    * Check whether a stuck-killed task should be re-queued or marked as failed.
    * Called by StuckTaskDetector's `beforeRequeue` callback.
    *
+   * Terminal contract for stuck-loop exhaustion:
+   * - Task is marked `status: "failed"` with `error` starting with
+   *   `STUCK_LOOP_EXHAUSTED: ` and including kill count, max, and last reason.
+   * - Task is moved to `in-review` (best-effort if move fails).
+   * - Task log gets a final `STUCK_LOOP_EXHAUSTED` entry with operator guidance
+   *   to manually retry, pause, or move to triage.
+   *
    * @returns `true` if the task should be re-queued, `false` if budget exhausted
    *          (task has been marked as permanently failed).
    */
-  async checkStuckBudget(taskId: string): Promise<boolean> {
+  async checkStuckBudget(taskId: string, reason: "loop" | "inactivity" = "inactivity"): Promise<boolean> {
     try {
       const settings = await this.store.getSettings();
       const maxKills = settings.maxStuckKills ?? 6;
@@ -457,11 +473,13 @@ export class SelfHealingManager {
 
       if (newCount > maxKills) {
         // Budget exhausted — mark as permanently failed
-        log.warn(`${taskId} exceeded stuck kill budget (${newCount}/${maxKills}) — marking failed`);
+        log.warn(`${taskId} exceeded stuck kill budget (${newCount}/${maxKills}, reason=${reason}) — marking failed`);
+        const exhaustedError =
+          `STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (${newCount}/${maxKills}) after last reason=${reason}.`;
         await this.store.updateTask(taskId, {
           stuckKillCount: newCount,
           status: "failed",
-          error: `Task stuck ${newCount} times — exceeded maximum of ${maxKills} stuck kills`,
+          error: exhaustedError,
         });
         try {
           await this.store.moveTask(taskId, "in-review");
@@ -469,11 +487,11 @@ export class SelfHealingManager {
           // moveTask may fail if task was concurrently moved (e.g., dep-abort).
           // The task is already marked failed — don't allow requeue.
           const moveErrMessage = moveErr instanceof Error ? moveErr.message : String(moveErr);
-          log.warn(`${taskId} moveTask("in-review") failed (${moveErrMessage}) — task already marked failed, not re-queuing`);
+          log.warn(`${taskId} moveTask("in-review") failed (${moveErrMessage}) after STUCK_LOOP_EXHAUSTED terminalization — task already marked failed, not re-queuing`);
         }
         await this.store.logEntry(
           taskId,
-          `Permanently failed: agent stuck ${newCount} times (max: ${maxKills}) — moved to in-review`,
+          `STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (${newCount}/${maxKills}), last reason=${reason}. No further automatic retries will run. Manually retry, pause, or move the task to triage to resume work.`,
         );
         return false;
       }
@@ -958,7 +976,9 @@ export class SelfHealingManager {
           { name: "recover-ghost-review", fn: () => this.recoverGhostReviewTasks() },
           { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents() },
           { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns() },
+          { name: "recover-running-on-inactive-tasks", fn: () => this.recoverAgentsRunningOnInactiveTasks() },
           { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy() },
+          { name: "surface-in-review-stalls", fn: () => this.surfaceInReviewStalls() },
         ];
         for (const fn of batch2Fns) {
           try {
@@ -1191,6 +1211,10 @@ export class SelfHealingManager {
    * 3. Blocker `column === "in-review"` and `paused === true`
    * 4. Blocker `column === "in-review"` and `status === "failed"`
    *    and `(mergeRetries ?? 0) >= MAX_AUTO_MERGE_RETRIES`
+   * 5. Blocker `column === "in-review"` and `status === "merging" | "merging-pr"`
+   *    (or a stale post-recovery `status === null` aftermath) with stale
+   *    `updatedAt` (older than `staleMergingFanoutMinAgeMs`) and no active
+   *    merger ownership in this process
    *
    * @returns Number of tasks unblocked
    */
@@ -1199,10 +1223,20 @@ export class SelfHealingManager {
       const settings = await this.store.getSettings();
       if (settings.globalPause || settings.enginePaused) return 0;
 
+      const staleMergingStatusMinAgeMs = this.options.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS;
+      const configuredFanoutMinAgeMs = this.options.staleMergingFanoutMinAgeMs ?? DEFAULT_STALE_MERGING_FANOUT_MIN_AGE_MS;
+      const staleMergingFanoutMinAgeMs = Math.max(staleMergingStatusMinAgeMs, configuredFanoutMinAgeMs);
+      const activeMergeTaskId = this.options.getActiveMergeTaskId?.() ?? null;
+      const now = Date.now();
+
       const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
-      const blockedTasks = todoTasks.filter(
-        (task) => typeof task.blockedBy === "string" && task.blockedBy.trim().length > 0,
-      );
+      const inProgressTasks = await this.store.listTasks({ column: "in-progress", slim: true });
+      const inReviewTasks = await this.store.listTasks({ column: "in-review", slim: true });
+      const blockedTasks = [
+        ...todoTasks,
+        ...inProgressTasks,
+        ...inReviewTasks.filter((task) => !task.paused),
+      ].filter((task) => typeof task.blockedBy === "string" && task.blockedBy.trim().length > 0);
       const queuedDependencyTasks = todoTasks.filter(
         (task) => task.status === "queued" && task.dependencies.length > 0,
       );
@@ -1213,6 +1247,7 @@ export class SelfHealingManager {
       const taskById = new Map(allTasks.map((task) => [task.id, task]));
 
       let recovered = 0;
+      const todoTaskIds = new Set(todoTasks.map((task) => task.id));
       const blockedTaskIds = new Set(blockedTasks.map((task) => task.id));
       const queuedDependencyTaskIds = new Set(queuedDependencyTasks.map((task) => task.id));
       const candidates = new Map<string, typeof todoTasks[number]>();
@@ -1253,25 +1288,47 @@ export class SelfHealingManager {
             isMissingWorktreeSessionStartFailure(blocker.error)
           ) {
             reason = `blocker ${blockerId} in-review + failed (missing-worktree session start)`;
+          } else if (
+            blocker.column === "in-review" &&
+            (blocker.status === "merging" || blocker.status === "merging-pr" || blocker.status == null) &&
+            (!activeMergeTaskId || activeMergeTaskId !== blocker.id)
+          ) {
+            const updatedAtMs = blocker.updatedAt ? Date.parse(blocker.updatedAt) : Number.NaN;
+            if (Number.isFinite(updatedAtMs)) {
+              const elapsedMs = now - updatedAtMs;
+              if (elapsedMs >= staleMergingFanoutMinAgeMs) {
+                const blockerStatus = blocker.status ?? "no-status";
+                reason = `blocker ${blockerId} in-review + ${blockerStatus} stale for ${elapsedMs}ms (threshold ${staleMergingFanoutMinAgeMs}ms)`;
+              }
+            }
           } else if (task.dependencies.length > 0 && !unresolvedDeps.includes(blockerId)) {
             reason = `blocker ${blockerId} not among unresolved dependencies`;
           }
 
           if (reason) {
             try {
-              if (unresolvedDeps.length > 0) {
-                const nextBlocker = unresolvedDeps[0]!;
-                await this.store.updateTask(task.id, { blockedBy: nextBlocker, status: "queued" });
-                await this.store.logEntry(task.id, `Auto-recovered: refreshed stale blockedBy — ${reason}; now blocked by ${nextBlocker}`);
+              if (todoTaskIds.has(task.id)) {
+                if (unresolvedDeps.length > 0) {
+                  const nextBlocker = unresolvedDeps[0]!;
+                  await this.store.updateTask(task.id, { blockedBy: nextBlocker, status: "queued" });
+                  await this.store.logEntry(task.id, `Auto-recovered: refreshed stale blockedBy — ${reason}; now blocked by ${nextBlocker}`);
+                } else {
+                  await this.store.updateTask(task.id, { blockedBy: null, status: null });
+                  await this.store.logEntry(task.id, `Auto-recovered: cleared stale blockedBy — ${reason}`);
+                }
               } else {
-                await this.store.updateTask(task.id, { blockedBy: null, status: null });
-                await this.store.logEntry(task.id, `Auto-recovered: cleared stale blockedBy — ${reason}`);
+                await this.store.updateTask(task.id, { blockedBy: null });
+                await this.store.logEntry(task.id, `Auto-recovered (FN-4091): cleared stale blockedBy — ${reason}`);
               }
               recovered++;
             } catch (err: unknown) {
               const errorMessage = err instanceof Error ? err.message : String(err);
               log.error(`Failed to clear stale blockedBy for ${task.id}: ${errorMessage}`);
             }
+            continue;
+          }
+
+          if (!todoTaskIds.has(task.id)) {
             continue;
           }
         }
@@ -1650,6 +1707,58 @@ export class SelfHealingManager {
    *
    * @returns Number of tasks kicked back to todo
    */
+  async surfaceInReviewStalls(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const cycleStartMs = Date.now();
+      const timeoutMs = settings.taskStuckTimeoutMs;
+      if (!timeoutMs || timeoutMs <= 0) return 0;
+
+      const activeMergeTaskId = this.options.getActiveMergeTaskId?.() ?? null;
+      const executingTaskIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
+      const tasks = await this.store.listTasks({ column: "in-review", slim: false });
+      let surfaced = 0;
+
+      for (const task of tasks) {
+        const signal = getInReviewStallReason(task, {
+          now: cycleStartMs,
+          activeMergeTaskId,
+          executingTaskIds,
+          staleMergingMinAgeMs: this.options.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS,
+          maxAutoMergeRetries: MAX_AUTO_MERGE_RETRIES,
+        });
+        if (!signal) continue;
+
+        if (Date.parse(task.updatedAt) >= cycleStartMs) {
+          continue;
+        }
+
+        const previous = [...(task.log ?? [])]
+          .reverse()
+          .find((entry) => entry.action.startsWith("In-review stall surfaced ["));
+        if (previous) {
+          const parsed = /^In-review stall surfaced \[([^\]]+)\]/.exec(previous.action);
+          const previousCode = parsed?.[1];
+          const previousAt = Date.parse(previous.timestamp);
+          if (Number.isFinite(previousAt) && previousAt >= cycleStartMs - timeoutMs && previousCode === signal.code) {
+            continue;
+          }
+        }
+
+        await this.store.logEntry(task.id, `In-review stall surfaced [${signal.code}]: ${signal.reason}`);
+        surfaced += 1;
+      }
+
+      return surfaced;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`In-review stall surfacing failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
   async recoverGhostReviewTasks(): Promise<number> {
     try {
       const settings = await this.store.getSettings();
@@ -2338,6 +2447,43 @@ export class SelfHealingManager {
     const clampedAttempts = Math.max(1, attempts);
     const exponential = DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS * Math.pow(2, clampedAttempts - 1);
     return Math.min(exponential, DURABLE_ERROR_RECOVERY_MAX_COOLDOWN_MS);
+  }
+
+  async recoverAgentsRunningOnInactiveTasks(): Promise<number> {
+    const agentStore = this.options.agentStore;
+    if (!agentStore) {
+      return 0;
+    }
+
+    const now = Date.now();
+    const recoveredAgentIds = new Set<string>();
+    const runningAgents = await agentStore.listAgents({ state: "running", includeEphemeral: true });
+
+    for (const agent of runningAgents) {
+      if (isEphemeralAgent(agent) || !agent.taskId) {
+        continue;
+      }
+
+      const linkedTask = await this.store.getTask(agent.taskId);
+      if (linkedTask && (linkedTask.column === "in-progress" || linkedTask.column === "in-review" || linkedTask.column === "done" || linkedTask.column === "archived")) {
+        continue;
+      }
+
+      const activeRun = await agentStore.getActiveHeartbeatRun(agent.id);
+      const runStartedAt = activeRun?.startedAt;
+      const runAgeMs = runStartedAt ? now - Date.parse(runStartedAt) : Number.POSITIVE_INFINITY;
+      const hasFreshRun = Boolean(activeRun) && Number.isFinite(runAgeMs) && runAgeMs <= RUNNING_ON_INACTIVE_TASK_STALE_RUN_MS;
+      if (hasFreshRun || this.options.hasActiveAgentExecution?.(agent.id) === true) {
+        continue;
+      }
+
+      await agentStore.updateAgentState(agent.id, "active");
+      await agentStore.syncExecutionTaskLink(agent.id, undefined);
+      recoveredAgentIds.add(agent.id);
+      log.log(`Recovered running durable agent ${agent.id} on inactive task ${agent.taskId}`);
+    }
+
+    return recoveredAgentIds.size;
   }
 
   async recoverOrphanedAgents(): Promise<number> {

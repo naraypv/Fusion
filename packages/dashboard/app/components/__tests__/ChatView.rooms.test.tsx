@@ -10,6 +10,13 @@ import { _resetInitialViewportHeight } from "../../hooks/useMobileKeyboard";
 
 vi.mock("../../hooks/useChat");
 vi.mock("../../hooks/useChatRooms");
+vi.mock("../../hooks/useNavigationHistory", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../hooks/useNavigationHistory")>();
+  return {
+    ...actual,
+    useNavigationHistoryContext: () => ({ pushNav: vi.fn(), replaceCurrent: vi.fn() }),
+  };
+});
 vi.mock("../../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api")>();
   return {
@@ -207,6 +214,7 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
   beforeEach(() => {
     _resetInitialViewportHeight();
     vi.clearAllMocks();
+    localStorage.clear();
     if (!window.matchMedia) {
       Object.defineProperty(window, "matchMedia", { value: vi.fn(), configurable: true, writable: true });
     }
@@ -239,6 +247,32 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
     expect(selectRoom).toHaveBeenCalledWith("room-b");
   });
 
+  it.each([
+    { memberCount: 1, expectedText: "1 member" },
+    { memberCount: 2, expectedText: "2 members" },
+  ])("shows active room member count ($expectedText) and hides inactive meta", ({ memberCount, expectedText }) => {
+    const roomB = { ...roomA, id: "room-b", name: "Room B", slug: "room-b" };
+    const activeMembers = Array.from({ length: memberCount }, (_, index) => ({
+      roomId: roomA.id,
+      agentId: `agent-${index + 1}`,
+      role: "member" as const,
+      addedAt: "2026-04-08T00:00:00.000Z",
+    }));
+
+    setup({}, { rooms: [roomA, roomB], activeRoom: roomA, activeRoomMembers: activeMembers });
+
+    const { container } = render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const activeRow = screen.getByTestId("chat-room-item-room-a");
+    const inactiveRow = screen.getByTestId("chat-room-item-room-b");
+
+    expect(within(activeRow).getByText(expectedText)).toBeInTheDocument();
+    expect(within(activeRow).queryByText("— members")).not.toBeInTheDocument();
+    expect(within(inactiveRow).getByText("#Room B")).toBeInTheDocument();
+    expect(inactiveRow.querySelector(".chat-room-item-meta")).toBeNull();
+    expect(container.textContent).not.toContain("— members");
+  });
+
   it("creates room via modal and sends room message on Enter", async () => {
     const createRoom = vi.fn().mockResolvedValue({ ...roomA, id: "room-new", name: "Room New", slug: "room-new" });
     const sendRoomMessage = vi.fn().mockResolvedValue(undefined);
@@ -269,22 +303,55 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
 
   it("keeps room composer text and toasts once when room send fails", async () => {
     const addToast = vi.fn();
-    const sendRoomMessage = vi.fn().mockRejectedValue(new Error("Room backend failed"));
+    let rejectSend: (error?: unknown) => void;
+    const sendPromise = new Promise<undefined>((_, reject) => {
+      rejectSend = reject;
+    });
+    const sendRoomMessage = vi.fn().mockReturnValue(sendPromise);
     setup({}, { sendRoomMessage, activeRoom: roomA });
 
     render(<ChatView projectId="proj-123" addToast={addToast} experimentalFeatures={{ chatRooms: true }} />);
 
-    const textarea = screen.getByTestId("chat-input");
+    const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
     await userEvent.type(textarea, "Will retry{enter}");
 
     await waitFor(() => {
       expect(sendRoomMessage).toHaveBeenCalledWith("Will retry");
     });
+    expect(textarea.value).toBe("");
+
+    rejectSend!(new Error("Room backend failed"));
+
     await waitFor(() => {
-      expect((textarea as HTMLTextAreaElement).value).toBe("Will retry");
+      expect(textarea.value).toBe("Will retry");
     });
     expect(addToast).toHaveBeenCalledTimes(1);
     expect(addToast).toHaveBeenCalledWith("Room backend failed", "error");
+  });
+
+  it("clears room composer optimistically before send resolves", async () => {
+    let resolveSend: () => void;
+    const sendPromise = new Promise<void>((resolve) => {
+      resolveSend = resolve;
+    });
+    const sendRoomMessage = vi.fn().mockReturnValue(sendPromise);
+    setup({}, { sendRoomMessage, activeRoom: roomA });
+
+    render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+    const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
+    await userEvent.type(textarea, "Optimistic clear{enter}");
+
+    await waitFor(() => {
+      expect(sendRoomMessage).toHaveBeenCalledWith("Optimistic clear");
+    });
+    expect(textarea.value).toBe("");
+
+    resolveSend!();
+
+    await waitFor(() => {
+      expect(textarea.value).toBe("");
+    });
   });
 
   it("supports delete-room confirm/cancel and rerenders messages from hook state", async () => {
@@ -570,6 +637,32 @@ describe("ChatView — rooms (FN-3805..FN-3811 contract)", () => {
     } finally {
       metrics.restore();
       restoreMatchMedia.mockRestore();
+    }
+  });
+
+  it("FN-4327: desktop visibility restore does not re-anchor active room thread", async () => {
+    const restoreMatchMedia = mockDesktopViewport();
+    const metrics = mockMessagesContainerMetrics({ scrollHeight: 1180, clientHeight: 240, initialScrollTop: 250 });
+
+    try {
+      setup({}, {
+        activeRoom: roomA,
+        messages: [{ id: "rmsg-1", roomId: roomA.id, role: "assistant", content: "One", createdAt: "2026-04-08T00:00:00.000Z", senderAgentId: "agent-1", mentions: [] }],
+      });
+
+      render(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+      metrics.setScrollTop(300);
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() => {
+        expect(metrics.getScrollTop()).toBe(300);
+      });
+    } finally {
+      metrics.restore();
+      restoreMatchMedia.mockRestore();
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
     }
   });
 

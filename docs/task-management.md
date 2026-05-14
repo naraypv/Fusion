@@ -99,6 +99,29 @@ Fusion task columns:
    - Self-healing can still auto-finalize retry-exhausted failed review tasks when it can prove their branch content already landed on the merge target, so already-merged work does not deadlock in `in-review`.
    - Repeated engine merge-queue drops now escalate to an explicit recoverable review failure: if auto-recovery hits `Auto-merge starvation:` in the task `error`, Fusion has already seen three consecutive enqueue attempts rejected by the engine merge queue. Operators can recover by clearing the failed state from the dashboard, which lets the usual unpause/clear flow re-attempt merge once the underlying queue wedge is resolved.
    - Non-recoverable state-machine errors during finalization (for example `Invalid transition: 'todo' → 'done'`) are treated as terminal review failures: recovery must not re-enqueue these tasks for merge unless task state changes prove they are recoverable.
+
+#### In-review stall signal
+
+Fusion now derives `task.inReviewStall` for non-paused `in-review` tasks when a known stuck-state shape is detected. This signal is state-based (not log-heuristic) and is computed server-side on task hydration.
+
+`InReviewStallCode` values:
+- `transient-merge-status-no-owner` — task is still in `merging`/`merging-pr`/`merging-fix` after the stale-merging age threshold, but no active merger owns it.
+- `merge-retries-exhausted` — `mergeRetries` reached the auto-merge retry cap without `mergeDetails.mergeConfirmed === true`.
+- `no-worktree-no-merge-confirmed` — task has no worktree path and merge is not confirmed (excluding explicit no-op merges).
+- `merge-blocker` — `getTaskMergeBlocker()` reports a merge/finalization blocker.
+
+Invariant: `inReviewStall` is **diagnostic-only**. It must never be used as an auto-completion trigger.
+
+Self-healing surfaces this diagnosis via task log entries in the form:
+- `In-review stall surfaced [<code>]: <reason>`
+
+These entries are rate-limited per `(task, code)` over `taskStuckTimeoutMs`, so unchanged stalls are not spammed every cycle while state transitions can still surface a new code immediately.
+
+Auto-completion/finalization remains owned by existing recovery passes:
+- `recoverStaleMergingStatus`
+- `finalizeNoOpReviewTasks`
+- `recoverMergeableReviewTasks`
+- `recoverAlreadyMergedReviewTasks`
 5. **done** — merged/finalized
 6. **archived** — preserved history, optionally cleaned from filesystem
 
@@ -116,6 +139,31 @@ fn task merge FN-001
 fn task archive FN-001
 fn task unarchive FN-001
 ```
+
+### Lifecycle invariants
+
+**Paused-state normalization on reopen:** When a task is moved from `in-progress`, `in-review`, or `done` back to `todo` or `triage` (retry/requeue), Fusion clears `task.paused` and `task.pausedByAgentId` to prevent contradictory `todo + paused` or `in-progress + paused` states. A paused task in `todo` is excluded from scheduler dispatch.
+
+**Paused-state normalization on explicit completion:** When an agent calls `fn_task_done` on a paused task, Fusion clears `task.paused` and `task.pausedByAgentId` regardless of the task's column (`in-progress` or `todo`). `task.paused` prevents new work from starting, but does not block an agent from completing in-flight work and transitioning the task to `done`. The scheduler respects `globalPause` independently.
+
+**Global pause vs task pause:** `settings.globalPause` gates new scheduler dispatches and is checked by the `fn_task_done` handoff logic. Task-level `task.paused` is a per-task gate that blocks execution start. They are independent — a task can be paused individually even when `globalPause` is `false`, and clearing `task.paused` does not affect `globalPause`.
+
+### Stranded-worktree recovery
+
+When Fusion detects uncommitted task-attributable changes in a task worktree during a requeue/release path, it will **not** silently move the task back to `todo`/`triage`. Instead, it parks the task in `status: "failed"` so operators can recover the stranded workspace state.
+
+Diagnostics are written to both places:
+
+- `task.error` (task detail summary)
+- task activity log entry (timeline)
+
+Each diagnostic includes task ID, absolute worktree path, dirty-file count, and sample dirty paths.
+
+Recovery flow:
+
+1. Inspect the worktree: `cd <worktreePath> && git status`
+2. Rescue changes as needed: `git diff` and/or `git stash push -u`
+3. Clear/retry the failed task from the dashboard/CLI so it can re-enter scheduling after the workspace is safe.
 
 ### Branch metadata semantics
 
@@ -160,6 +208,42 @@ Recommended pattern:
 - Re-audit after apply and resolve or explicitly disposition any related stale follow-up tasks.
 
 Do **not** patch `.fusion/fusion.db` directly without synchronizing `.fusion/tasks/*/task.json` through a supported store-backed path.
+
+## Branch conflict recovery
+
+When the executor tries to allocate the canonical task branch (`fusion/<task-id>`) and finds that branch already checked out in another live worktree, Fusion now fails loudly by default instead of silently renaming the run onto `fusion/<task-id>-2`, `-3`, or similar sibling branches. See [CLI Reference → Branch conflict recovery](./cli-reference.md#branch-conflict-recovery) for the command reference and [Settings Reference → executorAllowSiblingBranchRename](./settings-reference.md#executorallowsiblingbranchrename) for the legacy opt-out setting.
+
+1. **When this happens**
+
+   The executor refuses the branch allocation, moves the task from `in-progress` back to `todo`, sets `status: "failed"`, preserves the branch/worktree recovery metadata, and records the existing tip SHA plus stranded commit subjects in the task lifecycle log and structured agent log.
+
+2. **Inspect candidates**
+
+   Run the recovery command with no flags to list every matching canonical or sibling branch. The output includes the tip SHA, any attached worktree path, and the stranded commits that are not reachable from the run's start point.
+
+   ```bash
+   fn task branch-recovery FN-001
+   ```
+
+3. **Reclaim**
+
+   Reclaim points the task back at an existing canonical or sibling branch so the next executor run resumes there instead of allocating a new sibling. No commits are rewritten; Fusion only updates the task metadata.
+
+   ```bash
+   fn task branch-recovery FN-001 --reclaim fusion/fn-001-2
+   ```
+
+4. **Discard**
+
+   Discard deletes a stranded sibling branch and its worktree when you have confirmed the old work is no longer needed. `--yes` is mandatory because the action is destructive.
+
+   ```bash
+   fn task branch-recovery FN-001 --discard fusion/fn-001-2 --yes
+   ```
+
+5. **Opt-out / legacy mode**
+
+   If you must preserve the pre-FN-4068 behavior for a legacy workflow, enable [`executorAllowSiblingBranchRename`](./settings-reference.md#executorallowsiblingbranchrename). That restores silent suffixing onto sibling branches, but it is discouraged because it recreates the same hidden-work / data-loss pattern that motivated loud branch-conflict recovery in the first place.
 
 ## Task Execution Modes
 
@@ -286,6 +370,7 @@ This file is the contract for execution and review.
   - Pull-request mode refreshes live GitHub-backed review decision/thread/comment state and updates PR metadata freshness.
   - Direct/non-PR mode refreshes normalized reviewer-agent feedback from persisted task review artifacts and does not call GitHub.
 - In direct/non-PR auto-merge mode, the Review tab shows parsed reviewer-agent feedback with explicit loading/error/empty states instead of sending users to raw comments or agent logs.
+- Review item bodies render markdown by default, and users can switch between **Markdown** and **Plain** modes from the Review tab action bar; the preference persists locally per user.
 - **Comments remains the general discussion surface**; Review remains the actionable review surface.
 - **Steering comments** (`fn task steer`) are execution guidance for the running agent.
 
@@ -428,10 +513,12 @@ Tracking behavior is controlled per task:
 - `task.githubTracking.enabled` turns tracking on for that task.
 - `task.githubTracking.repoOverride` optionally forces a specific target repo (`owner/repo`).
 - In the dashboard **Task Detail** modal, eligible existing tasks (`triage`, `todo`, `in-progress`, `in-review`) always show a compact GitHub tracking summary row. When tracking is currently disabled and editable, the header exposes a one-click **Enable GitHub tracking** button; linked-issue details and the rest of the tracking controls remain behind the disclosure arrow for disable/retarget flows.
+- After an engine/dashboard restart, Task Detail preserves the fetched full `githubTracking` payload even when the board opened the modal from a slim task row that intentionally omitted tracking metadata.
 - When a task is already tracking-enabled but still unlinked, Task Detail exposes a **Create tracking issue** action in the disclosure content (including non-editable columns like `done`) so "Issue not yet created" is not a dead-end state.
 - Clearing the Task Detail repo override stores `null`, which reverts repo resolution to project/global defaults.
-- Explicit task-level enablement is honored even when project/global GitHub tracking defaults are unset. If `enabled: true` and the repo resolves at task scope (for example via `repoOverride`), Fusion attempts tracking-issue creation on both create-time and eligible edit-time flows.
+- Explicit task-level enablement is honored even when project/global GitHub tracking defaults are unset. If `enabled: true` and the repo resolves at task scope (for example via `repoOverride`), Fusion attempts tracking-issue creation on both create-time and eligible edit-time flows, including tasks imported from GitHub (`sourceType: "github_import"`).
 - Explicit manual unlink (`githubTracking.issue: null`) does not recreate a tracking issue in that same update request, and disabling tracking does not create new issues.
+- On board cards, Fusion shows both the imported-source provenance marker and tracking link when they refer to different issues. The tracking chip is hidden only when the linked tracking issue exactly matches the source issue (`owner/repo#number`) to avoid duplicate badges.
 
 Repository resolution order:
 
@@ -446,6 +533,8 @@ When Fusion creates a tracking issue, it uses:
 - Body content: bounded plain-text task summary snippet (not full prompt content)
 
 When tracked tasks later move to `in-progress` or `done`, Fusion also posts a short lifecycle comment on the linked tracking issue. The `in-progress` comment stays plain-text and capped, while the `done` comment can include the merge commit SHA/subject, task branch, PR link, file-change stats, and merge timestamp when those fields are available.
+
+When a tracked task moves into `done`, Fusion closes the linked GitHub issue with `state_reason: completed`; when it leaves `done` for an active column, Fusion reopens the issue with `state_reason: reopened`; and when the Fusion task is permanently deleted, Fusion closes the linked issue with `state_reason: not_planned`.
 
 GitHub authentication/settings are configured in [Settings Reference](./settings-reference.md) via `githubAuthMode` (`gh-cli` or `token`) and `githubAuthToken`.
 
@@ -567,7 +656,7 @@ Users can apply presets at task creation; manual model selection can override th
 
 ## AI Title Summarization
 
-When `autoSummarizeTitles` is enabled and a task has a long untitled description, Fusion can auto-generate a concise title. This applies to tasks created from the dashboard/API as well as tasks created by agents and tooling flows (`fn_task_create`, delegated tasks, and triage-created child tasks).
+When `autoSummarizeTitles` is enabled and a task has a long untitled description, Fusion can auto-generate a concise title. This applies to tasks created from the dashboard/API as well as tasks created by agents and tooling flows (`fn_task_create`, delegated tasks, and triage-created child tasks). GitHub tracking also opportunistically uses the title-summarizer lane for untitled tasks before falling back to a deterministic description-derived title.
 
 ## Screenshots
 

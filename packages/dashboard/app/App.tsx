@@ -1,5 +1,11 @@
 import { useState, useCallback, useEffect, useMemo, useRef, lazy, Suspense } from "react";
-import type { Task, TaskDetail, WorkflowStep } from "@fusion/core";
+import {
+  computeCapacityRisk,
+  DEFAULT_CAPACITY_RISK_TODO_THRESHOLD,
+  type Task,
+  type TaskDetail,
+  type WorkflowStep,
+} from "@fusion/core";
 import { Header, useViewportMode } from "./components/Header";
 import { Board } from "./components/Board";
 import { TaskCard } from "./components/TaskCard";
@@ -15,6 +21,8 @@ import { ExecutorStatusBar } from "./components/ExecutorStatusBar";
 import { SessionNotificationBanner } from "./components/SessionNotificationBanner";
 import { CliBinaryInstallBanner } from "./components/CliBinaryInstallBanner";
 import { SetupWarningBanner } from "./components/SetupWarningBanner";
+import { CapacityRiskBanner } from "./components/CapacityRiskBanner";
+import { TaskIdIntegrityBanner } from "./components/TaskIdIntegrityBanner";
 import { UpdateAvailableBanner } from "./components/UpdateAvailableBanner";
 import { ApprovalNotificationBanner } from "./components/ApprovalNotificationBanner";
 import { OnboardingResumeCard } from "./components/OnboardingResumeCard";
@@ -32,6 +40,7 @@ import { useBackgroundSessions } from "./hooks/useBackgroundSessions";
 import { useSessionBannersHidden } from "./hooks/useSessionBannerPref";
 import { useTasks } from "./hooks/useTasks";
 import { useProjects } from "./hooks/useProjects";
+import { useAgents } from "./hooks/useAgents";
 import { useNodes } from "./hooks/useNodes";
 import { useCurrentProject } from "./hooks/useCurrentProject";
 import { ToastProvider, useToast } from "./hooks/useToast";
@@ -47,7 +56,7 @@ import { useMobileScrollLock } from "./hooks/useMobileScrollLock";
 import { useSetupReadiness } from "./hooks/useSetupReadiness";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { useViewState, type TaskView } from "./hooks/useViewState";
-import { useNavigationHistory } from "./hooks/useNavigationHistory";
+import { NavigationHistoryProvider, useNavigationHistory } from "./hooks/useNavigationHistory";
 import { usePluginDashboardViews } from "./hooks/usePluginDashboardViews";
 import { PluginDashboardViewHost } from "./plugins/PluginDashboardViewHost";
 import { isPluginViewId, isPluginViewRegistered } from "./plugins/pluginViewRegistry";
@@ -57,6 +66,7 @@ import { useTaskHandlers } from "./hooks/useTaskHandlers";
 import { useRemoteNodeData } from "./hooks/useRemoteNodeData";
 import { useRemoteNodeEvents } from "./hooks/useRemoteNodeEvents";
 import { NodeProvider, useNodeContext } from "./context/NodeContext";
+import { FileBrowserProvider } from "./context/FileBrowserContext";
 import { ShellProvider } from "./context/ShellContext";
 import { ShellHostProvider, useShellHostContext } from "./context/ShellHostContext";
 import { useShellConnection } from "./hooks/useShellConnection";
@@ -64,9 +74,9 @@ import { NativeShellOnboardingModal } from "./components/NativeShellOnboardingMo
 import { NativeShellConnectionManager } from "./components/NativeShellConnectionManager";
 import { ShellConnectionStatus } from "./components/ShellConnectionStatus";
 import { getShellConnectionNativeResult, type ShellConnectionNativeResult } from "./shell-native";
-import type { AiSessionSummary } from "./api";
-import { api, fetchUnreadCount, fetchTaskDetail, fetchWorkflowSteps } from "./api";
-import { getScopedItem, setScopedItem } from "./utils/projectStorage";
+import type { AiSessionSummary, DashboardHealthResponse } from "./api";
+import { api, fetchDashboardHealth, fetchUnreadCount, fetchTaskDetail, fetchWorkflowSteps } from "./api";
+import { getScopedItem, removeScopedItem, setScopedItem } from "./utils/projectStorage";
 import { subscribeSse } from "./sse-bus";
 import { AUTH_TOKEN_RECOVERY_REQUIRED_EVENT } from "./auth";
 import { AuthTokenRecoveryDialog } from "./components/AuthTokenRecoveryDialog";
@@ -130,6 +140,7 @@ const WORKING_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-working-branch-filter";
 const BASE_BRANCH_FILTER_STORAGE_KEY = "kb-dashboard-base-branch-filter";
 const NO_BRANCH_FILTER_VALUE = "__fusion:no-branch__";
 const APPROVAL_BANNER_DISMISSED_STORAGE_KEY = "fusion:approval-banner-dismissed";
+const CAPACITY_RISK_DISMISSED_KEY = "kb-capacity-risk-banner-dismissed";
 
 interface ApprovalBannerCandidate {
   dedupeKey: string;
@@ -651,8 +662,12 @@ function AppInner() {
   const [milestoneSliceResumeSessionId, setMilestoneSliceResumeSessionId] = useState<string | undefined>(undefined);
   const [quickChatOpen, setQuickChatOpen] = useState(false);
   const [authTokenRecoveryOpen, setAuthTokenRecoveryOpen] = useState(false);
+  const [dashboardHealth, setDashboardHealth] = useState<DashboardHealthResponse | null>(null);
   const [setupWarningDismissed, setSetupWarningDismissed] = useState(
     () => getScopedItem(SETUP_WARNING_DISMISSED_KEY, currentProject?.id) === "true",
+  );
+  const [capacityRiskDismissed, setCapacityRiskDismissed] = useState(
+    () => getScopedItem(CAPACITY_RISK_DISMISSED_KEY, currentProject?.id) === "true",
   );
 
   useEffect(() => {
@@ -660,6 +675,32 @@ function AppInner() {
       getScopedItem(SETUP_WARNING_DISMISSED_KEY, currentProject?.id) === "true",
     );
   }, [currentProject?.id]);
+
+  useEffect(() => {
+    setCapacityRiskDismissed(
+      getScopedItem(CAPACITY_RISK_DISMISSED_KEY, currentProject?.id) === "true",
+    );
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetchDashboardHealth()
+      .then((health) => {
+        if (!cancelled) {
+          setDashboardHealth(health);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDashboardHealth(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const handleDaemonAuthFailure = () => {
@@ -677,6 +718,11 @@ function AppInner() {
     setSetupWarningDismissed(true);
   }, [currentProject?.id]);
 
+  const handleDismissCapacityRisk = useCallback(() => {
+    setScopedItem(CAPACITY_RISK_DISMISSED_KEY, "true", currentProject?.id);
+    setCapacityRiskDismissed(true);
+  }, [currentProject?.id]);
+
   // Settings state
   const {
     maxConcurrent,
@@ -685,6 +731,8 @@ function AppInner() {
     enginePaused,
     taskStuckTimeoutMs,
     staleHighFanoutBlockerAgeThresholdMs,
+    capacityRiskBannerEnabled,
+    capacityRiskTodoThreshold,
     showQuickChatFAB,
     prAuthAvailable,
     settingsLoaded,
@@ -698,6 +746,55 @@ function AppInner() {
     toggleEnginePause,
     refresh: refreshAppSettings,
   } = useAppSettings(currentProject?.id);
+
+  const { stats: agentStats } = useAgents(currentProject?.id);
+
+  const inProgressCount = useMemo(
+    () => boardSourceTasks.filter((task) => task.column === "in-progress").length,
+    [boardSourceTasks],
+  );
+  const inReviewCount = useMemo(
+    () => boardSourceTasks.filter((task) => task.column === "in-review").length,
+    [boardSourceTasks],
+  );
+  const capacityRiskSignal = useMemo(
+    () =>
+      computeCapacityRisk({
+        todoCount: agentStats?.todoTaskCount ?? 0,
+        inProgressCount,
+        inReviewCount,
+        idleNonEphemeralAgentCount: agentStats?.idleNonEphemeralCount ?? 0,
+        threshold: capacityRiskTodoThreshold ?? DEFAULT_CAPACITY_RISK_TODO_THRESHOLD,
+      }),
+    [agentStats?.todoTaskCount, agentStats?.idleNonEphemeralCount, inProgressCount, inReviewCount, capacityRiskTodoThreshold],
+  );
+
+  const previousCapacityRiskBannerEnabledRef = useRef(capacityRiskBannerEnabled);
+  const previousCapacityRiskTodoThresholdRef = useRef(capacityRiskTodoThreshold);
+  const previousCapacityRiskProjectIdRef = useRef(currentProject?.id);
+
+  useEffect(() => {
+    if (previousCapacityRiskProjectIdRef.current !== currentProject?.id) {
+      previousCapacityRiskProjectIdRef.current = currentProject?.id;
+      previousCapacityRiskBannerEnabledRef.current = capacityRiskBannerEnabled;
+      previousCapacityRiskTodoThresholdRef.current = capacityRiskTodoThreshold;
+      return;
+    }
+
+    const wasEnabled = previousCapacityRiskBannerEnabledRef.current;
+    const previousThreshold = previousCapacityRiskTodoThresholdRef.current;
+    const bannerEnabledChangedToTrue = !wasEnabled && capacityRiskBannerEnabled;
+    const thresholdChanged = previousThreshold !== capacityRiskTodoThreshold;
+
+    if (bannerEnabledChangedToTrue || thresholdChanged) {
+      removeScopedItem(CAPACITY_RISK_DISMISSED_KEY, currentProject?.id);
+      setCapacityRiskDismissed(false);
+    }
+
+    previousCapacityRiskProjectIdRef.current = currentProject?.id;
+    previousCapacityRiskBannerEnabledRef.current = capacityRiskBannerEnabled;
+    previousCapacityRiskTodoThresholdRef.current = capacityRiskTodoThreshold;
+  }, [capacityRiskBannerEnabled, capacityRiskTodoThreshold, currentProject?.id]);
 
   const skillsEnabled = experimentalFeatures.skillsView === true;
   const nodesEnabled = experimentalFeatures.nodesView === true;
@@ -954,8 +1051,13 @@ function AppInner() {
     }
   }, [modalManager, pushNav]);
 
-  const openFilesWithNav = useCallback(() => {
-    modalManager.openFiles();
+  const openFilesWithNav = useCallback((workspace?: string, initialFile?: string | null) => {
+    modalManager.openFiles(workspace, initialFile);
+    pushNav({ type: "modal", close: modalManager.closeFiles });
+  }, [modalManager, pushNav]);
+
+  const openFileInBrowser = useCallback((path: string, opts?: { workspace?: string; line?: number; col?: number }) => {
+    modalManager.openFiles(opts?.workspace, path);
     pushNav({ type: "modal", close: modalManager.closeFiles });
   }, [modalManager, pushNav]);
 
@@ -1404,6 +1506,9 @@ function AppInner() {
     if (taskView === "board") {
       return (
         <PageErrorBoundary>
+          {capacityRiskBannerEnabled && !capacityRiskDismissed ? (
+            <CapacityRiskBanner signal={capacityRiskSignal} onDismiss={handleDismissCapacityRisk} />
+          ) : null}
           <Board
             tasks={filteredBoardTasks}
             projectId={currentProject?.id}
@@ -1475,15 +1580,6 @@ function AppInner() {
     );
   };
 
-  if (!initialLoadComplete) {
-    return (
-      <>
-        <DashboardLoader stage={loadingStage} />
-        <ToastContainer toasts={toasts} onRemove={removeToast} />
-      </>
-    );
-  }
-
   const showOnboardingResumeCard = !modalManager.modelOnboardingOpen && isOnboardingResumable();
   const showPostOnboardingRecommendations =
     !modalManager.modelOnboardingOpen &&
@@ -1492,8 +1588,16 @@ function AppInner() {
     !isPostOnboardingDismissed();
 
   return (
-    <>
-      <Header
+    <NavigationHistoryProvider value={{ pushNav, replaceCurrent }}>
+      <FileBrowserProvider openFile={openFileInBrowser}>
+        {!initialLoadComplete ? (
+          <>
+            <DashboardLoader stage={loadingStage} />
+            <ToastContainer toasts={toasts} onRemove={removeToast} />
+          </>
+        ) : (
+          <>
+            <Header
         shellHost={shellHost.host}
         onOpenSettings={openSettingsWithNav}
         onOpenGitHubImport={openGitHubImportWithNav}
@@ -1599,6 +1703,27 @@ function AppInner() {
           latestVersion={latestVersion}
           currentVersion={currentVersion}
           onDismiss={dismissUpdateBanner}
+        />
+      )}
+      {viewMode === "project" && currentProject && dashboardHealth?.taskIdIntegrity?.status === "anomaly" && dashboardHealth.taskIdIntegrity.recommendedAction && (
+        <TaskIdIntegrityBanner
+          report={dashboardHealth.taskIdIntegrity}
+          recommendedAction={dashboardHealth.taskIdIntegrity.recommendedAction}
+          onRefresh={(report, recommendedAction) => {
+            setDashboardHealth((current) => {
+              if (!current) {
+                return null;
+              }
+              return {
+                ...current,
+                status: report.status === "anomaly" || !current.database.healthy ? "degraded" : "ok",
+                taskIdIntegrity: {
+                  ...report,
+                  recommendedAction,
+                },
+              };
+            });
+          }}
         />
       )}
       {viewMode === "project" && currentProject && !setupReadinessLoading && hasWarnings && !setupWarningDismissed && (
@@ -1733,23 +1858,26 @@ function AppInner() {
         onReopenOnboarding={reopenOnboardingWithNav}
       />
       <AuthTokenRecoveryDialog open={authTokenRecoveryOpen} />
-      {shellApi && (
-        <>
-          <NativeShellOnboardingModal
-            open={requiresShellOnboarding}
-            shellApi={shellApi}
-            shellState={shellState}
-            onComplete={() => setShellOnboardingComplete(true)}
-          />
-          <NativeShellConnectionManager
-            open={shellConnectionManagerOpen}
-            shellApi={shellApi}
-            shellState={shellState}
-            onClose={() => setShellConnectionManagerOpen(false)}
-          />
-        </>
-      )}
-    </>
+            {shellApi && (
+              <>
+                <NativeShellOnboardingModal
+                  open={requiresShellOnboarding}
+                  shellApi={shellApi}
+                  shellState={shellState}
+                  onComplete={() => setShellOnboardingComplete(true)}
+                />
+                <NativeShellConnectionManager
+                  open={shellConnectionManagerOpen}
+                  shellApi={shellApi}
+                  shellState={shellState}
+                  onClose={() => setShellConnectionManagerOpen(false)}
+                />
+              </>
+            )}
+          </>
+        )}
+      </FileBrowserProvider>
+    </NavigationHistoryProvider>
   );
 }
 

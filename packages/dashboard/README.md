@@ -110,6 +110,13 @@ AI-guided interactive planning for creating well-specified tasks from high-level
 - **PR Management**: Create, monitor, and merge pull requests for in-review tasks
 - **Deep Links**: Dashboard task links using `?task=FN-123` (or `?project=proj_456&task=FN-123` for cross-project) open the task detail modal as a one-time launch. Dismissing the modal removes the `task` parameter from the URL so that refreshing the page does not reopen it. Other query parameters (e.g., `?project=...`) are preserved. Task detail modals opened normally from the board, list, or activity log are not affected.
 
+### Back navigation on mobile
+`App.tsx` owns the single browser-history-integrated navigation stack via `useNavigationHistory({ enabled: true })` and now provides `{ pushNav, replaceCurrent }` to descendants through `NavigationHistoryProvider` / `useNavigationHistoryContext()`.
+
+Any mobile list→detail surface that swaps panes in place (for example Chat, Missions, or Planning) must push a `view` entry when detail opens, with an idempotent `revert` callback that returns to the list. This keeps iOS swipe-back and Android/browser back aligned with the in-app back button instead of skipping the intermediate list state.
+
+For surfaces with multiple entry paths into detail (for example selecting an existing row and creating a new item/session), key the push effect on the visible detail-pane signal rather than selected-item ID transitions so every path registers the back-stack entry.
+
 ### Responsive Header
 The dashboard header adapts across three responsive tiers to remain usable without wrapping or dropping controls:
 

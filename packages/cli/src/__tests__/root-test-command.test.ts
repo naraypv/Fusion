@@ -5,7 +5,7 @@ import {
   resolveAffectedPackages,
   shouldForceFullSuite,
 } from "../../../../scripts/test-changed.mjs";
-import { parseShardArgs, planShardAssignments, selectShardPackages } from "../../../../scripts/ci-test-shard.mjs";
+import { computeSplitPlan, parseShardArgs, planShardAssignments, selectShardPackages } from "../../../../scripts/ci-test-shard.mjs";
 
 describe("root test command changed-only planning", () => {
   it("uses changed mode when package-only changes are detected", () => {
@@ -78,43 +78,102 @@ describe("CI shard test planner", () => {
     );
   });
 
-  it("deterministically balances weighted packages across shards", () => {
+  it("deterministically balances weighted packages across shards with virtual dashboard slices", () => {
     const weightedPackages = [
-      { name: "@fusion/dashboard", testFileCount: 140 },
-      { name: "@fusion/engine", testFileCount: 120 },
-      { name: "@fusion/core", testFileCount: 60 },
-      { name: "@runfusion/fusion", testFileCount: 40 },
-      { name: "@fusion/plugin-sdk", testFileCount: 18 },
-      { name: "@fusion/mobile", testFileCount: 12 },
-      { name: "@fusion/desktop", testFileCount: 8 },
-      { name: "@fusion/dashboard-utils", testFileCount: 4 },
-      { name: "@fusion/no-tests-yet", testFileCount: 0 },
+      { name: "@fusion/dashboard", testFileCount: 505 },
+      { name: "@fusion/engine", testFileCount: 90 },
+      { name: "@fusion/core", testFileCount: 80 },
+      { name: "@runfusion/fusion", testFileCount: 50 },
+      { name: "@fusion/plugin-sdk", testFileCount: 30 },
     ];
 
     const shardAssignments = planShardAssignments(weightedPackages, 3);
-    expect(shardAssignments).toEqual([
-      ["@fusion/dashboard"],
-      ["@fusion/engine", "@fusion/desktop", "@fusion/dashboard-utils"],
-      ["@fusion/core", "@runfusion/fusion", "@fusion/plugin-sdk", "@fusion/mobile", "@fusion/no-tests-yet"],
-    ]);
-
     expect(selectShardPackages(weightedPackages, 1, 3)).toEqual(shardAssignments[0]);
     expect(selectShardPackages(weightedPackages, 2, 3)).toEqual(shardAssignments[1]);
     expect(selectShardPackages(weightedPackages, 3, 3)).toEqual(shardAssignments[2]);
 
-    const weightsByName = new Map(weightedPackages.map((pkg) => [pkg.name, pkg.testFileCount]));
-    const shardWeights = shardAssignments.map((shardPackages) =>
-      shardPackages.reduce((sum, pkgName) => sum + (weightsByName.get(pkgName) ?? 0), 0),
+    const dashboardSlices = shardAssignments
+      .flat()
+      .filter((entry) => entry.name === "@fusion/dashboard" && entry.shardCount === 3);
+    expect(dashboardSlices).toHaveLength(3);
+    expect(dashboardSlices.map((entry) => entry.shardIndex).sort()).toEqual([1, 2, 3]);
+
+    const shardsContainingDashboard = shardAssignments
+      .map((entries, index) => ({ entries, index }))
+      .filter(({ entries }) => entries.some((entry) => entry.name === "@fusion/dashboard"))
+      .map(({ index }) => index);
+    expect(shardsContainingDashboard).toEqual([0, 1, 2]);
+
+    const computedSplitPlan = computeSplitPlan(weightedPackages, 3);
+    const byWeight = new Map(computedSplitPlan.map((entry) => [
+      `${entry.name}:${entry.shardIndex ?? 0}/${entry.shardCount ?? 0}`,
+      entry.weight,
+    ]));
+    const shardWeights = shardAssignments.map((entries) =>
+      entries.reduce(
+        (sum, entry) =>
+          sum +
+          (byWeight.get(`${entry.name}:${entry.shardIndex ?? 0}/${entry.shardCount ?? 0}`) ?? 0),
+        0,
+      ),
     );
 
     const totalWeight = weightedPackages.reduce((sum, pkg) => sum + pkg.testFileCount, 0);
     const mean = totalWeight / 3;
-
-    expect(Math.max(...shardWeights)).toBeLessThanOrEqual(mean * 1.15);
+    expect(Math.max(...shardWeights)).toBeLessThanOrEqual(mean * 1.1);
     expect(Math.min(...shardWeights)).toBeGreaterThanOrEqual(mean * 0.85);
+  });
 
-    const dashboardShard = shardAssignments.findIndex((pkgs) => pkgs.includes("@fusion/dashboard"));
-    const engineShard = shardAssignments.findIndex((pkgs) => pkgs.includes("@fusion/engine"));
-    expect(dashboardShard).not.toBe(engineShard);
+  it("leaves packages whole when no single package exceeds the split threshold", () => {
+    const weightedPackages = [
+      { name: "@fusion/engine", testFileCount: 40 },
+      { name: "@fusion/core", testFileCount: 40 },
+      { name: "@runfusion/fusion", testFileCount: 40 },
+    ];
+
+    const shardAssignments = planShardAssignments(weightedPackages, 3, { threshold: 2 });
+    expect(shardAssignments.flat().every((entry) => entry.shardCount === undefined)).toBe(true);
+  });
+
+  it("splits never co-locate two slices of the same package on the same shard", () => {
+    const weightedPackages = [
+      { name: "@fusion/dashboard", testFileCount: 505 },
+      { name: "@fusion/engine", testFileCount: 10 },
+      { name: "@fusion/core", testFileCount: 10 },
+    ];
+
+    const shardAssignments = planShardAssignments(weightedPackages, 3);
+    for (const entries of shardAssignments) {
+      const dashboardEntries = entries.filter((entry) => entry.name === "@fusion/dashboard");
+      expect(dashboardEntries).toHaveLength(1);
+    }
+  });
+});
+
+describe("computeSplitPlan", () => {
+  it("splits oversized package into k slices where k is capped by total", () => {
+    const result = computeSplitPlan([{ name: "big", testFileCount: 100 }], 3);
+    expect(result).toEqual([
+      { name: "big", weight: 34, shardIndex: 1, shardCount: 3 },
+      { name: "big", weight: 34, shardIndex: 2, shardCount: 3 },
+      { name: "big", weight: 34, shardIndex: 3, shardCount: 3 },
+    ]);
+  });
+
+  it("returns rewritten list with whole and virtual entries", () => {
+    const result = computeSplitPlan(
+      [
+        { name: "@fusion/dashboard", testFileCount: 505 },
+        { name: "@fusion/core", testFileCount: 60 },
+      ],
+      3,
+    );
+
+    expect(result).toEqual([
+      { name: "@fusion/dashboard", weight: 169, shardIndex: 1, shardCount: 3 },
+      { name: "@fusion/dashboard", weight: 169, shardIndex: 2, shardCount: 3 },
+      { name: "@fusion/dashboard", weight: 169, shardIndex: 3, shardCount: 3 },
+      { name: "@fusion/core", weight: 60 },
+    ]);
   });
 });

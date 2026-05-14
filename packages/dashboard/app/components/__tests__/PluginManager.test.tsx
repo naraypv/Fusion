@@ -285,6 +285,125 @@ describe("PluginManager", () => {
     expect(within(builtInCard as HTMLElement).getByText("Built-in metadata only")).toBeTruthy();
   });
 
+  it.each([
+    {
+      name: "renders plugin error text in list and detail when plugin is errored",
+      plugin: {
+        ...mockPlugins[0],
+        id: "plugin-error-with-message",
+        name: "Broken Plugin",
+        state: "error" as const,
+        error: "Plugin entry must be a file, got directory: /plugins/broken-plugin",
+      },
+      expectMessage: true,
+    },
+    {
+      name: "does not render an error block when the error state has no message",
+      plugin: {
+        ...mockPlugins[0],
+        id: "plugin-error-without-message",
+        name: "Broken Plugin Without Message",
+        state: "error" as const,
+        error: undefined,
+      },
+      expectMessage: false,
+    },
+    {
+      name: "does not render an error block for non-error states",
+      plugin: {
+        ...mockPlugins[0],
+        id: "plugin-started-with-message",
+        name: "Healthy Plugin",
+        state: "started" as const,
+        error: "stale error should stay hidden",
+      },
+      expectMessage: false,
+    },
+  ])("$name", async ({ plugin, expectMessage }) => {
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([plugin]);
+
+    const expectedError = plugin.error;
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(plugin.name)).toBeTruthy();
+    });
+
+    const listItem = screen.getByText(plugin.name).closest(".plugin-item");
+    expect(listItem).toBeTruthy();
+
+    if (expectMessage && expectedError) {
+      expect(within(listItem as HTMLElement).getByText(expectedError)).toHaveAttribute("title", expectedError);
+    } else if (expectedError) {
+      expect(within(listItem as HTMLElement).queryByText(expectedError)).toBeNull();
+    } else {
+      expect((listItem as HTMLElement).querySelector(".plugin-error-text")).toBeNull();
+    }
+
+    const settingsButton = (listItem as HTMLElement).querySelector('button[title="Settings"]');
+    expect(settingsButton).toBeTruthy();
+    await userEvent.click(settingsButton as HTMLElement);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("plugin-manager-detail")).toBeTruthy();
+    });
+
+    if (expectMessage && expectedError) {
+      expect(screen.getByText(expectedError)).toHaveAttribute("title", expectedError);
+    } else if (expectedError) {
+      expect(screen.queryByText(expectedError)).toBeNull();
+    } else {
+      expect(screen.getByTestId("plugin-manager-detail").querySelector(".plugin-error-text")).toBeNull();
+    }
+  });
+
+  it("wraps long plugin error text in the detail view while preserving the detail variant class", async () => {
+    const { loadAllAppCss } = await import("../../test/cssFixture");
+    const styleEl = document.createElement("style");
+    styleEl.setAttribute("data-test-id", "plugin-manager-wrap-css");
+    styleEl.textContent = loadAllAppCss();
+    document.head.appendChild(styleEl);
+
+    const plugin = {
+      ...mockPlugins[0],
+      id: "plugin-error-detail-wrap",
+      name: "Long Error Plugin",
+      state: "error" as const,
+      error: "Error: Plugin loader failed while resolving /plugins/long-error-plugin/node_modules/@very-long-scope/very-long-package-name-with-no-natural-breakpoints/dist/index.mjs because configuration checksum validation did not complete successfully.",
+    };
+    vi.mocked(fetchPlugins).mockResolvedValueOnce([plugin]);
+
+    render(<PluginManager addToast={addToast} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(plugin.name)).toBeTruthy();
+    });
+
+    const listItem = screen.getByText(plugin.name).closest(".plugin-item");
+    expect(listItem).toBeTruthy();
+
+    const listError = (listItem as HTMLElement).querySelector(".plugin-error-text");
+    expect(listError).toBeTruthy();
+    const listStyle = window.getComputedStyle(listError as Element);
+    expect(listStyle.whiteSpace).toBe("nowrap");
+    expect(listStyle.textOverflow).toBe("ellipsis");
+
+    const settingsButton = (listItem as HTMLElement).querySelector('button[title="Settings"]');
+    expect(settingsButton).toBeTruthy();
+    await userEvent.click(settingsButton as HTMLElement);
+
+    const detailError = await screen.findByText(plugin.error);
+    expect(detailError).toHaveClass("plugin-error-text", "plugin-error-text--detail");
+
+    const detailStyle = window.getComputedStyle(detailError);
+    expect(detailStyle.whiteSpace).toBe("normal");
+    expect(detailStyle.overflow).toBe("visible");
+    expect(detailStyle.textOverflow).toBe("clip");
+    expect(detailStyle.overflowWrap).toBe("anywhere");
+
+    styleEl.remove();
+  });
+
   it("shows setup-required action for installed built-in agent browser", async () => {
     vi.mocked(fetchPlugins).mockResolvedValueOnce([
       {

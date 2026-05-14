@@ -2,9 +2,11 @@
 
 [← Docs index](./README.md)
 
-Fusion Research lets you create bounded research runs that search, fetch, and synthesize information with built-in web tools by default, then turn structured findings into actionable tasks — all from the dashboard, CLI, or agent sessions.
+Fusion Research is a cited search-and-synthesis pipeline: create bounded research runs, gather sources with built-in web tools, and synthesize findings into actionable task context from the dashboard, CLI, or agent sessions.
 
 ---
+
+> **Not pi-autoresearch:** Fusion Research is a cited search/synthesis pipeline. The autonomous try-measure-keep-revert loop from upstream `pi-autoresearch` is a separate domain (experiment sessions); see [naming-decision-2026-05.md](./research/naming-decision-2026-05.md).
 
 ## Overview
 
@@ -53,7 +55,7 @@ This also reveals the **Research Defaults** and **Research** settings sections i
 
 ### 2. Built-in web search is the default
 
-By default, `researchGlobalWebSearchProvider` resolves to `"builtin"`. Search and fetch run through the agent runtime's native `WebSearch` and `WebFetch` tools, so no API key is required for baseline usage.
+By default, `researchGlobalWebSearchProvider` resolves to `"builtin"`. Search and fetch run through the agent runtime's native `WebSearch` and `WebFetch` tools, so no API key is required for baseline usage, and web search stays enabled even if older persisted settings still contain `enabledSources.webSearch: false`.
 
 ### 3. Optional: external search backends
 
@@ -66,7 +68,6 @@ You can opt into external providers in global settings:
 | `"brave"` | `researchGlobalBraveApiKey` — Brave Search API key |
 | `"google"` | `researchGlobalGoogleSearchApiKey` + `researchGlobalGoogleSearchCx` — Google Custom Search credentials |
 | `"tavily"` | `researchGlobalTavilyApiKey` — Tavily API key |
-| `"none"` | Disables web search (Page Fetch, Local Docs, GitHub, and LLM synthesis can still run) |
 
 API keys are stored through Fusion's auth credential pipeline (`/api/auth/api-key`), not in settings JSON directly.
 
@@ -114,7 +115,7 @@ Research is intentionally not shown in the primary board/list/agents/missions/ch
 3. Select which providers to use (Web Search, Page Fetch, GitHub, Local Docs, LLM Synthesis)
 4. Click **Create Run**
 
-The run enters the `queued` status and progresses through orchestration phases as the engine processes it.
+The run enters the `queued` status. Depending on entrypoint, execution may start immediately or wait for an execution surface/engine path to pick it up.
 
 ### Viewing results
 
@@ -161,7 +162,7 @@ Each finding has two task-facing actions:
 
 ## CLI Usage
 
-The `fn research` command provides full research run management from the terminal.
+The `fn research` command provides cited-research run management from the terminal (search/fetch/synthesis runs, not experiment sessions).
 
 ### Commands
 
@@ -285,17 +286,19 @@ Additionally, planning-mode sessions and the LLM synthesis agent can opt into ru
 
 | Tool | Description |
 |---|---|
-| `fn_research_run` | Start a bounded research run. Parameters: `query`, `wait_for_completion`, `max_wait_ms` |
-| `fn_research_list` | List recent runs. Parameters: `status`, `limit` |
-| `fn_research_get` | Get a run's structured findings. Parameters: `id` |
-| `fn_research_cancel` | Cancel an active run. Parameters: `id` |
-| `fn_research_retry` | Retry a failed/timed-out run when retryable. Parameters: `id` |
+| `fn_research_run` | Start a bounded cited-research run (search/fetch/synthesis). Parameters: `query`, `wait_for_completion`, `max_wait_ms` |
+| `fn_research_list` | List recent cited-research runs. Parameters: `status`, `limit` |
+| `fn_research_get` | Get a cited-research run's structured findings. Parameters: `id` |
+| `fn_research_cancel` | Cancel an active cited-research run. Parameters: `id` |
+| `fn_research_retry` | Retry a failed/timed-out cited-research run when retryable. Parameters: `id` |
 
 ### Tool responses
 
 All tools return:
 - **Text content** — concise human-readable summary
 - **Structured details** — machine-readable metadata (`runId`, `status`, `summary`, `findings`, `citations`, `error`, `setup`)
+
+`ResearchFinding.confidence` in this subsystem is synthesis-emitted confidence from the LLM provider (0–1), not a statistical confidence score.
 
 ### Availability checks
 
@@ -304,7 +307,7 @@ Before creating runs, `fn_research_run` checks:
 2. Web search is available (`"builtin"` by default, or an explicitly configured external backend)
 3. Required API keys are present for external providers
 
-If a check fails, the tool returns an actionable error with setup guidance instead of crashing. In practice, with the default `"builtin"` backend, provider-setup errors are mostly limited to explicit external-provider selections or explicit `"none"` opt-out.
+If a check fails, the tool returns an actionable error with setup guidance instead of crashing. In practice, with the default `"builtin"` backend, provider-setup errors are mostly limited to explicit external-provider selections.
 
 ### Best practices for agents
 
@@ -437,7 +440,7 @@ When all retries are exhausted, the run transitions to `retry_exhausted`.
 | Symptom | Cause | Resolution |
 |---|---|---|
 | "Research is disabled in settings" | `researchGlobalEnabled` or `researchSettings.enabled` is `false` | Enable in Settings → Research |
-| "Research provider is not configured" | Web search was explicitly disabled (`researchGlobalWebSearchProvider: "none"`) or external provider setup is incomplete | Re-enable builtin search, or finish configuring your selected external provider in Settings |
+| "Research provider is not configured" | External provider setup is incomplete | Switch back to builtin search or finish configuring your selected external provider in Settings |
 | "Missing API key for {provider}" | Auth credential not found | Configure provider credentials in Settings → Authentication |
 | Run stuck in `queued` | Engine not running or no available concurrency slots | Start the project engine; check `maxConcurrentRuns` |
 | Run times out | Provider slow or `maxDurationMs` too low | Increase timeout in project research settings |

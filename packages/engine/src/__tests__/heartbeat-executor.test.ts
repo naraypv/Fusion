@@ -27,7 +27,13 @@ vi.mock("../pi.js", () => ({
   }),
 }));
 import { createFnAgent } from "../pi.js";
+import { acquireTaskWorktree } from "../worktree-acquisition.js";
 const mockedCreateFnAgent = vi.mocked(createFnAgent);
+const mockedAcquireTaskWorktree = vi.mocked(acquireTaskWorktree);
+
+vi.mock("../worktree-acquisition.js", () => ({
+  acquireTaskWorktree: vi.fn(),
+}));
 
 describe("executeHeartbeat", () => {
   let mockTaskStore: TaskStore;
@@ -57,6 +63,8 @@ describe("executeHeartbeat", () => {
         prompt: "# Test PROMPT.md\nSome content",
         steps: [],
         column: "todo",
+        worktree: "/tmp/worktree-fn-001",
+        branch: "fusion/fn-001",
         dependencies: [],
         log: [],
         attachments: [],
@@ -164,10 +172,17 @@ describe("executeHeartbeat", () => {
   beforeEach(() => {
     mockTaskStore = createMockTaskStore();
     vi.clearAllMocks();
+    mockedAcquireTaskWorktree.mockResolvedValue({
+      worktreePath: "/tmp/worktree-fn-001",
+      branch: "fusion/fn-001",
+      source: "existing",
+      hydrated: false,
+      isResume: true,
+    });
   });
 
   afterEach(() => {
-    vi.restoreAllMocks();
+    vi.clearAllMocks();
   });
 
   describe("reports health check", () => {
@@ -213,12 +228,113 @@ describe("executeHeartbeat", () => {
       const now = Date.now();
       const store = createStoreWithAgentForExec();
       vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
-        { id: "agent-003", name: "agent-3", state: "active", taskId: "FN-101", lastHeartbeatAt: new Date(now - 3 * 60 * 60 * 1000).toISOString(), updatedAt: new Date(now - 3 * 60 * 60 * 1000).toISOString() } as Agent,
+        { id: "agent-003", name: "agent-3", state: "active", taskId: "FN-101", lastHeartbeatAt: new Date(now - 5 * 60 * 60 * 1000).toISOString(), updatedAt: new Date(now - 5 * 60 * 60 * 1000).toISOString() } as Agent,
       ]);
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp", heartbeatTimeoutMs: 60_000 });
 
       const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
       expect(section).toContain("**stale**");
+    });
+
+    it("buildReportsHealthSection keeps 60m-interval reports healthy within the grace window", async () => {
+      const now = Date.now();
+      const store = createStoreWithAgentForExec();
+      vi.mocked(store.getCachedAgent).mockImplementation((id: string) => ({
+        id,
+        runtimeConfig: { heartbeatIntervalMs: 60 * 60_000 },
+      }) as unknown as Agent);
+      vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
+        { id: "agent-frontend", name: "Frontend Engineer", state: "active", taskId: "FN-201", lastHeartbeatAt: new Date(now - 53 * 60_000).toISOString(), updatedAt: new Date(now - 53 * 60_000).toISOString() } as Agent,
+        { id: "agent-writer", name: "Technical Writer", state: "active", taskId: "FN-202", lastHeartbeatAt: new Date(now - 51 * 60_000).toISOString(), updatedAt: new Date(now - 51 * 60_000).toISOString() } as Agent,
+        { id: "agent-qa", name: "QA Engineer", state: "active", taskId: "FN-203", lastHeartbeatAt: new Date(now - 35 * 60_000).toISOString(), updatedAt: new Date(now - 35 * 60_000).toISOString() } as Agent,
+        { id: "agent-ci", name: "CI Engineer", state: "active", taskId: "FN-204", lastHeartbeatAt: new Date(now - 39 * 60_000).toISOString(), updatedAt: new Date(now - 39 * 60_000).toISOString() } as Agent,
+      ]);
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+      expect(section).not.toContain("**stale**");
+      expect(section).toContain("Frontend Engineer");
+      expect(section).toContain("Technical Writer");
+      expect(section).toContain("QA Engineer");
+      expect(section).toContain("CI Engineer");
+    });
+
+    it("buildReportsHealthSection marks overdue 60m-interval reports as stale", async () => {
+      const now = Date.now();
+      const store = createStoreWithAgentForExec();
+      vi.mocked(store.getCachedAgent).mockImplementation((id: string) => ({
+        id,
+        runtimeConfig: { heartbeatIntervalMs: 60 * 60_000 },
+      }) as unknown as Agent);
+      vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
+        {
+          id: "agent-overdue-a",
+          name: "Overdue A",
+          state: "active",
+          taskId: "FN-205",
+          lastHeartbeatAt: new Date(now - ((1 * 60 + 47) * 60_000 + 4 * 60 * 60_000)).toISOString(),
+          updatedAt: new Date(now - ((1 * 60 + 47) * 60_000 + 4 * 60 * 60_000)).toISOString(),
+        } as Agent,
+        {
+          id: "agent-overdue-b",
+          name: "Overdue B",
+          state: "active",
+          taskId: "FN-206",
+          lastHeartbeatAt: new Date(now - 5 * 60 * 60_000).toISOString(),
+          updatedAt: new Date(now - 5 * 60 * 60_000).toISOString(),
+        } as Agent,
+      ]);
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+      expect(section).toContain("Overdue A");
+      expect(section).toContain("Overdue B");
+      expect(section).toContain("**stale**");
+    });
+
+    it("buildReportsHealthSection applies interval-specific stale thresholds in mixed report tables", async () => {
+      const now = Date.now();
+      const store = createStoreWithAgentForExec();
+      vi.mocked(store.getCachedAgent).mockImplementation((id: string) => {
+        if (id === "agent-short") {
+          return { id, runtimeConfig: { heartbeatIntervalMs: 5 * 60_000 } } as unknown as Agent;
+        }
+        if (id === "agent-medium") {
+          return { id, runtimeConfig: { heartbeatIntervalMs: 60 * 60_000 } } as unknown as Agent;
+        }
+        if (id === "agent-long") {
+          return { id, runtimeConfig: { heartbeatIntervalMs: 4 * 60 * 60_000 } } as unknown as Agent;
+        }
+        return null;
+      });
+      vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
+        { id: "agent-short", name: "Short Interval", state: "active", taskId: "FN-207", lastHeartbeatAt: new Date(now - 30 * 60_000).toISOString(), updatedAt: new Date(now - 30 * 60_000).toISOString() } as Agent,
+        { id: "agent-medium", name: "Medium Interval", state: "active", taskId: "FN-208", lastHeartbeatAt: new Date(now - 30 * 60_000).toISOString(), updatedAt: new Date(now - 30 * 60_000).toISOString() } as Agent,
+        { id: "agent-long", name: "Long Interval", state: "active", taskId: "FN-209", lastHeartbeatAt: new Date(now - 30 * 60_000).toISOString(), updatedAt: new Date(now - 30 * 60_000).toISOString() } as Agent,
+      ]);
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+      expect(section).toMatch(/\| Short Interval \| active \| FN-207 \| .* \| \*\*stale\*\* \|/);
+      expect(section).toMatch(/\| Medium Interval \| active \| FN-208 \| .* \| healthy \|/);
+      expect(section).toMatch(/\| Long Interval \| active \| FN-209 \| .* \| healthy \|/);
+    });
+
+    it("buildReportsHealthSection enforces a 5-minute minimum staleness floor", async () => {
+      const now = Date.now();
+      const store = createStoreWithAgentForExec();
+      vi.mocked(store.getCachedAgent).mockImplementation((id: string) => ({
+        id,
+        runtimeConfig: { heartbeatIntervalMs: 1_000 },
+      }) as unknown as Agent);
+      vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
+        { id: "agent-fast", name: "Fast Poller", state: "active", taskId: "FN-210", lastHeartbeatAt: new Date(now - 2 * 60_000).toISOString(), updatedAt: new Date(now - 2 * 60_000).toISOString() } as Agent,
+      ]);
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+      expect(section).toContain("Fast Poller");
+      expect(section).not.toContain("**stale**");
     });
 
     it("buildReportsHealthSection preserves AgentStore method binding for direct-report lookups", async () => {
@@ -855,6 +971,57 @@ describe("executeHeartbeat", () => {
       expect(executionPrompt).toContain(HEARTBEAT_NO_TASK_PROCEDURE);
     });
 
+    it("no-task run overrides a seeded task-scoped heartbeatProcedurePath in the assembled prompt", async () => {
+      const tmpRoot = mkdtempSync(join(tmpdir(), "fn-hb-no-task-procedure-"));
+      try {
+        writeFileSync(join(tmpRoot, "HEARTBEAT.md"), HEARTBEAT_PROCEDURE, "utf-8");
+
+        const store = createStoreWithAgentForExec({
+          taskId: undefined,
+          soul: "I am a coordinator",
+          heartbeatProcedurePath: "HEARTBEAT.md",
+        });
+        const mockSession = createMockAgentSession();
+        mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });
+
+        const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: tmpRoot });
+        const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+
+        expect(result.status).toBe("completed");
+        const executionPrompt = mockSession.prompt.mock.calls.at(-1)?.[0];
+        expect(executionPrompt).toBeDefined();
+        expect(executionPrompt).not.toContain("fn_task_log");
+        expect(executionPrompt).not.toContain("fn_task_document_write");
+        expect(executionPrompt).not.toContain("do not re-read PROMPT.md to advance it");
+        expect(executionPrompt).toContain("Implementation-scope discovery");
+
+        const savedRun = await store.getRunDetail("agent-001", result.id);
+        expect(savedRun?.heartbeatProcedureSource).toBe("default-no-task-override");
+      } finally {
+        rmSync(tmpRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("no-task run without a custom heartbeatProcedurePath still uses the ambient procedure", async () => {
+      const store = createStoreWithAgentForExec({ taskId: undefined, soul: "I am a coordinator" });
+      const mockSession = createMockAgentSession();
+      mockedCreateFnAgent.mockResolvedValue({ session: mockSession as any });
+
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+      const result = await monitor.executeHeartbeat({ agentId: "agent-001", source: "timer" });
+
+      expect(result.status).toBe("completed");
+      const executionPrompt = mockSession.prompt.mock.calls.at(-1)?.[0];
+      expect(executionPrompt).toBeDefined();
+      expect(executionPrompt).not.toContain("fn_task_log");
+      expect(executionPrompt).not.toContain("fn_task_document_write");
+      expect(executionPrompt).not.toContain("do not re-read PROMPT.md to advance it");
+      expect(executionPrompt).toContain("Implementation-scope discovery");
+
+      const savedRun = await store.getRunDetail("agent-001", result.id);
+      expect(savedRun?.heartbeatProcedureSource).toBe("default");
+    });
+
     it("task-scoped run receives HEARTBEAT_SYSTEM_PROMPT as system prompt", async () => {
       const store = createStoreWithAgentForExec({ taskId: "FN-001" });
       const mockSession = createMockAgentSession();
@@ -1305,6 +1472,9 @@ describe("executeHeartbeat", () => {
         expect(executionPrompt).not.toContain(HEARTBEAT_PROCEDURE);
         // Wake Delta still rendered.
         expect(executionPrompt).toContain("## Wake Delta");
+
+        const savedRun = await store.getRunDetail("agent-001", result.id);
+        expect(savedRun?.heartbeatProcedureSource).toBe("custom");
       } finally {
         rmSync(tmpRoot, { recursive: true, force: true });
       }
@@ -2041,7 +2211,7 @@ describe("executeHeartbeat", () => {
 
       expect(mockedCreateFnAgent).toHaveBeenCalledOnce();
       const callArgs = mockedCreateFnAgent.mock.calls[0]![0];
-      expect(callArgs.cwd).toBe("/tmp/test");
+      expect(callArgs.cwd).toBe("/tmp/worktree-fn-001");
       expect(callArgs.systemPrompt).toContain(HEARTBEAT_SYSTEM_PROMPT);
       expect(callArgs.systemPrompt).toContain("## Soul");
       expect(callArgs.systemPrompt).toContain("Act like a practical teammate who prioritizes clarity.");

@@ -863,6 +863,33 @@
   display: none;
 }
 
+.agent-org-chart-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.agent-org-chart-layout-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.agent-org-chart-layout-toggle__button {
+  width: auto;
+  padding: var(--space-xs) var(--space-sm);
+  gap: var(--space-xs);
+}
+
+.agent-org-chart-layout-toggle__text {
+  font-size: calc(var(--space-sm) + var(--space-xs) * 0.5);
+  font-weight: 500;
+}
+
 .agent-org-chart-controls__zoom-label {
   min-width: calc(var(--space-2xl) * 2);
   font-family: var(--font-mono);
@@ -1146,14 +1173,11 @@
   background: var(--org-chart-connector-color);
 }
 
-@media (max-width: 768px) {
-  .agent-org-chart {
-    --org-chart-sibling-gap: var(--space-lg);
-    padding: var(--space-md);
-  }
 
-  .agent-org-chart--vertical {
-    --org-chart-sibling-gap: var(--space-sm);
+@media (max-width: 768px) {
+  .agent-org-chart-shell {
+    min-height: 0;
+    overflow: hidden;
   }
 }
 
@@ -1242,12 +1266,36 @@
   .agent-org-chart-controls {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-sm);
+  }
+
+  .agent-org-chart-toolbar {
+    display: none;
+  }
+
+  .agent-org-chart-controls .agent-org-chart-layout-toggle {
+    order: 1;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .agent-org-chart-controls .agent-org-chart-layout-toggle__button {
+    justify-content: center;
+  }
+
+  .agent-org-chart-controls__zoom-label {
+    order: 2;
   }
 
   .agent-org-chart-controls .btn-icon,
   .agent-org-chart-controls .agent-org-chart-controls__fit-btn {
     min-height: calc(var(--space-lg) * 2 + var(--space-xs));
+  }
+
+  .agent-org-chart-controls .agent-org-chart-controls__fit-btn {
+    margin-left: 0;
   }
 
   .agent-org-chart-viewport {
@@ -1328,7 +1376,7 @@
 
   .agents-view-title h2 {
     display: block;
-    font-size: var(--space-md);
+    font-size: var(--space-lg);
     line-height: 1;
   }
 
@@ -1371,14 +1419,11 @@
     flex: 0 0 auto;
   }
 
-  /* Controls button: icon-only on mobile, sized to match view-toggle buttons */
+  /* Controls button: keep visible label on mobile with 36px touch target. */
   .agent-controls-trigger {
-    padding: 0;
-    width: calc(var(--space-lg) * 2 + var(--space-xs));
-    height: calc(var(--space-lg) * 2 + var(--space-xs));
-    min-width: calc(var(--space-lg) * 2 + var(--space-xs));
+    padding: 0 var(--space-sm);
     min-height: calc(var(--space-lg) * 2 + var(--space-xs));
-    font-size: 0;
+    font-size: var(--space-md);
     display: inline-flex;
     align-items: center;
     justify-content: center;

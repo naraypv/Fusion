@@ -17,7 +17,8 @@ const execAsync = promisify(exec);
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
-import { resolveModelFallbackChain, resolveRouteAllLlmCallsViaDspy, type AgentStore, type MessageStore, type PermanentAgentGatingContext, type TaskDetail, type Settings, type TaskStore } from "@fusion/core";
+import type { AgentStore, MessageStore, PermanentAgentGatingContext, TaskDetail, Settings, TaskStore } from "@fusion/core";
+import { resolveModelFallbackChain, resolvePersistAgentThinkingLog, resolveRouteAllLlmCallsViaDspy } from "@fusion/core";
 
 import {
   createResolvedAgentSession,
@@ -890,7 +891,8 @@ export class StepSessionExecutor {
           taskId: taskDetail.id,
           agent: "executor",
           persistAgentToolOutput: settings.persistAgentToolOutput,
-          persistAgentThinkingLog: settings.persistAgentThinkingLog,
+          // Step-session workers are task-scoped ephemeral agents.
+          persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
         });
         let session: AgentSession | null = null;
 

@@ -117,6 +117,7 @@ describe("ResearchView", () => {
     render(<ResearchView projectId="p1" />);
 
     expect(await screen.findByLabelText("Query")).toBeInTheDocument();
+    expect(screen.getByText("Cited search and synthesis runs: gather sources, fetch content, and synthesize findings.")).toBeInTheDocument();
     expect(screen.queryByText(/Research defaults are incomplete/i)).not.toBeInTheDocument();
     expect(screen.queryByTestId("research-state-unavailable")).not.toBeInTheDocument();
   });
@@ -134,19 +135,14 @@ describe("ResearchView", () => {
     expect(await screen.findByTestId("research-state-empty")).toBeInTheDocument();
   });
 
-  it("shows friendly web-search disabled state when provider is none", async () => {
-    const onOpenSettings = vi.fn();
-    mockFetchSettings.mockResolvedValue({ researchGlobalWebSearchProvider: "none" });
+  it("does not render a web-search disabled state when the provider setting is absent", async () => {
+    mockFetchSettings.mockResolvedValue({ researchSettings: { enabled: true } });
     mockFetchAuthStatus.mockResolvedValue({ providers: [] });
 
-    render(<ResearchView projectId="p1" onOpenSettings={onOpenSettings} />);
+    render(<ResearchView projectId="p1" />);
 
-    expect(await screen.findByTestId("research-state-web-search-disabled")).toHaveTextContent(
-      "Web search is disabled. Page Fetch, Local Docs, GitHub and LLM Synthesis still work.",
-    );
-    expect(screen.getByRole("checkbox", { name: "Web Search" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Re-enable Web Search" }));
-    expect(onOpenSettings).toHaveBeenCalledWith("research-global");
+    await screen.findByLabelText("Query");
+    expect(screen.queryByTestId("research-state-web-search-disabled")).not.toBeInTheDocument();
   });
 
   it("renders selected run details, citations, and history", async () => {
@@ -390,18 +386,19 @@ describe("ResearchView", () => {
     mockFetchAuthStatus.mockResolvedValue({ providers: [{ id: "openrouter", type: "api_key", authenticated: true }] });
     render(<ResearchView projectId="p1" />);
     expect(await screen.findByText("Web Search")).toBeInTheDocument();
+    expect(screen.getByText("Always on")).toBeInTheDocument();
     expect(screen.getByText("Page Fetch")).toBeInTheDocument();
     expect(screen.getByText("LLM Synthesis")).toBeInTheDocument();
   });
 
-  it("disables provider checkboxes when sources are disabled in settings", async () => {
+  it("keeps web search visibly locked on when other sources are disabled in settings", async () => {
     mockFetchSettings.mockResolvedValue({
       ...configuredResearchSettings,
       researchGlobalDefaults: {
         ...configuredResearchSettings.researchGlobalDefaults,
         enabledSources: {
           webSearch: false,
-          pageFetch: true,
+          pageFetch: false,
           github: false,
           localDocs: true,
           llmSynthesis: true,
@@ -417,13 +414,15 @@ describe("ResearchView", () => {
 
     render(<ResearchView projectId="p1" />);
 
-    const webSearch = (await screen.findByLabelText("Web Search")) as HTMLInputElement;
+    const webSearch = (await screen.findByLabelText(/Web Search/i)) as HTMLInputElement;
+    expect(screen.getByText("Always on")).toBeInTheDocument();
     const pageFetch = screen.getByLabelText("Page Fetch") as HTMLInputElement;
     expect(webSearch.disabled).toBe(true);
-    expect(pageFetch.disabled).toBe(false);
+    expect(webSearch.checked).toBe(true);
+    expect(pageFetch.disabled).toBe(true);
   });
 
-  it("submits only enabled providers", async () => {
+  it("submits only enabled providers while always including web search", async () => {
     const createRun = vi.fn().mockResolvedValue({ run: { id: "RR-2" } });
     mockFetchSettings.mockResolvedValue({
       ...configuredResearchSettings,
@@ -450,7 +449,7 @@ describe("ResearchView", () => {
     fireEvent.click(screen.getByText("Create Run"));
 
     await waitFor(() => {
-      expect(createRun).toHaveBeenCalledWith(expect.objectContaining({ providers: ["page-fetch", "llm-synthesis"] }));
+      expect(createRun).toHaveBeenCalledWith(expect.objectContaining({ providers: ["web-search", "page-fetch", "llm-synthesis"] }));
     });
   });
 
@@ -529,12 +528,27 @@ describe("ResearchView", () => {
     await waitFor(() => expect(enrichButton).not.toBeDisabled());
   });
 
-  it("FN-3912: research view content is scrollable on mobile", () => {
-    const css = loadAllAppCss();
+  it("FN-3912: keeps the desktop research split view as a bounded grid", () => {
     const baseCss = loadAllAppCssBaseOnly();
 
-    expect(baseCss).toMatch(/\.research-view__layout\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*minmax\(0,\s*2fr\);[^}]*\}/);
+    expect(baseCss).toMatch(/\.research-view__layout\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*minmax\(0,\s*2fr\);[^}]*overflow:\s*hidden;[^}]*\}/);
+    expect(baseCss).toMatch(/\.research-view__stats\s*\{[^}]*margin-top:\s*auto;[^}]*border-top:\s*var\(--btn-border-width\)\s+solid\s+var\(--border\);[^}]*\}/);
+    expect(baseCss).not.toMatch(/\.research-view__stats\s*\{[^}]*position:\s*absolute;[^}]*\}/);
+  });
 
-    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*\{[^}]*\.research-view\s*\{[^}]*overflow-y:\s*auto;[^}]*-webkit-overflow-scrolling:\s*touch;[^}]*padding-bottom:\s*calc\(var\(--space-md\)\s*\+\s*var\(--mobile-nav-height\)\s*\+\s*env\(safe-area-inset-bottom,\s*0px\)\s*\+\s*var\(--standalone-bottom-gap\)\);[^}]*\}/);
+  it("FN-3912: keeps the desktop reader pane scroll-contained", () => {
+    const baseCss = loadAllAppCssBaseOnly();
+
+    expect(baseCss).toMatch(/\.research-view__sidebar,\s*\.research-view__reader\s*\{[^}]*min-height:\s*0;[^}]*\}/);
+    expect(baseCss).toMatch(/\.research-view__reader\s*\{[^}]*overflow:\s*auto;[^}]*\}/);
+    expect(baseCss).not.toMatch(/\.research-view__reader\s*\{[^}]*position:\s*(absolute|fixed);[^}]*\}/);
+    expect(baseCss).toMatch(/\.research-view__reader-content\s*\{[^}]*display:\s*flex;[^}]*flex:\s*1(?:\s+1\s+0%)?;[^}]*min-height:\s*0;[^}]*\}/);
+  });
+
+  it("FN-3912: research view content is scrollable on mobile", () => {
+    const css = loadAllAppCss();
+
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*\{[\s\S]*?\.research-view\s*\{[^}]*overflow-y:\s*auto;[^}]*padding-bottom:\s*calc\(var\(--space-md\)\s*\+\s*var\(--mobile-nav-height\)\s*\+\s*env\(safe-area-inset-bottom,\s*0px\)\s*\+\s*var\(--standalone-bottom-gap\)\);[^}]*\}/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*\{[\s\S]*?\.research-view__layout\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*var\(--space-md\);[^}]*\}/);
   });
 });

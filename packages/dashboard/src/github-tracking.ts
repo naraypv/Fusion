@@ -1,5 +1,8 @@
 import {
+  AiServiceError,
+  MIN_DESCRIPTION_LENGTH,
   resolveTaskGithubTracking,
+  summarizeTitle,
   type GlobalSettings,
   type ProjectSettings,
   type Task,
@@ -14,6 +17,65 @@ const TRACKING_ISSUE_BODY_SUMMARY_LIMIT = 500;
 
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function truncateWithEllipsis(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+export function deriveTitleFromDescription(description: string | undefined, maxLength: number): string | null {
+  if (!description || !description.trim()) {
+    return null;
+  }
+
+  const lines = description.split(/\r?\n/);
+  const cleanedLines: string[] = [];
+  let inCodeFence = false;
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) {
+      continue;
+    }
+
+    let cleaned = line.trim();
+    while (cleaned) {
+      const next = cleaned
+        .replace(/^>\s*/, "")
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^(?:[-*+]\s+|\d+\.\s+)/, "");
+      if (next === cleaned) {
+        break;
+      }
+      cleaned = next.trimStart();
+    }
+
+    cleanedLines.push(cleaned);
+  }
+
+  const firstLine = cleanedLines.find((line) => line.trim().length > 0);
+  if (!firstLine) {
+    return null;
+  }
+
+  const terminatorMatch = /[.!?](?=\s|$)/.exec(firstLine);
+  const candidate = terminatorMatch
+    ? firstLine.slice(0, terminatorMatch.index + 1)
+    : firstLine;
+  const collapsed = collapseWhitespace(candidate);
+
+  if (!collapsed) {
+    return null;
+  }
+
+  return truncateWithEllipsis(collapsed, maxLength);
 }
 
 function firstNonEmptyParagraph(value: string | undefined): string | null {
@@ -39,17 +101,14 @@ function sanitizeSummaryText(value: string): string {
   return collapseWhitespace(withoutFusionUrls);
 }
 
-export function formatTrackingIssueTitle(task: Pick<Task, "id" | "title">): string {
+export function formatTrackingIssueTitle(task: Pick<Task, "id" | "title" | "description">): string {
   const prefix = `[${task.id}] `;
-  const baseTitle = collapseWhitespace(task.title ?? "") || "Untitled task";
   const maxTitleLength = Math.max(1, TRACKING_ISSUE_TITLE_LIMIT - prefix.length);
+  const baseTitle = collapseWhitespace(task.title ?? "")
+    || deriveTitleFromDescription(task.description, maxTitleLength)
+    || "Untitled task";
 
-  if (baseTitle.length <= maxTitleLength) {
-    return `${prefix}${baseTitle}`;
-  }
-
-  const truncated = `${baseTitle.slice(0, Math.max(0, maxTitleLength - 1)).trimEnd()}…`;
-  return `${prefix}${truncated}`;
+  return `${prefix}${truncateWithEllipsis(baseTitle, maxTitleLength)}`;
 }
 
 export function formatTrackingIssueBody(task: {
@@ -76,19 +135,48 @@ export interface MaybeCreateTrackingIssueDeps {
   taskStore: TaskStore;
   projectSettings: ProjectSettings;
   globalSettings: GlobalSettings;
+  rootDir: string;
   logger?: Pick<Console, "warn" | "info">;
 }
 
 export type MaybeCreateTrackingIssueReason =
   | "tracking_disabled"
   | "issue_already_linked"
-  | "github_import_source"
   | "no_repo_configured"
+  | "no_title_available"
   | "github_error"
   | "auth_token_missing"
   | "auth_gh_not_installed"
   | "auth_gh_not_authenticated"
   | "auth_invalid_mode";
+
+function resolveTrackingTitleSummarizerModel(
+  projectSettings: ProjectSettings,
+  globalSettings: GlobalSettings,
+): { provider?: string; modelId?: string } {
+  const candidates = [
+    {
+      provider: projectSettings.titleSummarizerProvider,
+      modelId: projectSettings.titleSummarizerModelId,
+    },
+    {
+      provider: globalSettings.titleSummarizerGlobalProvider,
+      modelId: globalSettings.titleSummarizerGlobalModelId,
+    },
+    {
+      provider: projectSettings.titleSummarizerFallbackProvider,
+      modelId: projectSettings.titleSummarizerFallbackModelId,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate.provider && candidate.modelId) {
+      return candidate;
+    }
+  }
+
+  return {};
+}
 
 export async function maybeCreateTrackingIssue(
   task: Task,
@@ -104,10 +192,6 @@ export async function maybeCreateTrackingIssue(
     return { created: false, reason: "issue_already_linked" };
   }
 
-  if (task.sourceType === "github_import") {
-    return { created: false, reason: "github_import_source" };
-  }
-
   const repo = resolvedTracking.repo;
 
   if (!repo) {
@@ -120,6 +204,57 @@ export async function maybeCreateTrackingIssue(
       metadata: { type: "github-tracking-no-repo" },
     });
     return { created: false, reason: "no_repo_configured" };
+  }
+
+  const titleMissing = collapseWhitespace(task.title ?? "").length === 0;
+  const resolvedSummarizer = resolveTrackingTitleSummarizerModel(deps.projectSettings, deps.globalSettings);
+  const canSummarizeTitle = titleMissing
+    && typeof task.description === "string"
+    && task.description.length >= MIN_DESCRIPTION_LENGTH
+    && Boolean(resolvedSummarizer.provider && resolvedSummarizer.modelId);
+
+  if (canSummarizeTitle) {
+    try {
+      const generatedTitle = await summarizeTitle(
+        task.description,
+        deps.rootDir,
+        resolvedSummarizer.provider,
+        resolvedSummarizer.modelId,
+      );
+
+      if (generatedTitle) {
+        const updatedTask = await deps.taskStore.updateTask(task.id, { title: generatedTitle });
+        task.title = updatedTask.title;
+        await deps.taskStore.recordActivity({
+          type: "task:updated",
+          taskId: task.id,
+          taskTitle: updatedTask.title,
+          details: "Generated task title for GitHub tracking issue",
+          metadata: { type: "github-tracking-title-summarized" },
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const prefix = error instanceof AiServiceError
+        ? "AI title summarizer failed"
+        : "Title summarizer failed";
+      deps.logger?.warn?.(`[github-tracking] ${task.id}: ${prefix}: ${message}`);
+    }
+  }
+
+  const effectiveTitle = collapseWhitespace(task.title ?? "")
+    || deriveTitleFromDescription(task.description, TRACKING_ISSUE_TITLE_LIMIT - `[${task.id}] `.length);
+
+  if (!effectiveTitle) {
+    deps.logger?.info?.(`[github-tracking] ${task.id}: deferred — no usable title; waiting for title or summarizer`);
+    await deps.taskStore.recordActivity({
+      type: "task:updated",
+      taskId: task.id,
+      taskTitle: task.title,
+      details: "GitHub tracking issue not created: task has no title yet",
+      metadata: { type: "github-tracking-no-title" },
+    });
+    return { created: false, reason: "no_title_available" };
   }
 
   const resolution = resolveGithubTrackingAuth({

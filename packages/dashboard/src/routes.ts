@@ -4809,6 +4809,7 @@ async function maybeCreateTaskTrackingIssue(taskStore: TaskStore, task: Task): P
       taskStore,
       projectSettings,
       globalSettings,
+      rootDir: taskStore.getRootDir(),
       logger: console,
     });
   } catch {

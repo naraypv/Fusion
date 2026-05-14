@@ -328,26 +328,36 @@ describe("SelfHealingManager", () => {
       expect(store.updateTask).toHaveBeenCalledWith("FN-001", { stuckKillCount: 3 });
     });
 
-    it("moves task to in-review when stuck-kill budget is exhausted", async () => {
-      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+    it("walks stuck kills from 0 to max+1 and terminalizes deterministically", async () => {
+      let killCount = 0;
+      (store.getTask as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
         id: "FN-001",
-        stuckKillCount: 6,
-      } as unknown as Task);
+        stuckKillCount: killCount,
+      } as unknown as Task));
+      (store.updateTask as ReturnType<typeof vi.fn>).mockImplementation(async (_taskId: string, patch: Partial<Task>) => {
+        if (typeof patch.stuckKillCount === "number") killCount = patch.stuckKillCount;
+      });
 
       manager.start();
 
-      const result = await manager.checkStuckBudget("FN-001");
+      for (let i = 1; i <= 6; i++) {
+        const result = await manager.checkStuckBudget("FN-001", "inactivity");
+        expect(result).toBe(true);
+        expect(killCount).toBe(i);
+      }
 
-      expect(result).toBe(false);
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
+      const terminal = await manager.checkStuckBudget("FN-001", "loop");
+      expect(terminal).toBe(false);
+      expect(killCount).toBe(7);
+      expect(store.updateTask).toHaveBeenLastCalledWith("FN-001", {
         stuckKillCount: 7,
         status: "failed",
-        error: expect.stringContaining("exceeded maximum of 6"),
+        error: "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6) after last reason=loop.",
       });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-review");
-      expect(store.logEntry).toHaveBeenCalledWith(
+      expect(store.moveTask).toHaveBeenLastCalledWith("FN-001", "in-review");
+      expect(store.logEntry).toHaveBeenLastCalledWith(
         "FN-001",
-        expect.stringContaining("moved to in-review"),
+        "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6), last reason=loop. No further automatic retries will run. Manually retry, pause, or move the task to triage to resume work.",
       );
     });
 
@@ -376,6 +386,32 @@ describe("SelfHealingManager", () => {
       const result = await manager.checkStuckBudget("FN-001");
 
       expect(result).toBe(true);
+      expect(store.updateTask).not.toHaveBeenCalledWith(
+        "FN-001",
+        expect.objectContaining({ error: expect.stringContaining("STUCK_LOOP_EXHAUSTED:") }),
+      );
+    });
+
+    it("keeps task failed and logs warning when moveTask(in-review) fails at exhaustion", async () => {
+      (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "FN-001",
+        stuckKillCount: 6,
+      } as unknown as Task);
+      (store.moveTask as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("concurrent move"));
+
+      manager.start();
+
+      const result = await manager.checkStuckBudget("FN-001", "loop");
+
+      expect(result).toBe(false);
+      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
+        stuckKillCount: 7,
+        status: "failed",
+        error: "STUCK_LOOP_EXHAUSTED: stuck kill budget exhausted (7/6) after last reason=loop.",
+      });
+      expect(getSelfHealingLogger().warn).toHaveBeenCalledWith(
+        expect.stringContaining("moveTask(\"in-review\") failed (concurrent move)"),
+      );
     });
 
     it("handles undefined stuckKillCount as 0", async () => {
@@ -440,7 +476,9 @@ describe("SelfHealingManager", () => {
       const recoverOrphanedExecutions = vi.spyOn(manager, "recoverOrphanedExecutions").mockResolvedValue(1);
       const recoverApprovedTriageTasks = vi.spyOn(manager, "recoverApprovedTriageTasks").mockResolvedValue(1);
       const recoverOrphanedAgents = vi.spyOn(manager, "recoverOrphanedAgents").mockResolvedValue(1);
+      const recoverAgentsRunningOnInactiveTasks = vi.spyOn(manager, "recoverAgentsRunningOnInactiveTasks").mockResolvedValue(1);
       const clearStaleBlockedBy = vi.spyOn(manager, "clearStaleBlockedBy").mockResolvedValue(1);
+      const surfaceInReviewStalls = vi.spyOn(manager, "surfaceInReviewStalls").mockResolvedValue(1);
 
       await manager.runStartupRecovery();
 
@@ -452,7 +490,9 @@ describe("SelfHealingManager", () => {
       expect(recoverOrphanedExecutions).toHaveBeenCalledTimes(1);
       expect(recoverApprovedTriageTasks).toHaveBeenCalledTimes(1);
       expect(recoverOrphanedAgents).toHaveBeenCalledTimes(1);
+      expect(recoverAgentsRunningOnInactiveTasks).toHaveBeenCalledTimes(1);
       expect(clearStaleBlockedBy).toHaveBeenCalledTimes(1);
+      expect(surfaceInReviewStalls).toHaveBeenCalledTimes(1);
     });
 
     it("runStartupRecovery clears stale blockedBy rows", async () => {
@@ -864,6 +904,58 @@ describe("SelfHealingManager", () => {
       await manager.runStartupRecovery();
 
       expect(recoverOrphanedAgents).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("recoverAgentsRunningOnInactiveTasks", () => {
+    it("recovers durable running agents linked to todo tasks", async () => {
+      const now = Date.now();
+      const agents: Agent[] = [
+        {
+          id: "agent-recover",
+          state: "running",
+          taskId: "FN-TODO",
+          updatedAt: new Date(now - 120_000).toISOString(),
+        } as Agent,
+        {
+          id: "agent-keep",
+          state: "running",
+          taskId: "FN-IP",
+          updatedAt: new Date(now - 120_000).toISOString(),
+        } as Agent,
+      ];
+
+      const getTask = vi.fn(async (taskId: string) => {
+        if (taskId === "FN-TODO") return { id: "FN-TODO", column: "todo" } as Task;
+        if (taskId === "FN-IP") return { id: "FN-IP", column: "in-progress" } as Task;
+        return null;
+      });
+
+      const agentStore = {
+        listAgents: vi.fn(async () => agents),
+        getActiveHeartbeatRun: vi.fn(async () => null),
+        updateAgentState: vi.fn(async (agentId: string, state: Agent["state"]) => {
+          const agent = agents.find((candidate) => candidate.id === agentId);
+          if (agent) agent.state = state;
+        }),
+        syncExecutionTaskLink: vi.fn(async (agentId: string, taskId?: string) => {
+          const agent = agents.find((candidate) => candidate.id === agentId);
+          if (agent) agent.taskId = taskId;
+        }),
+      } as unknown as AgentStore;
+
+      const managerWithAgents = new SelfHealingManager(
+        createMockStore({ getTask }),
+        { rootDir: "/tmp/test-project", agentStore },
+      );
+
+      const recovered = await managerWithAgents.recoverAgentsRunningOnInactiveTasks();
+
+      expect(recovered).toBe(1);
+      expect(agentStore.updateAgentState).toHaveBeenCalledWith("agent-recover", "active");
+      expect(agentStore.syncExecutionTaskLink).toHaveBeenCalledWith("agent-recover", undefined);
+      expect(agentStore.updateAgentState).not.toHaveBeenCalledWith("agent-keep", "active");
+      managerWithAgents.stop();
     });
   });
 
@@ -3751,6 +3843,116 @@ describe("SelfHealingManager", () => {
     });
   });
 
+  describe("surfaceInReviewStalls", () => {
+    function staleMergingTask(overrides: Record<string, unknown> = {}) {
+      return {
+        id: "FN-4110",
+        column: "in-review",
+        paused: false,
+        status: "merging",
+        mergeRetries: 0,
+        mergeDetails: {},
+        worktree: "/tmp/FN-4110",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        steps: [{ name: "step", status: "done" }],
+        workflowStepResults: [],
+        log: [],
+        ...overrides,
+      };
+    }
+
+    it("logs FN-4110 stale transient merge status once without moving task", async () => {
+      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([staleMergingTask()]);
+
+      const result = await managerWithRecovery.surfaceInReviewStalls();
+
+      expect(result).toBe(1);
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-4110",
+        expect.stringContaining("In-review stall surfaced [transient-merge-status-no-owner]:"),
+      );
+      expect(store.updateTask).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it("deduplicates same code inside stuck-timeout window", async () => {
+      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        staleMergingTask({
+          log: [{
+            timestamp: "2026-01-01T00:09:30.000Z",
+            action: "In-review stall surfaced [transient-merge-status-no-owner]: already surfaced",
+          }],
+        }),
+      ]);
+
+      expect(await managerWithRecovery.surfaceInReviewStalls()).toBe(0);
+      expect(store.logEntry).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+
+    it("re-logs after window expiry and on code transitions", async () => {
+      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
+      (store.listTasks as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([
+          staleMergingTask({
+            log: [{
+              timestamp: "2026-01-01T00:08:00.000Z",
+              action: "In-review stall surfaced [transient-merge-status-no-owner]: old",
+            }],
+          }),
+        ])
+        .mockResolvedValueOnce([
+          staleMergingTask({
+            status: undefined,
+            mergeRetries: 3,
+            log: [{
+              timestamp: "2026-01-01T00:09:30.000Z",
+              action: "In-review stall surfaced [transient-merge-status-no-owner]: recent",
+            }],
+          }),
+        ]);
+
+      expect(await managerWithRecovery.surfaceInReviewStalls()).toBe(1);
+      expect(await managerWithRecovery.surfaceInReviewStalls()).toBe(1);
+      expect(store.logEntry).toHaveBeenLastCalledWith(
+        "FN-4110",
+        expect.stringContaining("In-review stall surfaced [merge-retries-exhausted]:"),
+      );
+      managerWithRecovery.stop();
+    });
+
+    it("skips per-cycle dedup, paused, active merge owner, executing, awaiting-user-review, and mergeConfirmed", async () => {
+      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+      const managerWithRecovery = new SelfHealingManager(store, {
+        rootDir: "/tmp/test-project",
+        getActiveMergeTaskId: () => "FN-ACTIVE",
+        getExecutingTaskIds: () => new Set(["FN-EXEC"]),
+      });
+      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ taskStuckTimeoutMs: 60_000 });
+      (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([
+        staleMergingTask({ id: "FN-CYCLE", updatedAt: "2026-01-01T00:10:00.000Z" }),
+        staleMergingTask({ id: "FN-PAUSED", paused: true }),
+        staleMergingTask({ id: "FN-ACTIVE" }),
+        staleMergingTask({ id: "FN-EXEC" }),
+        staleMergingTask({ id: "FN-AWAIT", status: "awaiting-user-review" }),
+        staleMergingTask({ id: "FN-MERGED", mergeDetails: { mergeConfirmed: true } }),
+      ]);
+
+      expect(await managerWithRecovery.surfaceInReviewStalls()).toBe(0);
+      expect(store.logEntry).not.toHaveBeenCalled();
+      managerWithRecovery.stop();
+    });
+  });
+
   describe("recoverGhostReviewTasks", () => {
     it("preserves failed in-review tasks so actionable merge failures are not ghost-retried", async () => {
       const managerWithRecovery = new SelfHealingManager(store, {
@@ -4361,6 +4563,28 @@ describe("clearStaleBlockedBy", () => {
     });
   }
 
+  function mockSweepTasks(
+    store: ReturnType<typeof createRunningStore>,
+    {
+      todo = [],
+      inProgress = [],
+      inReview = [],
+      all = [...todo, ...inProgress, ...inReview],
+    }: {
+      todo?: Record<string, unknown>[];
+      inProgress?: Record<string, unknown>[];
+      inReview?: Record<string, unknown>[];
+      all?: Record<string, unknown>[];
+    },
+  ) {
+    (store.listTasks as ReturnType<typeof vi.fn>).mockImplementation(async (options?: { column?: string }) => {
+      if (options?.column === "todo") return todo;
+      if (options?.column === "in-progress") return inProgress;
+      if (options?.column === "in-review") return inReview;
+      return all;
+    });
+  }
+
   function createTask(id: string, overrides: Record<string, unknown> = {}) {
     return {
       id,
@@ -4376,7 +4600,7 @@ describe("clearStaleBlockedBy", () => {
   it("clears stale blockedBy when blocker is missing", async () => {
     const store = createRunningStore();
     const taskA = createTask("A", { blockedBy: "FN-MISSING" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA]);
+    mockSweepTasks(store, { todo: [taskA] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4393,7 +4617,7 @@ describe("clearStaleBlockedBy", () => {
     const blockerId = "FN-100";
     const taskA = createTask("A", { blockedBy: blockerId });
     const taskB = createTask(blockerId, { column });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4410,7 +4634,7 @@ describe("clearStaleBlockedBy", () => {
     const blockerId = "FN-200";
     const taskA = createTask("A", { blockedBy: blockerId });
     const taskB = createTask(blockerId, { column: "in-review", paused: true });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4427,7 +4651,7 @@ describe("clearStaleBlockedBy", () => {
     const blockerId = "FN-300";
     const taskA = createTask("A", { blockedBy: blockerId });
     const taskB = createTask(blockerId, { column: "in-review", status: "failed", mergeRetries: 3 });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4443,7 +4667,7 @@ describe("clearStaleBlockedBy", () => {
     const store = createRunningStore();
     const taskA = createTask("A", { blockedBy: "FN-400" });
     const taskB = createTask("FN-400", { column: "in-progress" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inProgress: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4458,7 +4682,7 @@ describe("clearStaleBlockedBy", () => {
     const taskA = createTask("A", { blockedBy: "FN-400", dependencies: ["FN-DEP"] });
     const overlapBlocker = createTask("FN-400", { column: "in-progress" });
     const dependency = createTask("FN-DEP", { column: "done" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, overlapBlocker, dependency]);
+    mockSweepTasks(store, { todo: [taskA], inProgress: [overlapBlocker], all: [taskA, overlapBlocker, dependency] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4473,7 +4697,7 @@ describe("clearStaleBlockedBy", () => {
     const store = createRunningStore();
     const taskA = createTask("A", { blockedBy: "FN-500" });
     const taskB = createTask("FN-500", { column: "in-review", paused: false, mergeRetries: 0 });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4483,11 +4707,81 @@ describe("clearStaleBlockedBy", () => {
     manager.stop();
   });
 
+  it.each(["merging", "merging-pr"] as const)("clears stale blockedBy when blocker is stale in-review %s", async (status) => {
+    vi.setSystemTime(new Date("2026-01-01T00:20:00.000Z"));
+    const store = createRunningStore();
+    const blockerId = "FN-510";
+    const taskA = createTask("A", { blockedBy: blockerId });
+    const taskB = createTask(blockerId, {
+      column: "in-review",
+      paused: false,
+      status,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
+    expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining(`blocker ${blockerId}`));
+    expect(store.logEntry).toHaveBeenCalledWith("A", expect.stringContaining("stale for"));
+    manager.stop();
+    vi.useRealTimers();
+  });
+
+  it("does not clear stale merging blocker inside threshold", async () => {
+    vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+    const store = createRunningStore();
+    const taskA = createTask("A", { blockedBy: "FN-511" });
+    const taskB = createTask("FN-511", {
+      column: "in-review",
+      paused: false,
+      status: "merging",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    });
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(0);
+    expect(store.updateTask).not.toHaveBeenCalled();
+    manager.stop();
+    vi.useRealTimers();
+  });
+
+  it("honors staleMergingFanoutMinAgeMs option override", async () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:04.000Z"));
+    const store = createRunningStore();
+    const taskA = createTask("A", { blockedBy: "FN-512" });
+    const taskB = createTask("FN-512", {
+      column: "in-review",
+      paused: false,
+      status: "merging",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
+
+    const manager = new SelfHealingManager(store, {
+      rootDir: "/tmp/test-project",
+      staleMergingStatusMinAgeMs: 1,
+      staleMergingFanoutMinAgeMs: 2_000,
+    });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith("A", { blockedBy: null, status: null });
+    manager.stop();
+    vi.useRealTimers();
+  });
+
   it("does not clear blockedBy when blocker failed retries are below threshold", async () => {
     const store = createRunningStore();
     const taskA = createTask("A", { blockedBy: "FN-600" });
     const taskB = createTask("FN-600", { column: "in-review", status: "failed", mergeRetries: 1 });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4507,7 +4801,7 @@ describe("clearStaleBlockedBy", () => {
       error: "Refusing to start coding agent in missing worktree: /Users/eclipxe/Projects/kb/.worktrees/bright-wren",
       steps: [{ status: "done" }, { status: "pending" }] as any,
     });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA, taskB]);
+    mockSweepTasks(store, { todo: [taskA], inReview: [taskB], all: [taskA, taskB] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4531,7 +4825,7 @@ describe("clearStaleBlockedBy", () => {
       ...settings,
     } as unknown as Settings);
     const taskA = createTask("A", { blockedBy: "FN-700" });
-    (store.listTasks as ReturnType<typeof vi.fn>).mockResolvedValue([taskA]);
+    mockSweepTasks(store, { todo: [taskA] });
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const recovered = await manager.clearStaleBlockedBy();
@@ -4550,9 +4844,14 @@ describe("clearStaleBlockedBy", () => {
     const recoveredState = createTask("A", { blockedBy: null });
 
     (store.listTasks as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce([blocked, blocker])
-      .mockResolvedValueOnce([blocked, blocker])
-      .mockResolvedValueOnce([recoveredState, blocker]);
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [blocked] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [blocked, blocker])
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [blocked] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [blocked, blocker])
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [recoveredState] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [recoveredState, blocker])
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [recoveredState] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [recoveredState, blocker])
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [recoveredState] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [recoveredState, blocker])
+      .mockImplementationOnce(async (options?: { column?: string }) => options?.column === "todo" ? [recoveredState] : options?.column === "in-progress" ? [] : options?.column === "in-review" ? [] : [recoveredState, blocker])
+      .mockImplementationOnce(async () => [recoveredState, blocker])
+      .mockImplementationOnce(async () => [recoveredState, blocker]);
 
     const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
     const first = await manager.clearStaleBlockedBy();
@@ -4562,6 +4861,66 @@ describe("clearStaleBlockedBy", () => {
     expect(second).toBe(0);
     expect(store.updateTask).toHaveBeenCalledTimes(1);
     expect(store.logEntry).toHaveBeenCalledTimes(1);
+    manager.stop();
+  });
+
+  it("clears stale blockedBy on an in-progress task when blocker is missing", async () => {
+    const store = createRunningStore();
+    const taskA = createTask("FN-4076", { column: "in-progress", blockedBy: "FN-MISSING" });
+    mockSweepTasks(store, { inProgress: [taskA], all: [taskA] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-4076", { blockedBy: null });
+    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-4091"));
+    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-MISSING"));
+    manager.stop();
+  });
+
+  it("clears stale blockedBy on an unpaused in-review task when blocker is done", async () => {
+    const store = createRunningStore();
+    const blockerId = "FN-4100";
+    const taskA = createTask("FN-4076", { column: "in-review", blockedBy: blockerId, paused: false });
+    const blocker = createTask(blockerId, { column: "done" });
+    mockSweepTasks(store, { inReview: [taskA], all: [taskA, blocker] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-4076", { blockedBy: null });
+    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("FN-4091"));
+    expect(store.logEntry).toHaveBeenCalledWith("FN-4076", expect.stringContaining("done"));
+    manager.stop();
+  });
+
+  it("does not clear blockedBy on an in-progress task when blocker is still active", async () => {
+    const store = createRunningStore();
+    const blockerId = "FN-4101";
+    const taskA = createTask("FN-4076", { column: "in-progress", blockedBy: blockerId });
+    const blocker = createTask(blockerId, { column: "todo" });
+    mockSweepTasks(store, { inProgress: [taskA], all: [taskA, blocker] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(0);
+    expect(store.updateTask).not.toHaveBeenCalled();
+    manager.stop();
+  });
+
+  it("does not clear blockedBy on a paused in-review task even when the blocker is stale", async () => {
+    const store = createRunningStore();
+    const taskA = createTask("FN-4076", { column: "in-review", paused: true, blockedBy: "FN-MISSING" });
+    mockSweepTasks(store, { inReview: [taskA], all: [taskA] });
+
+    const manager = new SelfHealingManager(store, { rootDir: "/tmp/test-project" });
+    const recovered = await manager.clearStaleBlockedBy();
+
+    expect(recovered).toBe(0);
+    expect(store.updateTask).not.toHaveBeenCalled();
     manager.stop();
   });
 

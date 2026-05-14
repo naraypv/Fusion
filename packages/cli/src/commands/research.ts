@@ -43,7 +43,6 @@ async function getStore(projectName?: string): Promise<TaskStore> {
 
 function hasProviderCredentials(settings: Awaited<ReturnType<TaskStore["getSettings"]>>, providerId: string | undefined): boolean {
   if (!providerId || providerId === "builtin") return true;
-  if (providerId === "none") return false;
   if (providerId === "searxng") return Boolean(settings.researchGlobalSearxngUrl);
   if (providerId === "brave") return Boolean(settings.researchGlobalBraveApiKey);
   if (providerId === "google") return Boolean(settings.researchGlobalGoogleSearchApiKey && settings.researchGlobalGoogleSearchCx);
@@ -59,7 +58,7 @@ async function getResearchRuntime(store: TaskStore) {
   }
 
   const configuredProvider = (resolved.searchProvider as string | undefined) ?? settings.researchGlobalWebSearchProvider ?? "builtin";
-  if (configuredProvider !== "builtin" && configuredProvider !== "none" && !hasProviderCredentials(settings, configuredProvider)) {
+  if (configuredProvider !== "builtin" && !hasProviderCredentials(settings, configuredProvider)) {
     throw new Error(`missing-credentials: ${configuredProvider} credentials are missing. Configure Authentication and Research defaults in settings.`);
   }
 
@@ -128,7 +127,7 @@ export async function runResearchCreate(options: ResearchCreateOptions): Promise
       if (options.json) {
         jsonOut(run);
       } else {
-        console.log(`Created research run ${runId}.`);
+        console.log(`Created cited-research run ${runId}.`);
         if (run) printRun(run);
       }
       return;
@@ -180,7 +179,7 @@ export async function runResearchList(options: ResearchListOptions = {}): Promis
     }
 
     if (!runs.length) {
-      console.log("No research runs found.");
+      console.log("No cited-research runs found.");
       return;
     }
 
@@ -196,7 +195,7 @@ export async function runResearchShow(runId: string, options: ResearchCommandOpt
   try {
     const store = await getStore(options.projectName);
     const run = store.getResearchStore().getRun(runId);
-    if (!run) throw new Error(`Research run not found: ${runId}`);
+    if (!run) throw new Error(`Cited-research run not found: ${runId}`);
 
     if (options.json) {
       jsonOut(run);
@@ -219,7 +218,7 @@ export async function runResearchExport(options: ResearchExportOptions): Promise
   try {
     const store = await getStore(options.projectName);
     const run = store.getResearchStore().getRun(options.runId);
-    if (!run) throw new Error(`Research run not found: ${options.runId}`);
+    if (!run) throw new Error(`Cited-research run not found: ${options.runId}`);
 
     const format = (options.format ?? "markdown") as ResearchExportFormat;
     if (!RESEARCH_EXPORT_FORMATS.includes(format)) {
@@ -250,7 +249,7 @@ export async function runResearchCancel(runId: string, options: ResearchCommandO
   try {
     const store = await getStore(options.projectName);
     const run = store.getResearchStore().getRun(runId);
-    if (!run) throw new Error(`Research run not found: ${runId}`);
+    if (!run) throw new Error(`Cited-research run not found: ${runId}`);
 
     if (!["queued", "running", "cancelling", "retry_waiting"].includes(run.status)) {
       throw new Error(`invalid-transition: Run ${runId} cannot be cancelled from status ${run.status}.`);
@@ -275,7 +274,7 @@ export async function runResearchRetry(runId: string, options: ResearchCommandOp
   try {
     const store = await getStore(options.projectName);
     const existing = store.getResearchStore().getRun(runId);
-    if (!existing) throw new Error(`Research run not found: ${runId}`);
+    if (!existing) throw new Error(`Cited-research run not found: ${runId}`);
 
     if (existing.status === "retry_exhausted" || existing.lifecycle?.errorCode === "RETRY_EXHAUSTED") {
       throw new Error(`retry-exhausted: Run ${runId} has exhausted retry attempts.`);

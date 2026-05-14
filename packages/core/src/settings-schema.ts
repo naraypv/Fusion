@@ -35,6 +35,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
     "planning-awaiting-input",
     "message:agent-to-user",
     "message:agent-to-agent",
+    "message:room",
     "gridlock",
     "fallback-used",
     "memory-dreams-processed",
@@ -88,6 +89,8 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   vitestKillThresholdPct: 90,
   // Agent log persistence controls
   persistAgentToolOutput: true,
+  persistAgentThinkingLogPermanent: false,
+  persistAgentThinkingLogEphemeral: false,
   persistAgentThinkingLog: false,
   researchGlobalDefaults: {
     searchProvider: undefined,
@@ -171,6 +174,7 @@ export const DEFAULT_PROJECT_SETTINGS = {
   overlapIgnorePaths: [],
   autoMerge: true,
   mergeStrategy: "direct",
+  directMergeCommitStrategy: "auto",
   requirePrApproval: false,
   pushAfterMerge: false,
   pushRemote: "origin",
@@ -180,6 +184,7 @@ export const DEFAULT_PROJECT_SETTINGS = {
   testCommand: undefined,
   buildCommand: undefined,
   recycleWorktrees: false,
+  executorAllowSiblingBranchRename: false,
   worktreeNaming: "random",
   taskPrefix: "FN",
   includeTaskIdInCommit: true,
@@ -212,7 +217,11 @@ export const DEFAULT_PROJECT_SETTINGS = {
   worktreeRebaseRemote: "",
   worktreeRebaseLocalBase: true,
   mergeConflictStrategy: "smart-prefer-main",
+  mergeDiffVolumeMinLines: undefined,
+  mergeDiffVolumeThreshold: undefined,
+  mergeDiffVolumeAllowlist: undefined,
   mergeStrategyOverlapBehavior: "flip-to-prefer-branch",
+  postMergeAuditMode: "block",
   workflowStepTimeoutMs: 360_000,
   workflowRevisionForkOnScopeMismatch: true,
   strictScopeEnforcement: false,
@@ -220,10 +229,14 @@ export const DEFAULT_PROJECT_SETTINGS = {
   verificationFixRetries: 3,
   buildTimeoutMs: 300_000,
   requirePlanApproval: false,
+  ephemeralAgentsEnabled: true,
   agentProvisioning: {},
   specStalenessEnabled: false,
   specStalenessMaxAgeMs: 6 * 60 * 60 * 1000,
   taskStuckTimeoutMs: 600_000,
+  // Capacity risk warning default: only warn once todo is meaningfully backlogged.
+  capacityRiskBannerEnabled: false,
+  capacityRiskTodoThreshold: 20,
   staleHighFanoutBlockerAgeThresholdMs: 2 * 60 * 60 * 1000,
   aiSessionTtlMs: 7 * 24 * 60 * 60 * 1000,
   aiSessionCleanupIntervalMs: 60 * 60 * 1000,
@@ -357,4 +370,17 @@ export function isProjectSettingsKey(key: string): key is keyof ProjectSettings 
 
 export function isGlobalOnlySettingsKey(key: string): key is keyof GlobalSettings {
   return isGlobalSettingsKey(key) && !isProjectSettingsKey(key);
+}
+
+export function resolvePersistAgentThinkingLog(
+  settings: Partial<GlobalSettings> | undefined,
+  opts: { ephemeral: boolean },
+): boolean {
+  const granular = opts.ephemeral
+    ? settings?.persistAgentThinkingLogEphemeral
+    : settings?.persistAgentThinkingLogPermanent;
+
+  if (typeof granular === "boolean") return granular;
+  if (typeof settings?.persistAgentThinkingLog === "boolean") return settings.persistAgentThinkingLog;
+  return false;
 }

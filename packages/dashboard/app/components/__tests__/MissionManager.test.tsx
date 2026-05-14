@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import { MissionManager } from "../MissionManager";
+import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
 
 /**
  * MissionManager layout reference (post FN-3136):
@@ -15,6 +16,8 @@ import { MissionManager } from "../MissionManager";
 
 const mockFetchAiSession = vi.fn();
 const mockFetchAiSessions = vi.fn();
+const mockFetchMissionInterviewDrafts = vi.fn();
+const mockDiscardMissionInterviewDraft = vi.fn();
 const mockCancelMissionInterview = vi.fn();
 const mockConnectMissionInterviewStream = vi.fn();
 const mockPreviewEnrichedDescription = vi.fn();
@@ -22,12 +25,22 @@ const mockSkipMilestoneInterview = vi.fn();
 const mockSkipSliceInterview = vi.fn();
 const mockTriageFeature = vi.fn();
 
+vi.mock("../../hooks/useNavigationHistory", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../hooks/useNavigationHistory")>();
+  return {
+    ...actual,
+    useNavigationHistoryContext: () => ({ pushNav: vi.fn(), replaceCurrent: vi.fn() }),
+  };
+});
+
 vi.mock("../../api", async () => {
   const actual = await vi.importActual<typeof import("../../api")>("../../api");
   return {
     ...actual,
     fetchAiSession: (...args: any[]) => mockFetchAiSession(...args),
     fetchAiSessions: (...args: any[]) => mockFetchAiSessions(...args),
+    fetchMissionInterviewDrafts: (...args: any[]) => mockFetchMissionInterviewDrafts(...args),
+    discardMissionInterviewDraft: (...args: any[]) => mockDiscardMissionInterviewDraft(...args),
     cancelMissionInterview: (...args: any[]) => mockCancelMissionInterview(...args),
     connectMissionInterviewStream: (...args: any[]) => mockConnectMissionInterviewStream(...args),
     previewEnrichedDescription: (...args: any[]) => mockPreviewEnrichedDescription(...args),
@@ -687,10 +700,14 @@ describe("MissionManager", () => {
     originalEventSource = globalThis.EventSource;
     mockFetchAiSession.mockReset();
     mockFetchAiSessions.mockReset();
+    mockFetchMissionInterviewDrafts.mockReset();
+    mockDiscardMissionInterviewDraft.mockReset();
     mockCancelMissionInterview.mockReset();
     mockConnectMissionInterviewStream.mockReset();
     mockFetchAiSession.mockResolvedValue(null);
     mockFetchAiSessions.mockResolvedValue([]);
+    mockFetchMissionInterviewDrafts.mockResolvedValue([]);
+    mockDiscardMissionInterviewDraft.mockResolvedValue({ removed: true });
     mockCancelMissionInterview.mockResolvedValue(undefined);
     mockConnectMissionInterviewStream.mockReturnValue({
       close: vi.fn(),
@@ -1679,6 +1696,17 @@ describe("MissionManager", () => {
         updatedAt: "2026-01-03T00:00:00.000Z",
       },
     ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValue([
+      {
+        id: "session-bg-1",
+        title: "Project A transient interview",
+        status: "awaiting_input",
+        projectId: "project-a",
+        createdAt: "2026-01-03T00:00:00.000Z",
+        updatedAt: "2026-01-03T00:00:00.000Z",
+        hasConversation: true,
+      },
+    ]);
 
     const missionsWithPersistedInterview = [
       {
@@ -1779,6 +1807,17 @@ describe("MissionManager", () => {
         projectId: "project-b",
         lockedByTab: null,
         updatedAt: "2026-01-04T00:00:00.000Z",
+      },
+    ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValue([
+      {
+        id: "session-bg-1",
+        title: "Project A transient interview",
+        status: "awaiting_input",
+        projectId: "project-a",
+        createdAt: "2026-01-03T00:00:00.000Z",
+        updatedAt: "2026-01-03T00:00:00.000Z",
+        hasConversation: true,
       },
     ]);
 
@@ -1920,6 +1959,35 @@ describe("MissionManager", () => {
         updatedAt: "2026-01-06T00:00:00.000Z",
       },
     ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "session-awaiting",
+        title: "Payment workflow planning",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-01-03T00:00:00.000Z",
+        updatedAt: "2026-01-03T00:00:00.000Z",
+        hasConversation: true,
+      },
+      {
+        id: "session-generating",
+        title: "Analytics mission drafting",
+        status: "generating",
+        projectId: null,
+        createdAt: "2026-01-04T00:00:00.000Z",
+        updatedAt: "2026-01-04T00:00:00.000Z",
+        hasConversation: false,
+      },
+      {
+        id: "session-error",
+        title: "SRE guardrails",
+        status: "error",
+        projectId: null,
+        createdAt: "2026-01-05T00:00:00.000Z",
+        updatedAt: "2026-01-05T00:00:00.000Z",
+        hasConversation: true,
+      },
+    ]);
     mockFetchAiSession.mockResolvedValue({
       id: "session-awaiting",
       type: "mission_interview",
@@ -1978,6 +2046,17 @@ describe("MissionManager", () => {
         projectId: null,
         lockedByTab: null,
         updatedAt: "2026-01-03T00:00:00.000Z",
+      },
+    ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "session-awaiting",
+        title: "Transient interview session",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-01-03T00:00:00.000Z",
+        updatedAt: "2026-01-03T00:00:00.000Z",
+        hasConversation: false,
       },
     ]);
 
@@ -2044,6 +2123,17 @@ describe("MissionManager", () => {
         updatedAt: "2026-01-05T00:00:00.000Z",
       },
     ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "session-project-a",
+        title: "Project A Interview",
+        status: "awaiting_input",
+        projectId: "project-a",
+        createdAt: "2026-01-03T00:00:00.000Z",
+        updatedAt: "2026-01-03T00:00:00.000Z",
+        hasConversation: true,
+      },
+    ]);
     globalThis.fetch = createFetchMock();
 
     render(
@@ -2075,6 +2165,17 @@ describe("MissionManager", () => {
         updatedAt: "2026-01-05T00:00:00.000Z",
       },
     ]);
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "session-error",
+        title: "Mission in error",
+        status: "error",
+        projectId: null,
+        createdAt: "2026-01-05T00:00:00.000Z",
+        updatedAt: "2026-01-05T00:00:00.000Z",
+        hasConversation: true,
+      },
+    ]);
     mockFetchAiSession.mockResolvedValue({
       id: "session-error",
       type: "mission_interview",
@@ -2104,6 +2205,216 @@ describe("MissionManager", () => {
     await waitFor(() => {
       expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
     });
+  });
+
+  it("renders mission interview drafts with explicit resume and discard actions", async () => {
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "draft-awaiting",
+        title: "Draft awaiting input",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-05-12T00:00:00.000Z",
+        updatedAt: "2026-05-12T00:05:00.000Z",
+        hasConversation: true,
+      },
+      {
+        id: "draft-generating",
+        title: "Draft generating",
+        status: "generating",
+        projectId: null,
+        createdAt: "2026-05-12T00:06:00.000Z",
+        updatedAt: "2026-05-12T00:09:00.000Z",
+        hasConversation: true,
+      },
+      {
+        id: "draft-error",
+        title: "Draft with error",
+        status: "error",
+        projectId: null,
+        createdAt: "2026-05-12T00:10:00.000Z",
+        updatedAt: "2026-05-12T00:15:00.000Z",
+        hasConversation: true,
+      },
+    ]);
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    expect(await screen.findByText("Drafts")).toBeInTheDocument();
+    expect(screen.getByText("Draft awaiting input")).toBeInTheDocument();
+    expect(screen.getByText("Draft generating")).toBeInTheDocument();
+    expect(screen.getByText("Draft with error")).toBeInTheDocument();
+
+    const statusCases = [
+      ["Draft awaiting input", "Resume interview", "Resume", false],
+      ["Draft generating", "Generating plan", "Generating…", true],
+      ["Draft with error", "Retry interview", "Retry", false],
+    ] as const;
+
+    for (const [title, actionLabel, buttonText, disabled] of statusCases) {
+      const row = screen.getByText(title).closest(".mission-list__item");
+      expect(row).not.toBeNull();
+      const actionButton = within(row!).getByRole("button", { name: actionLabel });
+      expect(actionButton).toBeInTheDocument();
+      expect(within(row!).getByText(buttonText)).toBeInTheDocument();
+      expect(actionButton).toHaveProperty("disabled", disabled);
+      expect(within(row!).getByRole("button", { name: "Discard draft" })).toBeInTheDocument();
+      expect(within(row!).getByText("Discard")).toBeInTheDocument();
+    }
+
+    const awaitingRow = screen.getByText("Draft awaiting input").closest(".mission-list__item");
+    fireEvent.click(within(awaitingRow!).getByRole("button", { name: "Discard draft" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+
+    await waitFor(() => {
+      expect(mockDiscardMissionInterviewDraft).toHaveBeenCalledWith("draft-awaiting", undefined);
+      expect(screen.queryByText("Draft awaiting input")).not.toBeInTheDocument();
+    });
+  });
+
+  it.each([
+    ["awaiting_input", "Resume interview", "Resume", false],
+    ["generating", "Generating plan", "Generating…", true],
+    ["error", "Retry interview", "Retry", false],
+  ] as const)(
+    "renders draft action copy for %s status",
+    async (status, actionLabel, visibleLabel, disabled) => {
+      mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+        {
+          id: `draft-${status}`,
+          title: `Draft ${status}`,
+          status,
+          projectId: null,
+          createdAt: "2026-05-12T00:00:00.000Z",
+          updatedAt: "2026-05-12T00:05:00.000Z",
+          hasConversation: true,
+        },
+      ]);
+      globalThis.fetch = createFetchMock();
+
+      render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+      const row = await screen.findByText(`Draft ${status}`);
+      const item = row.closest(".mission-list__item");
+      expect(item).not.toBeNull();
+      const actionButton = within(item!).getByRole("button", { name: actionLabel });
+      expect(actionButton).toHaveProperty("disabled", disabled);
+      expect(within(item!).getByText(visibleLabel)).toBeInTheDocument();
+      expect(within(item!).getByRole("button", { name: "Discard draft" })).toBeInTheDocument();
+      expect(within(item!).getByText("Discard")).toBeInTheDocument();
+    },
+  );
+
+  it("FN-4247: renders Drafts group above standard missions", async () => {
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "draft-priority",
+        title: "Draft priority mission",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-05-12T00:00:00.000Z",
+        updatedAt: "2026-05-12T00:05:00.000Z",
+        hasConversation: true,
+      },
+    ]);
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    const draftsHeader = await screen.findByText("Drafts");
+    const standardMission = await screen.findByText("Build Auth System");
+    expect(draftsHeader.compareDocumentPosition(standardMission) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("resumes a mission interview draft from the explicit resume action", async () => {
+    mockFetchAiSession.mockResolvedValue({
+      id: "draft-awaiting",
+      type: "mission_interview",
+      status: "awaiting_input",
+      title: "Draft awaiting input",
+      inputPayload: JSON.stringify({ missionTitle: "Draft awaiting input" }),
+      conversationHistory: "[]",
+      currentQuestion: JSON.stringify({
+        id: "q-1",
+        type: "text",
+        question: "What should happen next?",
+        description: "Resume the interview",
+      }),
+      result: null,
+      thinkingOutput: "",
+      error: null,
+      projectId: null,
+      createdAt: "2026-05-12T00:00:00.000Z",
+      updatedAt: "2026-05-12T00:05:00.000Z",
+    });
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "draft-awaiting",
+        title: "Draft awaiting input",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-05-12T00:00:00.000Z",
+        updatedAt: "2026-05-12T00:05:00.000Z",
+        hasConversation: true,
+      },
+    ]);
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    expect(await screen.findByText("Draft awaiting input")).toBeInTheDocument();
+    const draftRow = screen.getByText("Draft awaiting input").closest(".mission-list__item");
+    expect(draftRow).not.toBeNull();
+
+    fireEvent.click(within(draftRow!).getByRole("button", { name: "Resume interview" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Plan Mission with AI")).toBeInTheDocument();
+    });
+  });
+
+  it("hides drafts section when no mission interview drafts exist", async () => {
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([]);
+    globalThis.fetch = createFetchMock();
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Build Auth System")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Drafts")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the empty mission state when drafts exist without missions", async () => {
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([
+      {
+        id: "draft-only",
+        title: "Draft only mission",
+        status: "awaiting_input",
+        projectId: null,
+        createdAt: "2026-05-12T00:00:00.000Z",
+        updatedAt: "2026-05-12T00:05:00.000Z",
+        hasConversation: true,
+      },
+    ]);
+    globalThis.fetch = createFetchMockWithHealth([], {});
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    expect(await screen.findByText("Drafts")).toBeInTheDocument();
+    expect(screen.getByText("Draft only mission")).toBeInTheDocument();
+    expect(screen.queryByText("No missions yet")).not.toBeInTheDocument();
+  });
+
+  it("shows the empty mission state when there are no missions and no drafts", async () => {
+    mockFetchMissionInterviewDrafts.mockResolvedValueOnce([]);
+    globalThis.fetch = createFetchMockWithHealth([], {});
+
+    render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+    expect(await screen.findByText("No missions yet")).toBeInTheDocument();
+    expect(screen.queryByText("Drafts")).not.toBeInTheDocument();
   });
 
   it("logs a warning when pending interview session fetch fails", async () => {
@@ -3754,6 +4065,92 @@ describe("MissionManager", () => {
       expect(within(sidebar).getByText("API Redesign")).toBeInTheDocument();
       const sidebarList = document.querySelector(".mission-manager__sidebar-list") as HTMLElement;
       expect(getComputedStyle(sidebarList).overflowY).toBe("auto");
+    });
+  });
+
+  describe("mission list row interactions", () => {
+    it("renders mission and interview rows as keyboard-reachable buttons with labels", async () => {
+      mockFetchMissionInterviewDrafts.mockResolvedValue([
+        {
+          id: "S-001",
+          title: "Auth interview",
+          status: "awaiting_input",
+          projectId: null,
+          hasConversation: true,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ]);
+      globalThis.fetch = createFetchMock();
+      render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+      const missionRow = await screen.findByRole("button", { name: "Open mission Build Auth System" });
+      const interviewRow = await screen.findByRole("button", { name: "Resume interview Auth interview" });
+
+      expect(missionRow).toHaveAttribute("tabindex", "0");
+      expect(missionRow).toHaveAttribute("aria-pressed", "false");
+      expect(interviewRow).toHaveAttribute("tabindex", "0");
+    });
+
+    it("activates rows from keyboard and prevents bubbling from interview row actions", async () => {
+      mockFetchMissionInterviewDrafts.mockResolvedValue([
+        {
+          id: "S-002",
+          title: "Retry interview",
+          status: "error",
+          projectId: null,
+          hasConversation: true,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ]);
+      const fetchMock = createFetchMock();
+      globalThis.fetch = fetchMock;
+      render(<MissionManager isOpen={true} onClose={vi.fn()} addToast={vi.fn()} />);
+
+      const interviewRow = await screen.findByRole("button", { name: "Resume interview Retry interview" });
+      fireEvent.keyDown(interviewRow, { key: "Enter" });
+      await waitFor(() => {
+        expect(mockFetchAiSession).toHaveBeenCalledWith("S-002");
+      });
+
+      mockFetchAiSession.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Discard draft" }));
+      expect(mockFetchAiSession).not.toHaveBeenCalled();
+
+      const missionRow = await screen.findByRole("button", { name: "Open mission Build Auth System" });
+      const missionDetailFetchesBefore = fetchMock.mock.calls.filter(
+        (call) => typeof call[0] === "string" && call[0].includes("/api/missions/M-001"),
+      ).length;
+
+      const spaceEvent = fireEvent.keyDown(missionRow, { key: " " });
+      expect(spaceEvent).toBe(false);
+
+      await waitFor(() => {
+        const missionDetailFetchesAfter = fetchMock.mock.calls.filter(
+          (call) => typeof call[0] === "string" && call[0].includes("/api/missions/M-001"),
+        ).length;
+        expect(missionDetailFetchesAfter).toBe(missionDetailFetchesBefore + 1);
+      });
+    });
+  });
+
+  describe("MissionManager tokenized sizing regression", () => {
+    it("does not retain targeted hardcoded px literals in MissionManager selectors", async () => {
+      const css = await loadAllAppCssBaseOnly();
+
+      expect(css).not.toMatch(/\.mission-manager__title\s*\{[^}]*font-size:\s*16px/i);
+      expect(css).not.toMatch(/\.mission-manager__sidebar\s*\{[^}]*width:\s*300px/i);
+      expect(css).not.toMatch(/\.mission-status-badge\s*\{[^}]*font-size:\s*11px/i);
+      expect(css).not.toMatch(/\.mission-status-badge\s*\{[^}]*padding:\s*2px\s+8px/i);
+      expect(css).not.toMatch(/\.mission-status-badge--sm\s*\{[^}]*font-size:\s*10px/i);
+      expect(css).not.toMatch(/\.mission-status-badge--sm\s*\{[^}]*padding:\s*1px\s+6px/i);
+      expect(css).not.toMatch(/\.mission-detail__title\s*\{[^}]*font-size:\s*18px/i);
+      expect(css).not.toMatch(/\.mission-event__type\s*\{[^}]*font-size:\s*11px/i);
+      expect(css).not.toMatch(/\.mission-event__type\s*\{[^}]*padding:\s*2px\s+8px/i);
+      expect(css).not.toMatch(/\.mission-plan-state-indicator\s*\{[^}]*width:\s*16px/i);
+      expect(css).not.toMatch(/\.mission-plan-state-indicator\s*\{[^}]*height:\s*16px/i);
+      expect(css).not.toMatch(/\.mission-plan-state-indicator\s*\{[^}]*border-radius:\s*4px/i);
     });
   });
 

@@ -34,6 +34,7 @@ vi.mock("../../api", () => ({
 }));
 
 import { uploadAttachment, fetchMission, fetchAgent } from "../../api";
+import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -49,6 +50,31 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 const noop = () => {};
+
+function mountCssForBadgeTests() {
+  const style = document.createElement("style");
+  style.textContent = loadAllAppCss();
+  document.head.appendChild(style);
+  document.documentElement.style.setProperty("--status-error-bg", "rgb(255, 230, 230)");
+  document.documentElement.style.setProperty("--color-error-dark", "rgb(200, 0, 0)");
+  document.documentElement.style.setProperty("--status-in-review-bg", "rgb(230, 255, 230)");
+  document.documentElement.style.setProperty("--in-review", "rgb(0, 160, 0)");
+  return () => {
+    style.remove();
+    document.documentElement.style.removeProperty("--status-error-bg");
+    document.documentElement.style.removeProperty("--color-error-dark");
+    document.documentElement.style.removeProperty("--status-in-review-bg");
+    document.documentElement.style.removeProperty("--in-review");
+  };
+}
+
+const highFanout = {
+  totalCount: 7,
+  activeTodoCount: 3,
+  dependentIds: ["FN-002", "FN-003"],
+  staleBlockedByDependentIds: [],
+  isHighFanout: true,
+} as const;
 
 afterEach(() => {
   vi.useRealTimers();
@@ -144,6 +170,23 @@ describe("TaskCard", () => {
     expect(badge?.className).toContain("pulsing");
   });
 
+  it("FN-4208 keeps failed in-review TaskCard badge on error colors", () => {
+    const cleanupCss = mountCssForBadgeTests();
+    try {
+      const { container } = render(
+        <TaskCard task={makeTask({ column: "in-review", status: "failed" as any, error: "boom" })} onOpenDetail={noop} addToast={noop} />,
+      );
+
+      const badge = container.querySelector(".card-status-badge") as HTMLElement;
+      expect(badge.className).toContain("card-status-badge--in-review");
+      expect(badge.className).toContain("failed");
+      expect(getComputedStyle(badge).color).toBe("var(--color-error-dark)");
+      expect(getComputedStyle(badge).color).not.toBe("var(--in-review)");
+    } finally {
+      cleanupCss();
+    }
+  });
+
   it("renders the status badge after the card ID in DOM order", () => {
     const { container } = render(
       <TaskCard
@@ -165,6 +208,47 @@ describe("TaskCard", () => {
       <TaskCard task={makeTask({ status: undefined as any })} onOpenDetail={noop} addToast={noop} />,
     );
     expect(container.querySelector(".card-status-badge")).toBeNull();
+  });
+
+  it("renders stalled badge with visible reason when stalledReview is set", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          status: "merging",
+          stalledReview: {
+            reason: "Re-enqueued for merge 3 times in the last 60 minutes without leaving in-review",
+            heuristic: "reenqueue-churn",
+            matchCount: 3,
+            firstMatchAt: "2026-05-12T11:00:00.000Z",
+            lastMatchAt: "2026-05-12T11:50:00.000Z",
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const stalledBadge = screen.getByText("Stalled");
+    expect(stalledBadge.getAttribute("title")).toContain("Re-enqueued for merge 3 times");
+    expect(screen.getByText("Re-enqueued for merge 3 times in the last 60 minutes without leaving in-review")).toBeDefined();
+  });
+
+  it("does not render stalled badge when stalledReview is undefined", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "in-review",
+          status: "merging",
+          stalledReview: undefined,
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.queryByText("Stalled")).toBeNull();
+    expect(screen.queryByText(/Re-enqueued for merge/)).toBeNull();
   });
 
   it("shows paused by agent label when pausedByAgentId is set", () => {
@@ -234,16 +318,32 @@ describe("TaskCard", () => {
     expect(badge.textContent).toContain("(1 stale)");
   });
 
+  it("renders high fan-out badge without visible todo suffix while keeping tooltip context", () => {
+    render(
+      <TaskCard
+        task={makeTask({ column: "in-progress" })}
+        fanout={highFanout}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const badge = screen.getByText("High fan-out").closest(".card-fanout-badge") as HTMLElement;
+    expect(badge).not.toBeNull();
+    expect(badge.textContent).toContain("High fan-out 7");
+    expect(badge.textContent).not.toContain("todo)");
+    expect(badge.getAttribute("data-tooltip")).toContain("3 waiting in todo");
+  });
+
   it("escalates only threshold-crossing fan-out badges", () => {
     const { rerender } = render(
       <TaskCard
         task={makeTask({ column: "in-progress" })}
         fanout={{
+          ...highFanout,
           totalCount: 8,
           activeTodoCount: 5,
           dependentIds: ["FN-003"],
-          staleBlockedByDependentIds: [],
-          isHighFanout: true,
           escalation: { blockerId: "FN-001", activeTodoCount: 5, totalActiveCount: 8, blockingAgeMs: 3_600_000 },
         }}
         onOpenDetail={noop}
@@ -251,11 +351,11 @@ describe("TaskCard", () => {
       />,
     );
 
-    let badge = document.querySelector(".card-fanout-badge--high-impact") as HTMLElement;
+    let badge = screen.getByText("Escalated").closest(".card-fanout-badge") as HTMLElement;
     expect(badge).not.toBeNull();
-    expect(badge).toHaveClass("card-fanout-badge--escalated");
     expect(badge.textContent).toContain("Escalated");
-    expect(badge.textContent).toContain("(5 todo)");
+    expect(badge.textContent).toContain("8");
+    expect(badge.textContent).not.toContain("todo)");
 
     rerender(
       <TaskCard
@@ -267,7 +367,7 @@ describe("TaskCard", () => {
     );
 
     badge = screen.getByText("Blocks").closest(".card-fanout-badge") as HTMLElement;
-    expect(badge).not.toHaveClass("card-fanout-badge--high-impact");
+    expect(badge).not.toBeNull();
   });
 
   it("shows plain paused label when pausedByAgentId is not set", () => {
@@ -993,6 +1093,262 @@ describe("TaskCard", () => {
 
     expect(container.querySelector(".card-source-provenance")).toBeNull();
     expect(screen.queryByTestId("provider-icon-github")).toBeNull();
+  });
+
+  it("renders a GitHub tracking link for tracked issues on non-imported tasks", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    const bottomRightRow = container.querySelector(".card-bottom-right-row");
+    const footerRow = container.querySelector(".card-footer-row");
+    expect(link.getAttribute("href")).toBe("https://github.com/owner/repo/issues/42");
+    expect(link.getAttribute("title")).toBe("Linked GitHub issue: owner/repo#42");
+    expect(link).toHaveClass("card-source-provenance", "card-github-tracking-link");
+    expect(bottomRightRow?.contains(link)).toBe(true);
+    expect(footerRow).toBeNull();
+    expect(screen.getByTestId("provider-icon-github")).toBeDefined();
+  });
+
+  it("renders the GitHub tracking link below the queued badge in the bottom-right row", () => {
+    const { container } = render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          status: "queued",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    const bottomRightRow = container.querySelector(".card-bottom-right-row");
+    const queuedBadge = container.querySelector(".queued-badge");
+    expect(bottomRightRow).not.toBeNull();
+    expect(bottomRightRow?.contains(link)).toBe(true);
+    expect(queuedBadge).not.toBeNull();
+    expect(queuedBadge?.compareDocumentPosition(bottomRightRow as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the GitHub tracking link keyboard focusable", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    expect(link.tabIndex).not.toBe(-1);
+    link.focus();
+    expect(document.activeElement).toBe(link);
+  });
+
+  it("renders safe external-link attributes for the GitHub tracking link", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Linked GitHub issue #42" });
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(link.getAttribute("rel")).toContain("noreferrer");
+  });
+
+  it("keeps GitHub tracking link interaction-affordance CSS contract", () => {
+    const css = loadAllAppCssBaseOnly();
+
+    expect(css).toMatch(/\.card-github-tracking-link\s*\{[^}]*min-width:[^;]+;[^}]*min-height:[^;]+;[^}]*\}/);
+    expect(css).toContain(".card-github-tracking-link:hover");
+    expect(css).toMatch(/\.card-github-tracking-link:focus-visible\s*\{[^}]*--focus-ring-strong/);
+  });
+
+  it("keeps GitHub provenance indicators grouped on the right edge", () => {
+    const css = loadAllAppCssBaseOnly();
+
+    expect(css).toMatch(/\.card-footer-row\s*>\s*\.card-source-provenance:first-of-type\s*\{[^}]*margin-left:\s*auto;[^}]*\}/);
+    const provenanceRule = css.match(/\.card-source-provenance\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(provenanceRule).not.toMatch(/margin-left\s*:\s*auto/);
+  });
+
+  it("does not render a GitHub tracking link when githubTracking is absent", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: /Linked GitHub issue/i })).toBeNull();
+  });
+
+  it("renders a GitHub tracking link for github_import tasks when the tracking issue is distinct from source", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "github_import",
+          sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42" },
+          githubTracking: {
+            issue: {
+              owner: "other",
+              repo: "tracking",
+              number: 99,
+              url: "https://github.com/other/tracking/issues/99",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "Linked GitHub issue #99" })).toBeDefined();
+    expect(screen.getByLabelText("Imported from GitHub")).toBeDefined();
+  });
+
+  it("deduplicates the tracking link when github_import tracking issue matches source owner/repo/number", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "github_import",
+          sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42" },
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: /Linked GitHub issue/i })).toBeNull();
+    expect(screen.getByLabelText("Imported from GitHub")).toBeDefined();
+  });
+
+  it("does not render a GitHub tracking link when a matching issue badge is already shown", () => {
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+          issueInfo: {
+            url: "https://github.com/owner/repo/issues/42",
+            number: 42,
+            state: "open",
+            title: "Issue",
+          },
+        })}
+        onOpenDetail={noop}
+        addToast={noop}
+      />,
+    );
+
+    expect(screen.queryByRole("link", { name: /Linked GitHub issue/i })).toBeNull();
+  });
+
+  it("clicking the GitHub tracking link does not open the task detail modal", () => {
+    const onOpenDetail = vi.fn();
+    render(
+      <TaskCard
+        task={makeTask({
+          column: "todo",
+          sourceType: "dashboard_ui",
+          githubTracking: {
+            issue: {
+              owner: "owner",
+              repo: "repo",
+              number: 42,
+              url: "https://github.com/owner/repo/issues/42",
+              createdAt: "2026-05-12T00:00:00.000Z",
+            },
+          },
+        })}
+        onOpenDetail={onOpenDetail}
+        addToast={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Linked GitHub issue #42" }));
+    expect(onOpenDetail).not.toHaveBeenCalled();
   });
 
   it("renders agent-created provenance badge for automation tasks and prefers sourceMetadata.agentName", () => {

@@ -1136,21 +1136,38 @@ describe("PUT /settings/global", () => {
     expect(res.body.persistAgentToolOutput).toBe(false);
   });
 
-  it("accepts persistAgentThinkingLog in global updates", async () => {
-    const updatedMerged = { persistAgentThinkingLog: true };
+  it("accepts persistAgentThinkingLogPermanent in global updates", async () => {
+    const updatedMerged = { persistAgentThinkingLogPermanent: true };
     (store.updateGlobalSettings as ReturnType<typeof vi.fn>).mockResolvedValue(updatedMerged);
 
     const res = await REQUEST(
       buildApp(),
       "PUT",
       "/api/settings/global",
-      JSON.stringify({ persistAgentThinkingLog: true }),
+      JSON.stringify({ persistAgentThinkingLogPermanent: true }),
       { "Content-Type": "application/json" },
     );
 
     expect(res.status).toBe(200);
-    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ persistAgentThinkingLog: true });
-    expect(res.body.persistAgentThinkingLog).toBe(true);
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ persistAgentThinkingLogPermanent: true });
+    expect(res.body.persistAgentThinkingLogPermanent).toBe(true);
+  });
+
+  it("accepts persistAgentThinkingLogEphemeral in global updates", async () => {
+    const updatedMerged = { persistAgentThinkingLogEphemeral: true };
+    (store.updateGlobalSettings as ReturnType<typeof vi.fn>).mockResolvedValue(updatedMerged);
+
+    const res = await REQUEST(
+      buildApp(),
+      "PUT",
+      "/api/settings/global",
+      JSON.stringify({ persistAgentThinkingLogEphemeral: true }),
+      { "Content-Type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(store.updateGlobalSettings).toHaveBeenCalledWith({ persistAgentThinkingLogEphemeral: true });
+    expect(res.body.persistAgentThinkingLogEphemeral).toBe(true);
   });
 
   it("returns 500 on update error", async () => {
@@ -1291,6 +1308,8 @@ describe("GET /settings/scopes", () => {
         themeMode: "dark",
         defaultProvider: "anthropic",
         persistAgentToolOutput: true,
+        persistAgentThinkingLogPermanent: false,
+        persistAgentThinkingLogEphemeral: false,
         persistAgentThinkingLog: false,
       },
       project: { maxConcurrent: 4, autoMerge: false },
@@ -1302,10 +1321,14 @@ describe("GET /settings/scopes", () => {
     expect(res.body.global.themeMode).toBe("dark");
     expect(res.body.global.defaultProvider).toBe("anthropic");
     expect(res.body.global.persistAgentToolOutput).toBe(true);
+    expect(res.body.global.persistAgentThinkingLogPermanent).toBe(false);
+    expect(res.body.global.persistAgentThinkingLogEphemeral).toBe(false);
     expect(res.body.global.persistAgentThinkingLog).toBe(false);
     expect(res.body.project.maxConcurrent).toBe(4);
     expect(res.body.project.autoMerge).toBe(false);
     expect(res.body.project.persistAgentToolOutput).toBeUndefined();
+    expect(res.body.project.persistAgentThinkingLogPermanent).toBeUndefined();
+    expect(res.body.project.persistAgentThinkingLogEphemeral).toBeUndefined();
     expect(res.body.project.persistAgentThinkingLog).toBeUndefined();
   });
 
@@ -1866,6 +1889,39 @@ describe("POST /settings/test-notification", () => {
           fromId: "system",
           toId: "user",
           preview: "Fusion test message notification",
+        }),
+      }),
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("ntfy provider dispatches a room message-event pipeline test when messageEventType is message:room", async () => {
+    const dispatchSpy = vi.fn().mockResolvedValue(undefined);
+    mockGetActiveNotificationService.mockReturnValue({ dispatch: dispatchSpy });
+    (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ntfyEnabled: true,
+      ntfyTopic: "test-topic",
+    });
+
+    const res = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/settings/test-notification",
+      JSON.stringify({ providerId: "ntfy", messageEventType: "message:room" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    expect(dispatchSpy).toHaveBeenCalledWith(
+      "message:room",
+      expect.objectContaining({
+        event: "message:room",
+        metadata: expect.objectContaining({
+          roomId: "test-room",
+          roomName: "Test Room",
+          senderName: "Fusion",
+          preview: "Fusion test room notification",
         }),
       }),
     );

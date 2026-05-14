@@ -196,6 +196,25 @@ Fallback behavior remains unchanged:
 
 Execution-ownership sync intentionally avoids assignment-trigger side effects (`agent:assigned` wakeups) that are intended for control-plane delegation.
 
+### Running-state invariant for assigned durable agents (FN-4249)
+
+Invariant: a durable agent must not remain `state="running"` while its linked task is outside `in-progress` (especially `todo` + `status="queued"`).
+
+Layered enforcement:
+- **Scheduler rollback (`packages/engine/src/scheduler.ts`)**: when overlap gating requeues a todo task to `status="queued"`, scheduler immediately rolls back any running agent linked through `executionTaskId` to `state="active"` and clears the execution-task link.
+- **Heartbeat reconciliation (`packages/engine/src/agent-heartbeat.ts`)**: `reconcileOrphanedRunningAgents()` repairs persisted `state="running"` drift when no active run exists, or when a persisted active run is untracked and older than `heartbeatTimeoutMs × 3` (work-budget grace; see inline FN-4278/FN-4255 comment near that check).
+- **Heartbeat scheduler stale-run reap (`packages/engine/src/agent-heartbeat.ts`)**: `HeartbeatTriggerScheduler.maybeReapStaleActiveRun()` repairs stale persisted `status="active"` heartbeat runs using `heartbeatTimeoutMs × heartbeatRepairStaleMultiplier` (default multiplier `2`).
+- **Self-healing reconciler (`packages/engine/src/self-healing.ts`)**: `recoverAgentsRunningOnInactiveTasks()` and `recoverStaleHeartbeatRuns()` use task-column mismatch checks plus PID/young-run/age guards (including the 6h stale active-run max age) rather than a simple timeout multiplier.
+
+Manual recovery for pre-fix stuck rows:
+1. Open the agent in Dashboard → Agent Detail.
+2. Set state back to `active`.
+3. Clear execution task link (set task link to none).
+
+Programmatic equivalent:
+- `AgentStore.updateAgentState(agentId, "active")`
+- `AgentStore.syncExecutionTaskLink(agentId, undefined)`
+
 ### Assigned-agent runtime model precedence for task execution
 
 When a task is executed by an assigned durable agent, executor session model selection now prefers that agent's explicit runtime model when it is fully specified.
@@ -215,6 +234,8 @@ Heartbeat sessions for durable agents resolve models with heartbeat-specific fal
 2. Execution-lane settings fallback (`executionProvider`/`executionModelId` → `executionGlobalProvider`/`executionGlobalModelId` → project/global defaults)
 
 When the runtime model is present and differs from execution-lane settings, heartbeat passes the execution-lane model as a fallback pair for session creation.
+
+Task-scoped heartbeat runs for durable agents execute inside the task's git worktree (same as ephemeral task execution), while no-task heartbeat runs continue to execute from the project root.
 
 If a heartbeat cannot create/run a session due to unavailable provider credentials or missing provider registration, Fusion records `resultJson.reason = "heartbeat_model_unavailable"` with actionable diagnostics in `resultJson.detail`/`stderrExcerpt`.
 
@@ -763,7 +784,9 @@ When the bound task is `executor-class` or `blocked`, the default procedure dire
 
 The manager-facing reports health block in that prompt is populated from `AgentStore.getAgentsByReportsTo(agent.id)`. Engine code must call that store method with its `AgentStore` instance binding intact because some implementations resolve direct reports through `this.listAgents()`. If the section disappears unexpectedly, look for logs like `Failed to load reports ... Cannot read properties of undefined (reading 'listAgents')`, which indicate an unbound method call regressed.
 
-This behavior is inherited by new non-ephemeral agents because agent creation seeds a per-agent `HEARTBEAT.md` file from the built-in default. If an agent sets `heartbeatProcedurePath`, that markdown file fully replaces the built-in default at runtime.
+Direct-report staleness in this reports-health block uses each report's configured heartbeat interval, with threshold `max(heartbeatIntervalMs × 4, 5 minutes)`. This matches dashboard health classification semantics and avoids timeout-budget-based false stale flags.
+
+This behavior is inherited by new non-ephemeral agents because agent creation seeds a per-agent `HEARTBEAT.md` file from the built-in default. If an agent sets `heartbeatProcedurePath`, that markdown file fully replaces the built-in default at runtime for task-scoped heartbeats. No-task heartbeats always fall back to the ambient built-in procedure so the prompt never references task-only tools.
 
 For pre-existing agents, use `POST /api/agents/:id/upgrade-heartbeat-procedure` (also exposed as **Upgrade to Default Heartbeat Procedure** in the agent detail Config tab) to re-seed from the current built-in constant. When the built-in default changes, running this upgrade propagates the new default to existing agents; direct operator edits to an agent’s existing procedure file are preserved unless this upgrade is run (the upgrade overwrites the per-agent file).
 
@@ -825,11 +848,14 @@ This normalization applies on send and mailbox reads, so replies from agents sti
 
 ### How It Works
 
+Heartbeat runs now surface both direct-message inbox traffic and recent room activity for rooms the agent belongs to. Room traffic is lookback-based (bounded to the prior completed heartbeat / `lastHeartbeatAt`, capped at 24 hours) and is only shown when there are unread/recent messages worth surfacing.
+
 1. **Message Prefetch**: When `messageStore` is available, heartbeat runs fetch up to 10 unread inbox messages for the agent.
-2. **Prompt Injection**: Pending messages are injected into the execution prompt with message ID, sender, and timestamp information.
-3. **Reply Guidance**: System instructions remind agents to reply with `reply_to_message_id` for linked threads.
-4. **Mark as Read**: After successful heartbeat completion, messages are marked as read.
-5. **Failed Runs**: If the heartbeat execution fails, messages remain unread for retry on the next run.
+2. **Room Prefetch**: When `chatStore` is available, heartbeat runs fetch up to 10 recent room messages per active room (30 total max, self-authored room messages excluded).
+3. **Prompt Injection**: Pending messages are injected into the execution prompt with message ID, sender, and timestamp information, followed by a **Pending Room Messages** section grouped by room.
+4. **Reply Guidance**: System instructions remind agents to reply with `reply_to_message_id` for direct messages and use `fn_post_room_message` only when room content is relevant to the agent’s role/identity.
+5. **Mark as Read**: After successful heartbeat completion, direct inbox messages are marked as read.
+6. **Failed Runs**: If the heartbeat execution fails, inbox messages remain unread for retry on the next run.
 
 ### Message Response Modes
 
@@ -1093,9 +1119,33 @@ Effects:
 
 This covers the untracked timer-loss failure mode where no `agent:updated` event fires after a timer entry disappears. Manual stop/start is no longer required to re-arm the timer in that case.
 
+### Stale Active-Run Reaper (FN-4119)
+
+`HeartbeatTriggerScheduler` also reaps **stale persisted `status="active"` heartbeat runs** before they can block future timer progress forever.
+
+When it fires:
+- `onTimerTick()` finds an active run row for a durable, tickable agent
+- or `auditTimerRegistrations()` finds a missing timer plus an active run row for that same durable agent
+- the persisted run has no fresh heartbeat for longer than **`heartbeatTimeoutMs × heartbeatRepairStaleMultiplier`**
+- the engine is not globally paused and not timer-paused via `enginePaused`
+
+Threshold semantics:
+- The reaper reuses the same `heartbeatRepairStaleMultiplier` setting that timer-audit repair already uses; no extra stale-run knob exists
+- The base signal is the agent's `lastHeartbeatAt` / `recordHeartbeat(...)` freshness, not the scheduled timer interval
+- Default threshold is therefore **`2 × heartbeatTimeoutMs`** (default timeout `60s` → default reap threshold `120s`)
+
+Layering with the existing recovery paths:
+- **`HeartbeatMonitor.reconcileOrphanedRunningAgents()`** handles orphaned persisted `state="running"` rows and uses `heartbeatTimeoutMs × 3` as a run-budget grace threshold when the active run exists but is untracked.
+- **`HeartbeatTriggerScheduler.onTimerTick()`** reaps stale persisted `status="active"` runs at `heartbeatTimeoutMs × heartbeatRepairStaleMultiplier`, logs `reason=tick-proceeded-after-reap`, and proceeds with the scheduled callback in the same tick.
+- **`HeartbeatTriggerScheduler.auditTimerRegistrations()`** applies the same stale-run threshold, then reaps stale active runs before re-arming missing timers and logs `reason=timer-audit-rearmed`.
+- **`SelfHealingManager.recoverAgentsRunningOnInactiveTasks()` / `recoverStaleHeartbeatRuns()`** are the final backstop using task-state mismatch and PID/max-age guards (not the timeout multiplier formulas above).
+- Healthy active runs within threshold still keep the old `(active run)` skip behavior.
+- Ephemeral/task-worker agents are never reaped by this path.
+
 Separation of responsibilities:
 - **HeartbeatMonitor recovery** handles **tracked stale sessions** (stuck in-memory run/session cleanup + pause/resume restart)
 - **HeartbeatTriggerScheduler audit** handles **untracked missing-timer registration drift** (re-arm scheduling)
+- **HeartbeatTriggerScheduler stale-run reaper** handles **orphaned persisted active runs** that would otherwise cause both tick and audit to skip forever on `(active run)`
 
 ## Dashboard Health Status
 
@@ -1125,6 +1175,7 @@ Health status uses interval-based staleness evaluation:
 ### Key Behaviors
 
 - **Monitoring disabled**: Agents with `runtimeConfig.enabled === false` display "Disabled" — they are NOT falsely labeled as "Unresponsive"
+- **Interval-sized gaps are normal**: With the default `heartbeatIntervalMs = 3600000` (1 hour), an agent can legitimately go tens of minutes without a new heartbeat. Ages like 16–50 minutes are expected and should not be treated as unhealthy on interval age alone.
 - **Consistent across views**: All dashboard surfaces use the same centralized utility, ensuring consistent health labels everywhere
 - **Auto-refresh**: Health status is refreshed every 30 seconds while views are open to keep status current
 - **State-first evaluation**: Explicit non-idle states (error, paused, running) take priority over timeout-based evaluation

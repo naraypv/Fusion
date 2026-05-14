@@ -5,8 +5,8 @@ import { parse } from "yaml";
 
 const workspaceRoot = join(import.meta.dirname!, "..", "..", "..", "..");
 
-function loadWorkflow(name: string): any {
-  const path = join(workspaceRoot, ".github", "workflows", name);
+function loadYamlFile(...pathParts: string[]): any {
+  const path = join(workspaceRoot, ...pathParts);
   const content = readFileSync(path, "utf-8");
   const parsed = parse(content) as Record<string, unknown>;
 
@@ -19,9 +19,18 @@ function loadWorkflow(name: string): any {
   return { content, parsed };
 }
 
+function loadWorkflow(name: string): any {
+  return loadYamlFile(".github", "workflows", name);
+}
+
+function findCompositeSetupStep(steps: any[]) {
+  return steps.find((step) => step.uses === "./.github/actions/setup-node-pnpm");
+}
+
 describe("CI workflow (.github/workflows/ci.yml)", () => {
   let workflow: any;
   let content: string;
+  let compositeAction: any;
   let buildSteps: any[];
   let testShardJob: any;
   let contributingContent: string;
@@ -35,6 +44,7 @@ describe("CI workflow (.github/workflows/ci.yml)", () => {
     const result = loadWorkflow("ci.yml");
     workflow = result.parsed;
     content = result.content;
+    compositeAction = loadYamlFile(".github", "actions", "setup-node-pnpm", "action.yml").parsed;
     buildSteps = workflow.jobs?.build?.steps ?? [];
     testShardJob = workflow.jobs?.["test-shards"];
     contributingContent = readFileSync(join(workspaceRoot, "docs", "contributing.md"), "utf-8");
@@ -72,9 +82,13 @@ describe("CI workflow (.github/workflows/ci.yml)", () => {
   });
 
   it("pins dependency bootstrap to frozen lockfile", () => {
-    expect(content).toContain("run: pnpm install --frozen-lockfile");
+    const jobs = [workflow.jobs?.lint, workflow.jobs?.["test-shards"], workflow.jobs?.build];
+    for (const job of jobs) {
+      expect(findCompositeSetupStep(job?.steps ?? [])).toBeDefined();
+    }
     expect(content).not.toContain("run: pnpm install\n");
     expect(content).not.toContain("--no-frozen-lockfile");
+    expect(compositeAction.inputs?.["install-args"]?.default).toBe("--frozen-lockfile");
   });
 
   it("uses deterministic test sharding and keeps lint/build as explicit jobs", () => {
@@ -286,8 +300,8 @@ describe("Version & Release workflow (.github/workflows/version.yml)", () => {
 
   it("configures npm registry-url", () => {
     const steps = workflow.jobs.release.steps;
-    const nodeStep = steps.find((s: any) => s.uses?.includes("actions/setup-node"));
-    expect(nodeStep?.with?.["registry-url"]).toBe("https://registry.npmjs.org");
+    const compositeStep = findCompositeSetupStep(steps);
+    expect(compositeStep?.with?.["registry-url"]).toBe("https://registry.npmjs.org");
   });
 });
 
@@ -336,6 +350,33 @@ describe("Binary release workflow (.github/workflows/release.yml)", () => {
 
   it("uses softprops/action-gh-release", () => {
     expect(content).toContain("softprops/action-gh-release");
+  });
+
+  it("uses frozen-lockfile install in every matrix job", () => {
+    const steps = workflow.jobs["build-binaries"].steps ?? [];
+    const setupSteps = steps.filter((step: any) => step.uses === "./.github/actions/setup-node-pnpm");
+
+    const hasValidCompositeSetup = setupSteps.some((step: any) => {
+      const installArgs = step.with?.["install-args"];
+      return installArgs === undefined || String(installArgs).trim() === "--frozen-lockfile";
+    });
+
+    const hasInlineFrozenInstall = steps.some((step: any) =>
+      typeof step.run === "string" && /\bpnpm install --frozen-lockfile\b/.test(step.run),
+    );
+
+    expect(hasValidCompositeSetup || hasInlineFrozenInstall).toBe(true);
+
+    for (const step of setupSteps) {
+      const installArgs = step.with?.["install-args"];
+      if (installArgs !== undefined) {
+        expect(String(installArgs).trim()).toBe("--frozen-lockfile");
+      }
+    }
+
+    expect(content).not.toMatch(/run:\s*pnpm install\s*(?:\r?\n)/);
+    expect(content).not.toContain("--no-frozen-lockfile");
+    expect(content).not.toMatch(/install-args:\s*["']?\s*["']?\s*(?:\r?\n)/);
   });
 
   it("references signing scripts", () => {
@@ -397,8 +438,10 @@ describe("Test-release workflow (.github/workflows/test-release.yml)", () => {
   });
 
   it("uses frozen-lockfile install in every matrix job", () => {
-    const matches = content.match(/run:\s*pnpm install --frozen-lockfile/g) ?? [];
-    expect(matches.length).toBeGreaterThanOrEqual(1);
+    const steps = workflow.jobs["build-binaries"].steps ?? [];
+    const compositeStep = findCompositeSetupStep(steps);
+    expect(compositeStep).toBeDefined();
+    expect(compositeStep.with?.["install-args"] ?? "--frozen-lockfile").toBe("--frozen-lockfile");
     expect(content).not.toContain("run: pnpm install\n");
     expect(content).not.toContain("--no-frozen-lockfile");
   });

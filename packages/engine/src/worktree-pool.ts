@@ -1,11 +1,20 @@
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, rmSync, realpathSync } from "node:fs";
 import { join, relative, resolve, isAbsolute } from "node:path";
 import type { Column, TaskStore } from "@fusion/core";
+import { inspectBranchConflict } from "./branch-conflicts.js";
 import { worktreePoolLog } from "./logger.js";
 
 const execAsync = promisify(exec);
+
+function canonicalizePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
 
 function getExecStdout(result: unknown): string {
   if (typeof result === "string") return result;
@@ -41,7 +50,7 @@ export async function getRegisteredWorktreePaths(rootDir: string): Promise<Set<s
     const paths = new Set<string>();
     for (const line of stdout.split("\n")) {
       if (line.startsWith("worktree ")) {
-        paths.add(resolve(line.slice("worktree ".length)));
+        paths.add(canonicalizePath(line.slice("worktree ".length)));
       }
     }
     return paths;
@@ -53,7 +62,7 @@ export async function getRegisteredWorktreePaths(rootDir: string): Promise<Set<s
 }
 
 export async function isRegisteredGitWorktree(rootDir: string, worktreePath: string): Promise<boolean> {
-  return (await getRegisteredWorktreePaths(rootDir)).has(resolve(worktreePath));
+  return (await getRegisteredWorktreePaths(rootDir)).has(canonicalizePath(worktreePath));
 }
 
 export function hasRequiredWorktreeFiles(worktreePath: string): boolean {
@@ -66,9 +75,9 @@ export async function isUsableTaskWorktree(rootDir: string, worktreePath: string
     hasRequiredWorktreeFiles(worktreePath);
 }
 
-function isInsideWorktreesDir(rootDir: string, worktreePath: string): boolean {
-  const worktreesDir = resolve(rootDir, ".worktrees");
-  const target = resolve(worktreePath);
+export function isInsideWorktreesDir(rootDir: string, worktreePath: string): boolean {
+  const worktreesDir = canonicalizePath(join(rootDir, ".worktrees"));
+  const target = canonicalizePath(worktreePath);
   const rel = relative(worktreesDir, target);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
@@ -181,14 +190,20 @@ export class WorktreePool {
    * 4. `git checkout -B <branchName> <startPoint>` — create/reset branch from start point
    *
    * Returns the actual branch name used. This may differ from `branchName`
-   * when conflict recovery generates a suffixed name (e.g., `fusion/fn-042-2`).
+   * when legacy conflict recovery is explicitly enabled and generates a suffixed
+   * name (e.g., `fusion/fn-042-2`).
    *
    * @param worktreePath — Absolute path to the recycled worktree
    * @param branchName — Branch name for the new task (e.g., `fusion/fn-042`)
    * @param startPoint — Git ref to branch from (e.g., `fusion/fn-041`). Defaults to `main`.
    * @returns The actual branch name checked out in the worktree
    */
-  async prepareForTask(worktreePath: string, branchName: string, startPoint?: string): Promise<string> {
+  async prepareForTask(
+    worktreePath: string,
+    branchName: string,
+    startPoint?: string,
+    options?: { allowSiblingBranchRename?: boolean; repoDir?: string },
+  ): Promise<string> {
     // Clean tracked modifications
     try {
       await execAsync("git checkout -- .", { cwd: worktreePath });
@@ -223,20 +238,27 @@ export class WorktreePool {
         throw err;
       }
 
-      // The branch is checked out in a different worktree.
-      // First check if the conflicting worktree still exists on disk.
+      // The branch is checked out in a different worktree. Keep stale-conflict
+      // cleanup behavior for missing paths; otherwise either surface a typed
+      // conflict or, when explicitly enabled, fall back to the legacy sibling
+      // suffix flow.
       const conflictingPath = match[1];
-      if (!existsSync(conflictingPath)) {
-        // Conflicting worktree no longer exists — prune and retry with original name
+      const inspection = await inspectBranchConflict({
+        repoDir: options?.repoDir ?? worktreePath,
+        branchName,
+        conflictingWorktreePath: conflictingPath,
+        startPoint: base,
+      });
+      if (inspection.kind === "stale") {
         await execAsync("git worktree prune", { cwd: worktreePath });
         await execAsync(checkoutCmd, { cwd: worktreePath });
         return branchName;
       }
 
-      // Conflicting worktree exists and is active — use a suffixed branch name
-      // to avoid disrupting the other worktree. Seed the suffix from the
-      // original task branch tip rather than the generic base ref so retries
-      // preserve the task's commits instead of resetting to main/baseBranch.
+      if (!options?.allowSiblingBranchRename) {
+        throw inspection.error;
+      }
+
       const conflictBase = branchName;
       for (let suffix = 2; suffix <= 6; suffix++) {
         const suffixedName = `${branchName}-${suffix}`;
@@ -252,11 +274,9 @@ export class WorktreePool {
           if (!suffixStderr.includes("already used by worktree")) {
             throw suffixErr;
           }
-          // This suffixed name is also in use — try the next one
         }
       }
 
-      // All suffixed names exhausted — should not happen in practice
       throw new Error(
         `Cannot create branch for task: "${branchName}" and suffixes -2 through -6 are all in use by other worktrees`,
       );

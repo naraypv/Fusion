@@ -46,6 +46,7 @@ import { useSessionLock } from "../hooks/useSessionLock";
 import { useAiSessionSync } from "../hooks/useAiSessionSync";
 import { useViewportMode } from "../hooks/useViewportMode";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
+import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { getSessionTabId } from "../utils/getSessionTabId";
 
@@ -238,6 +239,8 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
   useModalResizePersist(modalRef, isOpen, "fusion:planning-modal-size");
   const viewportMode = useViewportMode();
+  const isMobile = viewportMode === "mobile";
+  const { pushNav } = useNavigationHistoryContext();
 
   const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } =
     useMobileKeyboard({ enabled: viewportMode === "mobile" });
@@ -973,6 +976,38 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const handleBackToList = useCallback(() => {
     setMobileShowDetail(false);
   }, []);
+
+  const previousMobileShowDetailRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (!isOpen) {
+      previousMobileShowDetailRef.current = false;
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    const previousMobileShowDetail = previousMobileShowDetailRef.current;
+
+    if (!isMobile) {
+      // Keep the previous mobile detail state untouched on desktop so viewport flips don't trigger stale pushes.
+      return;
+    }
+
+    if (!mobileShowDetail) {
+      previousMobileShowDetailRef.current = false;
+      return;
+    }
+
+    // FN-4187: Push on mobileShowDetail transitions (not selectedSessionId) so New Session also gets a back-stack entry.
+    if (!previousMobileShowDetail) {
+      pushNav({
+        type: "view",
+        revert: handleBackToList,
+      });
+    }
+
+    previousMobileShowDetailRef.current = true;
+  }, [handleBackToList, isMobile, mobileShowDetail, pushNav]);
 
   const syncPlanningDraft = useCallback(
     async (sessionId: string, planText: string) => {

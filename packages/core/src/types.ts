@@ -1,3 +1,11 @@
+import type { InReviewStallSignal } from "./in-review-stall.js";
+import type { StalledReviewSignal } from "./stalled-review-detector.js";
+
+export {
+  computeCapacityRisk,
+  DEFAULT_CAPACITY_RISK_TODO_THRESHOLD,
+} from "./capacity.js";
+export type { CapacityRiskSignal } from "./capacity.js";
 
 /** Valid thinking effort levels for AI agent sessions, controlling the cost/quality tradeoff of reasoning. */
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const;
@@ -118,6 +126,8 @@ export type ColorTheme = (typeof COLOR_THEMES)[number];
 
 export type PrStatus = "open" | "closed" | "merged";
 export type MergeStrategy = "direct" | "pull-request";
+export const DIRECT_MERGE_COMMIT_STRATEGIES = ["auto", "always-squash", "always-rebase"] as const;
+export type DirectMergeCommitStrategy = (typeof DIRECT_MERGE_COMMIT_STRATEGIES)[number];
 /** How merge conflicts are resolved when the AI agent can't (or shouldn't) decide.
  *
  *  Both `smart-*` strategies share the same cascade: pre-merge fetch +
@@ -186,6 +196,18 @@ export function normalizeMergeStrategyOverlapBehavior(
     && (MERGE_STRATEGY_OVERLAP_BEHAVIORS as readonly string[]).includes(value)
     ? value as MergeStrategyOverlapBehavior
     : "flip-to-prefer-branch";
+}
+
+export const POST_MERGE_AUDIT_MODES = ["block", "warn", "off"] as const;
+
+/** Controls how the merger reacts to a dirty post-merge audit (FN-4333). */
+export type PostMergeAuditMode = (typeof POST_MERGE_AUDIT_MODES)[number];
+
+export function normalizePostMergeAuditMode(value: unknown): PostMergeAuditMode {
+  return typeof value === "string"
+    && (POST_MERGE_AUDIT_MODES as readonly string[]).includes(value)
+    ? (value as PostMergeAuditMode)
+    : "block";
 }
 /** Policy for handling task execution when the selected node is unavailable/unhealthy. */
 export type UnavailableNodePolicy = "block" | "fallback-local";
@@ -266,7 +288,8 @@ export type NtfyNotificationEvent =
   | "fallback-used"
   | "memory-dreams-processed"
   | "message:agent-to-user"
-  | "message:agent-to-agent";
+  | "message:agent-to-agent"
+  | "message:room";
 
 /** Known notification event types. Providers may support additional custom events. */
 export const NOTIFICATION_EVENTS = [
@@ -281,6 +304,7 @@ export const NOTIFICATION_EVENTS = [
   "memory-dreams-processed",
   "message:agent-to-user",
   "message:agent-to-agent",
+  "message:room",
 ] as const;
 
 /** Notification event type. Known events plus provider-specific custom events. */
@@ -1166,6 +1190,10 @@ export interface Task {
   baseCommitSha?: string;
   /** List of files modified by this task (populated during execution) */
   modifiedFiles?: string[];
+  /** Opt out of the squash file-scope invariant for this task. */
+  scopeOverride?: boolean;
+  /** Optional justification for bypassing the squash file-scope invariant. */
+  scopeOverrideReason?: string;
   /** Mission ID this task is linked to (for mission hierarchy) */
   missionId?: string;
   /** Slice ID this task is linked to (for mission hierarchy) */
@@ -1196,6 +1224,11 @@ export interface Task {
    *  this on the fly from `log`, so this field is only populated by the slim
    *  list path and may be omitted on the full-detail object. */
   timedExecutionMs?: number;
+  /** Server-computed in-review stall signal. Undefined when no stall rule matches.
+   *  Diagnostic-only: must not be used as an auto-completion signal. */
+  inReviewStall?: InReviewStallSignal;
+  /** Heuristic stalled-review diagnostic signal (legacy compatibility contract). */
+  stalledReview?: StalledReviewSignal;
   /** Durable aggregate token usage totals for the task. Undefined when no usage has been recorded yet. */
   tokenUsage?: TaskTokenUsage;
   size?: "S" | "M" | "L";
@@ -1419,6 +1452,10 @@ export interface TaskCreateInput {
   nodeId?: string;
   /** Optional explicit user assignment for this task (used during review handoff) */
   assigneeUserId?: string;
+  /** Opt out of the squash file-scope invariant for this task. */
+  scopeOverride?: boolean;
+  /** Optional justification for bypassing the squash file-scope invariant. */
+  scopeOverrideReason?: string;
   /** Per-task GitHub issue tracking overrides for Fusion-created linked issues. */
   githubTracking?: Pick<TaskGithubTracking, "enabled" | "repoOverride">;
   /** Review level for task execution — controls review rigor: 0=None, 1=Plan Only, 2=Plan and Code, 3=Full */
@@ -1539,7 +1576,7 @@ export interface DaemonTokenSettings {
  * The dashboard UI shows these under a "Global" section.
  */
 /** Web search backend for auto-research provider. */
-export type WebSearchBackend = "builtin" | "searxng" | "brave" | "google" | "tavily" | "none";
+export type WebSearchBackend = "builtin" | "searxng" | "brave" | "google" | "tavily";
 
 export interface ResearchEnabledSources {
   webSearch: boolean;
@@ -1848,9 +1885,18 @@ export interface GlobalSettings {
    *  verbose `detail` payload is omitted to reduce log size/noise. Distinct
    *  from `persistAgentThinkingLog`, which controls `thinking` rows. */
   persistAgentToolOutput?: boolean;
-  /** When true, persist `thinking` log entries from agent reasoning deltas.
-   *  Default: false (suppressed). This only affects persisted `thinking` rows
-   *  and does not change normal assistant text/tool output behavior. */
+  /** When true, persist `thinking` log entries from agent reasoning deltas for
+   *  permanent (non-ephemeral) agents. Default: false (suppressed). */
+  persistAgentThinkingLogPermanent?: boolean;
+  /** When true, persist `thinking` log entries from agent reasoning deltas for
+   *  ephemeral / task-worker / spawned agents. Default: false (suppressed). */
+  persistAgentThinkingLogEphemeral?: boolean;
+  /** @deprecated Use `persistAgentThinkingLogPermanent` and
+   *  `persistAgentThinkingLogEphemeral` instead.
+   *
+   *  Legacy fallback: when explicitly set and one of the granular fields is
+   *  undefined, this value seeds that undefined granular kind at read time.
+   *  Default: false (suppressed). */
   persistAgentThinkingLog?: boolean;
   /** Research defaults shared across all projects.
    * Project settings may override these via `researchSettings`. */
@@ -1871,7 +1917,7 @@ export interface GlobalSettings {
   /** Default maximum number of synthesis rounds per run.
    *  Default: 2. */
   researchGlobalMaxSynthesisRounds?: number;
-  /** Web search backend for auto-research. Default: "builtin". */
+  /** Web search backend for auto-research. Default: "builtin"; web search itself cannot be disabled. */
   researchGlobalWebSearchProvider?: WebSearchBackend;
   /** SearXNG instance URL (required when researchGlobalWebSearchProvider is "searxng"). */
   researchGlobalSearxngUrl?: string;
@@ -2024,6 +2070,12 @@ export interface ProjectSettings {
    *  be enforced server-side. Only applies when `mergeStrategy === "pull-request"`.
    *  Default: false. */
   requirePrApproval?: boolean;
+  /** Direct-merge commit routing mode.
+   *  - "auto": squash single-substantive branches, preserve history for multi-substantive branches
+   *  - "always-squash": always use the legacy squash path for direct merges
+   *  - "always-rebase": always preserve individual branch commits during direct merges
+   *  Only applies when mergeStrategy is "direct". Default: "auto". */
+  directMergeCommitStrategy?: DirectMergeCommitStrategy;
   /** When true, automatically push to the configured remote after a successful direct merge.
    *  The push process includes pulling the latest from the remote (rebase) first.
    *  If conflicts arise during the pull, they are resolved using the AI conflict resolution pipeline.
@@ -2089,6 +2141,10 @@ export interface ProjectSettings {
    *  of being deleted. New tasks acquire a warm worktree from the pool,
    *  preserving build caches (node_modules, target/, dist/). Default: false. */
   recycleWorktrees?: boolean;
+  /** When true, restores the legacy behavior of silently creating sibling
+   *  branches like `fusion/FN-123-2` when the canonical task branch is already
+   *  checked out elsewhere. Default: false. */
+  executorAllowSiblingBranchRename?: boolean;
   /** Controls how worktree directory names are generated when creating fresh worktrees.
    *  Only applies when recycleWorktrees is NOT enabled (pooled worktrees retain their existing names).
    *  - "random": Human-friendly adjective-noun names (e.g., swift-falcon) — default
@@ -2207,9 +2263,24 @@ export interface ProjectSettings {
   /** Strategy used when a merge conflict can't be resolved by AI. See
    *  {@link MergeConflictStrategy}. Default: "smart". */
   mergeConflictStrategy?: MergeConflictStrategy;
+  /** Minimum branch net line volume before the pre-commit diff-volume gate evaluates a file. Default applied at read site: 20. */
+  mergeDiffVolumeMinLines?: number;
+  /** Minimum staged/branch-net ratio required by the pre-commit diff-volume gate. Default applied at read site: 0.2. */
+  mergeDiffVolumeThreshold?: number;
+  /** Additional file globs allowlisted by the pre-commit diff-volume gate on top of generated/lockfile patterns. Default applied at read site: []. */
+  mergeDiffVolumeAllowlist?: string[];
   /** Controls overlap protection when `mergeConflictStrategy="smart-prefer-main"`
    *  reaches its Attempt 3 fallback. Default: "flip-to-prefer-branch". */
   mergeStrategyOverlapBehavior?: MergeStrategyOverlapBehavior;
+  /** Controls how the merger reacts to a dirty post-merge / post-rebase audit (FN-4333).
+   *  - "block" (default): throw `SquashAuditError`, park task as failed (today's behavior).
+   *  - "warn": log audit findings on the agent log but auto-complete the merge.
+   *  - "off": skip the post-merge audit entirely.
+   *
+   *  Regardless of mode, the merger short-circuits overlap-only findings on the
+   *  rebase-strategy path when deterministic merge verification has already proven
+   *  the resulting tree (silent drops are impossible by construction in that case). */
+  postMergeAuditMode?: PostMergeAuditMode;
   /** Wall-clock timeout (ms) for a single pre-merge workflow step's AI call.
    *  When a step exceeds this, the session is aborted and the executor is
    *  given one shot to retry with the configured fallback model before the
@@ -2238,6 +2309,12 @@ export interface ProjectSettings {
    *  remain in triage with status "awaiting-approval" until a user approves
    *  or rejects the plan. Default: false. */
   requirePlanApproval?: boolean;
+  /** Controls task-worker execution mode.
+   *  - true (default): spawn short-lived `executor-FN-XXXX` ephemeral workers per task
+   *  - false: disable ephemeral workers; scheduler auto-assigns dispatchable tasks
+   *    to permanent executor agents using the reporting chain heuristic.
+   *  Tasks without an eligible permanent executor remain queued. */
+  ephemeralAgentsEnabled?: boolean;
   /** Approval policy for agent provisioning tools (fn_agent_create/fn_agent_delete). */
   agentProvisioning?: {
     approvalMode?: AgentProvisioningApprovalMode;
@@ -2262,6 +2339,14 @@ export interface ProjectSettings {
    *  Blocker age is measured from columnMovedAt when available, otherwise updatedAt.
    *  Only blockers currently in in-progress or in-review are eligible. */
   staleHighFanoutBlockerAgeThresholdMs?: number;
+  /** When true, the dashboard shows the capacity-risk banner once
+   *  capacityRiskTodoThreshold is exceeded with zero idle non-ephemeral agents.
+   *  Default: false. */
+  capacityRiskBannerEnabled?: boolean;
+  /** Todo count threshold for raising a capacity-risk warning when there are zero
+   *  idle non-ephemeral agents available. Warning fires only when todo is strictly
+   *  greater than this threshold. Default: 20. */
+  capacityRiskTodoThreshold?: number;
   /** TTL in milliseconds for persisted AI planning/subtask/mission interview sessions.
    *  Sessions older than this cutoff are expired by the dashboard session cleanup loop.
    *  Valid range: 600000 (10 minutes) to 2592000000 (30 days).
@@ -2524,6 +2609,7 @@ export {
   isGlobalOnlySettingsKey,
   isGlobalSettingsKey,
   isProjectSettingsKey,
+  resolvePersistAgentThinkingLog,
 } from "./settings-schema.js";
 
 export interface BoardConfig {
@@ -4055,8 +4141,8 @@ export interface AgentHeartbeatRun {
   systemPrompt?: string;
   /** Full per-tick execution prompt sent to the LLM for this run (truncated to 100,000 chars). */
   executionPrompt?: string;
-  /** Whether a custom heartbeat procedure was loaded ("custom") or the built-in default was used ("default"). */
-  heartbeatProcedureSource?: "default" | "custom";
+  /** Whether the run used a custom heartbeat procedure, the built-in default, or the no-task default override. */
+  heartbeatProcedureSource?: "default" | "custom" | "default-no-task-override";
 }
 
 /** Capabilities/roles an agent can have */
@@ -4946,6 +5032,10 @@ export interface AgentStats {
   failedRuns: number;
   /** Success rate (0-1) */
   successRate: number;
+  /** Number of idle non-ephemeral agents available for queue drain */
+  idleNonEphemeralCount: number;
+  /** Number of tasks currently in the todo column */
+  todoTaskCount: number;
 }
 
 /** Trigger source for an agent self-reflection run */

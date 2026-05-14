@@ -62,19 +62,45 @@ describe("settings key parity", () => {
     expect(isGlobalSettingsKey("persistAgentThinkingLog")).toBe(true);
     expect(isProjectSettingsKey("persistAgentThinkingLog")).toBe(false);
     expect(isGlobalOnlySettingsKey("persistAgentThinkingLog")).toBe(true);
+    expect(isGlobalSettingsKey("persistAgentThinkingLogPermanent")).toBe(true);
+    expect(isProjectSettingsKey("persistAgentThinkingLogPermanent")).toBe(false);
+    expect(isGlobalOnlySettingsKey("persistAgentThinkingLogPermanent")).toBe(true);
+    expect(isGlobalSettingsKey("persistAgentThinkingLogEphemeral")).toBe(true);
+    expect(isProjectSettingsKey("persistAgentThinkingLogEphemeral")).toBe(false);
+    expect(isGlobalOnlySettingsKey("persistAgentThinkingLogEphemeral")).toBe(true);
     expect(isGlobalSettingsKey("researchSettings")).toBe(false);
   });
 
   it("defaults persisted thinking logs to disabled", () => {
     expect(DEFAULT_GLOBAL_SETTINGS.persistAgentThinkingLog).toBe(false);
+    expect(DEFAULT_GLOBAL_SETTINGS.persistAgentThinkingLogPermanent).toBe(false);
+    expect(DEFAULT_GLOBAL_SETTINGS.persistAgentThinkingLogEphemeral).toBe(false);
   });
 
   it("includes heartbeatMultiplier in project defaults", () => {
     expect(DEFAULT_PROJECT_SETTINGS.heartbeatMultiplier).toBe(1);
   });
 
+  it("defaults sibling branch rename escape hatch to disabled", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.executorAllowSiblingBranchRename).toBe(false);
+    expect(isProjectSettingsKey("executorAllowSiblingBranchRename")).toBe(true);
+    expect(isGlobalSettingsKey("executorAllowSiblingBranchRename")).toBe(false);
+  });
+
+  it("defaults ephemeralAgentsEnabled to true and keeps it project-scoped", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.ephemeralAgentsEnabled).toBe(true);
+    expect(isProjectSettingsKey("ephemeralAgentsEnabled")).toBe(true);
+    expect(isGlobalSettingsKey("ephemeralAgentsEnabled")).toBe(false);
+  });
+
   it("defaults completionDocumentationMode to off", () => {
     expect(DEFAULT_PROJECT_SETTINGS.completionDocumentationMode).toBe("off");
+  });
+
+  it("keeps directMergeCommitStrategy project-scoped with auto default", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.directMergeCommitStrategy).toBe("auto");
+    expect(isProjectSettingsKey("directMergeCommitStrategy")).toBe(true);
+    expect(isGlobalSettingsKey("directMergeCommitStrategy")).toBe(false);
   });
 
   it("keeps task stuck timeout active by default without coupling to workflow step timeout", () => {
@@ -86,6 +112,12 @@ describe("settings key parity", () => {
     expect(DEFAULT_PROJECT_SETTINGS.staleHighFanoutBlockerAgeThresholdMs).toBe(2 * 60 * 60 * 1000);
     expect(isProjectSettingsKey("staleHighFanoutBlockerAgeThresholdMs")).toBe(true);
     expect(isGlobalSettingsKey("staleHighFanoutBlockerAgeThresholdMs")).toBe(false);
+  });
+
+  it("keeps capacity risk banner toggle project-scoped with off default", () => {
+    expect(DEFAULT_PROJECT_SETTINGS.capacityRiskBannerEnabled).toBe(false);
+    expect(isProjectSettingsKey("capacityRiskBannerEnabled")).toBe(true);
+    expect(isGlobalSettingsKey("capacityRiskBannerEnabled")).toBe(false);
   });
 
   it("keeps github tracking keys in expected scopes with documented defaults", () => {

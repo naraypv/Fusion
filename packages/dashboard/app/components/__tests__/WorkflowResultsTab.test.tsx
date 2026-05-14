@@ -2,14 +2,20 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { WorkflowResultsTab } from "../WorkflowResultsTab";
 import { fetchWorkflowSteps } from "../../api";
-import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
-import type { WorkflowStep, WorkflowStepResult } from "@fusion/core";
+import { useAgentLogs } from "../../hooks/useAgentLogs";
+import { loadAllAppCss, loadAllAppCssBaseOnly } from "../../test/cssFixture";
+import type { AgentLogEntry, WorkflowStep, WorkflowStepResult } from "@fusion/core";
 
 vi.mock("../../api", () => ({
   fetchWorkflowSteps: vi.fn(),
 }));
 
+vi.mock("../../hooks/useAgentLogs", () => ({
+  useAgentLogs: vi.fn(),
+}));
+
 const mockedFetchWorkflowSteps = vi.mocked(fetchWorkflowSteps);
+const mockedUseAgentLogs = vi.mocked(useAgentLogs);
 
 describe("WorkflowResultsTab", () => {
   const mockWorkflowSteps: WorkflowStep[] = [
@@ -52,6 +58,16 @@ describe("WorkflowResultsTab", () => {
   beforeEach(() => {
     mockedFetchWorkflowSteps.mockReset();
     mockedFetchWorkflowSteps.mockResolvedValue(mockWorkflowSteps);
+    mockedUseAgentLogs.mockReset();
+    mockedUseAgentLogs.mockReturnValue({
+      entries: [],
+      loading: false,
+      clear: vi.fn(),
+      loadMore: vi.fn(),
+      hasMore: false,
+      total: 0,
+      loadingMore: false,
+    });
   });
 
   const mockResults: WorkflowStepResult[] = [
@@ -129,6 +145,62 @@ describe("WorkflowResultsTab", () => {
     expect(pendingBadge).toHaveTextContent("Running…");
     expect(pendingBadge).toHaveClass("workflow-result-badge");
     expect(pendingBadge).toHaveClass("workflow-result-badge--pending");
+  });
+
+  it("FN-4214: shows waiting placeholder when pending-step entries are all stale", () => {
+    const historicalEntries: AgentLogEntry[] = [
+      {
+        timestamp: "2026-03-31T10:03:00Z",
+        taskId: "FN-001",
+        text: "Earlier workflow output",
+        type: "text",
+      },
+    ];
+    mockedUseAgentLogs.mockReturnValue({
+      entries: historicalEntries,
+      loading: false,
+      clear: vi.fn(),
+      loadMore: vi.fn(),
+      hasMore: false,
+      total: historicalEntries.length,
+      loadingMore: false,
+    });
+
+    render(
+      <WorkflowResultsTab taskId="FN-001" results={mockResults} isTaskInProgress />,
+    );
+
+    const liveLogPanel = screen.getByTestId("workflow-live-log-WS-004");
+    expect(within(liveLogPanel).getByText("Waiting for agent output…")).toBeInTheDocument();
+    expect(screen.queryByText("Earlier workflow output")).not.toBeInTheDocument();
+  });
+
+  it("FN-4214: hides waiting placeholder when current-step log entries exist", () => {
+    const currentStepEntries: AgentLogEntry[] = [
+      {
+        timestamp: "2026-03-31T10:03:25Z",
+        taskId: "FN-001",
+        text: "Current workflow output",
+        type: "text",
+      },
+    ];
+    mockedUseAgentLogs.mockReturnValue({
+      entries: currentStepEntries,
+      loading: false,
+      clear: vi.fn(),
+      loadMore: vi.fn(),
+      hasMore: false,
+      total: currentStepEntries.length,
+      loadingMore: false,
+    });
+
+    render(
+      <WorkflowResultsTab taskId="FN-001" results={mockResults} isTaskInProgress />,
+    );
+
+    const liveLogPanel = screen.getByTestId("workflow-live-log-WS-004");
+    expect(within(liveLogPanel).queryByText("Waiting for agent output…")).not.toBeInTheDocument();
+    expect(within(liveLogPanel).getByText("Current workflow output")).toBeInTheDocument();
   });
 
   it("shows output content when toggle is clicked to expand", () => {
@@ -465,6 +537,32 @@ describe("WorkflowResultsTab", () => {
       // WS-001 should be plain, WS-002 should still be markdown
       expect(screen.getByTestId("workflow-result-mode-toggle-WS-001")).toHaveTextContent("Plain");
       expect(screen.getByTestId("workflow-result-mode-toggle-WS-002")).toHaveTextContent("Markdown");
+    });
+
+    it("FN-4209: header wraps when preview content is long", () => {
+      const longToken = "X".repeat(520);
+      const longOutputResults: WorkflowStepResult[] = [
+        {
+          ...mockResults[0],
+          output: `Preview ${longToken}`,
+        },
+      ];
+
+      render(<WorkflowResultsTab taskId="FN-001" results={longOutputResults} />);
+
+      const outputHeader = document.querySelector(".workflow-result-output-header");
+      expect(outputHeader).not.toBeNull();
+      if (!outputHeader) {
+        return;
+      }
+
+      expect(getComputedStyle(outputHeader).flexWrap).toBe("wrap");
+
+      const preview = outputHeader.querySelector(".workflow-result-output-preview");
+      expect(preview).not.toBeNull();
+
+      const outputToggle = screen.getByTestId("workflow-result-toggle-WS-001");
+      expect(outputToggle).toBeInTheDocument();
     });
 
     it("does not show mode toggle when output is collapsed", () => {
@@ -817,6 +915,71 @@ describe("WorkflowResultsTab", () => {
         const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
         expect(match?.[1] ?? "").not.toMatch(/#[0-9a-fA-F]{3,8}|rgba?\(/);
       }
+    });
+
+    it("wraps configured workflow names and modal headers to prevent long-name overflow", () => {
+      const css = loadAllAppCssBaseOnly();
+
+      expect(css).toMatch(/\.workflow-configured-title-row\s*\{[^}]*flex-wrap:\s*wrap;[^}]*min-width:\s*0;/);
+      expect(css).toMatch(/\.workflow-configured-name\s*\{[^}]*flex-wrap:\s*wrap;[^}]*min-width:\s*0;/);
+      expect(css).toMatch(/\.workflow-configured-name-text\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/);
+      expect(css).toMatch(/\.workflow-output-modal-header\s*\{[^}]*flex-wrap:\s*wrap;/);
+      expect(css).toMatch(/\.workflow-output-modal-title\s*\{[^}]*flex-wrap:\s*wrap;[^}]*min-width:\s*0;/);
+      expect(css).toMatch(/\.workflow-output-modal-name\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/);
+    });
+
+    it("keeps workflow output header actions visible without hardcoded badge sizing", () => {
+      const baseCss = loadAllAppCssBaseOnly();
+      const allCss = loadAllAppCss();
+
+      expect(baseCss).toMatch(/\.phase-badge\s*\{[^}]*font-size:\s*calc\(var\(--space-sm\) \+ var\(--space-xs\) \* 0\.75\);/);
+      expect(baseCss).toMatch(/\.workflow-result-output-header\s*\{[^}]*flex-wrap:\s*wrap;/);
+      expect(baseCss).toMatch(/\.workflow-result-output-preview\s*\{[^}]*flex:\s*1 1 auto;[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/);
+      expect(allCss).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-result-output-preview\s*\{[^}]*flex-basis:\s*100%;[^}]*order:\s*3;/);
+      expect(baseCss).toMatch(/\.workflow-result-mode-toggle\s*\{[^}]*margin-left:\s*auto;[^}]*flex-shrink:\s*0;/);
+      expect(allCss).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-result-mode-toggle\s*\{[^}]*margin-left:\s*0;[^}]*min-width:\s*calc\(var\(--space-lg\) \* 2 \+ var\(--space-xs\)\);[^}]*min-height:\s*calc\(var\(--space-lg\) \* 2 \+ var\(--space-xs\)\);/);
+    });
+
+
+    it("keeps the workflow edit toggle on button primitives instead of fixed icon-button sizing", () => {
+      const baseCss = loadAllAppCssBaseOnly();
+      const editToggleRule = baseCss.match(/\.workflow-results-edit-toggle\s*\{([^}]*)\}/)?.[1] ?? "";
+      const buttonSmallRule = baseCss.match(/\.btn-sm\s*\{([^}]*)\}/)?.[1] ?? "";
+
+      expect(editToggleRule).not.toMatch(/\bwidth\s*:\s*28px\s*;/);
+      expect(editToggleRule).not.toMatch(/\bheight\s*:\s*28px\s*;/);
+      expect(buttonSmallRule).toMatch(/padding\s*:\s*(?!0(?:\s+0){0,3})[^;]+;/);
+    });
+
+    it("allows workflow modal controls to wrap on mobile so the close button stays visible", () => {
+      const css = loadAllAppCss();
+
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-output-modal-controls\s*\{[^}]*width:\s*100%;[^}]*justify-content:\s*space-between;/);
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-configured-header \.workflow-results-edit-toggle\s*\{[^}]*width:\s*100%;[^}]*justify-content:\s*center;/);
+    });
+
+    it("applies fullscreen modal dimensions on mobile", () => {
+      const css = loadAllAppCss();
+
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-output-modal\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*border-radius:\s*0;/);
+    });
+
+    it("removes mobile modal overlay inset padding", () => {
+      const css = loadAllAppCss();
+
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-output-modal-overlay\s*\{[^}]*padding:\s*0;/);
+    });
+
+    it("includes safe-area top padding for expanded output modal header on mobile", () => {
+      const css = loadAllAppCss();
+
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-output-modal-header\s*\{[^}]*padding-top:\s*max\([^;]*env\(safe-area-inset-top/);
+    });
+
+    it("includes safe-area bottom padding for expanded output modal body on mobile", () => {
+      const css = loadAllAppCss();
+
+      expect(css).toMatch(/@media \(max-width: 768px\)\s*\{[\s\S]*?\.workflow-output-modal-body\s*\{[^}]*padding-bottom:\s*calc\([^;]*env\(safe-area-inset-bottom/);
     });
   });
 

@@ -7,6 +7,7 @@ import {
   type MissionStore,
   type MissionFeature,
   type PrInfo,
+  type AgentStore,
 } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -21,6 +22,7 @@ import { resolveEffectiveNode } from "./effective-node.js";
 import { applyUnavailableNodePolicy } from "./node-routing-policy.js";
 import type { NodeDispatchValidationResult } from "./node-dispatch-validation.js";
 import type { MeshLeaseManager } from "./mesh-lease-manager.js";
+import { selectPermanentAgentForTask } from "./agent-assignment.js";
 
 /**
  * Check whether two sets of file scope paths overlap.
@@ -108,6 +110,8 @@ export interface SchedulerOptions {
    * agents that also hold slots).
    */
   semaphore?: AgentSemaphore;
+  /** Optional AgentStore for durable-agent state rollback during overlap requeue. */
+  agentStore?: AgentStore;
   /** Called when scheduler starts a task */
   onSchedule?: (task: Task) => void;
   /** Called when a task is blocked by deps */
@@ -176,6 +180,8 @@ export class Scheduler {
   private wasNodeBlocked = new Set<string>();
   /** Tracks tasks blocked by missing project-node mapping to deduplicate block log entries. */
   private wasNodeDispatchValidationBlocked = new Set<string>();
+  /** Tracks tasks queued due to missing permanent executors when ephemeral workers are disabled. */
+  private wasPermanentAgentUnavailable = new Set<string>();
   /** Tracks dispatch-queued reason signatures to avoid per-tick log spam. */
   private wasDispatchQueuedReasonLogged = new Set<string>();
 
@@ -462,6 +468,7 @@ export class Scheduler {
     this.failedTaskIds.clear();
     this.wasNodeBlocked.clear();
     this.wasNodeDispatchValidationBlocked.clear();
+    this.wasPermanentAgentUnavailable.clear();
     this.wasDispatchQueuedReasonLogged.clear();
     schedulerLog.log("Stopped");
   }
@@ -483,6 +490,20 @@ export class Scheduler {
     this.clearDispatchQueuedReasonMemo(taskId);
     this.wasDispatchQueuedReasonLogged.add(key);
     await this.store.logEntry(taskId, reason);
+  }
+
+  private async rollbackRunningAgentsForQueuedTodoTask(taskId: string): Promise<void> {
+    const agentStore = this.options.agentStore;
+    if (!agentStore) return;
+
+    const runningAgents = await agentStore.listAgents({ state: "running", includeEphemeral: true });
+    const linkedAgents = runningAgents.filter((agent) => agent.taskId === taskId);
+
+    for (const agent of linkedAgents) {
+      await agentStore.updateAgentState(agent.id, "active");
+      await agentStore.syncExecutionTaskLink(agent.id, undefined);
+      schedulerLog.log(`Rolled back running agent ${agent.id} after overlap requeue of ${taskId}`);
+    }
   }
 
   /**
@@ -733,12 +754,17 @@ export class Scheduler {
           const filteredScope = filterPathsByIgnoreList(scope, overlapIgnorePaths);
           if (filteredScope.length > 0) activeScopes.set(t.id, filteredScope);
         }
+        // Only live in-review tasks with a worktree belong in activeScopes.
         // Paused in-review tasks (e.g., failed-merge tasks awaiting human triage) cannot
-        // make progress, so they must not contribute to activeScopes. Including them
+        // make progress, so they must not contribute to overlap blockers; including them
         // caused a deadlock pattern where a paused task indefinitely re-stamped
         // `blockedBy` on overlapping todo tasks every scheduler tick. (FN-3867 / FN-3857)
+        // Permanently-failed in-review tasks from SelfHealingManager.checkStuckBudget()
+        // also keep their worktree, but after the stuck-kill budget is exhausted they
+        // will never merge, so superseding re-implementation tasks (for example FN-4177
+        // replaced by FN-4198) must not stay queued behind them. (FN-4200)
         const inReviewWithWorktree = tasks.filter(
-          (t) => t.column === "in-review" && t.worktree && !t.paused,
+          (t) => t.column === "in-review" && Boolean(t.worktree) && !t.paused && t.status !== "failed",
         );
         for (const t of inReviewWithWorktree) {
           const scope = await this.store.parseFileScopeFromPrompt(t.id);
@@ -750,6 +776,7 @@ export class Scheduler {
       // Resolve dependency order among todo tasks
       const ordered = resolveDependencyOrder(todo);
       let started = 0;
+      let loggedMissingAgentStoreThisPass = false;
 
       for (const taskId of ordered) {
         const task = tasks.find((t) => t.id === taskId)!;
@@ -842,6 +869,7 @@ export class Scheduler {
               if (task.status !== "queued" || task.blockedBy !== targetBlockedBy) {
                 await this.store.updateTask(task.id, { status: "queued", blockedBy: targetBlockedBy });
               }
+              await this.rollbackRunningAgentsForQueuedTodoTask(task.id);
               await this.logDispatchQueuedReason(task.id, `queued — file scope overlap with ${overlappingTaskId}`);
               continue;
             }
@@ -931,6 +959,42 @@ export class Scheduler {
           }
         }
 
+        if (latestSettings.ephemeralAgentsEnabled === false && !freshTask.assignedAgentId) {
+          if (!this.options.agentStore) {
+            if (!loggedMissingAgentStoreThisPass) {
+              loggedMissingAgentStoreThisPass = true;
+              schedulerLog.warn("ephemeralAgentsEnabled=false but scheduler has no agentStore; falling back to legacy dispatch behavior");
+            }
+          } else {
+            const selectedAgent = await selectPermanentAgentForTask({
+              task: freshTask,
+              agentStore: this.options.agentStore,
+              taskStore: this.store,
+            });
+
+            if (!selectedAgent) {
+              await this.store.updateTask(task.id, { status: "queued" });
+              if (!this.wasPermanentAgentUnavailable.has(task.id)) {
+                await this.logDispatchQueuedReason(
+                  task.id,
+                  "queued — no permanent executor available (ephemeral agents disabled)",
+                );
+                this.wasPermanentAgentUnavailable.add(task.id);
+              }
+              continue;
+            }
+
+            await this.store.updateTask(task.id, { assignedAgentId: selectedAgent.id });
+            await this.store.logEntry(
+              task.id,
+              `Auto-assigned to permanent agent ${selectedAgent.id} (ephemeral agents disabled)`,
+            );
+            this.wasPermanentAgentUnavailable.delete(task.id);
+          }
+        } else {
+          this.wasPermanentAgentUnavailable.delete(task.id);
+        }
+
         // Clear status, reserve worktree path, and then move to in-progress.
         // Reset mergeRetries so a fresh execution gets a fresh merge budget —
         // otherwise a task whose previous run exhausted its 3 retries (e.g.
@@ -953,6 +1017,7 @@ export class Scheduler {
         });
         this.wasNodeBlocked.delete(task.id);
         this.wasNodeDispatchValidationBlocked.delete(task.id);
+        this.wasPermanentAgentUnavailable.delete(task.id);
         this.clearDispatchQueuedReasonMemo(task.id);
         await this.store.logEntry(task.id, `Node routing resolved: ${effectiveNode.nodeId ?? "local"} (source: ${effectiveNode.source})`);
         this.options.onSchedule?.(task);

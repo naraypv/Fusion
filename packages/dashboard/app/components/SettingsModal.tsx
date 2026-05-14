@@ -6,6 +6,7 @@ import {
   isGlobalSettingsKey,
   isProjectSettingsKey,
   resolvePlanningSettingsModel,
+  resolvePersistAgentThinkingLog,
   resolveProjectDefaultModel,
   resolveRouteAllLlmCallsViaDspy,
   resolveTitleSummarizerSettingsModel,
@@ -311,6 +312,7 @@ const DEFAULT_NTFY_EVENTS: NtfyNotificationEvent[] = [
   "memory-dreams-processed",
   "message:agent-to-user",
   "message:agent-to-agent",
+  "message:room",
 ];
 
 const NOTIFICATION_EVENT_OPTIONS: Array<{ event: NtfyNotificationEvent; label: string; description: string }> = [
@@ -325,6 +327,7 @@ const NOTIFICATION_EVENT_OPTIONS: Array<{ event: NtfyNotificationEvent; label: s
   { event: "memory-dreams-processed", label: "DREAMS.md entry added", description: "When manual dream processing writes a new entry to project or agent DREAMS.md" },
   { event: "message:agent-to-user", label: "Agent → user message", description: "An agent sent you a direct message" },
   { event: "message:agent-to-agent", label: "Agent → agent message", description: "Agents are talking to each other (including replies)" },
+  { event: "message:room", label: "Agent message in room", description: "An agent posted a reply in a chat room you're watching" },
 ];
 
 /** Well-known experimental feature flags with display labels.
@@ -387,6 +390,8 @@ function normalizeExperimentalFeaturesForSave(features?: Record<string, boolean>
 type LegacySectionId = "pi-extensions";
 export type SectionId = SettingsSection["id"] | LegacySectionId;
 
+const DEFAULT_SETTINGS_SECTION: SectionId = "global-general";
+
 type PluginsSubsectionId = "fusion-plugins" | "pi-extensions";
 
 /** Local form state extends Settings with a worktreeInitCommand override and lets tokenCap carry null (delete semantic). */
@@ -396,7 +401,7 @@ interface SettingsModalProps {
   onClose: () => void;
   addToast: (message: string, type?: ToastType) => void;
   projectId?: string;
-  /** Optional section to show when the modal first opens. Defaults to first non-group-header section. */
+  /** Optional section to show when the modal first opens. Defaults to the global General section. */
   initialSection?: SectionId;
   /** Current theme mode */
   themeMode?: ThemeMode;
@@ -455,6 +460,7 @@ export function SettingsModal({
     autoMerge: true,
     mergeStrategy: "direct",
     recycleWorktrees: false,
+    executorAllowSiblingBranchRename: false,
     worktreeNaming: "random",
     includeTaskIdInCommit: true,
     worktreeInitCommand: "",
@@ -474,13 +480,13 @@ export function SettingsModal({
   const [scopedSettings, setScopedSettings] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
   // Track initial scoped values for null-as-delete semantics on project overrides
   const [initialScopedValues, setInitialScopedValues] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
-  // Find the first non-group-header section for default active section
+  // Find the first non-group-header section for visibility fallback handling
   const firstNonHeaderSection = SETTINGS_SECTIONS.find((s) => !s.isGroupHeader);
   const [activeSection, setActiveSection] = useState<SectionId>(() => {
     if (initialSection === "pi-extensions") {
       return "plugins";
     }
-    return initialSection ?? firstNonHeaderSection?.id ?? "authentication";
+    return initialSection ?? DEFAULT_SETTINGS_SECTION;
   });
   // Deterministic default: opening Plugins starts on Fusion Plugins unless legacy
   // `initialSection="pi-extensions"` is explicitly provided.
@@ -530,7 +536,9 @@ export function SettingsModal({
 
     return true;
   });
-  const firstVisibleSectionId = visibleSections.find((section) => !section.isGroupHeader)?.id ?? "general";
+  const firstVisibleSectionId = visibleSections.some((section) => section.id === DEFAULT_SETTINGS_SECTION)
+    ? DEFAULT_SETTINGS_SECTION
+    : (visibleSections.find((section) => !section.isGroupHeader)?.id ?? firstNonHeaderSection?.id ?? "general");
 
   /** Get the scope of the currently active section */
   const activeSectionScope = visibleSections.find((s) => s.id === activeSection)?.scope;
@@ -1072,12 +1080,28 @@ export function SettingsModal({
   }, []);
 
   const handleLogin = useCallback(async (providerId: string, addAnother = false) => {
+    const provider = authProviders.find((entry) => entry.id === providerId);
+    if (provider?.requiresManualCode === true) {
+      const shouldContinue = await confirm({
+        title: "Heads up — manual paste-back required",
+        message:
+          `After you sign in with ${provider.name}, the browser will try to redirect to a localhost address that this dashboard can't reach. The redirect tab will look like it failed. Before that happens, copy the full URL from the browser address bar — you'll paste it back here to finish login. Continue?`,
+        confirmLabel: "Continue to login",
+        cancelLabel: "Cancel",
+      });
+      if (!shouldContinue) {
+        return;
+      }
+    }
+
     setAuthActionInProgress(providerId);
     clearAuthLoginUiState(providerId);
     const startingAccountCount = authProviders.find((provider) => provider.id === providerId)?.accountCount ?? 0;
 
     try {
-      const { url, instructions, manualCode } = await loginProvider(providerId, { addAnother });
+      const { url, instructions, manualCode } = addAnother
+        ? await loginProvider(providerId, { addAnother: true })
+        : await loginProvider(providerId);
       if (instructions?.trim()) {
         setLoginInstructions((prev) => ({ ...prev, [providerId]: instructions }));
       }
@@ -1137,7 +1161,7 @@ export function SettingsModal({
       setAuthActionInProgress(null);
       clearAuthLoginUiState(providerId);
     }
-  }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
+  }, [addToast, authProviders, clearAuthLoginUiState, confirm, loadAuthStatus, scrollSettingsToTop]);
 
   const handleSubmitManualCode = useCallback(async (providerId: string) => {
     const code = manualCodeInputs[providerId]?.trim();
@@ -1369,8 +1393,8 @@ export function SettingsModal({
     }
   }, [addToast, authProviders, clearAuthLoginUiState, loadAuthStatus, scrollSettingsToTop]);
 
-  const handleTestProviderNotification = useCallback(async (providerId: "ntfy" | "webhook" | "ntfy-message") => {
-    if (providerId === "ntfy" || providerId === "ntfy-message") {
+  const handleTestProviderNotification = useCallback(async (providerId: "ntfy" | "webhook" | "ntfy-message" | "ntfy-room") => {
+    if (providerId === "ntfy" || providerId === "ntfy-message" || providerId === "ntfy-room") {
       if (!form.ntfyEnabled || !form.ntfyTopic || !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)) {
         return;
       }
@@ -1406,22 +1430,33 @@ export function SettingsModal({
         }
         : providerId === "ntfy-message"
           ? { messageEventType: "message:agent-to-user" }
-          : {
-            webhookUrl: form.webhookUrl,
-            webhookFormat: form.webhookFormat || "generic",
-          };
-      const result = await testNotification(providerId === "ntfy-message" ? "ntfy" : providerId, config, projectId);
+          : providerId === "ntfy-room"
+            ? { messageEventType: "message:room" }
+            : {
+              webhookUrl: form.webhookUrl,
+              webhookFormat: form.webhookFormat || "generic",
+            };
+      const result = await testNotification(
+        providerId === "ntfy-message" || providerId === "ntfy-room" ? "ntfy" : providerId,
+        config,
+        projectId,
+      );
       if (result.success) {
-        const providerName = providerId === "ntfy"
-          ? "ntfy app"
+        const successMessage = providerId === "ntfy"
+          ? "Test notification sent — check your ntfy app!"
           : providerId === "ntfy-message"
-            ? "ntfy app inbox"
-            : "webhook endpoint";
-        const successMessage = `Test notification sent — check your ${providerName}!`;
+            ? "Message inbox test sent — check your ntfy inbox for the agent-to-user message."
+            : providerId === "ntfy-room"
+              ? "Room reply test sent — check your ntfy inbox for the room reply."
+              : "Test notification sent — check your webhook endpoint!";
         setTestNotificationResult((prev) => ({ ...prev, [providerId]: { status: "success", message: successMessage } }));
         addToast(successMessage, "success");
       } else {
-        const failureMessage = "Failed to send test notification";
+        const failureMessage = providerId === "ntfy-message"
+          ? "Failed to send message inbox test"
+          : providerId === "ntfy-room"
+            ? "Failed to send room reply test"
+            : "Failed to send test notification";
         setTestNotificationResult((prev) => ({ ...prev, [providerId]: { status: "error", message: failureMessage } }));
         addToast(failureMessage, "error");
       }
@@ -1962,6 +1997,9 @@ export function SettingsModal({
         if (key === "githubTrackingDefaultRepo" && activeSection !== "global-general") {
           continue;
         }
+        if (key === "persistAgentThinkingLog") {
+          continue;
+        }
         if (isGlobalSettingsKey(key)) {
           // Implement null-as-delete semantics for global settings:
           // - undefined values are dropped during JSON serialization
@@ -2277,6 +2315,22 @@ export function SettingsModal({
               <small>When enabled, AI-generated task specifications require manual approval before moving to Todo</small>
             </div>
             <div className="form-group">
+              <label htmlFor="ephemeralAgentsEnabled" className="checkbox-label">
+                <input
+                  id="ephemeralAgentsEnabled"
+                  type="checkbox"
+                  checked={form.ephemeralAgentsEnabled !== false}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, ephemeralAgentsEnabled: e.target.checked }))
+                  }
+                />
+                Use ephemeral task-worker agents
+              </label>
+              <small>
+                When enabled (default), Fusion spawns short-lived <code>executor-FN-XXXX</code> agents to run each task. When disabled, only permanent agents execute tasks and the scheduler auto-assigns work using the agent reporting chain. Tasks with no eligible permanent agent stay queued.
+              </small>
+            </div>
+            <div className="form-group">
               <label htmlFor="completionDocumentationMode">Completion Documentation Automation</label>
               <select
                 id="completionDocumentationMode"
@@ -2310,6 +2364,82 @@ export function SettingsModal({
                 Show quick chat button
               </label>
               <small>Show the floating chat button in the dashboard. Chat is still accessible from the Chat tab in the mobile navigation.</small>
+            </div>
+            <h4 className="settings-section-heading settings-section-heading--spaced">Capacity Risk Banner</h4>
+            <div className="form-group">
+              <label htmlFor="capacityRiskBannerEnabled" className="checkbox-label">
+                <input
+                  id="capacityRiskBannerEnabled"
+                  type="checkbox"
+                  checked={form.capacityRiskBannerEnabled === true}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, capacityRiskBannerEnabled: e.target.checked }))
+                  }
+                />
+                Show capacity risk banner
+              </label>
+              <small>Warn on the board when todo work exceeds the threshold and no idle agents are available.</small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="capacityRiskTodoThresholdGeneral">Todo threshold</label>
+              <input
+                id="capacityRiskTodoThresholdGeneral"
+                type="number"
+                min={0}
+                className="input"
+                value={form.capacityRiskTodoThreshold ?? 20}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    capacityRiskTodoThreshold:
+                      e.target.value === ""
+                        ? 0
+                        : Math.max(0, Number.parseInt(e.target.value, 10) || 0),
+                  }))
+                }
+              />
+              <small>Banner fires when todo count is strictly greater than this value (default 20). Applies when the banner is enabled.</small>
+            </div>
+            <h4 className="settings-section-heading settings-section-heading--spaced">GitHub Tracking</h4>
+            <div className="form-group">
+              <label htmlFor="githubTrackingMode">Default tracking mode for new tasks</label>
+              <select
+                id="githubTrackingMode"
+                className="select"
+                value={form.githubTrackingEnabledByDefault ? "new-tasks" : "off"}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    githubTrackingEnabledByDefault: e.target.value === "new-tasks",
+                  }))
+                }
+              >
+                <option value="off">Off (default)</option>
+                <option value="new-tasks">On for new tasks</option>
+              </select>
+              <small>
+                Controls whether newly created tasks have GitHub issue tracking enabled by default. Individual tasks can still override this from the task detail modal.
+              </small>
+              <small>
+                Tracking issues use this task&apos;s title. If a task has no title yet, Fusion can summarize its description using the title summarization model in Project Models.
+                {!form.autoSummarizeTitles && !form.useAiMergeCommitSummary && !form.githubTrackingEnabledByDefault
+                  ? " Enable summarization in Project Models to configure that model."
+                  : ""}
+              </small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="projectGithubTrackingDefaultRepoGeneral">Project default tracking repo</label>
+              <input
+                id="projectGithubTrackingDefaultRepoGeneral"
+                type="text"
+                className="input"
+                placeholder="owner/repo"
+                value={form.githubTrackingDefaultRepo ?? ""}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, githubTrackingDefaultRepo: e.target.value || undefined }))
+                }
+              />
+              <small>Default repo used when creating GitHub issues for tracked tasks. Falls back to the global default if blank.</small>
             </div>
           </>
         );
@@ -2368,20 +2498,32 @@ export function SettingsModal({
               </div>
             </div>
             <div className="form-group">
-              <label htmlFor="persistAgentThinkingLog" className="checkbox-label">
+              <h5 className="settings-section-heading">Save AI thinking logs</h5>
+              <label htmlFor="persistAgentThinkingLogPermanent" className="checkbox-label">
                 <input
-                  id="persistAgentThinkingLog"
+                  id="persistAgentThinkingLogPermanent"
                   type="checkbox"
-                  checked={form.persistAgentThinkingLog === true}
+                  checked={resolvePersistAgentThinkingLog(form, { ephemeral: false })}
                   onChange={(e) =>
-                    setForm((f) => ({ ...f, persistAgentThinkingLog: e.target.checked }))
+                    setForm((f) => ({ ...f, persistAgentThinkingLogPermanent: e.target.checked }))
                   }
                 />
-                Save AI thinking/reasoning in agent logs
+                Save AI thinking for permanent agents
+              </label>
+              <label htmlFor="persistAgentThinkingLogEphemeral" className="checkbox-label">
+                <input
+                  id="persistAgentThinkingLogEphemeral"
+                  type="checkbox"
+                  checked={resolvePersistAgentThinkingLog(form, { ephemeral: true })}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, persistAgentThinkingLogEphemeral: e.target.checked }))
+                  }
+                />
+                Save AI thinking for ephemeral / task-worker agents
               </label>
               <div className="settings-field-help">
-                When disabled (default), internal thinking deltas are not persisted as log rows.
-                Assistant text output and tool timeline entries are unchanged.
+                Leave both thinking toggles off to keep the original default behavior.
+                This only controls persisted <code>thinking</code> rows and does not affect assistant text or tool rows.
               </div>
             </div>
             <div className="form-group">
@@ -3101,7 +3243,8 @@ export function SettingsModal({
                 When enabled, tasks created without a title but with descriptions over 200 characters
                 will automatically get an AI-generated title (max 60 characters). The same model is
                 also used to generate fallback merge commit message bodies when the branch's commit
-                log is empty (e.g. squash merges with no unique commits).
+                log is empty (e.g. squash merges with no unique commits), and GitHub tracking issue
+                titles when a tracked task has no title yet.
               </small>
             </div>
 
@@ -3120,10 +3263,10 @@ export function SettingsModal({
               </small>
             </div>
 
-            {(form.autoSummarizeTitles || form.useAiMergeCommitSummary || false) && (
+            {(form.autoSummarizeTitles || form.useAiMergeCommitSummary || form.githubTrackingEnabledByDefault || false) && (
               <>
                 <div className="form-group">
-                  <label>Title and commit message summarization model</label>
+                  <label>Title, commit message, and GitHub tracking issue summarization model</label>
                   {modelsLoading ? (
                     <small>Loading available models...</small>
                   ) : availableModels.length === 0 ? (
@@ -3131,7 +3274,7 @@ export function SettingsModal({
                   ) : (
                     <CustomModelDropdown
                       id="titleSummarizerModel"
-                      label="Title and commit message summarization model"
+                      label="Title, commit message, and GitHub tracking issue summarization model"
                       models={availableModels}
                       value={
                         form.titleSummarizerProvider && form.titleSummarizerModelId
@@ -3161,6 +3304,9 @@ export function SettingsModal({
                       onToggleModelFavorite={handleToggleModelFavorite}
                     />
                   )}
+                  <small>
+                    Also used to summarize task descriptions into GitHub tracking issue titles when a task has no title yet.
+                  </small>
                   <small>
                     {form.titleSummarizerProvider && form.titleSummarizerModelId
                       ? "Using explicitly configured model"
@@ -3809,6 +3955,22 @@ export function SettingsModal({
               <small>When enabled, completed task worktrees are returned to an idle pool instead of being deleted, preserving build caches for faster startup</small>
             </div>
             <div className="form-group">
+              <label htmlFor="executorAllowSiblingBranchRename" className="checkbox-label">
+                <input
+                  id="executorAllowSiblingBranchRename"
+                  type="checkbox"
+                  checked={form.executorAllowSiblingBranchRename === true}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, executorAllowSiblingBranchRename: e.target.checked }))
+                  }
+                />
+                Allow silent sibling branch rename during executor conflicts
+              </label>
+              <small>
+                Discouraged. This restores the legacy behavior where a live <code>fusion/&lt;task-id&gt;</code> branch collision silently forks work onto sibling branches like <code>-2</code> and can hide prior commits from the default recovery flow.
+              </small>
+            </div>
+            <div className="form-group">
               <label htmlFor="worktreeNaming">Worktree Naming Style</label>
               <select
                 id="worktreeNaming"
@@ -3986,7 +4148,7 @@ export function SettingsModal({
               <details className="settings-option-details">
                 <summary>More details</summary>
                 <small>
-                  Controls in-merge fix attempts after deterministic test/build verification failures (0-3).
+                  Controls auto-fix retry attempts after deterministic test/build verification failures — applies to both executor-time and in-merge verification (0-3).
                 </small>
               </details>
             </div>
@@ -4005,10 +4167,36 @@ export function SettingsModal({
               <details className="settings-option-details">
                 <summary>More details</summary>
                 <small>
-                  Controls what happens after a task reaches In Review. Direct mode preserves Fusion&apos;s current local squash-merge behavior. Pull request mode keeps the task in In Review while Fusion waits for GitHub reviews and required checks before merging the PR.
+                  Controls what happens after a task reaches In Review. Direct mode merges into the current branch locally. Pull request mode keeps the task in In Review while Fusion waits for GitHub reviews and required checks before merging the PR.
                 </small>
               </details>
             </div>
+            {form.mergeStrategy !== "pull-request" && (
+              <div className="form-group">
+                <label htmlFor="directMergeCommitStrategy">Direct merge commit routing</label>
+                <select
+                  id="directMergeCommitStrategy"
+                  className="select"
+                  value={form.directMergeCommitStrategy ?? "auto"}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      directMergeCommitStrategy: e.target.value as "auto" | "always-squash" | "always-rebase",
+                    }))
+                  }
+                >
+                  <option value="auto">Auto — squash single-substantive branches, preserve multi-substantive history</option>
+                  <option value="always-squash">Always squash direct merges</option>
+                  <option value="always-rebase">Always preserve direct-merge commit history</option>
+                </select>
+                <details className="settings-option-details">
+                  <summary>More details</summary>
+                  <small>
+                    Auto keeps today&apos;s squash behavior for branches with zero or one substantive commit, but switches multi-substantive branches to a history-preserving rebase-and-merge path. Individual tasks can override this in PROMPT.md with <code>**Direct Merge Commit Strategy:** auto|always-squash|always-rebase</code>.
+                  </small>
+                </details>
+              </div>
+            )}
             {form.mergeStrategy === "pull-request" && (
               <div className="form-group">
                 <label htmlFor="requirePrApproval" className="checkbox-label">
@@ -4030,33 +4218,7 @@ export function SettingsModal({
                 </details>
               </div>
             )}
-            <h4 className="settings-section-heading settings-section-heading--spaced">GitHub Issue Tracking</h4>
-            <div className="form-group">
-              <label htmlFor="githubTrackingEnabledByDefault" className="checkbox-label">
-                <input
-                  id="githubTrackingEnabledByDefault"
-                  type="checkbox"
-                  checked={form.githubTrackingEnabledByDefault ?? false}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, githubTrackingEnabledByDefault: e.target.checked }))
-                  }
-                />
-                Default GitHub tracking ON for new tasks
-              </label>
-            </div>
-            <div className="form-group">
-              <label htmlFor="projectGithubTrackingDefaultRepo">Project default tracking repo</label>
-              <input
-                id="projectGithubTrackingDefaultRepo"
-                type="text"
-                className="input"
-                placeholder="owner/repo"
-                value={form.githubTrackingDefaultRepo ?? ""}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, githubTrackingDefaultRepo: e.target.value || undefined }))
-                }
-              />
-            </div>
+            <h4 className="settings-section-heading settings-section-heading--spaced">GitHub Authentication</h4>
             <div className="form-group">
               <label htmlFor="githubAuthMode">GitHub auth mode</label>
               <select
@@ -4243,6 +4405,26 @@ export function SettingsModal({
               </select>
               <small>
                 When using smart-prefer-main, automatically prefer the branch side for files that main has recently modified to avoid silently discarding branch work.
+              </small>
+            </div>
+            <div className="form-group">
+              <label htmlFor="postMergeAuditMode">Post-Merge Audit Mode</label>
+              <select
+                id="postMergeAuditMode"
+                value={form.postMergeAuditMode ?? "block"}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    postMergeAuditMode: e.target.value as "block" | "warn" | "off",
+                  }))
+                }
+              >
+                <option value="block">Block — refuse to auto-complete merges with duplicate-subject or touched-file overlap risks (default)</option>
+                <option value="warn">Warn — log audit findings but auto-complete the merge</option>
+                <option value="off">Off — skip the post-merge audit entirely</option>
+              </select>
+              <small>
+                Controls how the post-squash / post-rebase audit reacts to risk findings. Regardless of mode, the audit short-circuits overlap-only findings on rebase merges when deterministic verification has already proven the tree — those cannot have produced silent drops. Switch to Warn or Off only if you trust your branches don&apos;t silently drop edits.
               </small>
             </div>
             <div className="form-group">
@@ -4629,8 +4811,7 @@ export function SettingsModal({
           resolvedProvider === "searxng" ||
           resolvedProvider === "brave" ||
           resolvedProvider === "google" ||
-          resolvedProvider === "tavily" ||
-          resolvedProvider === "none";
+          resolvedProvider === "tavily";
         const selectedCredentialProvider =
           resolvedProvider === "brave" || resolvedProvider === "tavily" ? resolvedProvider : null;
         const hasMissingResearchCredential = selectedCredentialProvider
@@ -4652,7 +4833,7 @@ export function SettingsModal({
           <>
             {renderScopeBanner()}
             <h4 className="settings-section-heading">Research Defaults</h4>
-            <div className="form-group">
+            <div className="form-group settings-research-provider-group">
               <label htmlFor="research-global-provider-builtin" className="checkbox-label">
                 <input
                   id="research-global-provider-builtin"
@@ -4666,63 +4847,62 @@ export function SettingsModal({
               <small>
                 Searches and fetches use the agent's native WebSearch/WebFetch tools. No API key required.
               </small>
+              <details className="settings-option-details settings-research-provider-advanced-details">
+                <summary>Advanced — external search providers</summary>
+                <div className="form-group">
+                  <label htmlFor="research-global-search-provider-advanced">Search Provider</label>
+                  <select
+                    id="research-global-search-provider-advanced"
+                    className="input"
+                    value={externalProvider ? resolvedProvider : "searxng"}
+                    onChange={(event) =>
+                      setSearchProvider(event.target.value as Settings["researchGlobalWebSearchProvider"])
+                    }
+                  >
+                    <option value="searxng">SearXNG</option>
+                    <option value="brave">Brave</option>
+                    <option value="google">Google Custom Search</option>
+                    <option value="tavily">Tavily</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label htmlFor="research-global-searxng-url">SearXNG URL</label>
+                  <input
+                    id="research-global-searxng-url"
+                    className="input"
+                    value={form.researchGlobalSearxngUrl ?? ""}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchGlobalSearxngUrl: event.target.value || undefined,
+                      }))
+                    }
+                    placeholder="https://searx.example.com"
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="research-global-google-cx">Google Search CX</label>
+                  <input
+                    id="research-global-google-cx"
+                    className="input"
+                    value={form.researchGlobalGoogleSearchCx ?? ""}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchGlobalGoogleSearchCx: event.target.value || undefined,
+                      }))
+                    }
+                    placeholder="custom-search-engine-id"
+                  />
+                </div>
+                <div className="settings-empty-state settings-research-empty-state" role="note">
+                  Configure Brave, Tavily, and Google API keys in Authentication.
+                  <button type="button" className="btn btn-sm" onClick={() => setActiveSection("authentication")}>
+                    Open Authentication Settings
+                  </button>
+                </div>
+              </details>
             </div>
-            <details className="settings-option-details">
-              <summary>Advanced — external search providers</summary>
-              <div className="form-group">
-                <label htmlFor="research-global-search-provider-advanced">Search Provider</label>
-                <select
-                  id="research-global-search-provider-advanced"
-                  className="input"
-                  value={externalProvider ? resolvedProvider : "searxng"}
-                  onChange={(event) =>
-                    setSearchProvider(event.target.value as Settings["researchGlobalWebSearchProvider"])
-                  }
-                >
-                  <option value="searxng">SearXNG</option>
-                  <option value="brave">Brave</option>
-                  <option value="google">Google Custom Search</option>
-                  <option value="tavily">Tavily</option>
-                  <option value="none">None (disable web search)</option>
-                </select>
-              </div>
-              <div className="form-group">
-                <label htmlFor="research-global-searxng-url">SearXNG URL</label>
-                <input
-                  id="research-global-searxng-url"
-                  className="input"
-                  value={form.researchGlobalSearxngUrl ?? ""}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      researchGlobalSearxngUrl: event.target.value || undefined,
-                    }))
-                  }
-                  placeholder="https://searx.example.com"
-                />
-              </div>
-              <div className="form-group">
-                <label htmlFor="research-global-google-cx">Google Search CX</label>
-                <input
-                  id="research-global-google-cx"
-                  className="input"
-                  value={form.researchGlobalGoogleSearchCx ?? ""}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      researchGlobalGoogleSearchCx: event.target.value || undefined,
-                    }))
-                  }
-                  placeholder="custom-search-engine-id"
-                />
-              </div>
-              <div className="settings-empty-state" role="note">
-                Configure Brave, Tavily, and Google API keys in Authentication.
-                <button type="button" className="btn btn-sm" onClick={() => setActiveSection("authentication")}>
-                  Open Authentication Settings
-                </button>
-              </div>
-            </details>
             <div className="form-group">
               <label htmlFor="research-global-max-sources">Default Max Sources Per Run</label>
               <input
@@ -4781,9 +4961,18 @@ export function SettingsModal({
             </div>
             <div className="form-group">
               <label>Enabled Sources</label>
+              <label
+                htmlFor="research-project-source-webSearch"
+                className="checkbox-label settings-research-source-locked"
+              >
+                <input id="research-project-source-webSearch" type="checkbox" checked disabled readOnly />
+                Web Search <span className="settings-muted">Always on</span>
+              </label>
+              <small className="settings-muted">
+                Web search is always enabled. Configure the search provider under Research Defaults.
+              </small>
               <div className="settings-research-source-grid">
                 {[
-                  ["webSearch", "Web Search"],
                   ["pageFetch", "Page Fetch"],
                   ["github", "GitHub"],
                   ["localDocs", "Local Docs"],
@@ -4813,93 +5002,97 @@ export function SettingsModal({
               </div>
             </div>
             <div className="form-group">
-              <label htmlFor="research-project-max-concurrent">Max Concurrent Runs</label>
-              <input
-                id="research-project-max-concurrent"
-                className="input"
-                type="number"
-                min={1}
-                value={limits?.maxConcurrentRuns ?? 3}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    researchSettings: {
-                      ...(current.researchSettings ?? {}),
-                      limits: {
-                        ...(current.researchSettings?.limits ?? {}),
-                        maxConcurrentRuns: event.target.value === "" ? undefined : Number(event.target.value),
-                      },
-                    },
-                  }))
-                }
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="research-project-max-sources">Max Sources Per Run</label>
-              <input
-                id="research-project-max-sources"
-                className="input"
-                type="number"
-                min={1}
-                value={limits?.maxSourcesPerRun ?? 20}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    researchSettings: {
-                      ...(current.researchSettings ?? {}),
-                      limits: {
-                        ...(current.researchSettings?.limits ?? {}),
-                        maxSourcesPerRun: event.target.value === "" ? undefined : Number(event.target.value),
-                      },
-                    },
-                  }))
-                }
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="research-project-max-duration">Max Duration (ms)</label>
-              <input
-                id="research-project-max-duration"
-                className="input"
-                type="number"
-                min={1000}
-                value={limits?.maxDurationMs ?? 300000}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    researchSettings: {
-                      ...(current.researchSettings ?? {}),
-                      limits: {
-                        ...(current.researchSettings?.limits ?? {}),
-                        maxDurationMs: event.target.value === "" ? undefined : Number(event.target.value),
-                      },
-                    },
-                  }))
-                }
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="research-project-request-timeout">Request Timeout (ms)</label>
-              <input
-                id="research-project-request-timeout"
-                className="input"
-                type="number"
-                min={1000}
-                value={limits?.requestTimeoutMs ?? 30000}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    researchSettings: {
-                      ...(current.researchSettings ?? {}),
-                      limits: {
-                        ...(current.researchSettings?.limits ?? {}),
-                        requestTimeoutMs: event.target.value === "" ? undefined : Number(event.target.value),
-                      },
-                    },
-                  }))
-                }
-              />
-              {researchLimitError && <small className="field-error">{researchLimitError}</small>}
+              <div className="settings-research-limits-grid">
+                <div className="settings-research-limit-field">
+                  <label htmlFor="research-project-max-concurrent">Max Concurrent Runs</label>
+                  <input
+                    id="research-project-max-concurrent"
+                    className="input"
+                    type="number"
+                    min={1}
+                    value={limits?.maxConcurrentRuns ?? 3}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchSettings: {
+                          ...(current.researchSettings ?? {}),
+                          limits: {
+                            ...(current.researchSettings?.limits ?? {}),
+                            maxConcurrentRuns: event.target.value === "" ? undefined : Number(event.target.value),
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </div>
+                <div className="settings-research-limit-field">
+                  <label htmlFor="research-project-max-sources">Max Sources Per Run</label>
+                  <input
+                    id="research-project-max-sources"
+                    className="input"
+                    type="number"
+                    min={1}
+                    value={limits?.maxSourcesPerRun ?? 20}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchSettings: {
+                          ...(current.researchSettings ?? {}),
+                          limits: {
+                            ...(current.researchSettings?.limits ?? {}),
+                            maxSourcesPerRun: event.target.value === "" ? undefined : Number(event.target.value),
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </div>
+                <div className="settings-research-limit-field">
+                  <label htmlFor="research-project-max-duration">Max Duration (ms)</label>
+                  <input
+                    id="research-project-max-duration"
+                    className="input"
+                    type="number"
+                    min={1000}
+                    value={limits?.maxDurationMs ?? 300000}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchSettings: {
+                          ...(current.researchSettings ?? {}),
+                          limits: {
+                            ...(current.researchSettings?.limits ?? {}),
+                            maxDurationMs: event.target.value === "" ? undefined : Number(event.target.value),
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </div>
+                <div className="settings-research-limit-field">
+                  <label htmlFor="research-project-request-timeout">Request Timeout (ms)</label>
+                  <input
+                    id="research-project-request-timeout"
+                    className="input"
+                    type="number"
+                    min={1000}
+                    value={limits?.requestTimeoutMs ?? 30000}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        researchSettings: {
+                          ...(current.researchSettings ?? {}),
+                          limits: {
+                            ...(current.researchSettings?.limits ?? {}),
+                            requestTimeoutMs: event.target.value === "" ? undefined : Number(event.target.value),
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </div>
+                {researchLimitError && <small className="field-error settings-research-limits-error">{researchLimitError}</small>}
+              </div>
             </div>
           </>
         );
@@ -5312,6 +5505,7 @@ export function SettingsModal({
                       disabled={
                         testNotificationLoading["ntfy"] ||
                         testNotificationLoading["ntfy-message"] ||
+                        testNotificationLoading["ntfy-room"] ||
                         !form.ntfyEnabled ||
                         !form.ntfyTopic ||
                         !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
@@ -5326,24 +5520,45 @@ export function SettingsModal({
                       disabled={
                         testNotificationLoading["ntfy"] ||
                         testNotificationLoading["ntfy-message"] ||
+                        testNotificationLoading["ntfy-room"] ||
                         !form.ntfyEnabled ||
                         !form.ntfyTopic ||
                         !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
                       }
                     >
-                      {testNotificationLoading["ntfy-message"] ? "Sending…" : "Test message notification"}
+                      {testNotificationLoading["ntfy-message"] ? "Sending…" : "Test message inbox"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => handleTestProviderNotification("ntfy-room")}
+                      disabled={
+                        testNotificationLoading["ntfy"] ||
+                        testNotificationLoading["ntfy-message"] ||
+                        testNotificationLoading["ntfy-room"] ||
+                        !form.ntfyEnabled ||
+                        !form.ntfyTopic ||
+                        !/^[a-zA-Z0-9_-]{1,64}$/.test(form.ntfyTopic)
+                      }
+                    >
+                      {testNotificationLoading["ntfy-room"] ? "Sending…" : "Test room reply"}
                     </button>
                   </div>
-                  {(testNotificationResult["ntfy"] || testNotificationResult["ntfy-message"]) && (
+                  {(testNotificationResult["ntfy"] || testNotificationResult["ntfy-message"] || testNotificationResult["ntfy-room"]) && (
                     <div className="notification-test-feedback" aria-live="polite">
                       {testNotificationResult["ntfy"] && (
                         <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy"].status}`}>
-                          {testNotificationResult["ntfy"].message}
+                          General: {testNotificationResult["ntfy"].message}
                         </small>
                       )}
                       {testNotificationResult["ntfy-message"] && (
                         <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy-message"].status}`}>
-                          {testNotificationResult["ntfy-message"].message}
+                          Message inbox: {testNotificationResult["ntfy-message"].message}
+                        </small>
+                      )}
+                      {testNotificationResult["ntfy-room"] && (
+                        <small className={`notification-test-feedback-item notification-test-feedback-item--${testNotificationResult["ntfy-room"].status}`}>
+                          Room reply: {testNotificationResult["ntfy-room"].message}
                         </small>
                       )}
                     </div>

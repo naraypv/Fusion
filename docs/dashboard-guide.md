@@ -27,6 +27,20 @@ Use deep links to open a specific task directly from notifications, chat, or ext
 /?task=FN-1234&project=my-project
 ```
 
+## Clickable File Paths
+
+File paths in dashboard text are automatically rendered as inline links. Clicking a linked path opens the Files browser modal at that path (including line/column targets when available) so you can inspect the file and use editor actions where supported.
+
+Current surfaces include:
+- Task detail modal content (description markdown, **Review** tab, and **Workflow Results** tab output)
+- Chat view messages/tool output
+- Agent log viewer
+- Activity log modal
+- Dev Server log viewer
+- Settings sync log
+
+Only detected file-path text is linkified; non-path text remains plain. Linked paths must resolve within the current project workspace to open successfully.
+
 ## Board View
 
 Board view is the kanban surface for day-to-day operation.
@@ -77,6 +91,7 @@ Behavior:
 - Dependency graph nodes reuse the same `TaskCard` UI as board/list views, so status badges, progress/steps, mission badges, retry/archive controls, and active-task glow stay visually consistent
 - Active graph nodes also add a dedicated top status indicator bar and current-step row highlighting so in-progress execution state stays visible even when zoomed out
 - Clicking a graph card opens task details via the host detail handler (`onOpenDetail`, with `onOpenTaskDetail` fallback), while clicking the same card again or empty canvas clears selection
+- On touch devices, single-tap is reserved for pan/drag gestures, so double-tapping a node opens its task detail modal; this does not change selection state.
 - Hovering or selecting a node highlights its full upstream and downstream dependency chain; highlighted nodes and connecting edges are emphasized while non-chain nodes are dimmed, and highlight clears when hover/selection is removed
 - Nodes support manual drag repositioning with a 4px movement threshold to separate click from drag, using pointer capture and zoom-aware delta scaling for reliable tracking
 - Custom node positions persist per project in browser localStorage (`kb:${projectId}:fusion-plugin-dependency-graph:positions`) across refresh/project switches, and **Fit to graph** clears saved positions and restores auto-layout
@@ -114,13 +129,13 @@ Chat Rooms are project-scoped group conversations for multiple agents. They are 
 - Confirming delete calls `rooms.deleteRoom(roomId)` and permanently removes the room and its messages ("This action cannot be undone. This room and all its messages will be permanently deleted."); failures surface a `Failed to delete room` toast.
 - Selecting a room opens the room thread pane with loading and empty states, then renders room messages from `rooms.messages` as `ChatMessageInfo` entries in the same thread UI used for direct Chat.
 - Submitting the room composer calls `rooms.sendRoomMessage(...)`, which immediately inserts a temporary local user message and then posts to `POST /api/chat/rooms/:id/messages`.
-- On successful room send, the optimistic message is reconciled with persisted server data, the transcript is refreshed to authoritative history, and the composer clears (matching direct-chat clear-on-success behavior).
+- The room composer clears immediately when send is dispatched so the user gets instant feedback; on success the optimistic message is reconciled with persisted server data and the transcript is refreshed to authoritative history.
 - On mobile, room threads use the same keyboard-aware thread anchoring as direct chat, keeping the composer pinned above the soft keyboard while typing.
 - The dashboard backend now orchestrates room responders on that POST: mentioned members are routed as direct responders, additional ambient members may reply (up to the room ambient responder cap), and each assistant reply is persisted with `senderAgentId` via `chatStore.addRoomMessage(...)`.
 - If room replies cannot be generated (for example no resolvable responders or all responders fail), the POST fails with an API error (HTTP 502) instead of silently returning only the user message.
 - If room responders cannot be resolved or all room-reply generations fail, the POST now returns an error instead of silently succeeding with only the user message, so failures are surfaced deterministically.
-- Room responder prompt construction now includes a bounded recent room transcript (role, sender label, timestamp, content) plus an explicit latest-user-message marker, so replies stay thread-aware without unbounded prompt growth.
-- On send failure, `useChatRooms` rolls back/reconciles optimistic state and rethrows; `ChatView` catches once, preserves composer text for retry/edit, and surfaces a single error toast (no duplicate hook+view notifications).
+- Room responder prompt construction now keeps the most recent room messages verbatim and, when the room runs long, prepends a compacted summary of older history (span, participants, and key highlights) plus an explicit latest-user-message marker so replies stay thread-aware without unbounded prompt growth.
+- On send failure, `useChatRooms` rolls back/reconciles optimistic state and rethrows; `ChatView` catches once, restores the exact pre-send composer text for retry/edit, and surfaces a single error toast (no duplicate hook+view notifications).
 - After each send attempt, the room transcript still re-fetches authoritative messages so persisted user/assistant replies remain visible even when SSE delivery is delayed, and `chat:room:message:*` SSE updates continue live fan-out.
 - Relationship summary: direct Chat runs one target (agent or model) per session; rooms are shared threads with multiple agent members and now use the same message contract as direct Chat; Quick Chat stays a floating single-target panel and does not host rooms.
 - For backend details, see the [Chat Room REST API reference](./architecture.md#real-time-channels) and the [chat room storage schema (`chat_rooms`, `chat_room_members`, `chat_room_messages`)](./storage.md#chat-rooms-migration-70).
@@ -138,6 +153,7 @@ Quick Chat is an optional floating panel for fast, project-scoped assistant conv
 - Entering `/new` or `/clear` (exact match after trimming) in the Quick Chat composer uses explicit fresh-session creation for the currently selected target (`startFreshSession()`), so the current thread resets without sending the command text to the model
 - The `+` action opens an inline new-session chooser (inside the panel, not a modal) with `Model` selected by default and optional switch to `Agent`
 - Submitting the inline chooser uses explicit fresh-session creation and immediately persists/selects the new thread, then refreshes the session dropdown list
+- On open after reload, Quick Chat restores the most recently used session (newest `updatedAt`); only when no prior session exists does it fall back to the first agent / configured default model.
 - Resume lookups still use targeted session queries instead of loading the full active-session list first
 - Tool-call summaries in the floating quick-chat panel are intentionally condensed into a single-line header row (especially on small screens) so tool name + status stay scannable without multi-line wrapping
 - On mobile viewports, opening Quick Chat auto-focuses the composer as soon as it is ready so the keyboard opens immediately

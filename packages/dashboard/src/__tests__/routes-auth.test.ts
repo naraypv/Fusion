@@ -2,7 +2,6 @@
 
 import { describe, it, expect, vi, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import express from "express";
-import http from "node:http";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -617,12 +616,43 @@ describe("GET /auth/status", () => {
     const providers = res.body.providers.filter((p: any) => !["claude-cli", "droid-cli", "cursor-cli", "cursor", "google-gemini-cli", "llama-cpp"].includes(p.id));
     expect(providers).toEqual([
       { id: "github-copilot", name: "GitHub Copilot", authenticated: true, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: false },
-      { id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: false, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
+      { id: "openai-codex", name: "OpenAI Codex", authenticated: false, type: "oauth", loginInProgress: false, requiresManualCode: true, accounts: [], accountCount: 0, supportsMultipleAccounts: true },
       { id: "openrouter", name: "OpenRouter", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "kimi-coding", name: "Kimi", authenticated: false, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
       { id: "acme-extension", name: "Acme Extension", authenticated: true, type: "api_key", accounts: [], accountCount: 0, supportsMultipleAccounts: false },
     ]);
   });
+
+  it.each(["https://my-host.example.com", undefined])(
+    "marks manual-code oauth providers during auth status when origin is %s",
+    async (origin) => {
+      (authStorage.getOAuthProviders as ReturnType<typeof vi.fn>).mockReturnValue([
+        { id: "github-copilot", name: "GitHub Copilot" },
+        { id: "openai-codex", name: "OpenAI Codex" },
+        { id: "anthropic", name: "Anthropic" },
+      ]);
+      (authStorage.getApiKeyProviders as ReturnType<typeof vi.fn>).mockReturnValue([
+        { id: "openrouter", name: "OpenRouter" },
+      ]);
+
+      const res = origin
+        ? await REQUEST(buildApp(), "GET", "/api/auth/status", undefined, { Origin: origin })
+        : await REQUEST(buildApp(), "GET", "/api/auth/status");
+
+      expect(res.status).toBe(200);
+      const openAiCodex = res.body.providers.find((p: any) => p.id === "openai-codex");
+      const anthropic = res.body.providers.find((p: any) => p.id === "anthropic");
+      const githubCopilot = res.body.providers.find((p: any) => p.id === "github-copilot");
+      const openrouter = res.body.providers.find((p: any) => p.id === "openrouter");
+      const claudeCli = res.body.providers.find((p: any) => p.id === "claude-cli");
+
+      expect(openAiCodex.requiresManualCode).toBe(true);
+      expect(anthropic.requiresManualCode).toBe(true);
+      expect(githubCopilot).not.toHaveProperty("requiresManualCode");
+      expect(openrouter).not.toHaveProperty("requiresManualCode");
+      expect(claudeCli).not.toHaveProperty("requiresManualCode");
+    },
+  );
 
   it("returns unauthenticated status", async () => {
     (authStorage.hasAuth as ReturnType<typeof vi.fn>).mockReturnValue(false);
@@ -1585,23 +1615,17 @@ describe("GET /auth/oauth-callback", () => {
   }
 
   it("proxies callback request to original localhost callback server", async () => {
-    const callbackServer = express();
-    callbackServer.get("/oauth2callback", (req, res) => {
-      res.status(200).type("text/html").send(`proxied:${String(req.query.code)}:${String(req.query.state)}`);
-    });
-
-    const callbackListener = await new Promise<import("node:http").Server>((resolve) => {
-      const listener = callbackServer.listen(0, () => resolve(listener));
-    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("proxied:test-code:test-state", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
 
     try {
-      const address = callbackListener.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      expect(port).toBeGreaterThan(0);
-
       (authStorage.login as ReturnType<typeof vi.fn>).mockImplementation((_provider: string, callbacks: any) => {
         callbacks.onAuth({
-          url: `https://accounts.example.com/o/oauth2/v2/auth?state=test-state&redirect_uri=${encodeURIComponent(`http://localhost:${port}/oauth2callback`)}`,
+          url: `https://accounts.example.com/o/oauth2/v2/auth?state=test-state&redirect_uri=${encodeURIComponent("http://localhost:18432/oauth2callback")}`,
         });
         return Promise.resolve();
       });
@@ -1619,8 +1643,11 @@ describe("GET /auth/oauth-callback", () => {
       const res = await REQUEST(app, "GET", "/api/auth/oauth-callback?code=test-code&state=test-state");
       expect(res.status).toBe(200);
       expect(String(res.body)).toContain("proxied:test-code:test-state");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toBe("http://localhost:18432/oauth2callback?code=test-code&state=test-state");
+      expect(fetchSpy.mock.calls[0]?.[1]).toEqual({ method: "GET" });
     } finally {
-      await new Promise<void>((resolve, reject) => callbackListener.close((err) => (err ? reject(err) : resolve())));
+      fetchSpy.mockRestore();
     }
   });
 

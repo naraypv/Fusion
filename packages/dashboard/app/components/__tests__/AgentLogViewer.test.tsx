@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { AgentLogViewer } from "../AgentLogViewer";
+import { FileBrowserProvider } from "../../context/FileBrowserContext";
 import type { AgentLogEntry } from "@fusion/core";
 import "../../styles.css";
 import "../TaskDetailModal.css";
@@ -130,6 +131,18 @@ describe("AgentLogViewer", () => {
     ).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  it("renders file paths in plain log lines as clickable file-browser links", async () => {
+    const openFile = vi.fn();
+    render(
+      <FileBrowserProvider openFile={openFile}>
+        <AgentLogViewer entries={[makeEntry({ text: "writing packages/engine/src/scheduler.ts" })]} loading={false} />
+      </FileBrowserProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "packages/engine/src/scheduler.ts" }));
+    expect(openFile).toHaveBeenCalledWith("packages/engine/src/scheduler.ts", { line: undefined, col: undefined });
   });
 
   it("renders tool entries with distinct styling", () => {
@@ -1282,6 +1295,27 @@ describe("AgentLogViewer", () => {
       const code = textSpans[0].querySelector("code");
       expect(code).toBeTruthy();
       expect(code!.textContent).toBe("inline code");
+    });
+
+    it("renders file links inside inline code with the code wrapper preserved", () => {
+      const openFile = vi.fn();
+      const entries = [
+        makeEntry({ text: "Check `packages/engine/src/scheduler.ts:7` now." }),
+      ];
+      const { container } = render(
+        <FileBrowserProvider openFile={openFile}>
+          <AgentLogViewer entries={entries} loading={false} />
+        </FileBrowserProvider>,
+      );
+
+      const fileLink = screen.getByRole("button", { name: "packages/engine/src/scheduler.ts:7" });
+      const code = fileLink.closest("code");
+      expect(code).toBeTruthy();
+      expect(code?.querySelector("button.file-path-link")).toBe(fileLink);
+
+      fireEvent.click(fileLink);
+      expect(openFile).toHaveBeenCalledWith("packages/engine/src/scheduler.ts", { line: 7, col: undefined });
+      expect(container.querySelectorAll("code button.file-path-link")).toHaveLength(1);
     });
 
     it("renders code blocks with GFM support", () => {

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { useState } from "react";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { Task } from "@fusion/core";
 import {
   makeTask,
   noop,
@@ -15,9 +16,55 @@ import {
   readDashboardStylesSource,
   setupTaskDetailModalHooks,
 } from "./TaskDetailModal.test-helpers";
+import { loadAllAppCss } from "../../test/cssFixture";
 import { TaskDetailModal, TaskDetailContent } from "../TaskDetailModal";
 
 setupTaskDetailModalHooks();
+
+function getMediaBlocks(css: string, mediaQuery: string): string[] {
+  const blocks: string[] = [];
+  let searchFrom = 0;
+
+  while (searchFrom < css.length) {
+    const mediaStart = css.indexOf(mediaQuery, searchFrom);
+    if (mediaStart === -1) {
+      break;
+    }
+
+    const blockStart = css.indexOf("{", mediaStart);
+    if (blockStart === -1) {
+      break;
+    }
+
+    let depth = 1;
+    let index = blockStart + 1;
+
+    while (index < css.length && depth > 0) {
+      const char = css[index];
+      if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+      }
+      index += 1;
+    }
+
+    if (depth === 0) {
+      blocks.push(css.slice(blockStart + 1, index - 1));
+      searchFrom = index;
+    } else {
+      break;
+    }
+  }
+
+  return blocks;
+}
+
+function getRuleBlock(css: string, selector: string): string {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ruleMatch = css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
+  return ruleMatch?.[1] ?? "";
+}
 
 describe("TaskDetailModal", () => {
   describe("source issue metadata", () => {
@@ -2188,6 +2235,54 @@ describe("TaskDetailModal", () => {
       expect(screen.getByRole("link", { name: "runfusion/fusion#123" })).toHaveAttribute("href", "https://github.com/runfusion/fusion/issues/123");
     });
 
+    it("preserves fetched githubTracking detail when the optimistic task prop came from a slim restart listing", async () => {
+      const { fetchTaskDetail } = await import("../../api");
+      vi.mocked(fetchTaskDetail).mockResolvedValueOnce(
+        makeTask({
+          id: "FN-301",
+          column: "todo",
+          prompt: "# Spec",
+          githubTracking: {
+            enabled: true,
+            repoOverride: "runfusion/fusion",
+            issue: {
+              owner: "runfusion",
+              repo: "fusion",
+              number: 301,
+              url: "https://github.com/runfusion/fusion/issues/301",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          },
+        }),
+      );
+
+      const optimisticTask = makeTask({ id: "FN-301", column: "todo" }) as Task;
+      delete (optimisticTask as Partial<Task>).prompt;
+      delete (optimisticTask as Partial<Task>).githubTracking;
+
+      render(
+        <TaskDetailModal
+          task={optimisticTask}
+          onClose={noop}
+          onOpenDetail={noopOpenDetail}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          addToast={noop}
+        />,
+      );
+
+      await waitFor(() => {
+        // FN-4161 repro: the optimistic task prop came from a slim restart listing,
+        // so fetched full detail must win when the prop omits githubTracking.
+        expect(screen.getByLabelText("GitHub tracking status")).toHaveTextContent("Linked");
+      });
+
+      expandGithubTracking();
+      expect(screen.getByDisplayValue("runfusion/fusion")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "runfusion/fusion#301" })).toHaveAttribute("href", "https://github.com/runfusion/fusion/issues/301");
+    });
+
     it("shows section when tracking is disabled and task is in an eligible column", () => {
       render(
         <TaskDetailModal
@@ -2203,6 +2298,54 @@ describe("TaskDetailModal", () => {
 
       expect(screen.getByText("GitHub tracking")).toBeTruthy();
       expect(screen.getByText("Tracking is currently disabled")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Enable GitHub tracking" })).toHaveTextContent("Enable");
+    });
+
+    it("FN-4228 shows loading state instead of disabled CTA while detail fetch is unresolved", async () => {
+      const { fetchTaskDetail } = await import("../../api");
+      const mockFetch = vi.mocked(fetchTaskDetail);
+      let resolveFetch: ((value: TaskDetail) => void) | undefined;
+      mockFetch.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFetch = resolve;
+          }),
+      );
+
+      const optimisticTask = makeTask({ id: "FN-001", column: "todo" });
+      delete (optimisticTask as Partial<Task>).prompt;
+      delete (optimisticTask as Partial<Task>).githubTracking;
+
+      render(
+        <TaskDetailModal
+          task={optimisticTask}
+          onClose={noop}
+          onOpenDetail={noopOpenDetail}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          addToast={noop}
+        />,
+      );
+
+      expect(screen.getByLabelText("GitHub tracking status")).toHaveTextContent("Loading");
+      expect(screen.getByText("Checking tracking status")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Enable GitHub tracking" })).toBeNull();
+      expect(screen.getByRole("status", { name: "Loading GitHub tracking status" })).toBeInTheDocument();
+
+      await act(async () => {
+        resolveFetch?.({
+          ...(makeTask({ id: "FN-001", column: "todo" }) as TaskDetail),
+          prompt: "# Spec",
+          githubTracking: { enabled: false },
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByLabelText("GitHub tracking status")).toHaveTextContent("Disabled");
+      });
+      expect(screen.getByText("Tracking is currently disabled")).toBeInTheDocument();
+      expect(screen.queryByRole("status", { name: "Loading GitHub tracking status" })).toBeNull();
       expect(screen.getByRole("button", { name: "Enable GitHub tracking" })).toBeInTheDocument();
     });
 
@@ -2241,6 +2384,60 @@ describe("TaskDetailModal", () => {
       expect(addToast).not.toHaveBeenCalledWith(expect.stringContaining("Failed to update FN-001"), "error");
       expect(screen.getByRole("button", { name: "Expand GitHub tracking details" })).toHaveAttribute("aria-expanded", "false");
       expect(screen.queryByRole("button", { name: "Collapse GitHub tracking details" })).toBeNull();
+    });
+
+    it("FN-4228 keeps the inline enable button mounted and disabled while saving", async () => {
+      const { updateTask } = await import("../../api");
+      const mockUpdate = vi.mocked(updateTask);
+      let resolveUpdate: ((task: Task) => void) | undefined;
+      mockUpdate.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveUpdate = resolve;
+          }),
+      );
+
+      render(
+        <TaskDetailModal
+          task={makeTask({
+            id: "FN-001",
+            column: "todo",
+            githubTracking: {
+              enabled: false,
+            },
+          })}
+          onClose={noop}
+          onOpenDetail={noopOpenDetail}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          addToast={noop}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Enable GitHub tracking" }));
+
+      const enableButton = await screen.findByRole("button", { name: "Enable GitHub tracking" });
+      expect(enableButton).toBeDisabled();
+      expect(screen.getByRole("status", { name: "Enabling GitHub tracking" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Expand GitHub tracking details" })).toHaveAttribute("aria-expanded", "false");
+
+      resolveUpdate?.({
+        id: "FN-001",
+        githubTracking: {
+          enabled: true,
+          issue: {
+            number: 42,
+            title: "Tracked issue",
+            url: "https://github.com/runfusion/fusion/issues/42",
+            state: "open",
+          },
+        },
+      } as Task);
+
+      await waitFor(() => {
+        expect(screen.queryByRole("status", { name: "Enabling GitHub tracking" })).toBeNull();
+      });
     });
 
     it("hides the inline enable button when tracking is already enabled", () => {
@@ -2287,6 +2484,30 @@ describe("TaskDetailModal", () => {
 
       expect(screen.queryByRole("button", { name: "Enable GitHub tracking" })).toBeNull();
       expect(screen.getByRole("button", { name: "Expand GitHub tracking details" })).toBeInTheDocument();
+    });
+
+    it("mobile layout keeps the enable button in source order without width forcing at the 768px breakpoint", () => {
+      const css = loadAllAppCss();
+      const mobileCss = getMediaBlocks(css, "@media (max-width: 768px)").join("\n");
+      const enableRule = getRuleBlock(mobileCss, ".detail-github-tracking-enable");
+      const headerRule = getRuleBlock(mobileCss, ".detail-source-header");
+      const githubSummaryRule = getRuleBlock(mobileCss, ".detail-github-tracking-section .detail-source-summary");
+      const sourceSummaryRule = getRuleBlock(mobileCss, ".detail-source-section .detail-source-summary");
+
+      expect(mobileCss).toBeTruthy();
+      expect(enableRule).toBeTruthy();
+      expect(headerRule).toBeTruthy();
+      expect(githubSummaryRule).toBeTruthy();
+      expect(sourceSummaryRule).toBeTruthy();
+      expect(enableRule).not.toMatch(/\border\s*:/);
+      expect(enableRule).not.toMatch(/\bwidth\s*:\s*100%/);
+      expect(headerRule).toMatch(/\bflex-wrap\s*:\s*wrap/);
+      expect(githubSummaryRule).toMatch(/\bflex\s*:\s*1\s+1\s+auto/);
+      expect(githubSummaryRule).toMatch(/\bmin-width\s*:\s*0/);
+      expect(githubSummaryRule).not.toMatch(/\bflex\s*:\s*1\s+1\s+100%/);
+      expect(githubSummaryRule).not.toMatch(/\bflex-basis\s*:\s*100%/);
+      expect(githubSummaryRule).not.toMatch(/\bwidth\s*:\s*100%/);
+      expect(sourceSummaryRule).toMatch(/\bflex\s*:\s*1\s+1\s+auto/);
     });
 
     it("hides section when tracking is disabled and task is not in an eligible column", () => {

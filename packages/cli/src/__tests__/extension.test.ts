@@ -977,7 +977,6 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
 
   describe("fn_mission_list", () => {
     it("returns formatted list of missions", async () => {
-      // First create a mission
       const createTool = api.tools.get("fn_mission_create")!;
       await createTool.execute(
         "c1",
@@ -999,6 +998,44 @@ describe.skipIf(!SHOULD_RUN_LEGACY_EXTENSION_INTEGRATION)("fn pi extension (lega
       expect(result.details.count).toBeGreaterThanOrEqual(1);
       expect(result.content[0].text).toContain("Missions");
       expect(result.content[0].text).toContain("Summary:");
+    });
+
+    it("includes mission interview drafts by default and exposes them in details", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+      store.getDatabase().prepare(
+        `INSERT INTO ai_sessions (id, type, status, title, inputPayload, conversationHistory, currentQuestion, result, thinkingOutput, error, projectId, createdAt, updatedAt, lockedByTab, lockedAt)
+         VALUES (?, 'mission_interview', 'awaiting_input', ?, '{}', '[]', NULL, NULL, '', NULL, NULL, ?, ?, NULL, NULL)`,
+      ).run("draft-1", "Draft Mission", "2026-05-12T00:00:00.000Z", "2026-05-12T00:00:00.000Z");
+
+      const listTool = api.tools.get("fn_mission_list")!;
+      const result = await listTool.execute("call-1", {}, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.content[0].text).toContain("Drafts (1)");
+      expect(result.content[0].text).toContain("draft-1: Draft Mission (draft · interview awaiting_input)");
+      expect(result.details.drafts).toEqual([
+        {
+          id: "draft-1",
+          title: "Draft Mission",
+          status: "awaiting_input",
+          updatedAt: "2026-05-12T00:00:00.000Z",
+        },
+      ]);
+    });
+
+    it("suppresses mission interview drafts when includeDrafts is false", async () => {
+      const store = new TaskStore(tmpDir);
+      await store.init();
+      store.getDatabase().prepare(
+        `INSERT INTO ai_sessions (id, type, status, title, inputPayload, conversationHistory, currentQuestion, result, thinkingOutput, error, projectId, createdAt, updatedAt, lockedByTab, lockedAt)
+         VALUES (?, 'mission_interview', 'error', ?, '{}', '[]', NULL, NULL, '', NULL, NULL, ?, ?, NULL, NULL)`,
+      ).run("draft-2", "Hidden Draft", "2026-05-12T00:00:00.000Z", "2026-05-12T00:00:00.000Z");
+
+      const listTool = api.tools.get("fn_mission_list")!;
+      const result = await listTool.execute("call-1", { includeDrafts: false }, undefined, undefined, makeCtx(tmpDir));
+
+      expect(result.content[0].text).not.toContain("Drafts");
+      expect(result.details.drafts).toEqual([]);
     });
   });
 
@@ -1934,6 +1971,20 @@ describe("fn pi extension (runnable structured-output regression slice)", () => 
   });
 
   describe("research tools", () => {
+    it.each([
+      "fn_research_run",
+      "fn_research_list",
+      "fn_research_get",
+      "fn_research_cancel",
+      "fn_research_retry",
+    ])("%s uses disambiguated cited-research wording", (toolName) => {
+      const tool = api.tools.get(toolName)!;
+      expect(tool.description).toMatch(/cited-research pipeline/i);
+      if (/experiment loop/i.test(tool.description)) {
+        expect(tool.description).toMatch(/not\s+.*experiment loop/i);
+      }
+    });
+
     it("fn_research_run treats builtin as configured when no provider is explicitly set", async () => {
       const store = new TaskStore(tmpDir);
       await store.init();

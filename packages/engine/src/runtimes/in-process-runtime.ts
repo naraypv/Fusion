@@ -11,7 +11,7 @@ import type {
   MessageStore,
   RoutineStore,
 } from "@fusion/core";
-import { isEphemeralAgent } from "@fusion/core";
+import { ChatStore, isEphemeralAgent } from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import type { PrMonitor, PrComment } from "../pr-monitor.js";
 import type { PrInfo } from "@fusion/core";
@@ -114,6 +114,7 @@ export class InProcessRuntime
   private missionAutopilot?: MissionAutopilot;
   private triageProcessor?: TriageProcessor;
   private messageStore?: MessageStore;
+  private chatStore?: ChatStore;
   private concurrencyChangedListener?: (state: { globalMaxConcurrent: number }) => void;
   /**
    * Optional callback the runtime forwards to SelfHealingManager so that
@@ -261,6 +262,18 @@ export class InProcessRuntime
         }
       }
 
+      // 5a. Initialize AgentStore (required for scheduler assignment, reflection service, and heartbeat monitoring)
+      let agentStoreForReflection: import("@fusion/core").AgentStore | undefined;
+      try {
+        const { AgentStore: AgentStoreClass } = await import("@fusion/core");
+        agentStoreForReflection = new AgentStoreClass({ rootDir: this.taskStore.getFusionDir(), taskStore: this.taskStore });
+        await agentStoreForReflection.init();
+        runtimeLog.log("AgentStore initialized for reflection service");
+      } catch (agentErr) {
+        runtimeLog.warn(`AgentStore initialization failed (reflection service will be unavailable):`, agentErr instanceof Error ? agentErr.message : agentErr);
+      }
+      this.agentStore = agentStoreForReflection;
+
       // 5. Initialize Scheduler
       const missionStore = this.taskStore.getMissionStore();
       this.missionAutopilot = missionStore
@@ -300,6 +313,7 @@ export class InProcessRuntime
         maxConcurrent: this.config.maxConcurrent,
         maxWorktrees: this.config.maxWorktrees,
         semaphore: this.globalSemaphore,
+        agentStore: this.agentStore,
         missionStore,
         missionAutopilot,
         missionExecutionLoop,
@@ -323,7 +337,7 @@ export class InProcessRuntime
 
       // 5b. Initialize TaskExecutor
       this.stuckTaskDetector = new StuckTaskDetector(this.taskStore, {
-        beforeRequeue: (taskId) => this.selfHealingManager?.checkStuckBudget(taskId) ?? Promise.resolve(true),
+        beforeRequeue: (taskId, reason) => this.selfHealingManager?.checkStuckBudget(taskId, reason) ?? Promise.resolve(true),
         onLoopDetected: (event) => this.executor?.handleLoopDetected(event) ?? Promise.resolve(false),
         onStuck: (event) => {
           this.triageProcessor?.markStuckAborted(event.taskId);
@@ -334,18 +348,6 @@ export class InProcessRuntime
           );
         },
       });
-
-      // 5a. Initialize AgentStore (required for reflection service and heartbeat monitoring)
-      let agentStoreForReflection: import("@fusion/core").AgentStore | undefined;
-      try {
-        const { AgentStore: AgentStoreClass } = await import("@fusion/core");
-        agentStoreForReflection = new AgentStoreClass({ rootDir: this.taskStore.getFusionDir(), taskStore: this.taskStore });
-        await agentStoreForReflection.init();
-        runtimeLog.log("AgentStore initialized for reflection service");
-      } catch (agentErr) {
-        runtimeLog.warn(`AgentStore initialization failed (reflection service will be unavailable):`, agentErr instanceof Error ? agentErr.message : agentErr);
-      }
-      this.agentStore = agentStoreForReflection;
 
       // 5b. Initialize ReflectionStore for agent reflections
       let reflectionStoreForService: import("@fusion/core").ReflectionStore | undefined;
@@ -450,12 +452,14 @@ export class InProcessRuntime
         // Already started — nothing to do
       }
       if (!this.heartbeatMonitor && this.agentStore) {
+        this.chatStore ??= new ChatStore(this.taskStore.getFusionDir(), this.taskStore.getDatabase());
         this.heartbeatMonitor = new HeartbeatMonitor({
           store: this.agentStore,
           agentStore: this.agentStore, // enables per-agent config resolution
           taskStore: this.taskStore,
           rootDir: this.config.workingDirectory,
           messageStore: this.messageStore,
+          chatStore: this.chatStore,
           pluginRunner: this.pluginRunner,
           reflectionStore: reflectionStoreForService,
           reflectionService,
@@ -526,6 +530,10 @@ export class InProcessRuntime
             taskStore: this.taskStore,
             logger: runtimeLog,
             isDeletionPendingExternal: (agentId) => this.executor?.isEphemeralDeletionPending(agentId) ?? false,
+            getSettings: async () => {
+              const settings = await this.taskStore.getSettings();
+              return { ephemeralAgentsEnabled: settings.ephemeralAgentsEnabled };
+            },
           });
         }
         if (this.workerManager) {
