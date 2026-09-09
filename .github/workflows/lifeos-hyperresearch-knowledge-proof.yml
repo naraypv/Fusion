@@ -1,0 +1,89 @@
+name: Isolated LifeOS HyperResearch evidence proof
+
+on:
+  push:
+    branches:
+      - proof/lifeos-hyperresearch-knowledge-20260909
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Verify exact non-sensitive model sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-knowledge-20260909
+          printf '%s  %s\n' \
+            '3569dbeb3e8da12e46d197469c40c30e6e2ec15e9ec6392d296007bfd61228d5' "$root/evidence_acquisition.qnt" \
+            '55f76fe9f518d292cc2744e12d13f924956ff2b6a9bb510dbe411f43f99bba32' "$root/evidence_acquisition_test.qnt" \
+            '3450961cc2104f957fc28767f9c26f3061aff2d7d7468c12e36c1e8ed54b70e5' "$root/evidence_acquisition_mutant.qnt" \
+            > expected-model-hashes.txt
+          sha256sum --check expected-model-hashes.txt
+
+      - name: Install pinned Quint
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = '0.32.0'
+
+      - name: Execute proof and mutation check
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-knowledge-20260909
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/runner-revision.txt
+          printf '%s\n' '${{ runner.os }}' > evidence/runner-os.txt
+          quint --version > evidence/quint-version.txt
+          sha256sum "$root"/*.qnt > evidence/model-hashes.txt
+          cat > evidence/commands.txt <<'COMMANDS'
+          quint typecheck evidence_acquisition.qnt
+          quint typecheck evidence_acquisition_mutant.qnt
+          quint test evidence_acquisition_test.qnt
+          quint run evidence_acquisition.qnt --invariant=invariant --max-samples=3000 --max-steps=8
+          quint verify evidence_acquisition.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json
+          quint verify evidence_acquisition_mutant.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json  # required nonzero
+          COMMANDS
+          quint typecheck "$root/evidence_acquisition.qnt" 2>&1 | tee evidence/typecheck.log
+          quint typecheck "$root/evidence_acquisition_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
+          quint test "$root/evidence_acquisition_test.qnt" 2>&1 | tee evidence/tests.log
+          quint run "$root/evidence_acquisition.qnt" \
+            --invariant=invariant --max-samples=3000 --max-steps=8 \
+            2>&1 | tee evidence/run.log
+          printf '{"maxHeap":"-Xmx2G","workers":2}\n' > evidence/tlc-config.json
+          quint verify "$root/evidence_acquisition.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            2>&1 | tee evidence/verify.log
+          set +e
+          quint verify "$root/evidence_acquisition_mutant.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            > evidence/mutant-verify.log 2>&1
+          mutant_status=$?
+          set -e
+          printf '%s\n' "$mutant_status" > evidence/mutant-verify.exit
+          if [ "$mutant_status" -eq 0 ]; then
+            cat evidence/mutant-verify.log
+            echo 'FAIL: partial-publication mutant escaped the invariant' >&2
+            exit 1
+          fi
+          echo 'PASS: the shared invariant rejected partial publication before a later fetch failure' \
+            | tee evidence/non-vacuity.log
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifeos-hyperresearch-knowledge-proof
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
