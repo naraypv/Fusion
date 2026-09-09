@@ -11,3 +11,7 @@ samples the positive model, exhaustively verifies the positive model with TLC,
 and requires TLC to reject the deliberately broken partial-publication mutant.
 Evidence is uploaded as a workflow artifact and later copied into the private
 LifeOS specification subtree with a receipt.
+
+Post-implementation surrogate recheck target: LifeOS commit
+`22c4989a85922ed16da7f14532eae7b52110dda1`. The model files are unchanged;
+this records temporal ordering only and is not a proof of the Rust implementation.
