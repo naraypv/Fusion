@@ -23,14 +23,14 @@ module project_store {
 
   var s: State
 
-  pure def idleWriter(): Writer = { phase: "idle", expected: 0, target: 0 }
+  pure val idleWriter: Writer = { phase: "idle", expected: 0, target: 0 }
 
   action init = s' = {
     current: 0,
     slot1Owner: 0,
     slot2Owner: 0,
-    writerA: idleWriter(),
-    writerB: idleWriter(),
+    writerA: idleWriter,
+    writerB: idleWriter,
     head: 0,
     headCorrupt: false,
     readDone: false,
