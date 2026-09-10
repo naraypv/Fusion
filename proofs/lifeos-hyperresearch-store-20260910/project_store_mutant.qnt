@@ -30,18 +30,19 @@ module project_store_mutant {
     s' = {...s,
       writerA: { phase: "staged", expected: 0, target: 1 },
       writerB: { phase: "staged", expected: 0, target: 1 },
+      readDone: false,
     },
   }
   action publishA = all {
     s.writerA.phase == "staged",
     s' = {...s, current: 1, slot1Owner: 1,
-      writerA: {...s.writerA, phase: "acknowledged"}},
+      writerA: {...s.writerA, phase: "acknowledged"}, readDone: false},
   }
   action overwriteWithB = all {
     s.writerB.phase == "staged",
     s.current == 1,
     s' = {...s, slot1Owner: 2,
-      writerB: {...s.writerB, phase: "acknowledged"}},
+      writerB: {...s.writerB, phase: "acknowledged"}, readDone: false},
   }
   action readLatest = all {
     s' = {...s, readDone: true, readRevision: s.current,
