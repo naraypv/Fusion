@@ -1,0 +1,58 @@
+name: Isolated LifeOS HyperResearch store proof
+on:
+  push:
+    branches: [proof/lifeos-hyperresearch-store-20260910]
+permissions:
+  contents: read
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify exact model sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-store-20260910
+          printf '%s  %s\n' \
+            '6f24340d2240795768758cab311a0c11696f6c2ecf0f55c080f175b7071549d4' "$root/project_store.qnt" \
+            'd28b83515e2a5e1c9f514f1c0b4ed192fe08ef65d47ef46170d62611e20ca175' "$root/project_store_test.qnt" \
+            '455cadea3844915fe8c1bb471816a5946d9406d18e0a4f6acf0e746b235e93ea' "$root/project_store_mutant.qnt" > expected.sha256
+          sha256sum --check expected.sha256
+      - name: Install pinned Quint
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = 0.32.0
+      - name: Verify positive model and reject mutant
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-store-20260910
+          mkdir evidence
+          git rev-parse HEAD > evidence/runner-revision.txt
+          quint --version > evidence/quint-version.txt
+          sha256sum "$root"/*.qnt > evidence/model-hashes.txt
+          quint typecheck "$root/project_store.qnt" 2>&1 | tee evidence/typecheck.log
+          quint typecheck "$root/project_store_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
+          quint test "$root/project_store_test.qnt" 2>&1 | tee evidence/tests.log
+          quint run "$root/project_store.qnt" --invariant=invariant --max-samples=3000 --max-steps=10 2>&1 | tee evidence/run.log
+          printf '{"maxHeap":"-Xmx2G","workers":2}\n' > evidence/tlc-config.json
+          quint verify "$root/project_store.qnt" --invariant=invariant --backend=tlc --tlc-config=evidence/tlc-config.json 2>&1 | tee evidence/verify.log
+          set +e
+          quint verify "$root/project_store_mutant.qnt" --invariant=invariant --backend=tlc --tlc-config=evidence/tlc-config.json > evidence/mutant-verify.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > evidence/mutant-verify.exit
+          test "$status" -ne 0
+          echo 'PASS: immutable-revision invariant rejected overwrite mutant' | tee evidence/non-vacuity.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifeos-hyperresearch-store-proof
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
