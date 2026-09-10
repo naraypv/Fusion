@@ -38,7 +38,8 @@ jobs:
           sha256sum "$root"/*.qnt > evidence/model-hashes.txt
           quint typecheck "$root/project_store.qnt" 2>&1 | tee evidence/typecheck.log
           quint typecheck "$root/project_store_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
-          quint test "$root/project_store_test.qnt" 2>&1 | tee evidence/tests.log
+          quint test "$root/project_store_test.qnt" --main project_store_test --match '.*' 2>&1 | tee evidence/tests.log
+          grep -q '10 passing' evidence/tests.log
           quint run "$root/project_store.qnt" --invariant=invariant --max-samples=3000 --max-steps=10 2>&1 | tee evidence/run.log
           printf '{"maxHeap":"-Xmx2G","workers":2}\n' > evidence/tlc-config.json
           quint verify "$root/project_store.qnt" --invariant=invariant --backend=tlc --tlc-config=evidence/tlc-config.json 2>&1 | tee evidence/verify.log
