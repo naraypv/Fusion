@@ -45,6 +45,7 @@ module project_store {
     Set(0, 1).contains(expected),
     s' = {...s,
       writerA: { phase: "staged", expected: expected, target: targetFor(expected) },
+      readDone: false,
     },
   }
 
@@ -53,6 +54,7 @@ module project_store {
     Set(0, 1).contains(expected),
     s' = {...s,
       writerB: { phase: "staged", expected: expected, target: targetFor(expected) },
+      readDone: false,
     },
   }
 
@@ -69,12 +71,14 @@ module project_store {
         current: 1,
         slot1Owner: 1,
         writerA: {...s.writerA, phase: "published"},
+        readDone: false,
       }
     else
       {...s,
         current: 2,
         slot2Owner: 1,
         writerA: {...s.writerA, phase: "published"},
+        readDone: false,
       },
   }
 
@@ -88,68 +92,70 @@ module project_store {
         current: 1,
         slot1Owner: 2,
         writerB: {...s.writerB, phase: "published"},
+        readDone: false,
       }
     else
       {...s,
         current: 2,
         slot2Owner: 2,
         writerB: {...s.writerB, phase: "published"},
+        readDone: false,
       },
   }
 
   action conflictA = all {
     s.writerA.phase == "staged",
     s.writerA.expected != s.current or not(slotFree(s, s.writerA.target)),
-    s' = {...s, writerA: {...s.writerA, phase: "conflict"}},
+    s' = {...s, writerA: {...s.writerA, phase: "conflict"}, readDone: false},
   }
 
   action conflictB = all {
     s.writerB.phase == "staged",
     s.writerB.expected != s.current or not(slotFree(s, s.writerB.target)),
-    s' = {...s, writerB: {...s.writerB, phase: "conflict"}},
+    s' = {...s, writerB: {...s.writerB, phase: "conflict"}, readDone: false},
   }
 
   action acknowledgeA = all {
     s.writerA.phase == "published",
-    s' = {...s, writerA: {...s.writerA, phase: "acknowledged"}},
+    s' = {...s, writerA: {...s.writerA, phase: "acknowledged"}, readDone: false},
   }
 
   action acknowledgeB = all {
     s.writerB.phase == "published",
-    s' = {...s, writerB: {...s.writerB, phase: "acknowledged"}},
+    s' = {...s, writerB: {...s.writerB, phase: "acknowledged"}, readDone: false},
   }
 
   action crashBeforeA = all {
     s.writerA.phase == "staged",
-    s' = {...s, writerA: {...s.writerA, phase: "failed"}},
+    s' = {...s, writerA: {...s.writerA, phase: "failed"}, readDone: false},
   }
 
   action crashBeforeB = all {
     s.writerB.phase == "staged",
-    s' = {...s, writerB: {...s.writerB, phase: "failed"}},
+    s' = {...s, writerB: {...s.writerB, phase: "failed"}, readDone: false},
   }
 
   action crashAfterA = all {
     s.writerA.phase == "published",
-    s' = {...s, writerA: {...s.writerA, phase: "unknown"}},
+    s' = {...s, writerA: {...s.writerA, phase: "unknown"}, readDone: false},
   }
 
   action crashAfterB = all {
     s.writerB.phase == "published",
-    s' = {...s, writerB: {...s.writerB, phase: "unknown"}},
+    s' = {...s, writerB: {...s.writerB, phase: "unknown"}, readDone: false},
   }
 
   action refreshHead = all {
     s.current > 0,
-    s' = {...s, head: s.current, headCorrupt: false},
+    s' = {...s, head: s.current, headCorrupt: false, readDone: false},
   }
 
   action loseHead = all {
-    s' = {...s, head: 0, headCorrupt: false},
+    s' = {...s, head: 0, headCorrupt: false, readDone: false},
   }
 
   action corruptHead = all {
-    s' = {...s, head: 2, headCorrupt: true},
+    s' = {...s, head: 2, headCorrupt: true, readDone: false},
   }
 
   pure def ownerAt(x: State, revision: int): int =
