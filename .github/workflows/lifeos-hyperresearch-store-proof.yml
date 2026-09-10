@@ -18,9 +18,9 @@ jobs:
           set -euo pipefail
           root=proofs/lifeos-hyperresearch-store-20260910
           printf '%s  %s\n' \
-            'c976fd6898b88d1054f6f7504ee868dcf87678d9960a1ed4218184147549d034' "$root/project_store.qnt" \
+            '63e12ca7198d598f596af690233ba8f382154763fef8ab827175ad6ce3bf20c7' "$root/project_store.qnt" \
             'd28b83515e2a5e1c9f514f1c0b4ed192fe08ef65d47ef46170d62611e20ca175' "$root/project_store_test.qnt" \
-            '80c335cd0192cd9c1e6f406b1f2a1be7ec93775128901e3637670fa187c842a8' "$root/project_store_mutant.qnt" > expected.sha256
+            'c35d5a3fa72987bd150311fa2a827461cb398a70555fab7035671165560af3e7' "$root/project_store_mutant.qnt" > expected.sha256
           sha256sum --check expected.sha256
       - name: Install pinned Quint
         run: |
