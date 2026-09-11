@@ -23,7 +23,7 @@ jobs:
           set -euo pipefail
           root=proofs/lifeos-hyperresearch-cutover-20260911
           test "$(git hash-object "$root/durable_cutover.qnt")" = aa9151d65c9e0a3fc618f17a8b344fc6b276e432
-          test "$(git hash-object "$root/durable_cutover_test.qnt")" = 9f97a4542bb8a47bb98a83ac40c899ba470700c1
+          test "$(git hash-object "$root/durable_cutover_test.qnt")" = 27334a06e185dc586c82e7bcc156abf96ec53739
           test "$(git hash-object "$root/durable_cutover_mutant.qnt")" = c8d5fcdcdc55d482112c8b5149901dd6631139d4
 
       - name: Install pinned Quint
@@ -33,7 +33,7 @@ jobs:
           npm install --global @informalsystems/quint@0.32.0
           test "$(quint --version)" = 0.32.0
 
-      - name: Execute positive proof and reject mutant
+      - name: Execute positive proof and reject both mutant paths
         shell: bash
         run: |
           set -euo pipefail
@@ -45,6 +45,7 @@ jobs:
           quint typecheck "$root/durable_cutover.qnt" 2>&1 | tee evidence/typecheck.log
           quint typecheck "$root/durable_cutover_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
           quint test "$root/durable_cutover_test.qnt" 2>&1 | tee evidence/tests.log
+          grep -Eq '13 passing|13 passed' evidence/tests.log
           quint run "$root/durable_cutover.qnt" \
             --invariant=invariant --max-samples=5000 --max-steps=8 \
             2>&1 | tee evidence/run.log
@@ -53,17 +54,27 @@ jobs:
             --invariant=invariant --backend=tlc \
             --tlc-config=evidence/tlc-config.json \
             2>&1 | tee evidence/verify.log
+
           set +e
           quint verify "$root/durable_cutover_mutant.qnt" \
-            --invariant=invariant --backend=tlc \
+            --invariant=noLegacyAccess --backend=tlc \
             --tlc-config=evidence/tlc-config.json \
-            > evidence/mutant-verify.log 2>&1
-          mutant_status=$?
+            > evidence/fallback-mutant-verify.log 2>&1
+          fallback_status=$?
+          quint verify "$root/durable_cutover_mutant.qnt" \
+            --invariant=writesRequireExactCursor --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            > evidence/stale-write-mutant-verify.log 2>&1
+          stale_status=$?
           set -e
-          printf '%s\n' "$mutant_status" > evidence/mutant-verify.exit
-          test "$mutant_status" -ne 0
-          echo 'PASS: invariant rejected legacy fallback and stale-cursor journal writes' \
-            | tee evidence/non-vacuity.log
+          printf '%s\n' "$fallback_status" > evidence/fallback-mutant-verify.exit
+          printf '%s\n' "$stale_status" > evidence/stale-write-mutant-verify.exit
+          test "$fallback_status" -ne 0
+          test "$stale_status" -ne 0
+          echo 'PASS: noLegacyAccess rejected store-unavailable legacy fallback' \
+            | tee evidence/fallback-non-vacuity.log
+          echo 'PASS: writesRequireExactCursor rejected stale-cursor journal publication' \
+            | tee evidence/stale-write-non-vacuity.log
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
