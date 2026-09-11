@@ -10,7 +10,9 @@ typechecks both models, runs ten witnesses and 5,000 sampled traces, exhaustivel
 verifies the positive model with TLC, and requires the unchanged invariant to
 reject the deliberately unsafe partial-publication mutant.
 
-Post-implementation surrogate recheck target: LifeOS production-source commit
-`7cb641058b5deeb58c82ecdcc35247efb4aa9f38`. Later documentation, verifier,
-and workflow commits do not modify the journal Rust implementation. This records
-temporal ordering only; the finite model is not a proof of the Rust program.
+Final post-implementation surrogate recheck target: LifeOS source/test commit
+`188cdec7e0844e96a29d896905c66a104387b09c`, which adds real different-batch
+writer races after the production journal implementation. Later documentation,
+receipt, verifier, and workflow commits do not modify journal Rust source or
+tests. This records temporal ordering only; the finite model is not a proof of
+the Rust program.
