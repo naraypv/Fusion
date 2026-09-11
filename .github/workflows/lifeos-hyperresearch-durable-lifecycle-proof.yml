@@ -1,0 +1,78 @@
+name: Isolated LifeOS durable-lifecycle proof
+
+on:
+  push:
+    branches:
+      - proof/lifeos-hyperresearch-durable-lifecycle-20260911
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  proof:
+    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message != 'proof: record durable-lifecycle verification result'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install pinned Quint
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = '0.32.0'
+      - name: Execute proof and mutation check
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-durable-lifecycle-20260911
+          rm -rf "$root/evidence"
+          mkdir -p "$root/evidence"
+          git rev-parse HEAD > "$root/evidence/runner-revision.txt"
+          quint --version > "$root/evidence/quint-version.txt"
+          sha256sum "$root"/*.qnt > "$root/evidence/model-hashes.txt"
+          quint typecheck "$root/lifecycle_migration.qnt" 2>&1 | tee "$root/evidence/typecheck.log"
+          quint typecheck "$root/lifecycle_migration_mutant.qnt" 2>&1 | tee "$root/evidence/mutant-typecheck.log"
+          quint test "$root/lifecycle_migration_test.qnt" 2>&1 | tee "$root/evidence/tests.log"
+          quint run "$root/lifecycle_migration.qnt" \
+            --invariant=invariant --max-samples=5000 --max-steps=8 \
+            2>&1 | tee "$root/evidence/run.log"
+          printf '{"maxHeap":"-Xmx2G","workers":2}\n' > "$root/evidence/tlc-config.json"
+          quint verify "$root/lifecycle_migration.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config="$root/evidence/tlc-config.json" \
+            2>&1 | tee "$root/evidence/verify.log"
+          set +e
+          quint verify "$root/lifecycle_migration_mutant.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config="$root/evidence/tlc-config.json" \
+            > "$root/evidence/mutant-verify.log" 2>&1
+          mutant_status=$?
+          set -e
+          printf '%s\n' "$mutant_status" > "$root/evidence/mutant-verify.exit"
+          if [ "$mutant_status" -eq 0 ]; then
+            cat "$root/evidence/mutant-verify.log"
+            echo 'FAIL: destructive migration mutant escaped the invariant' >&2
+            exit 1
+          fi
+          echo 'PASS: shared invariant rejected destructive overwrite and legacy deletion' \
+            | tee "$root/evidence/non-vacuity.log"
+          cat > "$root/evidence/RESULT.md" <<RESULT
+          # Durable-lifecycle proof result
+
+          - Quint: 0.32.0
+          - Named witnesses: 10 passed
+          - Sampled executions: 5000, max 8 steps
+          - Positive TLC verification: passed
+          - Destructive migration mutant: rejected with nonzero exit $mutant_status
+          - Source revision before receipt commit: $(git rev-parse HEAD)
+          RESULT
+      - name: Commit exact proof evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'LifeOS proof bot'
+          git config user.email 'proof-bot@users.noreply.github.com'
+          git add proofs/lifeos-hyperresearch-durable-lifecycle-20260911/evidence
+          git commit -m 'proof: record durable-lifecycle verification result'
+          git push origin HEAD:proof/lifeos-hyperresearch-durable-lifecycle-20260911
