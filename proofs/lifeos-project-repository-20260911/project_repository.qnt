@@ -77,17 +77,17 @@ module project_repository {
     },
   }
 
-  action load(exists: bool, valid: bool, operationPresent: bool,
+  action load(projectPresent: bool, valid: bool, operationPresent: bool,
       operationEqual: bool, expectedMatches: bool,
       stage: int, findings: int): bool = all {
     s.phase == "loading",
     Set(0, 1, 2, 3, 4).contains(stage),
     Set(0, 1, 2).contains(findings),
     operationEqual implies operationPresent,
-    not(exists) implies (not(operationPresent) and stage == 0 and findings == 0),
+    not(projectPresent) implies (not(operationPresent) and stage == 0 and findings == 0),
     s' = {...s,
       phase: "loaded",
-      projectExists: exists,
+      projectExists: projectPresent,
       documentValid: valid,
       operationIdPresent: operationPresent,
       operationEqual: operationEqual,
@@ -99,8 +99,8 @@ module project_repository {
       candidateStage: stage,
       candidateFindings: findings,
       initialReads: 1,
-      operationVisible: exists and valid and operationEqual,
-      effectApplications: if (exists and valid and operationEqual) 1 else 0,
+      operationVisible: projectPresent and valid and operationEqual,
+      effectApplications: if (projectPresent and valid and operationEqual) 1 else 0,
     },
   }
 
@@ -349,14 +349,14 @@ module project_repository {
       begin(kind, targetStage, targetFindings, legacyPresent)
     },
     {
-      nondet exists = Set(false, true).oneOf()
+      nondet projectPresent = Set(false, true).oneOf()
       nondet valid = Set(false, true).oneOf()
       nondet operationPresent = Set(false, true).oneOf()
       nondet operationEqual = Set(false, true).oneOf()
       nondet expectedMatches = Set(false, true).oneOf()
       nondet stage = Set(0, 1, 2, 3, 4).oneOf()
       nondet findings = Set(0, 1, 2).oneOf()
-      load(exists, valid, operationPresent, operationEqual,
+      load(projectPresent, valid, operationPresent, operationEqual,
         expectedMatches, stage, findings)
     },
     rejectCorrupt,

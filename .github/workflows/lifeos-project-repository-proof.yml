@@ -22,7 +22,7 @@ jobs:
         run: |
           set -euo pipefail
           root=proofs/lifeos-project-repository-20260911
-          test "$(git hash-object "$root/project_repository.qnt")" = c46d10c55fdc1fff754beda1b0096b94d99c8319
+          test "$(git hash-object "$root/project_repository.qnt")" = bb0fc8d4ecaa6607d8e2a8b1d922fb37a0b7ef14
           test "$(git hash-object "$root/project_repository_test.qnt")" = f4af6400313cf872d539362df79b11bb694552b8
           test "$(git hash-object "$root/project_repository_mutant.qnt")" = 6164f1e668246adcf834fc88a834a4d996380044
 
