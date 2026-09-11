@@ -1,0 +1,87 @@
+name: Isolated LifeOS durable project-repository proof
+
+on:
+  push:
+    branches:
+      - proof/lifeos-project-repository-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Verify exact non-sensitive model sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-project-repository-20260911
+          test "$(git hash-object "$root/project_repository.qnt")" = c46d10c55fdc1fff754beda1b0096b94d99c8319
+          test "$(git hash-object "$root/project_repository_test.qnt")" = f4af6400313cf872d539362df79b11bb694552b8
+          test "$(git hash-object "$root/project_repository_mutant.qnt")" = 6164f1e668246adcf834fc88a834a4d996380044
+
+      - name: Install pinned Quint
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = '0.32.0'
+
+      - name: Execute proof and mutation check
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-project-repository-20260911
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/runner-revision.txt
+          printf '%s\n' '${{ runner.os }}' > evidence/runner-os.txt
+          quint --version > evidence/quint-version.txt
+          sha256sum "$root"/*.qnt > evidence/model-hashes.txt
+          cat > evidence/commands.txt <<'COMMANDS'
+          quint typecheck project_repository.qnt
+          quint typecheck project_repository_mutant.qnt
+          quint test project_repository_test.qnt
+          quint run project_repository.qnt --invariant=invariant --max-samples=5000 --max-steps=9
+          quint verify project_repository.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json
+          quint verify project_repository_mutant.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json  # required nonzero
+          COMMANDS
+          quint typecheck "$root/project_repository.qnt" 2>&1 | tee evidence/typecheck.log
+          quint typecheck "$root/project_repository_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
+          quint test "$root/project_repository_test.qnt" 2>&1 | tee evidence/tests.log
+          quint run "$root/project_repository.qnt" \
+            --invariant=invariant --max-samples=5000 --max-steps=9 \
+            2>&1 | tee evidence/run.log
+          printf '{"maxHeap":"-Xmx3G","workers":2}\n' > evidence/tlc-config.json
+          quint verify "$root/project_repository.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            2>&1 | tee evidence/verify.log
+          set +e
+          quint verify "$root/project_repository_mutant.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            > evidence/mutant-verify.log 2>&1
+          mutant_status=$?
+          set -e
+          printf '%s\n' "$mutant_status" > evidence/mutant-verify.exit
+          if [ "$mutant_status" -eq 0 ]; then
+            cat evidence/mutant-verify.log
+            echo 'FAIL: duplicate-application mutant escaped the invariant' >&2
+            exit 1
+          fi
+          echo 'PASS: the invariant rejected applying one finding operation twice' \
+            | tee evidence/non-vacuity.log
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifeos-project-repository-proof
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
