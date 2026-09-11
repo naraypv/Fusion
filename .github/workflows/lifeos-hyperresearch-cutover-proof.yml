@@ -1,0 +1,74 @@
+name: Isolated LifeOS HyperResearch cutover proof
+
+on:
+  push:
+    branches:
+      - proof/lifeos-hyperresearch-cutover-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Verify exact model sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-cutover-20260911
+          test "$(git hash-object "$root/durable_cutover.qnt")" = aa9151d65c9e0a3fc618f17a8b344fc6b276e432
+          test "$(git hash-object "$root/durable_cutover_test.qnt")" = 9f97a4542bb8a47bb98a83ac40c899ba470700c1
+          test "$(git hash-object "$root/durable_cutover_mutant.qnt")" = c8d5fcdcdc55d482112c8b5149901dd6631139d4
+
+      - name: Install pinned Quint
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = 0.32.0
+
+      - name: Execute positive proof and reject mutant
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-hyperresearch-cutover-20260911
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/runner-revision.txt
+          quint --version > evidence/quint-version.txt
+          sha256sum "$root"/*.qnt > evidence/model-hashes.txt
+          quint typecheck "$root/durable_cutover.qnt" 2>&1 | tee evidence/typecheck.log
+          quint typecheck "$root/durable_cutover_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
+          quint test "$root/durable_cutover_test.qnt" 2>&1 | tee evidence/tests.log
+          quint run "$root/durable_cutover.qnt" \
+            --invariant=invariant --max-samples=5000 --max-steps=8 \
+            2>&1 | tee evidence/run.log
+          printf '{"maxHeap":"-Xmx2G","workers":2}\n' > evidence/tlc-config.json
+          quint verify "$root/durable_cutover.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            2>&1 | tee evidence/verify.log
+          set +e
+          quint verify "$root/durable_cutover_mutant.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            > evidence/mutant-verify.log 2>&1
+          mutant_status=$?
+          set -e
+          printf '%s\n' "$mutant_status" > evidence/mutant-verify.exit
+          test "$mutant_status" -ne 0
+          echo 'PASS: invariant rejected legacy fallback and stale-cursor journal writes' \
+            | tee evidence/non-vacuity.log
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifeos-hyperresearch-cutover-proof
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
