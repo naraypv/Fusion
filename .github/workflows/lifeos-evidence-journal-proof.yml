@@ -1,0 +1,86 @@
+name: Isolated LifeOS evidence journal proof
+
+on:
+  push:
+    branches:
+      - proof/lifeos-evidence-journal-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Verify exact model sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-evidence-journal-20260911
+          test "$(git hash-object "$root/evidence_journal.qnt")" = bd5e3f11ead75102b968514e5dff6ffb42eed68d
+          test "$(git hash-object "$root/evidence_journal_test.qnt")" = 57da1bbe7f3095c72b3b4fa1555d4b9de0a1cfab
+          test "$(git hash-object "$root/evidence_journal_mutant.qnt")" = 92dabf724bfdb957dc4d7b3c22519312cc6d49ad
+
+      - name: Install pinned Quint
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global @informalsystems/quint@0.32.0
+          test "$(quint --version)" = 0.32.0
+
+      - name: Execute proof and mutation check
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=proofs/lifeos-evidence-journal-20260911
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/runner-revision.txt
+          quint --version > evidence/quint-version.txt
+          sha256sum "$root"/*.qnt > evidence/model-hashes.txt
+          cat > evidence/commands.txt <<'COMMANDS'
+          quint typecheck evidence_journal.qnt
+          quint typecheck evidence_journal_mutant.qnt
+          quint test evidence_journal_test.qnt
+          quint run evidence_journal.qnt --invariant=invariant --max-samples=5000 --max-steps=8
+          quint verify evidence_journal.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json
+          quint verify evidence_journal_mutant.qnt --invariant=invariant --backend=tlc --tlc-config=tlc-config.json  # required nonzero
+          COMMANDS
+          quint typecheck "$root/evidence_journal.qnt" 2>&1 | tee evidence/typecheck.log
+          quint typecheck "$root/evidence_journal_mutant.qnt" 2>&1 | tee evidence/mutant-typecheck.log
+          quint test "$root/evidence_journal_test.qnt" 2>&1 | tee evidence/tests.log
+          quint run "$root/evidence_journal.qnt" \
+            --invariant=invariant --max-samples=5000 --max-steps=8 \
+            2>&1 | tee evidence/run.log
+          printf '{"maxHeap":"-Xmx2G","workers":2}\n' > evidence/tlc-config.json
+          quint verify "$root/evidence_journal.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            2>&1 | tee evidence/verify.log
+          set +e
+          quint verify "$root/evidence_journal_mutant.qnt" \
+            --invariant=invariant --backend=tlc \
+            --tlc-config=evidence/tlc-config.json \
+            > evidence/mutant-verify.log 2>&1
+          mutant_status=$?
+          set -e
+          printf '%s\n' "$mutant_status" > evidence/mutant-verify.exit
+          if [ "$mutant_status" -eq 0 ]; then
+            cat evidence/mutant-verify.log
+            echo 'FAIL: partial-publication mutant escaped the invariant' >&2
+            exit 1
+          fi
+          echo 'PASS: the invariant rejected partial evidence visibility' \
+            | tee evidence/non-vacuity.log
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifeos-evidence-journal-proof
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
